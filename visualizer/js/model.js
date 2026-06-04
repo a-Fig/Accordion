@@ -264,6 +264,124 @@
 		this._emit();
 	};
 
+	// ---- additive helpers for the "paper" view (timeline, segmented budget,
+	//      keep-N conductor, replay). These don't change existing behavior. -----
+
+	// tokens shown at FULL detail (the raised cards) — budget bar's bright segment
+	Store.prototype.fullTokens = function () {
+		let sum = 0;
+		for (const s of this.visible()) {
+			const g = this.groupOf(s);
+			if (g && g.collapsed) continue;                 // inside a collapsed group → not full
+			if (!(s.state === "folded" && !s.pinned)) sum += s.tokens;
+		}
+		return sum;
+	};
+	// what the context WOULD cost with nothing folded (every visible turn full)
+	Store.prototype.wouldBeTokens = function () { return this.totalTokens(); };
+
+	// ordered visible turns with their EFFECTIVE folded state — drives the timeline
+	Store.prototype.leafStates = function () {
+		const out = [];
+		for (const s of this.visible()) {
+			const g = this.groupOf(s);
+			const folded = (g && g.collapsed) || (s.state === "folded" && !s.pinned);
+			out.push({ id: s.id, index: s.index, by: s.by, pinned: !!s.pinned, folded });
+		}
+		return out;
+	};
+
+	// full serializable state — for replay history (no logging/side effects)
+	Store.prototype.snapshot = function () {
+		return {
+			sections: this.sections.map((s) => ({ id: s.id, state: s.state, pinned: s.pinned, by: s.by, groupId: s.groupId })),
+			groups: [...this.groups.values()].map((g) => ({ id: g.id, sectionIds: g.sectionIds.slice(), collapsed: g.collapsed, by: g.by })),
+			revealUpTo: this.revealUpTo,
+			gid: this._gid,
+		};
+	};
+	Store.prototype.restore = function (snap) {
+		const byId = new Map(snap.sections.map((x) => [x.id, x]));
+		for (const s of this.sections) {
+			const x = byId.get(s.id);
+			if (x) { s.state = x.state; s.pinned = x.pinned; s.by = x.by; s.groupId = x.groupId; }
+		}
+		this.groups = new Map(snap.groups.map((g) => [g.id, { id: g.id, sectionIds: g.sectionIds.slice(), collapsed: g.collapsed, by: g.by }]));
+		this.revealUpTo = snap.revealUpTo;
+		this._gid = snap.gid;
+	};
+
+	// One Conductor move toward "keep the last N turns hot": first group a run of
+	// >=3 consecutive cold folds (fold the folds), else fold the oldest full turn
+	// beyond the recent window. Returns an attributed event, or null when settled.
+	Store.prototype.conductorKeepPass = function (keep) {
+		keep = Math.max(1, keep || 4);
+		const vis = this.visible();
+		if (!vis.length) return null;
+		const top = vis.filter((s) => !s.groupId);          // top-level (ungrouped) turns
+		const lastId = vis[vis.length - 1].id;
+
+		// 1) group the first run of >=3 consecutive folded, ungrouped, non-pinned turns
+		let run = [], found = null;
+		for (const s of top) {
+			if (s.state === "folded" && !s.pinned) run.push(s);
+			else { if (run.length >= 3) { found = run.slice(); break; } run = []; }
+		}
+		if (!found && run.length >= 3) found = run.slice();
+		if (found) {
+			const id = "g" + this._gid++;
+			this.groups.set(id, { id, sectionIds: found.map((s) => s.id), collapsed: true, by: "conductor" });
+			found.forEach((s) => (s.groupId = id));
+			const a = found[0].index, b = found[found.length - 1].index;
+			this.log("conductor", "grouped", `turns ${a}–${b}`);
+			this._emit();
+			return { by: "conductor", action: "group", label: `Conductor grouped turns ${a}–${b} into one fold` };
+		}
+
+		// 2) fold the oldest full turn beyond the keep window
+		const keepIds = new Set(top.slice(-keep).map((s) => s.id));
+		for (const s of top) {
+			const folded = s.state === "folded" && !s.pinned;
+			if (folded || s.pinned || keepIds.has(s.id) || s.id === lastId) continue;
+			s.state = "folded"; s.by = "conductor";
+			this.log("conductor", "folded", "#" + s.index);
+			this._emit();
+			return { by: "conductor", action: "fold", label: `Conductor folded “${s.title}”` };
+		}
+		return null;
+	};
+
+	// Clean batch fit for initial load: keep the last `keep` turns hot, fold the
+	// rest, and group each MAXIMAL run (>=3) of consecutive cold folds into one
+	// group — yields a few large cold-history groups rather than many tiny ones.
+	Store.prototype.conductorFit = function (keep) {
+		keep = Math.max(1, keep || 5);
+		const vis = this.visible();
+		if (!vis.length) return;
+		const top = vis.filter((s) => !s.groupId);
+		const lastId = vis[vis.length - 1].id;
+		const keepIds = new Set(top.slice(-keep).map((s) => s.id));
+		for (const s of top) {                              // 1) fold all cold turns
+			if (s.pinned || keepIds.has(s.id) || s.id === lastId) continue;
+			if (s.state !== "folded") { s.state = "folded"; s.by = s.by || "conductor"; }
+		}
+		let run = [];                                        // 2) group maximal cold runs
+		const flush = () => {
+			if (run.length >= 3) {
+				const id = "g" + this._gid++;
+				this.groups.set(id, { id, sectionIds: run.map((s) => s.id), collapsed: true, by: "conductor" });
+				run.forEach((s) => (s.groupId = id));
+			}
+			run = [];
+		};
+		for (const s of top) {
+			if (s.groupId) { flush(); continue; }
+			if (s.state === "folded" && !s.pinned) run.push(s);
+			else flush();
+		}
+		flush();
+	};
+
 	App.Store = Store;
 	App.util = { estTokens, clip, messageText, messageTokens, sectionDigest, digestTokens, blockText };
 })((window.App = window.App || {}));

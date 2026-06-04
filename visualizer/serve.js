@@ -18,6 +18,8 @@ const mime = {
 	".jsonl": "application/x-ndjson; charset=utf-8",
 	".json": "application/json; charset=utf-8",
 	".svg": "image/svg+xml",
+	".woff2": "font/woff2",
+	".woff": "font/woff",
 };
 
 http
