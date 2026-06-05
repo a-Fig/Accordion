@@ -114,6 +114,11 @@
 	//      uniform size ⇒ strict order with no reflow holes (linearity for free).
 	const tiles = $derived(store.blocks.map((b) => ({ b, face: faceFor(b.tokens) })));
 	const count = $derived(store.blocks.length);
+	// the protected working tail — newest blocks the auto-folder never touches.
+	// split the grid into two boxes: older/foldable (top) and protected (bottom).
+	const protectedFrom = $derived(store.protectedFromIndex);
+	const olderTiles = $derived(tiles.slice(0, protectedFrom));
+	const protectedTiles = $derived(tiles.slice(protectedFrom));
 
 	let stage = $state<HTMLDivElement>();
 	let cell = $state(20);
@@ -123,11 +128,15 @@
 
 	function fit() {
 		if (!stage || zoom !== "grid") return;
-		const W = stage.clientWidth - 28; // minus padding
-		const H = stage.clientHeight - 22;
+		// reserve room for the two boxes' chrome (borders, padding, gap)
+		const CHROME_H = 84;
+		const CHROME_W = 28; // box inner padding
+		const W = stage.clientWidth - 28 - CHROME_W;
+		const H = stage.clientHeight - 22 - CHROME_H;
 		if (W < 40 || H < 40) return;
-		// uniform squares: size a cell so all `count` tiles fill the stage.
-		const waste = 1.06;
+		// uniform squares: size a cell so all `count` tiles fill the stage. extra
+		// waste because each box rounds its last row up independently.
+		const waste = 1.12;
 		const cpg = Math.sqrt((W * H) / (count * waste));
 		let c = Math.floor(cpg - GAP) + nudge;
 		c = Math.max(9, Math.min(40, c));
@@ -244,17 +253,29 @@
 		onkeydown={onKey}
 	>
 		{#if zoom === "grid"}
-			<div class="grid" style:--cell="{cell}px" style:--cols={cols}>
-				{#each tiles as t (t.b.id)}
-					<div
-						class="cell face f{t.face} k-{t.b.kind}"
-						class:folded={store.isFolded(t.b)}
-						class:pinned={t.b.override === "pinned"}
-						class:sel={t.b.id === selectedId}
-						data-id={t.b.id}
-						title={tip(t.b)}
-					></div>
-				{/each}
+			{#snippet tile(t: { b: Block; face: number })}
+				<div
+					class="cell face f{t.face} k-{t.b.kind}"
+					class:folded={store.isFolded(t.b)}
+					class:pinned={t.b.override === "pinned"}
+					class:sel={t.b.id === selectedId}
+					data-id={t.b.id}
+					title={tip(t.b)}
+				></div>
+			{/snippet}
+			<div class="boxes" style:--cell="{cell}px" style:--cols={cols}>
+				{#if olderTiles.length}
+					<section class="box older">
+						<div class="grid">
+							{#each olderTiles as t (t.b.id)}{@render tile(t)}{/each}
+						</div>
+					</section>
+				{/if}
+				<section class="box prot">
+					<div class="grid">
+						{#each protectedTiles as t (t.b.id)}{@render tile(t)}{/each}
+					</div>
+				</section>
 			</div>
 		{:else}
 			{#each units as u (u.key)}
@@ -425,6 +446,26 @@
 		box-shadow: inset 0 0 0 1px var(--accent-dim, var(--line));
 	}
 
+	/* ---- two boxes: older/foldable (top) + protected tail (bottom) ---- */
+	.boxes {
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		width: 100%;
+	}
+	.box {
+		border-radius: 14px;
+		border: 1.5px solid var(--line);
+		background: var(--panel-2);
+		padding: 12px;
+	}
+	/* the protected box: a meaningfully thicker, accented frame implies protection */
+	.box.prot {
+		border: 4px solid var(--accent-dim, var(--accent));
+		background: var(--panel);
+		box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+	}
+
 	/* ---- grid: uniform squares, conversation order (no dense backfill) ---- */
 	.grid {
 		display: grid;
@@ -437,12 +478,15 @@
 	}
 	.cell {
 		box-sizing: border-box;
+		/* skip painting tiles outside the viewport → smooth scroll over ~1k tiles */
+		content-visibility: auto;
+		contain-intrinsic-size: var(--cell) var(--cell);
 		border-radius: 3px;
 		cursor: pointer;
-		transition: filter 90ms ease, box-shadow 110ms ease;
 		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.22);
 	}
 	.cell:hover {
+		/* instant (no transition) so scrolling past tiles doesn't animate a repaint storm */
 		filter: brightness(1.22);
 		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3);
 		z-index: 2;
@@ -465,7 +509,8 @@
 		box-shadow: inset 0 0 0 2px #fff;
 	}
 	.cell.sel {
-		box-shadow: inset 0 0 0 2px var(--text), 0 0 0 2px var(--bg), 0 0 0 3px var(--accent);
+		/* inset-only so paint-containment (content-visibility) never clips it */
+		box-shadow: inset 0 0 0 2px var(--accent), inset 0 0 0 3px rgba(0, 0, 0, 0.55);
 		filter: brightness(1.18);
 		z-index: 3;
 	}

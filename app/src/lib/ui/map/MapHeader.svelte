@@ -38,15 +38,30 @@
 			{/if}
 		</div>
 		<div class="ctl">
-			<input
-				type="range"
-				min="12000"
-				max="160000"
-				step="2000"
-				value={store.budget}
-				oninput={(e) => store.setBudget(+e.currentTarget.value)}
-				aria-label="Context budget"
-			/>
+			<label class="knob">
+				<span class="kl">protected <b class="mono">{k(store.protectTokens)}</b></span>
+				<input
+					type="range"
+					min="0"
+					max="60000"
+					step="2000"
+					value={store.protectTokens}
+					oninput={(e) => store.setProtect(+e.currentTarget.value)}
+					aria-label="Protected tokens"
+				/>
+			</label>
+			<label class="knob">
+				<span class="kl">budget <b class="mono">{k(store.budget)}</b></span>
+				<input
+					type="range"
+					min="12000"
+					max="160000"
+					step="2000"
+					value={store.budget}
+					oninput={(e) => store.setBudget(+e.currentTarget.value)}
+					aria-label="Context budget"
+				/>
+			</label>
 			<button class="reset" onclick={() => store.resetAll()}>Reset</button>
 		</div>
 	</div>
@@ -118,13 +133,28 @@
 	.ctl {
 		margin-left: auto;
 		display: flex;
-		align-items: center;
-		gap: 10px;
+		align-items: flex-end;
+		gap: 14px;
 		flex: 0 0 auto;
 	}
+	.knob {
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.kl {
+		font-size: 10px;
+		color: var(--faint);
+		letter-spacing: 0.02em;
+	}
+	.kl b {
+		color: var(--muted);
+		font-weight: 600;
+	}
 	.ctl input[type="range"] {
-		width: 190px;
+		width: 140px;
 		accent-color: var(--accent);
+		margin: 0;
 	}
 	.reset {
 		background: var(--panel-3);

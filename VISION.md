@@ -50,6 +50,14 @@ Three parties operate the same accordion. Not all of them can do everything — 
 - **The agent** can reach for context it needs — unfold a past section mid-task, or pin one it wants to keep — but it never decides what to throw away, and it has no reason to peek (it isn't looking at a window; it simply receives context).
 - **The Conductor** is Accordion's automatic mode. Between every turn it reads what the agent is doing, folds the sections that have gone cold, and unfolds the ones becoming relevant again — keeping the most useful context in view and within budget on its own. It never pins, because a pin exists precisely to overrule it.
 
+## The protected working tail
+
+One slice of context is special: the most recent stretch of the conversation. The agent's latest reasoning, the tool results it just saw, the turn it's mid-way through — this is its working memory, and silently summarizing any of it would undercut the work in progress and the trust the whole tool depends on.
+
+So Accordion reserves a **protected working tail**: the newest ~20k tokens of context (configurable) are **never auto-folded**. Both the automatic folder and the Conductor are held back from this window — they only ever operate on context older than it. The guarantee is token-based, not turn-based: it always covers a real, recent slice of the conversation regardless of how the turns happen to divide.
+
+This is a constraint on *automation only*. You and the agent may still fold something inside the tail by hand if you choose; the promise is specifically that nothing automatic will reach in and collapse recent context behind your back. Recent reasoning stays intact, always.
+
 ## Folding the folds
 
 A single summary per turn is enough for a normal session. A session that runs for days is not — you would end up with a long wall of summaries, which is just a smaller wall.

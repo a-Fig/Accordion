@@ -35,8 +35,13 @@ export class AccordionStore {
 	blocks = $state<Block[]>([]);
 	/** Token budget for the live context window. */
 	budget = $state(70_000);
-	/** Never auto-fold the most recent N blocks. */
-	hotTail = $state(2);
+	/**
+	 * The protected working tail: the most recent blocks whose combined full size
+	 * reaches this many tokens are NEVER auto-folded. The automatic folder and the
+	 * future Conductor only ever operate on context older than this window — the
+	 * recent ~N tokens stay verbatim. (Manual fold by the user is still allowed.)
+	 */
+	protectTokens = $state(20_000);
 	log = $state<LogEntry[]>([]);
 	private logN = 0;
 	/** Bumped on every settled change — a cheap redraw signal for canvas views. */
@@ -86,6 +91,32 @@ export class AccordionStore {
 		return this.liveTokens > this.budget;
 	}
 
+	/**
+	 * Index of the first protected block. Walking back from the newest block, the
+	 * most recent blocks whose combined full size reaches `protectTokens` are
+	 * protected; blocks at this index and later are never auto-folded. Always
+	 * protects at least the newest block. Returns 0 if the whole session is
+	 * smaller than the protected window (then nothing is fold-eligible).
+	 */
+	get protectedFromIndex(): number {
+		let sum = 0;
+		for (let i = this.blocks.length - 1; i >= 0; i--) {
+			sum += this.blocks[i].tokens;
+			if (sum >= this.protectTokens) return i;
+		}
+		return 0;
+	}
+	/** Is this block inside the protected working tail (never auto-folded)? */
+	isProtected(b: Block): boolean {
+		return this.blocks.indexOf(b) >= this.protectedFromIndex;
+	}
+	/** Full tokens currently held in the protected tail. */
+	get protectedTokens(): number {
+		let n = 0;
+		for (let i = this.protectedFromIndex; i < this.blocks.length; i++) n += this.blocks[i].tokens;
+		return n;
+	}
+
 	// ---- the automatic folder ---------------------------------------------
 	/**
 	 * Recompute every auto-controlled block from scratch so the live context fits
@@ -104,12 +135,12 @@ export class AccordionStore {
 		if (live <= this.budget) return;
 
 		// 2) fold lowest-value, oldest candidates until the live context fits.
-		// Protect the hot tail by array position (blocks are stored in order), and
-		// never fold a block whose digest wouldn't actually save tokens — folding it
-		// would only grow the live context and churn the view.
-		const cutoff = this.blocks.length - 1 - this.hotTail;
+		// Protect the recent working tail (the newest ~protectTokens of context),
+		// and never fold a block whose digest wouldn't actually save tokens — folding
+		// it would only grow the live context and churn the view.
+		const protectedFrom = this.protectedFromIndex;
 		const cand = this.blocks
-			.filter((b, i) => b.override === null && i <= cutoff && digestTokens(b) < b.tokens)
+			.filter((b, i) => b.override === null && i < protectedFrom && digestTokens(b) < b.tokens)
 			.sort((a, b) => FOLD_RANK[a.kind] - FOLD_RANK[b.kind] || a.order - b.order);
 
 		for (const b of cand) {
@@ -122,6 +153,12 @@ export class AccordionStore {
 
 	setBudget(n: number): void {
 		this.budget = Math.max(1000, Math.round(n));
+		this.refold();
+	}
+
+	/** Resize the protected working tail, then re-fold so the change takes effect. */
+	setProtect(n: number): void {
+		this.protectTokens = Math.max(0, Math.round(n));
 		this.refold();
 	}
 

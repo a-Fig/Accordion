@@ -32,6 +32,15 @@ standalone HTML visualizer — not the focus; touch only if asked.
   `isFolded(b)`, `effTokens(b)`, `digestOf(b)`, `toggle/fold/unfold/pin/unpin(id)`,
   `resetAll()`, `liveTokens`, `fullTokens`, `savedTokens`, `foldedCount`, `overBudget`,
   `log`, `meta`. Exposed as `window.__store` for debugging.
+  - **Protected working tail:** `protectTokens` (default `20_000`) reserves the newest
+    ~N tokens of context so the auto-folder never touches recent reasoning. `protectedFromIndex`
+    walks back from the newest block summing full `tokens` and returns the index where the
+    sum first reaches `protectTokens` (blocks at that index and later are protected; always
+    at least the newest block; `0` if the whole session is smaller than the window).
+    `isProtected(b)` and `protectedTokens` are the reads. `refold()` only builds fold
+    candidates from blocks with `i < protectedFromIndex` — i.e. older than the tail. Manual
+    `fold()`/`pin()` are unaffected; protection constrains the automatic folder only.
+    `setProtect(n)` resizes the tail and re-folds — wired to a header slider (0–60k).
 - `tokens.ts` (chars/4 estimate) · `digest.ts` (what a kind collapses to when folded).
 
 Folding is **content substitution, never removal** — provider-safe and fully reversible.
@@ -45,6 +54,11 @@ Folding is **content substitution, never removal** — provider-safe and fully r
   **weight is read as a dice face 1–6** (more pips = heavier block). Current
   thresholds in `ContextMap.svelte → faceFor()`: ≥500→2, ≥1500→3, ≥5000→4, ≥10000→5,
   ≥50000→6, else 1. Arrow keys traverse blocks (←/→ = prev/next, ↑/↓ = ± one row).
+  The grid is split into **two rounded boxes stacked like paragraphs**, divided at
+  `store.protectedFromIndex`: the top box holds older/foldable blocks (thin border);
+  the bottom box holds the protected tail and has a **meaningfully thicker, accented
+  border** to signal protection (`.box.prot`). No text labels — the border does the
+  talking. Each box holds its own uniform grid; order is continuous across both.
 
 ## Conventions
 
@@ -57,6 +71,12 @@ Folding is **content substitution, never removal** — provider-safe and fully r
   Radial gradients and per-element `filter` re-rasterize on every repaint and tank
   interaction. The dice pips are **one cached SVG data-URI per face** (decoded once,
   blitted) — keep that pattern for anything tile-dense.
+- **Scroll perf on the tile grid:** `.cell` uses `content-visibility: auto` +
+  `contain-intrinsic-size: var(--cell)` to cull off-screen tiles, and hover is
+  instant (no `transition`) so scrolling past tiles doesn't animate a repaint storm.
+  Because `content-visibility` implies paint containment, keep tile decorations
+  **inset** (the selection ring is inset-only) — outset box-shadows get clipped.
+  (Scroll smoothness is still under active investigation — see handoff.)
 
 ## Running & verifying
 

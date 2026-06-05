@@ -29,6 +29,8 @@ Accordion shows the agent's context as a list of **sections** — one per turn �
 
 Nothing is ever deleted — folding only changes what the agent is *shown*, never what's *stored* — so every fold is instantly reversible, with no database or search index behind it.
 
+And the recent past is always safe: the most recent ~20k tokens of context are **never auto-folded**, so the agent's working tail — its latest reasoning — stays at full fidelity. You and the agent can still fold inside that window by hand; only the automatic system is held back.
+
 ## Three hands on the same controls
 
 - **You** — fold, unfold, pin, and peek, by hand.
