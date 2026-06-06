@@ -1,7 +1,9 @@
 <script lang="ts">
+	import { untrack } from "svelte";
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block } from "../../engine/types";
 	import { ghosts, type Ghost } from "../../live/ghostState.svelte";
+	import { nextVacated } from "./drain";
 
 	let {
 		store,
@@ -120,12 +122,27 @@
 	const protectedFrom = $derived(store.protectedFromIndex);
 	const olderTiles = $derived(tiles.slice(0, protectedFrom));
 	const protectedTiles = $derived(tiles.slice(protectedFrom));
+	// live (effective) token weight in each box — shown as a vertical tally on the
+	// box's left rail. The protected tail never folds, so its eff == full.
+	const olderTok = $derived(olderTiles.reduce((s, t) => s + store.effTokens(t.b), 0));
+	const protTok = $derived(protectedTiles.reduce((s, t) => s + t.b.tokens, 0));
 
 	let stage = $state<HTMLDivElement>();
 	let cell = $state(20);
 	let cols = $state(40);
 	let nudge = $state(0); // user density adjustment (± px per cell)
 	const GAP = 4;
+
+	// ---- "drain without reflow" -------------------------------------------------
+	// When a block crosses out of the protected tail it should leave a HOLE rather
+	// than yanking its neighbours back a slot. Holes pile up at the front of the
+	// protected grid; only when a whole leading row is empty (or a resize re-flows
+	// everything) do we reclaim the space — so the tiles move once per row, not on
+	// every single departure. `vacated` is the number of leading placeholder cells.
+	let vacated = $state(0);
+	const vacatedCells = $derived(Array.from({ length: vacated }, (_, i) => i));
+	let _prevBoundary = 0;
+	let _prevCols = 0;
 
 	// ---- scroll smoothness: while the stage is actively scrolling, suppress
 	//      per-tile :hover. Otherwise ~1k tiles sliding under a STATIONARY cursor
@@ -145,7 +162,7 @@
 		if (!stage || zoom !== "grid") return;
 		// reserve room for the two boxes' chrome (borders, padding, gap)
 		const CHROME_H = 84;
-		const CHROME_W = 28; // box inner padding
+		const CHROME_W = 56; // box inner padding + the left token rail
 		const W = stage.clientWidth - 28 - CHROME_W;
 		const H = stage.clientHeight - 22 - CHROME_H;
 		if (W < 40 || H < 40) return;
@@ -171,6 +188,19 @@
 		void nudge;
 		void count;
 		fit();
+	});
+
+	// Track the protected boundary so a departing block leaves a hole instead of
+	// reflowing the grid. Reclaim space only when a full leading row is empty, or
+	// when a resize (cols change) re-flows everything anyway.
+	$effect(() => {
+		const boundary = store.protectedFromIndex;
+		const c = cols;
+		untrack(() => {
+			vacated = nextVacated(vacated, _prevBoundary, boundary, _prevCols, c);
+			_prevCols = c;
+			_prevBoundary = boundary;
+		});
 	});
 
 	const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`);
@@ -290,13 +320,20 @@
 			<div class="boxes" style:--cell="{cell}px" style:--cols={cols}>
 				{#if olderTiles.length}
 					<section class="box older">
+						<div class="rail" title="{olderTok.toLocaleString()} live tokens · foldable">
+							<span class="tok">{k(olderTok)}</span>
+						</div>
 						<div class="grid">
 							{#each olderTiles as t (t.b.id)}{@render tile(t, false)}{/each}
 						</div>
 					</section>
 				{/if}
 				<section class="box prot">
+					<div class="rail" title="{protTok.toLocaleString()} tokens · protected working tail">
+						<span class="tok">{k(protTok)}</span>
+					</div>
 					<div class="grid">
+						{#each vacatedCells as i (i)}<div class="cell vacated"></div>{/each}
 						{#each protectedTiles as t (t.b.id)}{@render tile(t, true)}{/each}
 						{#each ghosts as g (g.contentIndex)}
 							{@render ghostTile(g)}
@@ -488,6 +525,29 @@
 		border: 1.5px solid var(--line);
 		background: var(--panel-2);
 		padding: 12px;
+		display: flex;
+		align-items: stretch;
+		gap: 8px;
+	}
+	/* left rail: a small vertical token tally for the group */
+	.rail {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		writing-mode: vertical-rl;
+		transform: rotate(180deg);
+		font-variant-numeric: tabular-nums;
+		font-size: 11px;
+		letter-spacing: 0.04em;
+		color: var(--faint);
+		user-select: none;
+	}
+	.rail .tok {
+		font-weight: 700;
+	}
+	.box.prot .rail {
+		color: color-mix(in srgb, var(--accent) 70%, var(--muted));
 	}
 	/* the protected box: a meaningfully thicker, accented frame implies protection */
 	.box.prot {
@@ -504,7 +564,8 @@
 		gap: 4px;
 		align-content: start;
 		justify-content: center;
-		width: 100%;
+		flex: 1;
+		min-width: 0;
 	}
 	/* while scrolling, make tiles transparent to the pointer so a stationary cursor
 	   doesn't trigger :hover on every tile that slides past it (repaint storm). */
@@ -539,6 +600,19 @@
 	}
 	.cell.pinned {
 		box-shadow: inset 0 0 0 2px #fff;
+	}
+	/* vacated slot: a block left the protected tail but we hold its place (no reflow)
+	   until the whole leading row empties. Reads as an empty outline, not a tile. */
+	.cell.vacated {
+		background: transparent;
+		border: 1px dashed color-mix(in srgb, var(--accent) 30%, transparent);
+		box-shadow: none;
+		cursor: default;
+		pointer-events: none;
+	}
+	.cell.vacated:hover {
+		filter: none;
+		box-shadow: none;
 	}
 	.cell.sel {
 		/* inset-only so paint-containment (content-visibility) never clips it */
