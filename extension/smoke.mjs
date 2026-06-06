@@ -544,7 +544,96 @@ if (!agentEndAbort) fails.push("agent_end did not send a ghost abort sweep (back
 else if (agentEndAbort.contentIndex !== -1)
 	fails.push(`agent_end abort sweep should have contentIndex:-1, got ${agentEndAbort.contentIndex}`);
 
-ws2.close();
+// Ensure fully detached before the resume sub-tests (server-side `client` is cleared
+// on the socket's close event, which is async after ws2.close()).
+await new Promise((resolve) => { ws2.on("close", resolve); ws2.close(); });
+await new Promise((r) => setTimeout(r, 50));
+
+// ── resumed-session attach: history must flush on connect with NO hooks firing ──
+// The real "session with history" case is a RESUMED session: pi loads a prior session
+// file and fires `session_start` (reason "resume") — but no `context`/`agent_end` has
+// run yet, so the cached `lastMessages` is empty. The extension must read the live
+// history straight from `ctx.sessionManager` (buildSessionContext, or getBranch
+// fallback) so the attach flush still carries the whole conversation.
+//
+// We seed `latestCtx` via a DETACHED `context` hook (messages:[]) carrying a ctx whose
+// sessionManager exposes the prior history. (Using `context` rather than a second
+// `session_start` avoids minting a new sessionId / perturbing the registry, while
+// exercising the exact attach-time read path the connection handler uses.) Then we
+// connect a fresh GUI and assert the flush carries the session-manager history with
+// NO further hook firing.
+const resumeHistory = [
+	{ role: "user", content: "resumed: first question", timestamp: T0 + 1000 },
+	{ role: "assistant", content: [{ type: "text", text: "RESUMED PRIOR REPLY" }], responseId: "resp-resume-1", timestamp: T0 + 1001 },
+	{ role: "user", content: "resumed: follow up", timestamp: T0 + 1002 },
+];
+const resumeCtx = {
+	...ctx,
+	// pi's authoritative resolver — the preferred path in readSessionMessages()
+	sessionManager: { buildSessionContext: () => ({ messages: resumeHistory, thinkingLevel: "high", model: null }) },
+};
+handlers.context({ messages: [] }, resumeCtx); // detached → passthrough; sets latestCtx=resumeCtx
+
+let resumeFlush = null;
+let resumeStrayContext = false;
+const ws3 = new WebSocket(`ws://127.0.0.1:${PORT}`);
+await new Promise((resolve, reject) => {
+	const timeout = setTimeout(() => reject(new Error("resume attach timed out")), 2000);
+	ws3.on("error", reject);
+	ws3.on("message", (data) => {
+		const m = JSON.parse(data.toString());
+		if (m.type === "sync") {
+			if (resumeFlush) resumeStrayContext = true; // a second sync would mean a hook fired
+			else {
+				resumeFlush = m;
+				setTimeout(() => { clearTimeout(timeout); resolve(); }, 150); // settle window
+			}
+		}
+	});
+});
+await new Promise((resolve) => { ws3.on("close", resolve); ws3.close(); });
+if (!resumeFlush) fails.push("resumed session: GUI received no history flush on attach (reads sessionManager?)");
+else {
+	if (!resumeFlush.full) fails.push("resumed session: attach flush should be a full sync");
+	if (!resumeFlush.blocks?.some((b) => b.text === "RESUMED PRIOR REPLY"))
+		fails.push("resumed session: attach flush missing the prior assistant reply");
+	if (!resumeFlush.blocks?.some((b) => b.id === "a:resp-resume-1:p0"))
+		fails.push("resumed session: attach flush block missing durable id a:resp-resume-1:p0");
+	if (resumeFlush.blocks?.length < 3)
+		fails.push(`resumed session: attach flush carried too few blocks: ${resumeFlush.blocks?.length}`);
+}
+if (resumeStrayContext) fails.push("resumed session: an extra sync arrived — flush should not require a context hook");
+
+// getBranch fallback: when buildSessionContext is absent, readSessionMessages must
+// reconstruct from the active branch's message entries (leaf→root → reversed).
+const branchHistory = [
+	{ role: "user", content: "branch q", timestamp: T0 + 2000 },
+	{ role: "assistant", content: [{ type: "text", text: "BRANCH FALLBACK REPLY" }], responseId: "resp-branch-1", timestamp: T0 + 2001 },
+];
+const branchCtx = {
+	...ctx,
+	// getBranch returns entries leaf→root; the reader must reverse to chronological
+	sessionManager: { getBranch: () => [...branchHistory].reverse().map((message, i) => ({ type: "message", id: `e${i}`, message })) },
+};
+handlers.context({ messages: [] }, branchCtx); // detached → sets latestCtx=branchCtx
+let branchFlush = null;
+const ws4 = new WebSocket(`ws://127.0.0.1:${PORT}`);
+await new Promise((resolve, reject) => {
+	const timeout = setTimeout(() => reject(new Error("branch-fallback attach timed out")), 2000);
+	ws4.on("error", reject);
+	ws4.on("message", (data) => {
+		const m = JSON.parse(data.toString());
+		if (m.type === "sync" && !branchFlush) { branchFlush = m; setTimeout(() => { clearTimeout(timeout); resolve(); }, 150); }
+	});
+});
+await new Promise((resolve) => { ws4.on("close", resolve); ws4.close(); });
+if (!branchFlush) fails.push("getBranch fallback: no flush on attach");
+else {
+	if (branchFlush.blocks?.[0]?.kind !== "user")
+		fails.push("getBranch fallback: chronological order wrong (first block should be the user message)");
+	if (!branchFlush.blocks?.some((b) => b.id === "a:resp-branch-1:p0"))
+		fails.push("getBranch fallback: attach flush missing reconstructed block a:resp-branch-1:p0");
+}
 
 // ── assertions ───────────────────────────────────────────────────────────────
 if (!seen.hello) fails.push("never received hello");
@@ -584,6 +673,7 @@ console.log(
 		`message_end committed-streaming ✓  tool-loop (2 msgs/turn) ✓  no-dup after context ✓  ` +
 		`empty-leading-part dedup ✓  agent_end live-view ✓  shutdown cleanup ✓  ` +
 		`stream(start/end/abort) ✓  no-content-on-frame ✓  delta-dropped ✓  ` +
-		`message_end ghost-sweep ✓  agent_end ghost-sweep ✓`,
+		`message_end ghost-sweep ✓  agent_end ghost-sweep ✓  ` +
+			`resumed-session attach-flush ✓  getBranch fallback ✓`,
 );
 process.exit(0);

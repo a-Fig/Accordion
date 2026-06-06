@@ -74,6 +74,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// turn/order and never drops or mis-numbers the earlier message. Reset whenever an
 	// authoritative snapshot (`context`/`agent_end`) supersedes it.
 	let pendingSince: PiMessage[] = [];
+	// Most recent ExtensionContext seen on any hook. Captured so the WS connection
+	// handler (which gets no ctx of its own) can read pi's CURRENT session history
+	// directly at attach time — the authoritative way to populate the view for a
+	// session that already has turns (especially a RESUMED session, where no
+	// `context`/`agent_end` has fired yet so `lastMessages` would still be empty).
+	let latestCtx: ExtensionContext | null = null;
 
 	// ── discovery (registry) state ──────────────────────────────────────────────
 	let port = 0; // actual ephemeral port, filled once the server is listening
@@ -161,6 +167,43 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Read pi's CURRENT session history as an AgentMessage[] (the same shape the
+	 * `context` hook delivers), straight from the session manager. This is the
+	 * authoritative source for "what's in this session right now" — it works even
+	 * when no hook has fired yet (a freshly resumed/loaded session), which is the
+	 * exact case where `lastMessages` is still empty.
+	 *
+	 * Prefer `buildSessionContext()` — pi's own resolver (tree traversal from the
+	 * current leaf; collapses compaction/branches to exactly what would go to the
+	 * model). It lives on SessionManager but is omitted from the ReadonlySessionManager
+	 * type, so we reach it via a guarded cast. Fall back to reconstructing from the
+	 * active branch's message entries (leaf→root, so reverse to chronological).
+	 * Best-effort throughout: any failure yields [] and the caller keeps its cache.
+	 */
+	function readSessionMessages(c: ExtensionContext | null): PiMessage[] {
+		if (!c) return [];
+		const sm = c.sessionManager as unknown as {
+			buildSessionContext?: () => { messages?: unknown };
+			getBranch?: (fromId?: string) => Array<{ type: string; message?: unknown }>;
+		} | undefined;
+		if (!sm) return [];
+		try {
+			const sc = sm.buildSessionContext?.();
+			if (sc && Array.isArray(sc.messages)) return sc.messages as PiMessage[];
+		} catch {
+			/* fall through to the branch reconstruction */
+		}
+		try {
+			const branch = sm.getBranch?.() ?? [];
+			const msgs = branch.filter((e) => e.type === "message" && e.message).map((e) => e.message as PiMessage);
+			msgs.reverse(); // getBranch walks leaf→root; the view wants chronological order
+			return msgs;
+		} catch {
+			return [];
+		}
+	}
+
 	/** Pull model id + live usage off the hook context (best-effort). */
 	function refreshFromCtx(ctx: ExtensionContext): void {
 		try {
@@ -211,11 +254,18 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// already has turns stays empty in the app until the next hook fires — and the
 			// only hook that streams the backlog is `context`, which fires before the next
 			// model call (i.e. when the user sends their next message). So `/accordion` in a
-			// session with history would show nothing until the first message. We push the
-			// cached snapshot now as a VIEW-ONLY full sync: folding may legally happen only at
-			// `context`, so (like agent_end/message_end) we do NOT await or apply a plan here.
-			// `lastMessages` is kept complete even while detached (see context/agent_end),
-			// so this is the whole conversation up to and including the last reply.
+			// session with history would show nothing until the first message.
+			//
+			// Read the history STRAIGHT FROM THE SESSION at attach time (not from the cached
+			// `lastMessages`): on a resumed/loaded session no hook has fired yet, so the cache
+			// is empty — but the session manager already holds the full conversation. We adopt
+			// that read as the new baseline so the flush, the message_end dedup, and the cursor
+			// all agree. If the live read is empty (e.g. a brand-new session, or no session
+			// manager in tests) we fall back to whatever the hooks have cached.
+			const live = readSessionMessages(latestCtx);
+			if (live.length) lastMessages = live;
+			// VIEW-ONLY full sync: folding may legally happen only at `context`, so (like the
+			// agent_end/message_end paths) we do NOT await or apply a plan here.
 			const backlog = linearize(lastMessages);
 			if (backlog.length) {
 				send(ws, { type: "sync", reqId: ++reqSeq, full: true, blocks: backlog });
@@ -270,10 +320,16 @@ export default function accordionLive(pi: ExtensionAPI): void {
 
 	// ── lifecycle ──────────────────────────────────────────────────────────────
 	pi.on("session_start", (_event, ctx: ExtensionContext) => {
+		latestCtx = ctx;
 		sessionId = `s-${process.pid}-${Date.now()}`;
 		sentCount = 0;
-		lastMessages = [];
 		pendingSince = [];
+		// Seed the cache from the session itself. For a fresh session this is []; for a
+		// RESUMED/loaded session (reason "resume"/"startup"/"fork") it is the full prior
+		// conversation, which would otherwise stay invisible until the first `context` hook
+		// (i.e. the user's next message) — the bug. Reading here means an attach that lands
+		// before any turn still has a correct baseline to flush.
+		lastMessages = readSessionMessages(ctx);
 		startedAt = Date.now();
 		try {
 			meta = { title: "pi session", cwd: process?.cwd?.() ?? "", model: "", format: "pi" };
@@ -344,6 +400,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// only an explicit `{ messages }` replaces them. Every passthrough path below
 	// returns undefined, so we never alter a model call without a plan.
 	pi.on("context", async (event, ctx: ExtensionContext) => {
+		latestCtx = ctx;
 		const myEpoch = epoch;
 		// Refresh model/usage in memory only — NO disk I/O on the model-call critical
 		// path. The 5s heartbeat persists these to the registry for the sidebar.
@@ -445,7 +502,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// may legally happen only at `context`, the one place we can alter the outgoing
 	// call). It shares the `sentCount` cursor with `context`, so the deltas never
 	// overlap; any plan the GUI replies with carries an unknown reqId and is ignored.
-	pi.on("agent_end", (event) => {
+	pi.on("agent_end", (event, ctx: ExtensionContext) => {
+		latestCtx = ctx;
 		// Cache for next message_end (backstop path); also keeps lastMessages current
 		// after the loop ends so any late message_end fires against the right context.
 		// This snapshot is authoritative, so drop anything accumulated since the last.
