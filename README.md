@@ -100,6 +100,11 @@ Then run `pi` in any project — it appears in the app's **Sessions** sidebar wi
 second. Click it (or run `/accordion` in that terminal to foreground the app on it) and
 watch its context populate live.
 
+### Developing
+
+Setting up for development (prerequisites, running the app, the quality gate, the live-link
+setup, and platform gotchas) is in **[CONTRIBUTING.md](CONTRIBUTING.md)**.
+
 ## Roadmap
 
 - [x] Core fold/unfold engine — reversible, tool-pair safe
@@ -119,4 +124,4 @@ watch its context populate live.
 
 🪗
 
-<sub>An experiment in context engineering. Contributions, ideas, and benchmarks welcome.</sub>
+<sub>An experiment in context engineering. Contributions, ideas, and benchmarks welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).</sub>
