@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { linearize, applyPlan, blockId, type PiMessage } from "./mapping";
+import { linearize, applyPlan, blockId, isDurableId, type PiMessage } from "./mapping";
 import type { FoldOp } from "./protocol";
 
 // A small but representative pi context: a user turn, an assistant turn that
@@ -259,5 +259,132 @@ describe("applyPlan", () => {
 		// Protected tail: the last 2 messages are never folded
 		expect((out[3].content as string)).toBe("continue");
 		expect((out[4].content as any[])[0].text).toBe("newest reply");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 0 (ADR 0003) — the ANCHOR-LESS / POSITIONAL path, end to end.
+//
+// The durable-id tests above prove anchored ids are stable. These prove the
+// CONVERSE: a message with no anchor falls back to a positional id (`m<i>:…`),
+// that id is UNSTABLE across array shifts, and `applyPlan`'s durable-id filter
+// refuses to act on it. This is the property that makes live folding safe even
+// when pi hands us a message without timestamp/responseId/toolCallId.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("positional ids — instability + the applyPlan durable-id guard", () => {
+	it("a positional id is position-dependent (unstable), an anchored id is not", () => {
+		// The SAME logical assistant message, with NO anchor fields. Its id is
+		// derived purely from its array index, so it MUST change when the index does.
+		const anchorless: PiMessage = { role: "assistant", content: [{ type: "text", text: "x" }] };
+
+		// Position 0 in a 1-message array → m0:p0.
+		const atIndex0 = linearize([anchorless]);
+		// Same logical message now at index 2 (two earlier messages push it down).
+		const atIndex2 = linearize([
+			{ role: "user", content: "earlier 1", timestamp: 1 },
+			{ role: "user", content: "earlier 2", timestamp: 2 },
+			anchorless,
+		]);
+
+		const id0 = atIndex0[0].id;
+		const id2 = atIndex2.find((b) => b.kind === "text")!.id;
+
+		// WHY this matters: the positional id literally encoded the wrong location at
+		// the new index — proof that a fold op keyed by it could point at a different
+		// block after the array shifts. They must differ.
+		expect(id0).toBe("m0:p0");
+		expect(id2).toBe("m2:p0");
+		expect(id0).not.toBe(id2);
+
+		// And BOTH are non-durable, so the guard will refuse a fold op for either.
+		expect(isDurableId(id0)).toBe(false);
+		expect(isDurableId(id2)).toBe(false);
+
+		// CONTRAST: give the same message a durable anchor (responseId) and its id is
+		// identical at index 0 and index 2 — the stability the positional path lacks.
+		const anchored: PiMessage = {
+			role: "assistant",
+			responseId: "resp_stable",
+			content: [{ type: "text", text: "x" }],
+		};
+		const anchoredAt0 = linearize([anchored])[0].id;
+		const anchoredAt2 = linearize([
+			{ role: "user", content: "earlier 1", timestamp: 1 },
+			{ role: "user", content: "earlier 2", timestamp: 2 },
+			anchored,
+		]).find((b) => b.kind === "text")!.id;
+		expect(anchoredAt0).toBe("a:resp_stable:p0");
+		expect(anchoredAt2).toBe("a:resp_stable:p0");
+		expect(anchoredAt0).toBe(anchoredAt2); // durable: index-independent
+		expect(isDurableId(anchoredAt0)).toBe(true);
+	});
+
+	it("applyPlan REFUSES a positional-id op but APPLIES the same fold under the durable id", () => {
+		// An anchor-less assistant message whose text part WOULD be foldable by
+		// position. Pad after it so it sits outside the PROTECT_RECENT_MSGS=2 tail.
+		const target: PiMessage = { role: "assistant", content: [{ type: "text", text: "ORIGINAL" }] };
+		const msgs: PiMessage[] = [
+			target, // index 0 → positional id m0:p0 (no responseId/timestamp)
+			{ role: "user", content: "pad 1", timestamp: 10 },
+			{ role: "user", content: "pad 2", timestamp: 11 },
+		];
+
+		// The positional id correctly NAMES the foldable part by position…
+		expect(blockId(target, 0, 0)).toBe("m0:p0");
+		// …but the guard refuses it because it is not durable. Same array back, by ref.
+		const refused = applyPlan(msgs, [{ id: "m0:p0", digestText: "FOLDED" }]);
+		expect(refused).toBe(msgs); // unchanged — the guard filtered the only op out
+		expect((refused[0].content as any[])[0].text).toBe("ORIGINAL");
+
+		// Now express the SAME fold via a DURABLE id by giving the message an anchor.
+		// (responseId is the durable anchor; with it the id becomes a:resp_t:p0.)
+		const durableTarget: PiMessage = { role: "assistant", responseId: "resp_t", content: [{ type: "text", text: "ORIGINAL" }] };
+		const durableMsgs: PiMessage[] = [durableTarget, msgs[1], msgs[2]];
+		expect(blockId(durableTarget, 0, 0)).toBe("a:resp_t:p0");
+		const applied = applyPlan(durableMsgs, [{ id: "a:resp_t:p0", digestText: "FOLDED" }]);
+		// WHY this matters: the guard DISCRIMINATES — it is not refusing all folds,
+		// only non-durable ones. The durable fold goes through (content substituted).
+		expect(applied).not.toBe(durableMsgs);
+		expect((applied[0].content as any[])[0].text).toBe("FOLDED");
+	});
+
+	it("applyPlan refuses an empty-digest op even when the id is durable", () => {
+		// Durable id, but digestText:"" would BLANK the content part — the second half
+		// of the guard (isDurableId(id) && o.digestText) must filter it out.
+		const msgs: PiMessage[] = [
+			{ role: "assistant", responseId: "resp_e", content: [{ type: "text", text: "KEEP ME" }] },
+			{ role: "user", content: "pad 1", timestamp: 10 },
+			{ role: "user", content: "pad 2", timestamp: 11 },
+		];
+		const out = applyPlan(msgs, [{ id: "a:resp_e:p0", digestText: "" }]);
+		expect(out).toBe(msgs); // unchanged — empty digest refused
+		expect((out[0].content as any[])[0].text).toBe("KEEP ME");
+	});
+
+	it("applyPlan never folds a tool_call or a user message, even with a durable id", () => {
+		// Both the new durable filter AND the kind checks must hold: a durable id that
+		// happens to resolve to a tool_call (orphans its result → provider 400) or to a
+		// user message (never folded) must leave the messages untouched.
+		const msgs: PiMessage[] = [
+			{ role: "user", content: "fold me?", timestamp: 100 }, // durable id u:100
+			{
+				role: "assistant",
+				responseId: "resp_tc",
+				content: [
+					{ type: "text", text: "calling" },
+					{ type: "toolCall", id: "call_z", name: "bash", arguments: { cmd: "ls" } }, // a:resp_tc:p1
+				],
+			},
+			{ role: "user", content: "pad 1", timestamp: 101 },
+			{ role: "user", content: "pad 2", timestamp: 102 },
+		];
+		const ops: FoldOp[] = [
+			{ id: "u:100", digestText: "should not fold a user" }, // durable, but kind=user → ignored
+			{ id: "a:resp_tc:p1", digestText: "should not fold a tool_call" }, // durable, but kind=tool_call → ignored
+		];
+		const out = applyPlan(msgs, ops);
+		expect(out).toBe(msgs); // nothing applied → original array returned by reference
+		expect(msgs[0].content).toBe("fold me?"); // user untouched
+		expect((msgs[1].content as any[])[1]).toEqual({ type: "toolCall", id: "call_z", name: "bash", arguments: { cmd: "ls" } });
 	});
 });

@@ -2,6 +2,8 @@
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { BlockKind } from "../../engine/types";
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
+	import { folding, setFolding } from "$lib/live/folding.svelte";
+	import { live } from "$lib/live/liveClient.svelte";
 
 	let { store }: { store: AccordionStore } = $props();
 
@@ -49,6 +51,21 @@
 			{/if}
 		</div>
 		<div class="ctl">
+			{#if live.status === "connected"}
+				<button
+					class="fold-arm"
+					class:on={folding.enabled}
+					aria-pressed={folding.enabled}
+					aria-label="Apply folds to the live agent"
+					title={folding.enabled
+						? "Accordion is applying folds to the live agent's context. Takes effect on the agent's next turn."
+						: "Folds are previewed in the view only. The agent's context is unchanged."}
+					onclick={() => setFolding(!folding.enabled)}
+				>
+					<span class="dot" aria-hidden="true"></span>
+					<span class="fl">Folding: {folding.enabled ? "steering" : "preview"}</span>
+				</button>
+			{/if}
 			<label class="knob">
 				<span class="kl">protected <b class="mono">{k(store.protectTokens)}</b></span>
 				<input
@@ -178,6 +195,55 @@
 	}
 	.reset:hover {
 		background: var(--line);
+	}
+
+	/* Folding arm switch — the first control that changes what a live model sees.
+	   OFF (preview): muted, recessed, reads as inert. ON (steering): accent-lit
+	   with a glowing dot so it's unmistakable the agent is being touched. */
+	.fold-arm {
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+		align-self: center;
+		background: var(--panel-3);
+		border: 1px solid var(--line);
+		color: var(--muted);
+		padding: 5px 11px;
+		border-radius: 999px;
+		font-size: 12px;
+		font-weight: 600;
+		letter-spacing: 0.01em;
+		cursor: pointer;
+		transition:
+			background var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out);
+	}
+	.fold-arm:hover {
+		border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+		color: var(--text);
+	}
+	.fold-arm .dot {
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		background: var(--faint);
+		flex: 0 0 auto;
+		transition:
+			background var(--dur-fast) var(--ease-out),
+			box-shadow var(--dur-fast) var(--ease-out);
+	}
+	.fold-arm.on {
+		background: color-mix(in srgb, var(--accent) 16%, var(--panel));
+		border-color: color-mix(in srgb, var(--accent) 60%, var(--line));
+		color: var(--accent);
+	}
+	.fold-arm.on:hover {
+		background: color-mix(in srgb, var(--accent) 24%, var(--panel));
+	}
+	.fold-arm.on .dot {
+		background: var(--accent);
+		box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent);
 	}
 
 	.bar {

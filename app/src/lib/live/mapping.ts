@@ -77,6 +77,26 @@ export function blockId(m: PiMessage, i: number, partIndex?: number): string {
 	}
 }
 
+/**
+ * Is `id` a durable, content-anchored block id (vs. a positional fallback)?
+ *
+ * `blockId()` prefers a durable anchor (`u:`, `a:`, `r:`, `s:` — keyed off the
+ * message timestamp / responseId / toolCallId), and only falls back to a
+ * POSITIONAL id (`m<i>:…`) when that anchor is missing. The distinction matters
+ * for folding: a positional id encodes the message's *current array index*, and
+ * that index is NOT stable once the array shifts. Folding itself makes the
+ * context non-append-only (a later structural change can renumber positions), so
+ * a positional id can silently come to point at a DIFFERENT block. We therefore
+ * must never emit a fold op for a block we can't durably re-identify — otherwise
+ * applyPlan could fold the wrong part (or, worse, a tool_call). This guard is the
+ * gate: fold only durable ids.
+ *
+ * Kept in lockstep with the formats `blockId()` produces above.
+ */
+export function isDurableId(id: string): boolean {
+	return id.startsWith("u:") || id.startsWith("a:") || id.startsWith("r:") || id.startsWith("s:");
+}
+
 function textOf(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (Array.isArray(content))
@@ -193,7 +213,14 @@ export const PROTECT_RECENT_MSGS = 2;
  */
 export function applyPlan(messages: PiMessage[], ops: FoldOp[]): PiMessage[] {
 	if (!ops.length) return messages;
-	const byId = new Map(ops.map((o) => [o.id, o] as const));
+	// Defense in depth (matches the GUI's `computeFoldOps`): refuse any op whose id is
+	// NOT durable, or whose digest is empty. A positional/fallback id is not stable
+	// across array shifts and could resolve to the wrong block; an empty digest would
+	// blank a content part. Both sides enforce this so neither alone is a single point
+	// of failure.
+	const safe = ops.filter((o) => isDurableId(o.id) && o.digestText);
+	if (!safe.length) return messages;
+	const byId = new Map(safe.map((o) => [o.id, o] as const));
 	const protectFrom = messages.length - PROTECT_RECENT_MSGS;
 	let changed = false;
 

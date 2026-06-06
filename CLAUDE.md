@@ -79,8 +79,12 @@ plan the app returns. Decisions live in ADRs: [0001](docs/adr/0001-pi-live-integ
 
 **Invariants (don't break):** discovery I/O is best-effort and **never blocks or alters
 a model call**; no GUI / reply timeout / empty plan ⇒ messages pass through untouched;
-no disk I/O on the `context` (pre-model-call) hook. **Today the app returns an empty
-plan** — the loop and the live view are proven, but no model call is changed yet.
+no disk I/O on the `context` (pre-model-call) hook. **The engine is now on (M2, ADR
+0004) but folding the live agent is OPT-IN and OFF by default** (`folding.enabled`, a
+header toggle). Disarmed, the GUI still replies with an empty plan — M1 behavior, no
+model call altered. Armed, `computePlan` mirrors the engine's fold decisions into ops
+via `computeFoldOps` (`plan.ts`), guarded so only **durable-id** `text`/`thinking`/
+`tool_result` blocks are ever folded (`isDurableId`; `applyPlan` enforces the same).
 
 **Known characteristic:** the view syncs on pi's `context` hook, which fires *before*
 each model call — so an assistant reply is only seen at the *next* model call (i.e. the

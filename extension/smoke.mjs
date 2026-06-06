@@ -635,6 +635,86 @@ else {
 		fails.push("getBranch fallback: attach flush missing reconstructed block a:resp-branch-1:p0");
 }
 
+// ── Phase 0 (ADR 0003): anchor-less / POSITIONAL id round-trip + guard ───────
+// Everything above feeds messages WITH timestamps/responseIds, so every id is
+// durable (u:/a:/r:). This scenario proves the OTHER branch: a message with NO
+// anchor fields streams with a POSITIONAL id (m<i>:…), and the applyPlan guard
+// refuses to fold it (and refuses an empty-digest op) so pi's messages come back
+// UNCHANGED. We use a fresh GUI so sentCount resets to 0 → the first context sync
+// after attach carries the WHOLE array (positional block included).
+//
+// Determinism: positional ids are pure functions of array index, and we drive the
+// `context` hook directly with a fixed array, so the ids below are exact. The
+// anchor-less assistant sits at index 0 (→ m0:p0), well outside the protected tail
+// (PROTECT_RECENT_MSGS=2, padded by two trailing anchored messages).
+const posTarget = { role: "assistant", content: [{ type: "text", text: "ANCHORLESS ORIGINAL" }] }; // NO responseId / timestamp
+const posMsgs = [
+	posTarget, // index 0 → positional id m0:p0
+	{ role: "user", content: "pos pad 1", timestamp: T0 + 3000 },
+	{ role: "user", content: "pos pad 2", timestamp: T0 + 3001 },
+];
+
+// Seed the cache while DETACHED (passthrough) so the upcoming attach-flush is built
+// purely from this anchor-less array — exactly the pattern the resume/history tests
+// above use. The flush then carries the POSITIONAL block (sentCount starts at 0 on
+// connect, so the whole array streams).
+handlers.context({ messages: posMsgs }, ctx); // detached → passthrough; caches lastMessages = posMsgs
+
+let posFlush = null; // attach-flush sync (carries the full anchor-less array)
+let posContextReturn = null;
+const ws5 = new WebSocket(`ws://127.0.0.1:${PORT}`);
+await new Promise((resolve, reject) => {
+	const timeout = setTimeout(() => reject(new Error("positional-id round-trip timed out")), 3000);
+	ws5.on("error", reject);
+	ws5.on("message", async (data) => {
+		const m = JSON.parse(data.toString());
+		if (m.type === "sync" && !posFlush) {
+			// FIRST sync after hello = the attach-flush of the cached anchor-less history.
+			posFlush = m;
+			// Now drive one ATTACHED context turn (same array) to exercise the fold-apply
+			// return path. Reply with a plan targeting BOTH the positional id (guard:
+			// non-durable) and an empty-digest op (guard: empty digest). Neither may be
+			// applied, so the messages the hook returns to pi must equal the originals.
+			posContextReturn = await Promise.resolve(handlers.context({ messages: posMsgs }, ctx));
+			setTimeout(() => { clearTimeout(timeout); resolve(); }, 200); // let the hook resolve
+		} else if (m.type === "sync") {
+			// The attached context turn's sync (0 deltas — flush already sent everything).
+			// Reply so its requestPlan resolves and the hook returns.
+			ws5.send(JSON.stringify({
+				type: "plan",
+				reqId: m.reqId,
+				ops: [
+					{ id: "m0:p0", digestText: "FOLD THE POSITIONAL BLOCK" }, // refused: positional id
+					{ id: "u:" + (T0 + 3000), digestText: "" },               // refused: empty digest
+				],
+			}));
+		}
+	});
+});
+await new Promise((resolve) => { ws5.on("close", resolve); ws5.close(); });
+
+// Part 1 — the anchor-less path round-trips with a POSITIONAL id.
+if (!posFlush) fails.push("anchor-less path: never received the attach-flush sync");
+else {
+	const posBlock = posFlush.blocks?.find((b) => b.text === "ANCHORLESS ORIGINAL");
+	if (!posBlock) fails.push("anchor-less path: flush missing the anchor-less assistant block");
+	else if (!posBlock.id.startsWith("m")) fails.push(`anchor-less path: block id is not positional (got ${posBlock.id})`);
+	else if (posBlock.id !== "m0:p0") fails.push(`anchor-less path: expected positional id m0:p0, got ${posBlock.id}`);
+}
+
+// Part 2 — the applyPlan guard refuses both ops, so pi's messages are UNCHANGED.
+if (!posContextReturn || !posContextReturn.messages) {
+	// undefined return = passthrough = pi keeps its originals: that is ALSO a pass for
+	// the guard (the empty effective plan never altered a model call).
+	if (posContextReturn !== undefined) fails.push("anchor-less path: context hook returned an unexpected non-message value");
+} else {
+	const ret = posContextReturn.messages;
+	if (ret[0]?.content?.[0]?.text !== "ANCHORLESS ORIGINAL")
+		fails.push("anchor-less path: positional-id op was applied — guard failed to refuse a non-durable id");
+	if (ret[1]?.content !== "pos pad 1")
+		fails.push("anchor-less path: empty-digest op altered a message — guard failed to refuse it");
+}
+
 // ── assertions ───────────────────────────────────────────────────────────────
 if (!seen.hello) fails.push("never received hello");
 if (!seen.flushOnAttach) fails.push("GUI received no history flush on attach (would stay empty until first message — the bug)");
@@ -674,6 +754,7 @@ console.log(
 		`empty-leading-part dedup ✓  agent_end live-view ✓  shutdown cleanup ✓  ` +
 		`stream(start/end/abort) ✓  no-content-on-frame ✓  delta-dropped ✓  ` +
 		`message_end ghost-sweep ✓  agent_end ghost-sweep ✓  ` +
-			`resumed-session attach-flush ✓  getBranch fallback ✓`,
+			`resumed-session attach-flush ✓  getBranch fallback ✓  ` +
+				`anchor-less positional-id round-trip ✓  applyPlan guard (positional + empty-digest refused) ✓`,
 );
 process.exit(0);

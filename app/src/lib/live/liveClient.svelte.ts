@@ -3,8 +3,9 @@
  *
  * Connects (as a WebSocket CLIENT) to the pi extension's server, builds a live
  * AccordionStore from the streamed context, and answers each `sync` with a fold
- * plan. In Milestone 1 the plan is always empty (`ops: []`) — the loop is proven
- * end-to-end while never altering a model call.
+ * plan. The plan is empty unless the user has armed folding (`folding.enabled`);
+ * armed, it mirrors the engine's fold decisions into provider-safe ops (see
+ * `computePlan` / `plan.ts`). Disarmed, no model call is ever altered.
  *
  * It drives the SAME `session` object the rest of the UI already renders, so
  * "live mode" needs no new view: populating `session.store` is enough.
@@ -12,6 +13,8 @@
 import { session } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import { wireToBlock } from "./mapping";
+import { computeFoldOps } from "./plan";
+import { folding } from "./folding.svelte";
 import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 
@@ -25,12 +28,20 @@ export const live = $state<{ status: "idle" | "connecting" | "connected" | "erro
 });
 
 /**
- * The fold plan the GUI returns for a sync. Milestone 1: fold nothing. Milestone 2
- * reads the live store's auto-fold decisions and emits one op per folded block,
- * carrying the digest text (computed GUI-side via engine/digest).
+ * The fold plan the GUI returns for a sync — Milestone 2, "engine on."
+ *
+ * The folder is OPT-IN and OFF by default (`folding.enabled`). While off, the GUI
+ * still folds locally for the on-screen preview but replies with an EMPTY plan, so
+ * the live model call is untouched (M1 behavior). Only when the user explicitly
+ * arms folding does this mirror the engine's current fold decisions into wire ops
+ * (kind- and durable-id-guarded in `computeFoldOps`). No store ⇒ empty plan.
+ *
+ * This is the one place the GUI can alter a real model call; keep it a pure read.
  */
 function computePlan(): FoldOp[] {
-	return [];
+	if (!folding.enabled) return [];
+	if (!session.store) return [];
+	return computeFoldOps(session.store);
 }
 
 export function connectLive(port: number = DEFAULT_PORT): void {
@@ -74,6 +85,9 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			session.error = "";
 			session.live = true;
 			session.filePath = null;
+				// Safety (review Q5b): every new live attach starts DISARMED - folding is
+				// opt-in per session, never silently carried from a previously armed agent.
+				folding.enabled = false;
 			// Structural reset: clear all ghosts — no ghost survives a session reconnect.
 			ghostClearAll();
 			session.store = new AccordionStore({
@@ -171,5 +185,5 @@ export function disconnectLive(): void {
 	if (live.status !== "error") live.status = "idle";
 }
 
-/** Reserved for M2: kept so the import graph and protocol version are referenced. */
+/** The protocol version this client speaks; surfaced for the mismatch guard above. */
 export const CLIENT_PROTOCOL_VERSION = PROTOCOL_VERSION;
