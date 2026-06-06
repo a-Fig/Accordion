@@ -206,6 +206,21 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			sentCount = 0; // re-sync the whole context to the freshly-connected GUI
 			reqSeq = 0;
 			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, meta });
+
+			// Flush existing history IMMEDIATELY on attach. Without this, a session that
+			// already has turns stays empty in the app until the next hook fires — and the
+			// only hook that streams the backlog is `context`, which fires before the next
+			// model call (i.e. when the user sends their next message). So `/accordion` in a
+			// session with history would show nothing until the first message. We push the
+			// cached snapshot now as a VIEW-ONLY full sync: folding may legally happen only at
+			// `context`, so (like agent_end/message_end) we do NOT await or apply a plan here.
+			// `lastMessages` is kept complete even while detached (see context/agent_end),
+			// so this is the whole conversation up to and including the last reply.
+			const backlog = linearize(lastMessages);
+			if (backlog.length) {
+				send(ws, { type: "sync", reqId: ++reqSeq, full: true, blocks: backlog });
+				sentCount = backlog.length; // cursor now matches what the GUI holds
+			}
 			ws.on("message", (data: Buffer) => {
 				if (ws !== client) return; // ignore stray messages from a superseded GUI
 				let msg: any;
@@ -431,8 +446,19 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// call). It shares the `sentCount` cursor with `context`, so the deltas never
 	// overlap; any plan the GUI replies with carries an unknown reqId and is ignored.
 	pi.on("agent_end", (event) => {
+		// Cache for next message_end (backstop path); also keeps lastMessages current
+		// after the loop ends so any late message_end fires against the right context.
+		// This snapshot is authoritative, so drop anything accumulated since the last.
+		//
+		// Done BEFORE the no-GUI guard ON PURPOSE: even when no app is attached, this
+		// keeps the cached history COMPLETE (including this turn's final reply) so that a
+		// later `/accordion` attach can flush the whole conversation immediately. `context`
+		// alone keeps the cache only up to the last model call — one reply short.
+		lastMessages = event.messages as unknown as PiMessage[];
+		pendingSince = [];
+
 		const ws = client;
-		if (!ws || ws.readyState !== 1) return; // no GUI → nothing to update
+		if (!ws || ws.readyState !== 1) return; // no GUI → cache refreshed, nothing to push
 
 		// Guaranteed teardown (invariant #2, ADR 0003): sweep all active ghosts as a
 		// backstop at loop end. Any ghost that survived the message_end sweep (e.g. if
@@ -440,11 +466,6 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		// cleared here so no ghost can survive the agent loop.
 		sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
 
-		// Cache for next message_end (backstop path); also keeps lastMessages current
-		// after the loop ends so any late message_end fires against the right context.
-		// This snapshot is authoritative, so drop anything accumulated since the last.
-		lastMessages = event.messages as unknown as PiMessage[];
-		pendingSince = [];
 		const all = linearize(lastMessages);
 		if (all.length <= sentCount) return; // nothing new since the last sync
 		const reqId = ++reqSeq;

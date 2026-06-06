@@ -99,21 +99,43 @@ const sample = [
 	{ role: "assistant", content: [{ type: "text", text: "second reply" }], responseId: "resp-def", timestamp: T0 + 3 },
 ];
 
-const seen = { hello: false, sync: false, syncBlocks: 0 };
+// ── attach-flush regression: a GUI connecting to a session that ALREADY has
+// history must receive those blocks IMMEDIATELY on connect (a full sync right
+// after hello), WITHOUT the user sending a message — i.e. with NO `context` hook
+// firing after hello. Bug: `/accordion` in a session with history used to stay
+// empty until the first message, because only `context` (which fires before the
+// next model call) streamed the backlog.
+//
+// Establish the history while DETACHED so what the GUI receives on connect is
+// purely the cached snapshot being flushed — not a freshly-driven context.
+handlers.context({ messages: sample }, ctx); // no GUI yet → passthrough; caches lastMessages
+
+const seen = { hello: false, flushOnAttach: false, flushBlocks: 0, contextSync: false, contextBlocks: 0 };
 let contextReturn;
 
 const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
 await new Promise((resolve, reject) => {
 	const timeout = setTimeout(() => reject(new Error("smoke timed out")), 3000);
+	let flushSeen = false;
 	ws.on("error", reject);
 	ws.on("message", async (data) => {
 		const m = JSON.parse(data.toString());
 		if (m.type === "hello") {
 			seen.hello = true;
+			// Deliberately do NOT fire `context` here — the backlog flush must arrive on
+			// its own, driven purely by the connection (the whole point of the fix).
+		} else if (m.type === "sync" && !flushSeen) {
+			// FIRST sync after hello = the attach-flush of the cached history.
+			flushSeen = true;
+			seen.flushOnAttach = true;
+			seen.flushBlocks = m.blocks.length;
+			// Now drive one real `context` turn to exercise fold-apply. The cursor is
+			// already at the backlog length, so this sync carries only deltas (0 here) —
+			// folding still applies to the outgoing messages regardless of what's fresh.
 			contextReturn = await Promise.resolve(handlers.context({ messages: sample }, ctx));
 		} else if (m.type === "sync") {
-			seen.sync = true;
-			seen.syncBlocks = m.blocks.length;
+			seen.contextSync = true;
+			seen.contextBlocks = m.blocks.length;
 			// Use durable id (a:<responseId>:p0) — exercises the Phase-1 id path
 			ws.send(JSON.stringify({ type: "plan", reqId: m.reqId, ops: [{ id: "a:resp-abc:p0", digestText: "FOLDED" }] }));
 			setTimeout(() => {
@@ -526,8 +548,11 @@ ws2.close();
 
 // ── assertions ───────────────────────────────────────────────────────────────
 if (!seen.hello) fails.push("never received hello");
-if (!seen.sync) fails.push("never received sync");
-if (seen.syncBlocks < 4) fails.push(`expected >=4 blocks in sync, got ${seen.syncBlocks}`);
+if (!seen.flushOnAttach) fails.push("GUI received no history flush on attach (would stay empty until first message — the bug)");
+if (seen.flushBlocks < 4) fails.push(`attach flush carried too few blocks: got ${seen.flushBlocks}, expected >=4`);
+if (!seen.contextSync) fails.push("never received the post-flush context sync");
+// Note: the post-flush context sync legitimately carries 0 delta blocks — the attach
+// flush already delivered the whole history, so there is nothing fresh to re-send.
 if (!contextReturn || !contextReturn.messages) fails.push("context hook did not return replacement messages");
 else {
 	const foldedText = contextReturn.messages[1]?.content?.[0]?.text;
@@ -555,7 +580,7 @@ if (fails.length) {
 }
 console.log(
 	`SMOKE PASS — registry(port ${PORT}, model ✓, tokens ✓) ✓  no-GUI passthrough ✓  focus request ✓  ` +
-		`hello ✓  sync(${seen.syncBlocks} blocks) ✓  plan applied per-block ✓  backstop ✓  ` +
+		`hello ✓  attach-flush(${seen.flushBlocks} blocks on connect) ✓  plan applied per-block ✓  backstop ✓  ` +
 		`message_end committed-streaming ✓  tool-loop (2 msgs/turn) ✓  no-dup after context ✓  ` +
 		`empty-leading-part dedup ✓  agent_end live-view ✓  shutdown cleanup ✓  ` +
 		`stream(start/end/abort) ✓  no-content-on-frame ✓  delta-dropped ✓  ` +
