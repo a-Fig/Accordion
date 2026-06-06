@@ -123,13 +123,28 @@ export class AccordionStore {
 	 * the budget. Idempotent: same blocks + budget + overrides → same result.
 	 */
 	refold(): void {
-		// 1) hand all auto-controlled blocks back to full.
-		for (const b of this.blocks) {
+		// Compute the protected boundary once; folding never changes a block's full
+		// `tokens`, so this index is stable for the whole pass.
+		const protectedFrom = this.protectedFromIndex;
+
+		// 1) Reset auto-controlled blocks to full, AND heal any protected block that
+		// is still folded by a manual override. Protection is ABSOLUTE: a block in the
+		// working tail is never folded, by the auto-folder OR the user. This also
+		// self-corrects a block that became protected after being folded (e.g. the
+		// tail grew via setProtect) — it springs back to live.
+		this.blocks.forEach((b, i) => {
+			if (i >= protectedFrom && b.override === "folded") {
+				// Protection is absolute, but do not silently erase the user intent - log the
+				// forced unfold so the activity feed shows what happened.
+				this.emit(b.by ?? "auto", "unfolded (protected)", label(b));
+				b.override = null;
+				b.by = null;
+			}
 			if (b.override === null) {
 				b.autoFolded = false;
 				if (b.by === "auto") b.by = null;
 			}
-		}
+		});
 		this.version++;
 		let live = this.liveTokens;
 		if (live <= this.budget) return;
@@ -138,7 +153,6 @@ export class AccordionStore {
 		// Protect the recent working tail (the newest ~protectTokens of context),
 		// and never fold a block whose digest wouldn't actually save tokens — folding
 		// it would only grow the live context and churn the view.
-		const protectedFrom = this.protectedFromIndex;
 		const cand = this.blocks
 			.filter((b, i) => b.override === null && i < protectedFrom && digestTokens(b) < b.tokens)
 			.sort((a, b) => FOLD_RANK[a.kind] - FOLD_RANK[b.kind] || a.order - b.order);
@@ -153,6 +167,33 @@ export class AccordionStore {
 
 	setBudget(n: number): void {
 		this.budget = Math.max(1000, Math.round(n));
+		this.refold();
+	}
+
+	/**
+	 * Live mode: ingest blocks streamed from the pi link, then re-fold. Blocks
+	 * arrive in conversation order and are append-only (the live context grows;
+	 * folding is the only mutation, and that is the store's own decision).
+	 *
+	 * Idempotent by durable id. The same block may arrive twice — streamed early
+	 * when pi finishes it (the `message_end` view sync), then again in the next
+	 * `context` full-array reconcile or a structural resync. The first arrival
+	 * commits the block; a repeat id is dropped, so any user fold state already on
+	 * that block is preserved (we never touch a block that is already present). The
+	 * source of truth therefore never holds two blocks with the same id — including
+	 * a duplicate id within a single batch.
+	 */
+	appendBlocks(blocks: Block[]): void {
+		if (!blocks.length) return;
+		const seen = new Set(this.blocks.map((b) => b.id));
+		const fresh: Block[] = [];
+		for (const b of blocks) {
+			if (seen.has(b.id)) continue; // already committed (or dup within this batch)
+			seen.add(b.id);
+			fresh.push(b);
+		}
+		if (!fresh.length) return;
+		this.blocks.push(...fresh);
 		this.refold();
 	}
 
@@ -171,6 +212,9 @@ export class AccordionStore {
 	fold(id: string, by: Actor = "you"): void {
 		const b = this.get(id);
 		if (!b || b.override === "pinned") return;
+		// Protected working tail is never folded — not even by an explicit user action.
+		// (Pin it or widen the budget instead; protection is the safety pillar.)
+		if (this.isProtected(b)) return;
 		b.override = "folded";
 		b.by = by;
 		this.emit(by, "folded", label(b));

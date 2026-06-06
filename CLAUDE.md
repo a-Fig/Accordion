@@ -7,16 +7,18 @@ about **how to work in the code**, not what the product is.
 ## Where the live work is
 
 The active surface is the **desktop app** in `app/` — a Tauri 2 + SvelteKit window
-that visualizes an agent's context window. Two routes:
+that visualizes an agent's context window. A **single route** (`routes/+page.svelte`):
+the **Map** app, an abstraction-first view. In the desktop app it's a shell — a
+**`SessionsSidebar`** (live pi sessions via the pull model, minimizable to a slim icon
+rail, plus a pinned **Demo session** that loads the bundled sample) + the session view:
+`MapHeader` (composition strip + budget) + `ContextMap` + `Inspector` (on-demand text
+panel). The old **Classic** view (summary/timeline of `BlockCard`s) was removed; its
+components (`ContextSummary` / `ContextTimeline` / `Timeline` / `BlockCard`) are gone.
 
-- `/`  — **Classic** view (`routes/+page.svelte`): `ContextSummary` / `ContextTimeline`
-  toggle on top, a scrollable `Timeline` of `BlockCard`s, activity feed.
-- `/map` — **Map** app (`routes/map/+page.svelte`): an abstraction-first view.
-  `MapHeader` (composition strip + budget) + `ContextMap` + `Inspector` (on-demand
-  text panel). This is where most recent design iteration lives.
-
-`src/` (repo root) and `visualizer/` are the older pi-extension POC and the
-standalone HTML visualizer — not the focus; touch only if asked.
+The current pi extension is **`extension/accordion.ts`** (the live link — see below).
+`src/` (repo root) and `visualizer/` are the *older* pi-extension POC and the
+standalone HTML visualizer — not the focus; touch only if asked. Don't confuse
+`src/accordion.ts` (old POC) with `extension/accordion.ts` (current).
 
 ## The engine is the source of truth — use it, don't change it
 
@@ -31,7 +33,8 @@ standalone HTML visualizer — not the focus; touch only if asked.
 - `store.svelte.ts` — `AccordionStore` (Svelte runes). API: `blocks`, `budget`/`setBudget`,
   `isFolded(b)`, `effTokens(b)`, `digestOf(b)`, `toggle/fold/unfold/pin/unpin(id)`,
   `resetAll()`, `liveTokens`, `fullTokens`, `savedTokens`, `foldedCount`, `overBudget`,
-  `log`, `meta`. Exposed as `window.__store` for debugging.
+  `log`, `meta`, and `appendBlocks(blocks)` (used by the live link to stream new
+  blocks in). Exposed as `window.__store` for debugging.
   - **Protected working tail:** `protectTokens` (default `20_000`) reserves the newest
     ~N tokens of context so the auto-folder never touches recent reasoning. `protectedFromIndex`
     walks back from the newest block summing full `tokens` and returns the index where the
@@ -44,6 +47,45 @@ standalone HTML visualizer — not the focus; touch only if asked.
 - `tokens.ts` (chars/4 estimate) · `digest.ts` (what a kind collapses to when folded).
 
 Folding is **content substitution, never removal** — provider-safe and fully reversible.
+
+## The live link (`app/src/lib/live/` + `extension/`)
+
+How the app attaches to a *running* pi session and (eventually) steers its context.
+Two halves talk over a loopback WebSocket; **"GUI drives, extension is thin"** — the
+extension makes no folding decisions, it streams pi's messages and applies whatever
+plan the app returns. Decisions live in ADRs: [0001](docs/adr/0001-pi-live-integration.md)
+(the loop) and [0002](docs/adr/0002-pull-connection-model.md) (how they find each other).
+
+- **Shared contract — imported by *both* sides** (extension via relative path, app via
+  `$lib`), so the wire and safety rules have one home. Keep these dependency-free /
+  Node-safe (no Svelte, no `$state`):
+  - `protocol.ts` — wire messages (`hello` / `sync` / `plan`), `WireBlock`, `FoldOp`,
+    `PROTOCOL_VERSION`. Block ids encode message location (`m<i>:p<j>`, `m<i>:r`, …).
+  - `mapping.ts` — `linearize(messages)` (mirrors `engine/parse`) and the **pure,
+    kind-checked** `applyPlan(messages, ops)` (a `tool_call` is never folded → never
+    orphans its result; recent messages are backstopped).
+  - `registry.ts` — the **discovery** contract: `SessionEntry`, `FocusRequest`,
+    `isLiveEntry`, and the `~/.accordion/` layout. The Tauri Rust layer mirrors these
+    constants — change them in lockstep.
+- **App side (Svelte):** `liveClient.svelte.ts` (WS *client* → builds the live store),
+  `discovery.svelte.ts` (polls native discovery, reaps stale sessions, handles focus),
+  rendered by `ui/live/SessionsSidebar.svelte` on the `/map` shell.
+- **Extension side (Node):** `extension/accordion.ts` hosts the WS *server* on an
+  **ephemeral** port and advertises the session in `~/.accordion/sessions/<id>.json`
+  (5 s heartbeat; deleted on shutdown). `/accordion` writes `~/.accordion/focus.json`.
+- **Native discovery (Rust):** `app/src-tauri/src/lib.rs` — `list_sessions`,
+  `reap_session`, `take_focus_request`, `focus_window`. A browser tab can't read the
+  registry, which is why discovery is desktop-only (browser dev has a manual-port box).
+
+**Invariants (don't break):** discovery I/O is best-effort and **never blocks or alters
+a model call**; no GUI / reply timeout / empty plan ⇒ messages pass through untouched;
+no disk I/O on the `context` (pre-model-call) hook. **Today the app returns an empty
+plan** — the loop and the live view are proven, but no model call is changed yet.
+
+**Known characteristic:** the view syncs on pi's `context` hook, which fires *before*
+each model call — so an assistant reply is only seen at the *next* model call (i.e. the
+next user turn for a plain reply; immediately for tool-using turns). Closing that gap
+(a post-turn view sync) is a planned follow-up.
 
 ## Visual grammar (consistent across ALL views)
 
@@ -71,21 +113,32 @@ Folding is **content substitution, never removal** — provider-safe and fully r
   Radial gradients and per-element `filter` re-rasterize on every repaint and tank
   interaction. The dice pips are **one cached SVG data-URI per face** (decoded once,
   blitted) — keep that pattern for anything tile-dense.
-- **Scroll perf on the tile grid:** `.cell` uses `content-visibility: auto` +
-  `contain-intrinsic-size: var(--cell)` to cull off-screen tiles, and hover is
-  instant (no `transition`) so scrolling past tiles doesn't animate a repaint storm.
-  Because `content-visibility` implies paint containment, keep tile decorations
-  **inset** (the selection ring is inset-only) — outset box-shadows get clipped.
-  (Scroll smoothness is still under active investigation — see handoff.)
+- **Scroll perf on the tile grid:** the win came from killing hover repaints during
+  scroll, not from culling. `ContextMap` sets `class:scrolling` on the stage while a
+  scroll is in flight and clears it ~140 ms after it stops; `.stage.scrolling .grid`
+  drops `pointer-events: none` so the cursor can't trigger per-tile hover repaints
+  mid-scroll. The `.boxes` get GPU layer promotion (`transform: translateZ(0)`) and
+  hover is instant (no `transition`). `content-visibility`/`contain-intrinsic-size`
+  were **removed** from `.cell` (they hurt more than helped here). Keep tile
+  decorations **inset** (the selection ring is inset-only) — outset box-shadows clip.
 
 ## Running & verifying
 
 ```bash
 cd app
-npm run dev          # browser dev server → http://localhost:1420
-npm run tauri dev    # native desktop window (needs Rust toolchain)
+npm run dev          # browser dev server → http://localhost:1420 (UI iteration only)
+npm run tauri dev    # native desktop window — REQUIRED for live session discovery
 npm run check        # svelte-check / typecheck — keep it 0 errors / 0 warnings
+npm run test         # vitest — unit tests for the risky live/mapping logic
 ```
+
+```bash
+cd extension && node smoke.mjs   # drives the extension via jiti + a real WS client
+cd app/src-tauri && cargo check  # the native discovery layer (PowerShell — see below)
+```
+
+Live discovery (the Sessions sidebar) only works in the **desktop** app — the browser
+build can't read `~/.accordion/`, so it falls back to a manual-port Connect box.
 
 Environment gotchas (Windows, this repo's usual setup):
 

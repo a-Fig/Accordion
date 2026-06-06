@@ -1,6 +1,10 @@
 <script lang="ts">
+	import { untrack } from "svelte";
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block } from "../../engine/types";
+	import { ghosts, type Ghost } from "../../live/ghostState.svelte";
+	import { nextVacated } from "./drain";
+	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 
 	let {
 		store,
@@ -119,6 +123,10 @@
 	const protectedFrom = $derived(store.protectedFromIndex);
 	const olderTiles = $derived(tiles.slice(0, protectedFrom));
 	const protectedTiles = $derived(tiles.slice(protectedFrom));
+	// live (effective) token weight in each box — shown as a vertical tally on the
+	// box's left rail. The protected tail never folds, so its eff == full.
+	const olderTok = $derived(olderTiles.reduce((s, t) => s + store.effTokens(t.b), 0));
+	const protTok = $derived(protectedTiles.reduce((s, t) => s + t.b.tokens, 0));
 
 	let stage = $state<HTMLDivElement>();
 	let cell = $state(20);
@@ -126,11 +134,38 @@
 	let nudge = $state(0); // user density adjustment (± px per cell)
 	const GAP = 4;
 
+	// ---- "drain without reflow" -------------------------------------------------
+	// When a block crosses out of the protected tail it should leave a HOLE rather
+	// than yanking its neighbours back a slot. Holes pile up at the front of the
+	// protected grid; only when a whole leading row is empty (or a resize re-flows
+	// everything) do we reclaim the space — so the tiles move once per row, not on
+	// every single departure. `vacated` is the number of leading placeholder cells.
+	let vacated = $state(0);
+	const vacatedCells = $derived(Array.from({ length: vacated }, (_, i) => i));
+	let _prevBoundary = 0;
+	let _prevCols = 0;
+	let _prevStore: AccordionStore | null = null;
+	let _prevProtect = -1;
+
+	// ---- scroll smoothness: while the stage is actively scrolling, suppress
+	//      per-tile :hover. Otherwise ~1k tiles sliding under a STATIONARY cursor
+	//      each fire :hover in/out → a repaint per tile per frame (a repaint storm
+	//      that has nothing to do with the user actually hovering). We flip the
+	//      grid to pointer-events:none during scroll, then restore ~140ms after it
+	//      settles — so scrolling is pure layer compositing, no paint.
+	let scrolling = $state(false);
+	let scrollTimer: ReturnType<typeof setTimeout> | undefined;
+	function onScroll() {
+		if (!scrolling) scrolling = true;
+		clearTimeout(scrollTimer);
+		scrollTimer = setTimeout(() => (scrolling = false), 140);
+	}
+
 	function fit() {
 		if (!stage || zoom !== "grid") return;
 		// reserve room for the two boxes' chrome (borders, padding, gap)
 		const CHROME_H = 84;
-		const CHROME_W = 28; // box inner padding
+		const CHROME_W = 56; // box inner padding + the left token rail
 		const W = stage.clientWidth - 28 - CHROME_W;
 		const H = stage.clientHeight - 22 - CHROME_H;
 		if (W < 40 || H < 40) return;
@@ -158,11 +193,32 @@
 		fit();
 	});
 
-	const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`);
-	function tip(b: Block): string {
+	// Track the protected boundary so a departing block leaves a hole instead of
+	// reflowing the grid. Reclaim space only when a full leading row is empty, or
+	// when a resize (cols change) re-flows everything anyway. A session swap or a
+	// protect-slider drag also moves the boundary but is a clean re-flow, not a
+	// flurry of departures — forceReset drops the holes in those cases.
+	$effect(() => {
+		const st = store;
+		const boundary = store.protectedFromIndex;
+		const protect = store.protectTokens;
+		const c = cols;
+		untrack(() => {
+			const forceReset = st !== _prevStore || protect !== _prevProtect;
+			vacated = nextVacated(vacated, _prevBoundary, boundary, _prevCols, c, forceReset);
+			_prevStore = st;
+			_prevProtect = protect;
+			_prevCols = c;
+			_prevBoundary = boundary;
+		});
+	});
+
+	const k = (n: number) => { n = Math.round(n); return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`; };
+	function tip(b: Block, prot = false): string {
 		const tool = b.toolName ? ` ${b.toolName}` : "";
 		const f = store.isFolded(b) ? ` · folded ${b.tokens}→${store.effTokens(b)}` : "";
-		return `${b.kind}${tool} · ${b.tokens.toLocaleString()} tok${f}\nclick to inspect · double-click to fold`;
+		const action = prot ? "click to inspect · protected — never folds" : "click to inspect · double-click to fold";
+		return `${b.kind}${tool} · ${b.tokens.toLocaleString()} tok${f}\n${action}`;
 	}
 
 	function findId(e: Event): string | null {
@@ -244,6 +300,7 @@
 	<div
 		class="stage"
 		class:isgrid={zoom === "grid"}
+		class:scrolling
 		bind:this={stage}
 		role="toolbar"
 		tabindex="0"
@@ -251,29 +308,46 @@
 		onclick={onClick}
 		ondblclick={onDbl}
 		onkeydown={onKey}
+		onscroll={onScroll}
 	>
 		{#if zoom === "grid"}
-			{#snippet tile(t: { b: Block; face: number })}
+			{#snippet ghostTile(g: Ghost)}
+				<div
+					class="cell ghost k-{g.kind}"
+					title="{g.kind} · forming…"
+				></div>
+			{/snippet}
+			{#snippet tile(t: { b: Block; face: number }, prot: boolean)}
 				<div
 					class="cell face f{t.face} k-{t.b.kind}"
 					class:folded={store.isFolded(t.b)}
 					class:pinned={t.b.override === "pinned"}
 					class:sel={t.b.id === selectedId}
 					data-id={t.b.id}
-					title={tip(t.b)}
+					title={tip(t.b, prot)}
 				></div>
 			{/snippet}
 			<div class="boxes" style:--cell="{cell}px" style:--cols={cols}>
 				{#if olderTiles.length}
 					<section class="box older">
+						<div class="rail" title="{olderTok.toLocaleString()} live tokens · foldable">
+							<span class="tok"><AnimatedNumber value={olderTok} format={k} /></span>
+						</div>
 						<div class="grid">
-							{#each olderTiles as t (t.b.id)}{@render tile(t)}{/each}
+							{#each olderTiles as t (t.b.id)}{@render tile(t, false)}{/each}
 						</div>
 					</section>
 				{/if}
 				<section class="box prot">
+					<div class="rail" title="{protTok.toLocaleString()} tokens · protected working tail">
+						<span class="tok"><AnimatedNumber value={protTok} format={k} /></span>
+					</div>
 					<div class="grid">
-						{#each protectedTiles as t (t.b.id)}{@render tile(t)}{/each}
+						{#each vacatedCells as i (i)}<div class="cell vacated"></div>{/each}
+						{#each protectedTiles as t (t.b.id)}{@render tile(t, true)}{/each}
+						{#each ghosts as g (g.contentIndex)}
+							{@render ghostTile(g)}
+						{/each}
 					</div>
 				</section>
 			</div>
@@ -340,7 +414,7 @@
 		font-weight: 600;
 		padding: 4px 13px;
 		border-radius: 5px;
-		transition: background 130ms ease, color 130ms ease;
+		transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
 	}
 	.seg button:hover {
 		color: var(--text);
@@ -412,7 +486,7 @@
 		font-size: 12px;
 		padding: 3px 9px;
 		min-width: 26px;
-		transition: background 120ms ease, color 120ms ease;
+		transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
 	}
 	.density button:hover {
 		background: var(--panel-3);
@@ -452,12 +526,38 @@
 		flex-direction: column;
 		gap: 16px;
 		width: 100%;
+		/* promote the scroll content to its own GPU layer: once painted, scrolling
+		   is a cheap layer translation rather than a repaint of the tiles. */
+		transform: translateZ(0);
 	}
 	.box {
 		border-radius: 14px;
 		border: 1.5px solid var(--line);
 		background: var(--panel-2);
 		padding: 12px;
+		display: flex;
+		align-items: stretch;
+		gap: 8px;
+	}
+	/* left rail: a small vertical token tally for the group */
+	.rail {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		writing-mode: vertical-rl;
+		transform: rotate(180deg);
+		font-variant-numeric: tabular-nums;
+		font-size: 11px;
+		letter-spacing: 0.04em;
+		color: var(--faint);
+		user-select: none;
+	}
+	.rail .tok {
+		font-weight: 700;
+	}
+	.box.prot .rail {
+		color: color-mix(in srgb, var(--accent) 70%, var(--muted));
 	}
 	/* the protected box: a meaningfully thicker, accented frame implies protection */
 	.box.prot {
@@ -474,13 +574,16 @@
 		gap: 4px;
 		align-content: start;
 		justify-content: center;
-		width: 100%;
+		flex: 1;
+		min-width: 0;
+	}
+	/* while scrolling, make tiles transparent to the pointer so a stationary cursor
+	   doesn't trigger :hover on every tile that slides past it (repaint storm). */
+	.stage.scrolling .grid {
+		pointer-events: none;
 	}
 	.cell {
 		box-sizing: border-box;
-		/* skip painting tiles outside the viewport → smooth scroll over ~1k tiles */
-		content-visibility: auto;
-		contain-intrinsic-size: var(--cell) var(--cell);
 		border-radius: 3px;
 		cursor: pointer;
 		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.22);
@@ -508,11 +611,56 @@
 	.cell.pinned {
 		box-shadow: inset 0 0 0 2px #fff;
 	}
+	/* vacated slot: a block left the protected tail but we hold its place (no reflow)
+	   until the whole leading row empties. Reads as an empty outline, not a tile. */
+	.cell.vacated {
+		background: transparent;
+		border: 1px dashed color-mix(in srgb, var(--accent) 30%, transparent);
+		box-shadow: none;
+		cursor: default;
+		pointer-events: none;
+	}
+	.cell.vacated:hover {
+		filter: none;
+		box-shadow: none;
+	}
+	@keyframes pop {
+		0%   { transform: scale(1); }
+		45%  { transform: scale(1.08); }
+		100% { transform: scale(1); }
+	}
 	.cell.sel {
 		/* inset-only so paint-containment (content-visibility) never clips it */
 		box-shadow: inset 0 0 0 2px var(--accent), inset 0 0 0 3px rgba(0, 0, 0, 0.55);
 		filter: brightness(1.18);
 		z-index: 3;
+		animation: pop var(--dur-fast) var(--ease-spring);
+	}
+
+	/* ---- ghost tiles: third visual state — "forming" ----
+	   A ghost is a presentation-only pulsing placeholder. It is NOT a block, NOT
+	   selectable, and NOT foldable. It uses the same kind color as a real tile but
+	   in a clearly distinct state: reduced opacity pulsing via a compositor-only
+	   opacity animation (transform/opacity only — no filter/box-shadow/gradients,
+	   per CLAUDE.md perf rules). There are at most a few ghosts at a time so one
+	   cheap keyframe each is fine.                                                  */
+	.cell.ghost {
+		cursor: default;
+		/* Compositor-only animation: opacity pulse — no filter, no box-shadow. */
+		animation: ghost-pulse 1.4s ease-in-out infinite;
+		/* Dashed inset ring marks it visually as "not yet real." */
+		box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.35);
+		/* pointer-events: none so it never hijacks clicks/hovers on real tiles */
+		pointer-events: none;
+	}
+	.cell.ghost:hover {
+		/* Override the inherited :hover brightness — ghosts are not interactive. */
+		filter: none;
+		box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.35);
+	}
+	@keyframes ghost-pulse {
+		0%, 100% { opacity: 0.55; transform: scale(1); }
+		50%       { opacity: 0.85; transform: scale(0.93); }
 	}
 
 	/* ---- dice-face pips: token weight read as a die face 1–6 ----
@@ -604,7 +752,7 @@
 		min-width: 0;
 		flex-basis: 0;
 		cursor: pointer;
-		transition: filter 90ms ease;
+		transition: filter var(--dur-fast) var(--ease-out);
 	}
 	.rtile:hover {
 		filter: brightness(1.4);

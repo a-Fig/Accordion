@@ -64,32 +64,59 @@ Drag any session `.jsonl` onto the window, or use the bundled sample. Everything
 
 ## Status
 
-[VISION.md](VISION.md) is the north star — the finished product we're building toward. What exists **today** is an early proof-of-concept:
+[VISION.md](VISION.md) is the north star — the finished product we're building toward. What exists **today**:
 
-- A [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) extension (`src/accordion.ts`) that automatically folds older turns as context grows and keeps the recent window at full fidelity.
-- Reversible folding (originals retained), manual `/expand` and `/collapse`, and an `/accordion` status view.
-- Summaries today are deterministic digests, not yet LLM-generated.
+- **A desktop app** (`app/`, Tauri + SvelteKit) — the *separate window*. It renders an
+  agent's context window as a foldable map, with a token budget and a protected working
+  tail. It opens saved `.jsonl` sessions (the Open dialog lands in `~/.pi/agent/sessions`
+  or `~/.claude/projects`), and — new — attaches to a **live** pi session.
+- **A live link** (`extension/accordion.ts` + `app/src/lib/live/`). A pi extension
+  streams a running session's context to the app over a local WebSocket; the app
+  **auto-discovers** every running pi (the "pull" model) and shows it in a Sessions
+  sidebar — click to watch its context update live.
+- Reversible, provider-safe folding in the app (content substitution, never removal),
+  with deterministic digest summaries.
 
-Honest about what's **not** there yet: no visual window, no autonomous Conductor, no agent-driven control, no hierarchical folding — that's the build ahead. (The POC is implemented and syntax-checked; it hasn't yet been exercised across a long real session.)
+Honest about what's **not** there yet: the app currently *reads* a live session but does
+**not** yet steer it — it returns an empty fold plan, so the agent's context is unchanged.
+No autonomous Conductor on a live session, no agent-driven control, no hierarchical
+folding, no LLM-generated summaries, no replay — that's the build ahead. There's also an
+older terminal-only POC (`src/accordion.ts`, `/expand` · `/collapse` · `/accordion`) that
+predates the app.
 
-### Try the proof-of-concept
+### Try it
 
 ```bash
-cp src/accordion.ts ~/.pi/agent/extensions/accordion.ts
-pi   # Accordion loads automatically; tune the fold band at the top of the file
+cd app && npm install && npm run tauri dev    # opens the desktop window
 ```
 
-Commands: `/accordion` (status) · `/expand <n>` · `/collapse <n>`
+Register the live extension in `~/.pi/agent/settings.json`:
+
+```json
+{ "extensions": ["<path-to-repo>/extension/accordion.ts"] }
+```
+
+Then run `pi` in any project — it appears in the app's **Sessions** sidebar within a
+second. Click it (or run `/accordion` in that terminal to foreground the app on it) and
+watch its context populate live.
+
+### Developing
+
+Setting up for development (prerequisites, running the app, the quality gate, the live-link
+setup, and platform gotchas) is in **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
 ## Roadmap
 
-- [x] Core fold/unfold engine — reversible, tool-pair safe *(POC)*
-- [x] Rolling automatic folding + manual expansion *(POC)*
+- [x] Core fold/unfold engine — reversible, tool-pair safe
+- [x] Rolling automatic folding + manual expansion, protected working tail
+- [x] The separate window — desktop app: Map view, budget, inspector
+- [x] Live link to a running pi session + auto-discovery *(view only — empty fold plan)*
+- [ ] Steer a live session — apply the fold plan to what the agent is shown
 - [ ] LLM-generated summaries, computed once and cached
-- [ ] The separate window — see, steer, replay
 - [ ] The Conductor — automatic fold/unfold between turns, based on context
 - [ ] Hierarchical folding — fold the folds, for million-turn sessions
 - [ ] Agent-driven unfold and pin
+- [ ] Replay — scrub how the context evolved across a session
 
 ---
 
@@ -97,4 +124,4 @@ Commands: `/accordion` (status) · `/expand <n>` · `/collapse <n>`
 
 🪗
 
-<sub>An experiment in context engineering. Contributions, ideas, and benchmarks welcome.</sub>
+<sub>An experiment in context engineering. Contributions, ideas, and benchmarks welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).</sub>

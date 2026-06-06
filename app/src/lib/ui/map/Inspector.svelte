@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { fly } from "svelte/transition";
+	import { cubicOut } from "svelte/easing";
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block } from "../../engine/types";
 
@@ -17,12 +19,16 @@
 
 	const folded = $derived(block ? store.isFolded(block) : false);
 	const pinned = $derived(block?.override === "pinned");
+	// Protected working tail — never folded (the safety pillar). The Fold control is
+	// disabled here so the guarantee is visible, not just enforced silently.
+	const protect = $derived(block ? store.isProtected(block) : false);
 
 	// the call/result partner — they're separate blocks sharing a callId
 	const partner = $derived.by<Block | null>(() => {
 		if (!block?.callId) return null;
 		return store.blocks.find((x) => x.id !== block.id && x.callId === block.callId) ?? null;
 	});
+	const partnerProtected = $derived(partner ? store.isProtected(partner) : false);
 
 	function body(b: Block): { text: string; clipped: number } {
 		const t = b.text ?? "";
@@ -33,7 +39,7 @@
 </script>
 
 {#if block}
-	<aside class="insp">
+	<aside class="insp" transition:fly={{ x: 24, duration: 200, easing: cubicOut, opacity: 0 }}>
 		<header>
 			<span class="kind k-{block.kind}">{KIND_LABEL[block.kind]}</span>
 			{#if block.toolName}<span class="tool mono">{block.toolName}</span>{/if}
@@ -50,8 +56,13 @@
 				<span class="state live">live</span>
 				<span class="mono">{fmt(block.tokens)} tok</span>
 			{/if}
+			{#if protect}<span class="state prot" title="In the protected working tail — never folded">protected</span>{/if}
 			<span class="grow"></span>
-			<button class="btn" onclick={() => store.toggle(block.id)}>{folded ? "Unfold" : "Fold"}</button>
+			<button
+				class="btn"
+				disabled={protect}
+				title={protect ? "Protected working tail — never folded" : ""}
+				onclick={() => store.toggle(block.id)}>{folded ? "Unfold" : "Fold"}</button>
 			<button class="btn" class:on={pinned} onclick={() => (pinned ? store.unpin(block.id) : store.pin(block.id))}>
 				{pinned ? "Unpin" : "Pin"}
 			</button>
@@ -73,8 +84,8 @@
 					{partner.kind === "tool_result" ? "↳ Result it produced" : "↰ Call that produced this"}
 					<span class="mono dim">{store.isFolded(partner) ? "folded" : "live"} · {fmt(store.effTokens(partner))} tok</span>
 				</div>
-				<button class="jump" onclick={() => store.toggle(partner.id)}>
-					{store.isFolded(partner) ? "Unfold" : "Fold"} partner
+				<button class="jump" disabled={partnerProtected} title={partnerProtected ? "Protected — never folded" : ""} onclick={() => store.toggle(partner.id)}>
+					{partnerProtected ? "protected" : store.isFolded(partner) ? "Unfold" : "Fold"} partner
 				</button>
 				<pre class="content sub mono">{body(partner).text}</pre>
 			</div>
@@ -160,6 +171,10 @@
 		color: var(--warn);
 		background: color-mix(in srgb, var(--warn) 16%, transparent);
 	}
+	.state.prot {
+		color: var(--accent);
+		background: color-mix(in srgb, var(--accent) 16%, transparent);
+	}
 	.meta s {
 		color: var(--faint);
 	}
@@ -177,6 +192,17 @@
 	}
 	.btn:hover {
 		background: var(--line);
+	}
+	.btn:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
+	}
+	.btn:disabled:hover {
+		background: var(--panel-3);
+	}
+	.jump:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 	.btn.on {
 		color: var(--accent);

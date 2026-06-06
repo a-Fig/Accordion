@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { BlockKind } from "../../engine/types";
+	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 
 	let { store }: { store: AccordionStore } = $props();
 
@@ -20,21 +21,31 @@
 	});
 
 	const denom = $derived(Math.max(store.fullTokens, store.budget, 1));
-	const fmt = (n: number) => n.toLocaleString();
+	// fmt/k formatters must round their input because AnimatedNumber passes a float mid-tween
+	const fmt = (n: number) => Math.round(n).toLocaleString();
 	const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
-	const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`);
+	const k = (n: number) => {
+		const r = Math.round(n);
+		return r >= 1000 ? `${(r / 1000).toFixed(r >= 10000 ? 0 : 1)}k` : `${r}`;
+	};
+	// over-by figure for the pill — rounds the difference mid-tween
+	const fmtOverBy = (n: number) => k(Math.round(n));
 </script>
 
 <div class="hdr">
 	<div class="top">
 		<div class="nums">
-			<b class="live mono" class:over={store.overBudget}>{fmt(store.liveTokens)}</b>
+			<b class="live mono" class:over={store.overBudget}><AnimatedNumber value={store.liveTokens} format={fmt} /></b>
 			<span class="of">/ {fmt(store.budget)} budget</span>
 			<span class="pill" class:over={store.overBudget}>
-				{store.overBudget ? `over by ${k(store.liveTokens - store.budget)}` : `${pct(store.liveTokens, store.budget)}%`}
+				{#if store.overBudget}
+					over by <AnimatedNumber value={store.liveTokens - store.budget} format={fmtOverBy} />
+				{:else}
+					<AnimatedNumber value={pct(store.liveTokens, store.budget)} format={(n) => `${Math.round(n)}%`} />
+				{/if}
 			</span>
 			{#if store.savedTokens > 0}
-				<span class="saved">folding saved {fmt(store.savedTokens)} ({pct(store.savedTokens, store.fullTokens)}% of {k(store.fullTokens)})</span>
+				<span class="saved">folding saved <AnimatedNumber value={store.savedTokens} format={fmt} /> ({pct(store.savedTokens, store.fullTokens)}% of {k(store.fullTokens)})</span>
 			{/if}
 		</div>
 		<div class="ctl">
@@ -163,6 +174,7 @@
 		padding: 4px 10px;
 		border-radius: var(--radius-sm);
 		font-size: 12px;
+		transition: background var(--dur-fast) var(--ease-out);
 	}
 	.reset:hover {
 		background: var(--line);

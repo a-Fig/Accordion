@@ -1,0 +1,13 @@
+{
+  "name": "accordion-pi-extension",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Accordion live link — a pi extension that streams context to the Accordion GUI and applies the fold plan the GUI returns.",
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "jiti": "^2.7.0"
+  }
+}
