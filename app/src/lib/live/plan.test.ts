@@ -3,6 +3,7 @@ import { AccordionStore } from "../engine/store.svelte";
 import type { Block, BlockKind, ParsedSession } from "../engine/types";
 import { computeFoldOps, resolveUnfold } from "./plan";
 import { isDurableId } from "./mapping";
+import { foldCode } from "../engine/digest";
 
 // computeFoldOps mirrors the engine's LOCAL fold decisions into provider-safe wire
 // ops. These tests lock the kind filter, the durable-id guard, and the empty-digest
@@ -139,7 +140,7 @@ describe("computeFoldOps", () => {
 		expect(computeFoldOps(s)).toEqual([]);
 	});
 
-	it("tags each op's digestText with the block's own id so the agent can unfold it", () => {
+	it("tags each op's digestText with the block's own fold code so the agent can unfold it", () => {
 		order = 0;
 		const blocks = [
 			blk({ id: "a:resp1:p0", kind: "text", tokens: 8000 }),
@@ -153,15 +154,16 @@ describe("computeFoldOps", () => {
 		const ops = computeFoldOps(s);
 		expect(ops.length).toBeGreaterThan(0);
 		for (const op of ops) {
-			// the agent reads `{#<id> FOLDED}` and passes <id> back — so the op MUST carry
-			// its own id in its tag, not some other block's.
-			expect(op.digestText.startsWith(`{#${op.id} FOLDED} `)).toBe(true);
+			// the agent reads `{#<code> FOLDED}` and passes <code> back — so the op MUST carry
+			// THIS block's code in its tag, not the raw id and not another block's code.
+			expect(op.digestText.startsWith(`{#${foldCode(op.id)} FOLDED} `)).toBe(true);
+			expect(op.digestText).not.toContain(op.id); // the ugly raw id never ships
 		}
 	});
 });
 
 describe("resolveUnfold", () => {
-	it("restores known ids (sticky, provenance agent) and reports unknown ids as missing", () => {
+	it("restores a known code (sticky, provenance agent) and reports unknown codes as missing", () => {
 		order = 0;
 		const blocks = [
 			blk({ id: "a:resp1:p0", kind: "text", tokens: 8000 }),
@@ -173,20 +175,56 @@ describe("resolveUnfold", () => {
 		s.setBudget(1000); // fold the old blocks
 		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(true);
 
-		const { restored, missing } = resolveUnfold(s, ["a:resp1:p0", "nope:404"]);
+		const code = foldCode("a:resp1:p0");
+		const { restored, missing } = resolveUnfold(s, [code, "zzzz"]);
 
 		// the known block is now held open, with agent provenance
 		const b = s.get("a:resp1:p0")!;
 		expect(s.isFolded(b)).toBe(false);
 		expect(b.override).toBe("unfolded");
 		expect(b.by).toBe("agent");
-		// returned record carries id + kind + a label, NO content (state-change-only)
-		expect(restored.map((r) => r.id)).toEqual(["a:resp1:p0"]);
+		// returned record carries code + kind + a label, NO content (state-change-only)
+		expect(restored.map((r) => r.code)).toEqual([code]);
 		expect(restored[0].kind).toBe("text");
 		expect(restored[0].label).toContain("text");
 		expect("text" in restored[0]).toBe(false);
-		// the unknown id is reported, not silently dropped
-		expect(missing).toEqual(["nope:404"]);
+		// the unknown code is reported, not silently dropped
+		expect(missing).toEqual(["zzzz"]);
+	});
+
+	it("restores ALL folded blocks sharing a code (collision → unfold both)", () => {
+		// Brute-force two distinct durable ids that hash to the same 4-char code (FNV
+		// collides within a couple thousand tries — fast and deterministic).
+		let idA = "", idB = "";
+		const seen = new Map<string, string>();
+		for (let i = 0; i < 500000; i++) {
+			const id = `a:c${i}:p0`;
+			const c = foldCode(id);
+			const prev = seen.get(c);
+			if (prev) { idA = prev; idB = id; break; }
+			seen.set(c, id);
+		}
+		expect(idA && idB).toBeTruthy();
+		expect(foldCode(idA)).toBe(foldCode(idB));
+
+		order = 0;
+		const blocks = [
+			blk({ id: idA, kind: "text", tokens: 8000 }),
+			blk({ id: idB, kind: "text", tokens: 8000 }),
+			blk({ id: "u:1000", kind: "user", tokens: 50, text: "hi" }),
+		];
+		const s = makeStore(blocks);
+		s.setProtect(40);
+		s.setBudget(1000);
+		expect(s.isFolded(s.get(idA)!)).toBe(true);
+		expect(s.isFolded(s.get(idB)!)).toBe(true);
+
+		const { restored, missing } = resolveUnfold(s, [foldCode(idA)]);
+		// both colliding blocks restored from the single code
+		expect(restored.length).toBe(2);
+		expect(s.isFolded(s.get(idA)!)).toBe(false);
+		expect(s.isFolded(s.get(idB)!)).toBe(false);
+		expect(missing).toEqual([]);
 	});
 
 	it("refuses to touch a human-pinned block — reports it missing, pin survives", () => {
@@ -203,10 +241,11 @@ describe("resolveUnfold", () => {
 		expect(s.get("a:resp1:p0")!.override).toBe("pinned");
 
 		// the agent must NOT be able to convert a pin into an agent-unfold (it can request,
-		// never force). The pinned id is reported as nothing-to-restore.
-		const { restored, missing } = resolveUnfold(s, ["a:resp1:p0"]);
+		// never force). The pinned block's code resolves to no FOLDED block → missing.
+		const code = foldCode("a:resp1:p0");
+		const { restored, missing } = resolveUnfold(s, [code]);
 		expect(restored).toEqual([]);
-		expect(missing).toEqual(["a:resp1:p0"]);
+		expect(missing).toEqual([code]);
 		expect(s.get("a:resp1:p0")!.override).toBe("pinned"); // pin intact
 		expect(s.get("a:resp1:p0")!.by).toBe("you");
 	});
@@ -221,9 +260,10 @@ describe("resolveUnfold", () => {
 		s.setBudget(1_000_000); // nothing folds
 		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(false);
 
-		const { restored, missing } = resolveUnfold(s, ["a:resp1:p0"]);
+		const code = foldCode("a:resp1:p0");
+		const { restored, missing } = resolveUnfold(s, [code]);
 		expect(restored).toEqual([]);
-		expect(missing).toEqual(["a:resp1:p0"]);
+		expect(missing).toEqual([code]);
 		// it must NOT have been flipped to a sticky agent-unfold override
 		expect(s.get("a:resp1:p0")!.override).toBe(null);
 	});
@@ -240,7 +280,7 @@ describe("resolveUnfold", () => {
 		s.setBudget(1000);
 		expect(computeFoldOps(s).map((o) => o.id)).toContain("a:resp1:p0");
 
-		resolveUnfold(s, ["a:resp1:p0"]);
+		resolveUnfold(s, [foldCode("a:resp1:p0")]);
 		// next plan omits it → the extension sends it full → agent's past context changes
 		expect(computeFoldOps(s).map((o) => o.id)).not.toContain("a:resp1:p0");
 	});

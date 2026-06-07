@@ -65,12 +65,13 @@ export interface WireBlock {
 /**
  * One fold instruction: replace block `id`'s content with `digestText`.
  *
- * Since protocol v3, `digestText` carries a leading `{#<id> FOLDED}` tag so the live
- * agent can SEE that this content was compacted (not lost) and ask for it back via the
- * `unfold` tool, passing that same id. The tag is produced by the ENGINE's `digest()`
- * (so the GUI renders, and token-accounts, the exact string the agent receives — one
- * source of truth); the GUI's `computeFoldOps` sends `store.digestOf(b)` verbatim and
- * the extension substitutes it opaquely.
+ * Since protocol v3, `digestText` carries a leading `{#<code> FOLDED}` tag (a short
+ * hash of the block's durable id) so the live agent can SEE that this content was
+ * compacted (not lost) and ask for it back via the `unfold` tool, passing that same
+ * code. The tag is produced by the ENGINE's `digest()` (so the GUI renders, and
+ * token-accounts, the exact string the agent receives — one source of truth); the
+ * GUI's `computeFoldOps` sends `store.digestOf(b)` verbatim and the extension
+ * substitutes it opaquely.
  */
 export interface FoldOp {
 	id: string;
@@ -121,10 +122,11 @@ export interface StreamMessage {
 /**
  * Sent by the extension when the live AGENT calls the `unfold` tool, asking the GUI
  * to restore folded blocks to full content (protocol v3 — "the agent can pull its
- * own context back"). `ids` are the durable block ids the agent read from the
- * `{#<id> FOLDED}` tags in its context. The GUI resolves each id to a block and marks
- * it unfolded (sticky; provenance "agent"), then replies via `unfoldResult`
- * (correlated by `reqId`).
+ * own context back"). `codes` are the short fold codes the agent read from the
+ * `{#<code> FOLDED}` tags in its context. The GUI resolves each code to every folded
+ * block carrying it (a code can rarely collide → restore all matches) and marks them
+ * unfolded (sticky; provenance "agent"), then replies via `unfoldResult` (correlated
+ * by `reqId`).
  *
  * This is a STATE change only: the restored content reaches the model at the NEXT
  * `context` hook (the unfolded block simply no longer appears in the fold plan), so the
@@ -135,7 +137,7 @@ export interface StreamMessage {
 export interface UnfoldRequestMessage {
 	type: "unfoldRequest";
 	reqId: number;
-	ids: string[];
+	codes: string[];
 }
 
 export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage;
@@ -157,8 +159,8 @@ export interface AttachMessage {
 
 /** One block restored by an `unfoldResult`. */
 export interface UnfoldRestored {
-	/** The durable block id the agent referenced (now held unfolded). */
-	id: string;
+	/** The fold code the agent referenced (the block now held unfolded). */
+	code: string;
 	kind: WireBlock["kind"];
 	/** Short human label for a useful confirmation, e.g. "tool_result read_file · turn 12". */
 	label: string;
@@ -167,9 +169,9 @@ export interface UnfoldRestored {
 /**
  * The GUI's reply to an `unfoldRequest` (protocol v3). `restored` lists the blocks
  * that resolved and are now held unfolded (NO content — the content returns to the
- * agent at its next `context` hook); `missing` lists ids the GUI could not resolve
- * (unknown / not in this session). The extension formats this into the `unfold`
- * tool's confirmation for the agent.
+ * agent at its next `context` hook); `missing` lists codes the GUI could not resolve
+ * to any folded block (unknown, or already full). The extension formats this into the
+ * `unfold` tool's confirmation for the agent.
  */
 export interface UnfoldResultMessage {
 	type: "unfoldResult";

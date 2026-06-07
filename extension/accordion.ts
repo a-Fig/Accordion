@@ -70,7 +70,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	const pending = new Map<number, (ops: FoldOp[]) => void>();
 	// Unfold requests: keyed by reqId, resolved when the GUI replies (or null on flush).
 	let unfoldSeq = 0;
-	const pendingUnfold = new Map<number, (res: { restored: Array<{ id: string; kind: string; label: string }>; missing: string[] } | null) => void>();
+	const pendingUnfold = new Map<number, (res: { restored: Array<{ code: string; kind: string; label: string }>; missing: string[] } | null) => void>();
 	// Last messages snapshot seen at `context` or `agent_end`. Used by the
 	// `message_end` committed-streaming path to build a full array for linearize
 	// without losing global turn/order numbering (see Phase 3 in ADR 0003).
@@ -340,8 +340,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		});
 	}
 
-	/** Ask the GUI to restore a set of folded blocks; mirrors requestPlan in structure. */
-	function requestUnfold(ids: string[]): Promise<{ restored: Array<{ id: string; kind: string; label: string }>; missing: string[] } | null> {
+	/** Ask the GUI to restore folded blocks by their codes; mirrors requestPlan in structure. */
+	function requestUnfold(codes: string[]): Promise<{ restored: Array<{ code: string; kind: string; label: string }>; missing: string[] } | null> {
 		return new Promise((resolve) => {
 			const ws = client;
 			if (!ws || ws.readyState !== 1) return resolve(null);
@@ -352,7 +352,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				if (pendingUnfold.has(reqId)) { pendingUnfold.delete(reqId); resolve(null); }
 			}, UNFOLD_TIMEOUT_MS);
 			pendingUnfold.set(reqId, (res) => { clearTimeout(timer); resolve(res); });
-			send(ws, { type: "unfoldRequest", reqId, ids } as UnfoldRequestMessage);
+			send(ws, { type: "unfoldRequest", reqId, codes } as UnfoldRequestMessage);
 		});
 	}
 
@@ -630,35 +630,37 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		name: "unfold",
 		label: "Unfold Context",
 		description:
-			"Restore folded context. Accordion (the live context manager attached to this session) may replace older parts of YOUR OWN context with a short summary tagged like `{#a:resp-abc:p0 FOLDED}`. The original content is preserved, not lost. Call this tool with the id(s) from those tags to restore the full content. The restored content reappears in your context on your NEXT turn (your past context changes); this call confirms what was scheduled. Only unfold what you actually need — it costs tokens.",
-		promptSnippet: "unfold(ids) — restore context folded by Accordion (blocks tagged {#<id> FOLDED}).",
+			"Restore folded context. Accordion (the live context manager attached to this session) may replace older parts of YOUR OWN context with a short summary tagged like `{#3f9a FOLDED}`. The original content is preserved, not lost. Call this tool with the short code(s) from those tags to restore the full content. The restored content reappears in your context on your NEXT turn (your past context changes); this call confirms what was scheduled. Only unfold what you actually need — it costs tokens.",
+		promptSnippet: "unfold(codes) — restore context folded by Accordion (blocks tagged {#<code> FOLDED}).",
 		promptGuidelines: [
-			"When you see a `{#<id> FOLDED}` marker in your context, that block was compacted by Accordion to save tokens — the full content is preserved, not lost. If the summary is not enough for your current task, call `unfold` with the id(s) from the marker(s) to restore them; the content returns on your next turn.",
+			"When you see a `{#<code> FOLDED}` marker in your context (e.g. `{#3f9a FOLDED}`), that block was compacted by Accordion to save tokens — the full content is preserved, not lost. If the summary is not enough for your current task, call `unfold` with the code(s) from the marker(s) to restore them; the content returns on your next turn.",
 		],
 		parameters: Type.Object({
-			ids: Type.Array(Type.String({ description: "A durable block id copied from a {#<id> FOLDED} tag, e.g. a:resp-abc:p0" }), {
-				description: "One or more block ids to restore to full content.",
+			ids: Type.Array(Type.Union([Type.String(), Type.Number()]), {
+				description: "One or more fold codes copied from {#<code> FOLDED} tags (e.g. \"3f9a\"). Strings; a purely numeric code may be passed as a number.",
 			}),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const ids = Array.isArray(params.ids) ? params.ids.filter((s) => typeof s === "string" && s.trim()).map((s) => s.trim()) : [];
-			if (!ids.length) {
-				return { content: [{ type: "text", text: 'No block ids given. Pass the id(s) from a {#<id> FOLDED} tag, e.g. unfold({ids:["a:resp-abc:p0"]}).' }] };
+			const codes = Array.isArray(params.ids)
+				? params.ids.map((s) => String(s).trim()).filter((s) => s.length > 0)
+				: [];
+			if (!codes.length) {
+				return { content: [{ type: "text", text: 'No fold codes given. Pass the code(s) from a {#<code> FOLDED} tag, e.g. unfold({ids:["3f9a"]}).' }] };
 			}
 			if (!attached()) {
 				return { content: [{ type: "text", text: "Accordion isn't attached, so nothing in your context is folded right now — it is already full." }] };
 			}
-			const res = await requestUnfold(ids);
+			const res = await requestUnfold(codes);
 			if (res === null) {
 				return { content: [{ type: "text", text: "Accordion did not respond. Folded content restores automatically if it detaches; otherwise try again." }], isError: true };
 			}
 			const lines: string[] = [];
 			if (res.restored.length) {
 				lines.push(`Unfolded ${res.restored.length} block(s); full content returns on your next turn:`);
-				for (const r of res.restored) lines.push(`  • ${r.label} (${r.id})`);
+				for (const r of res.restored) lines.push(`  • ${r.label} (#${r.code})`);
 			}
 			if (res.missing.length) {
-				lines.push(`Not found (already full, or not in this session's context): ${res.missing.join(", ")}`);
+				lines.push(`No folded block for: ${res.missing.map((c) => "#" + c).join(", ")} (already full, or not in this session's context).`);
 			}
 			if (!lines.length) lines.push("Nothing to unfold.");
 			return { content: [{ type: "text", text: lines.join("\n") }], details: res };

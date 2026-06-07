@@ -26,18 +26,18 @@ without breaking the human's oversight or the engine's single-source-of-truth pr
 Every folded block's digest begins with:
 
 ```
-{#<id> FOLDED}
+{#<code> FOLDED}
 ```
 
-where `<id>` is the block's durable id (e.g. `a:resp-abc:p0`, `r:call-xyz`,
-`u:1733250000000`). The tag is produced by the engine's `digest()`, which is already the
-single function computing what a folded block collapses to. A short human-readable
-summary follows the tag on the same line.
+where `<code>` is a short stable handle for the block (e.g. `{#3f9a FOLDED}`, `{#0a2c
+FOLDED}`). The tag is produced by the engine's `digest()`, which is already the single
+function computing what a folded block collapses to. A short human-readable summary
+follows the tag on the same line.
 
 This placement has two consequences. First, the GUI renders exactly the same string the
 agent receives — there is no separate "agent wire" representation. Second, token
 accounting includes the tag: the tokens saved by folding are measured against the actual
-digest the agent sees, including the tag overhead (~10 tokens per block). Both properties
+digest the agent sees, including the tag overhead (~4 tokens per block). Both properties
 are structural — they cannot drift because there is only one code path.
 
 **Caveat (the armed/disarmed distinction):** "the GUI shows exactly what the agent sees"
@@ -54,36 +54,53 @@ what the model actually sees, which is exactly what "source of truth" must preve
 savings would also be miscounted (the GUI would omit the ~10 tag tokens from its
 estimate).
 
-### 2. Durable block id as the handle — no separate short-number map
+### 2. The handle is a short *hash* of the durable id — stateless, readable
 
-The id in the tag is the block's durable id, defined in ADR 0003. The agent reads the
-id directly from the tag and passes it back verbatim to `unfold`. There is no
-secondary mapping from short handles (e.g. `#1`, `#2`) to ids.
+`<code>` is a 4-char base36 hash of the block's durable id (FNV-1a → base36, last 4
+chars), computed by `foldCode(id)` in `digest.ts`. It is a **pure function of the id**:
+no counter, no per-session map, no reset wiring, and globally stable (the same block
+yields the same code in every session). `unfold` resolves a code back to the block(s)
+that hash to it.
 
-A short-handle map would need to be constructed, maintained across re-folds, and reset on
-every new session attach — non-trivial state with wiring consequences. The durable id is
-already engine truth; the agent never needs to type one from memory, only copy it from a
-tag it is currently looking at. The size cost (~10 extra tokens per folded block vs. a
-short handle) is acceptable for the simplicity and single-source-of-truth win.
+This decision was made *after* the raw-id version was tried live. A durable id is a UUID
+or millisecond timestamp — `{#a:f2965ed9-323d-4c24-b489-d93e8c55c59e:p0 FOLDED}` — ~50
+characters of line-noise repeated on every folded block. Unusable. The hash keeps the
+single-source-of-truth property (still derived in `digest()`, still what the GUI shows
+and token-accounts) while being short and readable.
 
-**Rejected: short handle map** (`#1 → a:resp-abc:p0`, maintained as folding state). The
-id is already unambiguous and durable; a parallel map is needless state with reset wiring
-and no correctness advantage.
+**Collisions** are handled by resolution, not avoidance: `resolveUnfold` restores EVERY
+folded block whose code matches the requested one. A 4-char base36 space (~1.68M) makes
+collisions rare (birthday ≈1% even at ~200 folded blocks), and the consequence of one is
+merely that two blocks restore together — harmless, since unfolding only ever shows the
+model more of its own content. This keeps `foldCode` a pure function (no "codes already
+issued" registry).
+
+**Rejected: the raw durable id as the handle.** Correct and absolutely stable, but the
+id is a UUID/timestamp — far too long and noisy to repeat on every folded block (tried
+live; rejected on sight).
+**Rejected: a short ordinal map** (`#1 → <id>`, assigned on first fold). Clean numbers,
+but needs per-session state, careful assignment across re-folds, and reset-on-attach
+wiring — and the numbering isn't globally stable. The hash gets the brevity with none of
+the state.
+**Rejected: a raw id *suffix*** (last N chars). Stateless too, but for `u:`/`s:` blocks
+the id tail is a timestamp whose low digits cluster, so suffixes collide unevenly; a hash
+spreads uniformly across all id kinds and lets us tune the length.
 
 ### 3. `unfold` tool — state change only, content returns next turn
 
 The Accordion extension registers a pi tool named `unfold`. Signature:
 
 ```
-unfold({ids: string[]})
+unfold({ids: string[]})   // each entry is a fold code from a {#<code> FOLDED} tag
 ```
 
-The agent passes id(s) read from the `{#<id> FOLDED}` tags. "GUI drives, extension is
-thin": the extension relays the request over the wire (`unfoldRequest`); the **GUI**
-resolves each id and marks the block unfolded with provenance `"agent"` and override
-`"unfolded"` (sticky — protected from auto-refold), then replies (`unfoldResult`). The
-tool result is a confirmation of what was scheduled; it does NOT echo the full block
-content back in the tool result.
+The agent passes code(s) read from the `{#<code> FOLDED}` tags (a purely numeric code may
+be passed as a number; the tool coerces it). "GUI drives, extension is thin": the
+extension relays the request over the wire (`unfoldRequest{codes}`); the **GUI** resolves
+each code to its folded block(s) and marks them unfolded with provenance `"agent"` and
+override `"unfolded"` (sticky — protected from auto-refold), then replies
+(`unfoldResult`). The tool result is a confirmation of what was scheduled; it does NOT
+echo the full block content back in the tool result.
 
 The restored content returns to the agent on its **next turn** via the normal mechanism:
 its past context changes (the block drops out of the fold plan), so the next `context`
@@ -111,7 +128,7 @@ inconsistent with the fold model. Retained as the deferred fallback.
 
 ### 4. `accordion-context-folding` skill — standalone, auto-exposed
 
-The agent needs to know (a) that `{#<id> FOLDED}` markers are Accordion fold tags, (b)
+The agent needs to know (a) that `{#<code> FOLDED}` markers are Accordion fold tags, (b)
 how to call `unfold`, and (c) what to expect (next-turn restoration). This is captured in
 a standalone pi skill at `extension/skills/accordion-context-folding/SKILL.md`.
 
@@ -133,7 +150,8 @@ first cut.
 
 ### 5. Protocol bumped to v3
 
-`unfoldRequest` / `unfoldResult` are new wire message types. `PROTOCOL_VERSION` → 3.
+`unfoldRequest{codes}` / `unfoldResult{restored, missing}` are new wire message types.
+`PROTOCOL_VERSION` → 3.
 Extension and app share `protocol.ts`; a mismatched pair detects the version mismatch via
 the `hello` handshake.
 
@@ -175,10 +193,12 @@ no automatic mitigation is included in this cut.
 
 ## Verification
 
-Extension `smoke.mjs`: the `unfold` round-trip (no-ids and detached guards, then an
-attached request → `unfoldRequest` → mock-GUI `unfoldResult` → confirmation result) and
-`resources_discover` skill exposure. Unit tests (`vitest`): the `{#<id> FOLDED}` tag
-format and tag-aware token accounting (`digest.test.ts`); the GUI's `resolveUnfold`
-(restores known ids sticky/agent-provenance, reports missing, drops from the next fold
-plan) and the id-tagged `digestText` (`plan.test.ts`); the `isDurableId` guard (already
-covered). Full gate: `svelte-check` 0/0/0, `vitest` (62), `npm run build`, extension smoke.
+Extension `smoke.mjs`: the `unfold` round-trip (no-codes and detached guards, a numeric
+code coerced to a string, then an attached request → `unfoldRequest{codes}` → mock-GUI
+`unfoldResult` → confirmation result) and `resources_discover` skill exposure. Unit tests
+(`vitest`): `foldCode` shape/determinism, the `{#<code> FOLDED}` tag, and tag-aware token
+accounting (`digest.test.ts`); the GUI's `resolveUnfold` (restores by code sticky/
+agent-provenance, **refuses a human-pinned or already-full block** → reports missing,
+**unfolds all blocks sharing a colliding code**, drops from the next fold plan) and the
+code-tagged `digestText` (`plan.test.ts`); the `isDurableId` guard (already covered). Full
+gate: `svelte-check` 0/0/0, `vitest` (66), `npm run build`, extension smoke.

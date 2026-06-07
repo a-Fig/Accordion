@@ -119,15 +119,15 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			}
 		} else if (msg.type === "unfoldRequest") {
 			// The live agent asked (via the `unfold` tool) to restore folded blocks it saw
-			// tagged `{#<id> FOLDED}`. Resolve each id and hold it unfolded with provenance
-			// "agent" — so it shows in the activity log as agent-initiated and the human
-			// stays the source of truth (they can re-fold it). This is a STATE change only:
-			// the restored content reaches the agent at its NEXT context hook (the block
-			// drops out of the fold plan). Unfolding only ever shows the model MORE of its
-			// own original context, so there is no provider-safety risk to guard here.
+			// tagged `{#<code> FOLDED}`. Resolve each code to its folded block(s) and hold
+			// them unfolded with provenance "agent" — so it shows in the activity log as
+			// agent-initiated and the human stays the source of truth (they can re-fold it).
+			// This is a STATE change only: the restored content reaches the agent at its NEXT
+			// context hook (the block drops out of the fold plan). Unfolding only ever shows
+			// the model MORE of its own original context, so there is no provider-safety risk.
 			const { restored, missing } = session.store
-				? resolveUnfold(session.store, msg.ids)
-				: { restored: [], missing: msg.ids };
+				? resolveUnfold(session.store, msg.codes)
+				: { restored: [], missing: msg.codes };
 			const reply: UnfoldResultMessage = { type: "unfoldResult", reqId: msg.reqId, restored, missing };
 			try {
 				ws.send(JSON.stringify(reply));

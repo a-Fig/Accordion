@@ -6,28 +6,45 @@
  * keeps only its shape and a taste of WHAT it saw. No LLM here yet — these are
  * structured digests so behaviour is reproducible and debuggable.
  *
- * Every digest carries a leading `{#<id> FOLDED}` tag. This is the engine's
+ * Every digest carries a leading `{#<code> FOLDED}` tag. This is the engine's
  * source-of-truth string: it is what the GUI renders for a folded block, what
  * `digestTokens` counts, AND (in live mode) the exact text the agent receives in
- * place of the folded content. The agent reads the id from the tag and can call the
- * `unfold` tool with it to pull the block back to full content. Keeping the tag here
- * — not bolted on at the wire — guarantees the GUI shows precisely what the model
- * sees and the saved-tokens figure includes the tag's real cost.
+ * place of the folded content. The agent reads the short `code` from the tag and
+ * calls the `unfold` tool with it to pull the block back to full content. Keeping the
+ * tag here — not bolted on at the wire — guarantees the GUI shows precisely what the
+ * model sees and the saved-tokens figure includes the tag's real cost.
+ *
+ * The code is a short HASH of the durable block id, not the id itself: a raw id is a
+ * UUID/timestamp (`a:f2965ed9-…-d93e8c55c59e:p0`) — unreadable line-noise repeated on
+ * every folded block. The hash is a pure function of the id, so it needs no state and
+ * is globally stable (same block → same code, every session). A 4-char base36 space
+ * (~1.68M) keeps collisions rare; the rare collision is handled by `resolveUnfold`
+ * unfolding every folded block that shares the code (cheap and harmless).
  */
 import type { Block } from "./types";
 import { estTokens, clip, firstLine, BLOCK_OVERHEAD } from "./tokens";
 
 /**
- * The folded-block marker the agent sees and passes back to `unfold`. The id is the
- * durable block id (`a:…` / `r:…` / `u:…` / `s:…`); the skill `accordion-context-folding`
- * teaches agents to parse it. One definition so the engine, the live link, and the
- * skill never drift.
+ * Short, stable handle for a block, derived purely from its durable id (FNV-1a → base36,
+ * 4 chars). Stateless and deterministic so the engine, the live link, and the
+ * `accordion-context-folding` skill never drift. Not collision-free by construction —
+ * `resolveUnfold` resolves a code to ALL folded blocks that carry it.
  */
-export function foldTag(id: string): string {
-	return `{#${id} FOLDED}`;
+export function foldCode(id: string): string {
+	let h = 0x811c9dc5; // FNV-1a 32-bit
+	for (let i = 0; i < id.length; i++) {
+		h ^= id.charCodeAt(i);
+		h = Math.imul(h, 0x01000193);
+	}
+	return (h >>> 0).toString(36).padStart(4, "0").slice(-4);
 }
 
-/** The full folded representation: the `{#<id> FOLDED}` tag followed by the per-kind body. */
+/** The folded-block marker the agent sees and passes back to `unfold`, e.g. `{#3f9a FOLDED}`. */
+export function foldTag(id: string): string {
+	return `{#${foldCode(id)} FOLDED}`;
+}
+
+/** The full folded representation: the `{#<code> FOLDED}` tag followed by the per-kind body. */
 export function digest(b: Block): string {
 	return `${foldTag(b.id)} ${digestBody(b)}`;
 }

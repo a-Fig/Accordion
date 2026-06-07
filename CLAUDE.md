@@ -87,16 +87,18 @@ via `computeFoldOps` (`plan.ts`), guarded so only **durable-id** `text`/`thinkin
 `tool_result` blocks are ever folded (`isDurableId`; `applyPlan` enforces the same).
 
 **M3 — agent self-unfold ([ADR 0005](docs/adr/0005-agent-unfold.md)):** the engine's
-`digest()` now prefixes every folded block's digest with `{#<id> FOLDED}` (the durable
-block id from ADR 0003). This is the single source of truth: the GUI renders the exact
-string the agent receives, and token accounting includes the tag — no separate wire
-representation, no drift. The extension registers an `unfold` pi tool: the agent calls
-`unfold({ids: [...]})` with id(s) copied from the tags, the GUI marks those blocks
+`digest()` now prefixes every folded block's digest with `{#<code> FOLDED}`, where
+`<code>` is a short stateless hash of the durable block id (`foldCode` — a raw id is a
+UUID/timestamp, too noisy to repeat). This is the single source of truth: the GUI renders
+the exact string the agent receives, and token accounting includes the tag — no separate
+wire representation, no drift. The extension registers an `unfold` pi tool: the agent
+calls `unfold({ids: [...]})` with code(s) copied from the tags, the GUI resolves each code
+to its folded block(s) (a rare hash collision restores all matches) and marks them
 unfolded (sticky, provenance `"agent"`), and the full content returns on the agent's
-**next turn** (state-change-only; no content echo in the tool result this cut). Agent
-unfolds are visible in the activity log; the human can re-fold them. The skill
-`accordion-context-folding` is auto-exposed via `resources_discover` so the agent knows
-what the tags mean and how to call the tool — no manual skill loading required.
+**next turn** (state-change-only; no content echo this cut). The agent can only unfold a
+block that is actually folded — it can't downgrade a human pin. Agent unfolds show in the
+activity log; the human can re-fold them. The skill `accordion-context-folding` is
+auto-exposed via `resources_discover` — no manual loading.
 
 **Known characteristic:** the view syncs on pi's `context` hook, which fires *before*
 each model call — so an assistant reply is only seen at the *next* model call (i.e. the
