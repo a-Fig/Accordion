@@ -123,7 +123,12 @@ export class AccordionStore {
 		}
 		return 0;
 	});
-	/** Is this block inside the protected working tail (never auto-folded)? */
+	/**
+	 * Is this block inside the protected working tail (never auto-folded)? Resolves the
+	 * block by id, so `b` MUST be store-owned (from `blocks`/`get`) — a foreign object that
+	 * merely shares an id resolves to the committed block's position. Every caller passes a
+	 * store block today; an off-store/wire/ghost block is out of contract here.
+	 */
 	isProtected(b: Block): boolean {
 		return (this.index.get(b.id) ?? -1) >= this.protectedFromIndex;
 	}

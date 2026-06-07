@@ -63,6 +63,12 @@ export function foldTag(id: string): string {
  * `liveTokens` read recomputes it per folded block; each call re-runs the FNV hash plus a
  * couple of text splits. A WeakMap keyed by the block makes those repeats free and is
  * GC-friendly (no cross-session leak: the entry dies with the block).
+ *
+ * TRIPWIRE: there is no invalidation. This is sound ONLY because a committed block's content
+ * fields are never mutated in place (the live resend path drops duplicate ids rather than
+ * overwriting; applyPlan clones). If a future feature ever mutates an existing block's
+ * `text`/`tokens` (e.g. streaming partial-text growth into a committed block), it MUST clear
+ * both caches for that block, or the rendered digest and saved-tokens accounting go stale.
  */
 const digestCache = new WeakMap<Block, string>();
 const digestTokenCache = new WeakMap<Block, number>();

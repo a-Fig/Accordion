@@ -66,8 +66,9 @@ async function poll(): Promise<void> {
 		// Only publish a new array when something the sidebar actually renders changed.
 		// `list_sessions` returns a fresh array every tick and heartbeats rewrite the
 		// descriptor every 5s, so an unconditional assign churned every reactive consumer
-		// once a second for zero visible change. (heartbeatAt/pid are diagnostics, not
-		// rendered, so they're excluded from the comparison.)
+		// once a second for zero visible change. (heartbeatAt/pid are excluded — they're
+		// diagnostics the sidebar never renders; a stale session instead drops out of `live`
+		// via isLiveEntry, changing the length, so liveness still propagates.)
 		if (!sameSessions(discovery.sessions, live)) discovery.sessions = live;
 		discovery.ready = true;
 		if (
@@ -126,7 +127,14 @@ export function selectSession(sessionId: string | null): void {
 	discovery.selected = sessionId;
 }
 
-/** True when two session lists are identical in every field the sidebar renders or connects with. */
+/**
+ * True when two session lists are identical in every field the sidebar renders or connects
+ * with. Compared positionally — both lists are sorted by `startedAt`, and the sidebar renders
+ * in array order, so this captures "would the rendered rows differ" including order. `cwd` is
+ * compared because it is the row's primary label (`baseName(cwd) || title` in SessionsSidebar),
+ * not just a tooltip. Worst case (two sessions sharing an exact `startedAt` ms whose readdir
+ * order flips) is a redundant reassign, never a missed update.
+ */
 function sameSessions(a: SessionEntry[], b: SessionEntry[]): boolean {
 	if (a.length !== b.length) return false;
 	for (let i = 0; i < a.length; i++) {
@@ -135,6 +143,7 @@ function sameSessions(a: SessionEntry[], b: SessionEntry[]): boolean {
 		if (
 			x.sessionId !== y.sessionId ||
 			x.port !== y.port ||
+			x.cwd !== y.cwd ||
 			x.title !== y.title ||
 			x.model !== y.model ||
 			x.tokens !== y.tokens ||
