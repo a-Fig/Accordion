@@ -28,6 +28,11 @@
 	const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
 	const k = (n: number) => {
 		const r = Math.round(n);
+		if (r >= 1_000_000) {
+			const m = r / 1_000_000;
+			// whole millions read cleanest as "1M"; keep one decimal otherwise ("1.5M")
+			return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+		}
 		return r >= 1000 ? `${(r / 1000).toFixed(r >= 10000 ? 0 : 1)}k` : `${r}`;
 	};
 	// over-by figure for the pill — rounds the difference mid-tween
