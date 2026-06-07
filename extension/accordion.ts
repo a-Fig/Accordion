@@ -221,7 +221,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	/** Pull model id + live usage off the hook context (best-effort). */
 	function refreshFromCtx(ctx: ExtensionContext): void {
 		try {
-			const m = ctx.getModel?.();
+			const m = ctx.model;
 			if (m?.id) {
 				model = m.id;
 				meta.model = m.id;
@@ -378,7 +378,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		lastMessages = readSessionMessages(ctx);
 		startedAt = Date.now();
 		try {
-			meta = { title: "pi session", cwd: process?.cwd?.() ?? "", model: "", format: "pi" };
+			meta = { title: "pi session", cwd: process?.cwd?.() ?? "", model: "", contextWindow: null, format: "pi" };
 		} catch {
 			/* keep defaults */
 		}
