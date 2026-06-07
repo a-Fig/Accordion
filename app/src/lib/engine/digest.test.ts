@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import type { Block, BlockKind } from "./types";
-import { digest, digestTokens, foldTag, foldCode } from "./digest";
+import type { Block, BlockKind, Group } from "./types";
+import { digest, digestTokens, foldTag, foldCode, groupDigest, groupDigestTokens } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 
 // The folded digest carries a leading `{#<code> FOLDED}` tag, where <code> is a short
@@ -80,5 +80,37 @@ describe("digestTokens includes the tag cost", () => {
 		// tag that the engine under-counts.)
 		const expected = estTokens(digest(b)) + BLOCK_OVERHEAD;
 		expect(digestTokens(b)).toBe(expected);
+	});
+});
+
+describe("groupDigest (multiblock folds)", () => {
+	const grp: Group = { id: "g:a:r1:p0", memberIds: ["a:r1:p0", "a:r1:p1", "r:c1", "u:1"], folded: true };
+	const members: Block[] = [
+		blk({ id: "u:1", kind: "user", turn: 1, text: "please fix the failing parser test" }),
+		blk({ id: "a:r1:p0", kind: "thinking", turn: 1 }),
+		blk({ id: "a:r1:p1", kind: "text", turn: 2 }),
+		blk({ id: "r:c1", kind: "tool_result", turn: 2, toolName: "read", tokens: 3000 }),
+	];
+
+	it("carries ONE group fold tag = foldCode(group.id) — the single handle for the whole range", () => {
+		expect(groupDigest(grp, members).startsWith(`{#${foldCode(grp.id)} FOLDED} group ·`)).toBe(true);
+	});
+
+	it("summarizes count, turn span, total tokens and a kind breakdown", () => {
+		const d = groupDigest(grp, members);
+		expect(d).toContain("4 blocks");
+		expect(d).toContain("turns 1–2");
+		expect(d).toMatch(/~\d+ tok/);
+		expect(d).toContain("1 result");
+		expect(d).toContain("1 thought");
+	});
+
+	it("always surfaces the user's instruction when a user block is inside (never silently dropped)", () => {
+		expect(groupDigest(grp, members)).toContain("please fix the failing parser test");
+	});
+
+	it("is deterministic and token-accounted including the tag", () => {
+		expect(groupDigest(grp, members)).toBe(groupDigest(grp, members));
+		expect(groupDigestTokens(grp, members)).toBe(estTokens(groupDigest(grp, members)) + BLOCK_OVERHEAD);
 	});
 });

@@ -11,8 +11,32 @@
  * tool_results before thinking before reply text before tool_calls before user
  * intent. Deterministic and explainable; the smarts come later.
  */
-import type { Block, BlockKind, Actor, SessionMeta, ParsedSession } from "./types";
-import { digest, digestTokens } from "./digest";
+import type { Block, BlockKind, Actor, SessionMeta, ParsedSession, Group } from "./types";
+import { digest, digestTokens, groupDigest, groupDigestTokens } from "./digest";
+
+/**
+ * The "message key" of a block id — the id with any trailing `:p<n>` part suffix
+ * removed, so every part of one assistant message shares a key (`a:resp:p0`,
+ * `a:resp:p1` → `a:resp`) while a user/result/summary block is its own key. Group
+ * creation snaps to whole messages on this key so a group never collapses a message's
+ * parts in half (ADR 0006 §2/§4) — which makes GUI accounting message-exact.
+ */
+function messageKey(id: string): string {
+	const m = id.match(/^(.*):p(?:\d+|\?)$/);
+	return m ? m[1] : id;
+}
+
+/** Classification of a folded group's members for accounting + the wire (ADR 0006 §4/§5). */
+interface GroupShape {
+	members: Block[];
+	/** Members that collapse into the one summary entry (whole, pair-balanced messages). */
+	collapsedMembers: Block[];
+	collapsed: Set<string>;
+	/** Members kept LIVE at full size — a tool-pair half whose partner is outside the group. */
+	stragglers: Set<string>;
+	/** First collapsed member (by order): the one block that "carries" the summary's token cost. */
+	carrier: string | null;
+}
 
 /** Lower value → folded sooner. The whole asymmetry the tool is built around. */
 const FOLD_RANK: Record<BlockKind, number> = {
@@ -49,6 +73,12 @@ export class AccordionStore {
 	/** Bumped on every settled change — a cheap redraw signal for canvas views. */
 	version = $state(0);
 	/**
+	 * Multiblock folds (ADR 0006). Human-created groups, each collapsing a contiguous run
+	 * of blocks into one tile/entry. An OVERLAY over `blocks` — never mutates a block, so
+	 * all block-indexed math (index / protectedFromIndex / append dedup) is untouched.
+	 */
+	groups = $state<Group[]>([]);
+	/**
 	 * id → position lookup, kept in lockstep with `blocks` (built in the constructor,
 	 * extended in `appendBlocks` — the only two paths that change the array's length or
 	 * order). Turns `get(id)`, `appendBlocks` dedup, and `isProtected` from O(n) scans into
@@ -71,12 +101,19 @@ export class AccordionStore {
 
 	// ---- reads -------------------------------------------------------------
 	isFolded(b: Block): boolean {
+		// A member of a FOLDED group: collapsed → reads folded; straggler → reads live.
+		const w = this.groupWire.get(b.id);
+		if (w) return w.collapsed;
 		if (b.override === "folded") return true;
 		if (b.override === "pinned" || b.override === "unfolded") return false;
 		return b.autoFolded;
 	}
 	/** Tokens this block currently costs the live context. */
 	effTokens(b: Block): number {
+		// Inside a folded group the contribution is the group's, not the block's own
+		// (carrier holds the one summary's tokens; other collapsed members hold 0).
+		const w = this.groupWire.get(b.id);
+		if (w) return w.tokens;
 		return this.isFolded(b) ? digestTokens(b) : b.tokens;
 	}
 	digestOf(b: Block): string {
@@ -109,6 +146,84 @@ export class AccordionStore {
 		return n;
 	});
 	overBudget = $derived.by(() => this.liveTokens > this.budget);
+
+	// ---- groups (multiblock folds, ADR 0006) -------------------------------
+	/** blockId → the group it belongs to (if any). Reactive on `groups`. */
+	private groupAt = $derived.by(() => {
+		const m = new Map<string, Group>();
+		for (const g of this.groups) for (const id of g.memberIds) m.set(id, g);
+		return m;
+	});
+	/**
+	 * For every block inside a FOLDED group, its effective live contribution + folded
+	 * state — so `effTokens`/`isFolded` mirror exactly what the wire does (ADR 0006 §5):
+	 * the carrier holds the one summary's tokens, other collapsed members hold 0, and a
+	 * straggler (split tool-pair half) stays live at full. Reactive on `groups`/`blocks`.
+	 * Blocks NOT in a folded group are absent → callers fall back to per-block logic.
+	 */
+	private groupWire = $derived.by(() => {
+		const m = new Map<string, { tokens: number; collapsed: boolean }>();
+		for (const g of this.groups) {
+			if (!g.folded) continue;
+			const c = this.classifyGroup(g);
+			const summaryTok = c.carrier ? groupDigestTokens(g, c.collapsedMembers) : 0;
+			for (const b of c.members) {
+				if (c.collapsed.has(b.id)) m.set(b.id, { tokens: b.id === c.carrier ? summaryTok : 0, collapsed: true });
+				else m.set(b.id, { tokens: b.tokens, collapsed: false }); // straggler: live, full
+			}
+		}
+		return m;
+	});
+
+	/**
+	 * Split a group's members into what collapses (whole, tool-pair-balanced messages →
+	 * the one summary) vs. what stays live (a tool-pair half whose partner sits outside the
+	 * group — the owner's "leave straggler live" rule). Pure; no durability gate here (that
+	 * is the WIRE's concern in `plan.ts` — the GUI shows the logical collapse so the demo /
+	 * loaded sessions render real savings).
+	 */
+	private classifyGroup(g: Group): GroupShape {
+		const members: Block[] = [];
+		for (const id of g.memberIds) {
+			const b = this.get(id);
+			if (b) members.push(b);
+		}
+		// Pairing WITHIN the member set: a tool_call is balanced iff its result is also a
+		// member; a tool_result iff its call is. A block whose partner is outside is a straggler.
+		const memberCalls = new Set<string>();
+		const memberResults = new Set<string>();
+		for (const b of members) {
+			if (!b.callId) continue;
+			if (b.kind === "tool_call") memberCalls.add(b.callId);
+			else if (b.kind === "tool_result") memberResults.add(b.callId);
+		}
+		const balanced = (b: Block): boolean => {
+			if (b.kind === "tool_call") return !b.callId || memberResults.has(b.callId);
+			if (b.kind === "tool_result") return !b.callId || memberCalls.has(b.callId);
+			return true;
+		};
+		// Removal is per MESSAGE: a message collapses only if ALL its member blocks are
+		// balanced (so a message holding an unbalanced tool_call stays whole/live).
+		const byMsg = new Map<string, Block[]>();
+		for (const b of members) {
+			const k = messageKey(b.id);
+			const arr = byMsg.get(k);
+			if (arr) arr.push(b);
+			else byMsg.set(k, [b]);
+		}
+		const removable = new Set<string>(); // message keys that collapse
+		for (const [k, msgBlocks] of byMsg) if (msgBlocks.every(balanced)) removable.add(k);
+		const collapsed = new Set<string>();
+		const stragglers = new Set<string>();
+		const collapsedMembers: Block[] = [];
+		for (const b of members) {
+			if (removable.has(messageKey(b.id))) {
+				collapsed.add(b.id);
+				collapsedMembers.push(b);
+			} else stragglers.add(b.id);
+		}
+		return { members, collapsedMembers, collapsed, stragglers, carrier: collapsedMembers[0]?.id ?? null };
+	}
 
 	/**
 	 * Index of the first protected block. Walking back from the newest block, the
@@ -177,8 +292,10 @@ export class AccordionStore {
 		// Protect the recent working tail (the newest ~protectTokens of context),
 		// and never fold a block whose digest wouldn't actually save tokens — folding
 		// it would only grow the live context and churn the view.
+		// Skip members of a folded group: they are already collapsed into the group's one
+		// entry, so folding them individually would double-count against the group accounting.
 		const cand = this.blocks
-			.filter((b, i) => b.override === null && i < protectedFrom && digestTokens(b) < b.tokens)
+			.filter((b, i) => b.override === null && i < protectedFrom && !this.groupWire.has(b.id) && digestTokens(b) < b.tokens)
 			.sort((a, b) => FOLD_RANK[a.kind] - FOLD_RANK[b.kind] || a.order - b.order);
 
 		for (const b of cand) {
@@ -292,6 +409,115 @@ export class AccordionStore {
 		}
 		this.emit("you", "reset", "all blocks to auto");
 		this.refold();
+	}
+
+	// ---- group actions (multiblock folds, ADR 0006) -----------------------
+	/** The group a block belongs to, if any. */
+	groupOf(b: Block): Group | undefined {
+		return this.groupAt.get(b.id);
+	}
+	groupById(id: string): Group | undefined {
+		return this.groups.find((g) => g.id === id);
+	}
+	groupMembers(g: Group): Block[] {
+		const out: Block[] = [];
+		for (const id of g.memberIds) {
+			const b = this.get(id);
+			if (b) out.push(b);
+		}
+		return out;
+	}
+	/** The one summary string the group's folded tile renders / the agent receives. */
+	groupSummary(g: Group): string {
+		const c = this.classifyGroup(g);
+		return groupDigest(g, c.collapsedMembers.length ? c.collapsedMembers : c.members);
+	}
+	/** Full tokens of the whole range, ignoring fold state. */
+	groupFullTokens(g: Group): number {
+		let n = 0;
+		for (const b of this.groupMembers(g)) n += b.tokens;
+		return n;
+	}
+	/** What the group costs live: folded → one summary (+ any straggler full); open → members' own eff. */
+	groupLiveTokens(g: Group): number {
+		if (!g.folded) {
+			let n = 0;
+			for (const b of this.groupMembers(g)) n += this.effTokens(b);
+			return n;
+		}
+		const c = this.classifyGroup(g);
+		let n = c.carrier ? groupDigestTokens(g, c.collapsedMembers) : 0;
+		for (const id of c.stragglers) n += this.get(id)?.tokens ?? 0;
+		return n;
+	}
+	groupSavedTokens(g: Group): number {
+		return this.groupFullTokens(g) - this.groupLiveTokens(g);
+	}
+	/** How many members stay LIVE on the wire (split tool-pair halves) — surfaced in the tooltip. */
+	groupStragglerCount(g: Group): number {
+		return g.folded ? this.classifyGroup(g).stragglers.size : 0;
+	}
+
+	/**
+	 * Create a group from a block range (the human's selection, any two member ids). The
+	 * range is SNAPPED outward to whole messages (never splits an assistant message's parts),
+	 * then validated: entirely older than the protected tail, no member already grouped
+	 * (no overlap), ≥2 members. Folds it on creation. Returns the group, or null if invalid.
+	 */
+	createGroup(startId: string, endId: string, by: Actor = "you"): Group | null {
+		const i0 = this.index.get(startId);
+		const i1 = this.index.get(endId);
+		if (i0 === undefined || i1 === undefined) return null;
+		let lo = Math.min(i0, i1);
+		let hi = Math.max(i0, i1);
+		// Snap to whole messages so a group never collapses a message's parts in half.
+		const keyLo = messageKey(this.blocks[lo].id);
+		while (lo > 0 && messageKey(this.blocks[lo - 1].id) === keyLo) lo--;
+		const keyHi = messageKey(this.blocks[hi].id);
+		while (hi < this.blocks.length - 1 && messageKey(this.blocks[hi + 1].id) === keyHi) hi++;
+		// Never reach into the protected tail (ADR 0006 §1).
+		if (hi >= this.protectedFromIndex) return null;
+		const memberIds: string[] = [];
+		for (let i = lo; i <= hi; i++) {
+			const b = this.blocks[i];
+			if (this.groupAt.get(b.id)) return null; // overlap with an existing group
+			memberIds.push(b.id);
+		}
+		if (memberIds.length < 2) return null;
+		const g: Group = { id: `g:${memberIds[0]}`, memberIds, folded: true };
+		this.groups = [...this.groups, g];
+		this.emit(by, "grouped", `${memberIds.length} blocks`);
+		this.refold();
+		return g;
+	}
+	/** Delete a group (members return to normal). The UI's "edit membership" is delete + recreate. */
+	deleteGroup(id: string, by: Actor = "you"): void {
+		const g = this.groupById(id);
+		if (!g) return;
+		this.groups = this.groups.filter((x) => x.id !== id);
+		this.emit(by, "ungrouped", `${g.memberIds.length} blocks`);
+		this.refold();
+	}
+	foldGroup(id: string, by: Actor = "you"): void {
+		const g = this.groupById(id);
+		if (!g || g.folded) return;
+		g.folded = true;
+		this.groups = [...this.groups];
+		this.emit(by, "group folded", `${g.memberIds.length} blocks`);
+		this.refold();
+	}
+	unfoldGroup(id: string, by: Actor = "you"): void {
+		const g = this.groupById(id);
+		if (!g || !g.folded) return;
+		g.folded = false;
+		this.groups = [...this.groups];
+		this.emit(by, "group unfolded", `${g.memberIds.length} blocks`);
+		this.refold();
+	}
+	toggleGroup(id: string, by: Actor = "you"): void {
+		const g = this.groupById(id);
+		if (!g) return;
+		g.folded ? this.unfoldGroup(id, by) : this.foldGroup(id, by);
 	}
 
 	get(id: string): Block | undefined {

@@ -60,6 +60,22 @@ export interface Block {
 	by: Actor | null;
 }
 
+/**
+ * A multiblock fold (ADR 0006). A group is an ENGINE OVERLAY, never a `Block`: it
+ * references a CONTIGUOUS, non-overlapping run of member blocks (by id) that the human
+ * collapses into a single tile. `folded` is the group's own state, orthogonal to each
+ * member's per-block override — folding the group collapses the range; unfolding it
+ * returns the members to their own fold state. The id is `g:<firstMemberDurableId>`; its
+ * agent-unfold handle is `foldCode(id)`. Invariants (enforced at creation, store.createGroup):
+ * contiguous · non-overlapping · flat (members are blocks, never groups) · ≥2 members ·
+ * entirely older than the protected tail. `memberIds` is in conversation (block) order.
+ */
+export interface Group {
+	id: string;
+	memberIds: string[];
+	folded: boolean;
+}
+
 export interface SessionMeta {
 	format: "pi" | "claude" | "unknown";
 	title: string;
