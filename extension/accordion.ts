@@ -218,18 +218,25 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 	}
 
+	/** Adopt a model's id + context window into the live + meta state (best-effort). */
+	function applyModel(m: { id?: string; contextWindow?: number } | undefined): void {
+		if (!m) return;
+		if (m.id) {
+			model = m.id;
+			meta.model = m.id;
+		}
+		// Set the window independent of `id` — some providers surface a usable
+		// contextWindow even when id is momentarily absent (the registry showed this).
+		if (typeof m.contextWindow === "number" && m.contextWindow > 0) {
+			contextWindow = m.contextWindow;
+			meta.contextWindow = m.contextWindow;
+		}
+	}
+
 	/** Pull model id + live usage off the hook context (best-effort). */
 	function refreshFromCtx(ctx: ExtensionContext): void {
 		try {
-			const m = ctx.model;
-			if (m?.id) {
-				model = m.id;
-				meta.model = m.id;
-				if (typeof m.contextWindow === "number") {
-					contextWindow = m.contextWindow;
-					meta.contextWindow = m.contextWindow;
-				}
-			}
+			applyModel(ctx.model as { id?: string; contextWindow?: number } | undefined);
 			const u = ctx.getContextUsage?.();
 			if (u) {
 				tokens = u.tokens;
@@ -471,6 +478,19 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		if (ops.length === 0) return; // empty plan (Milestone 1) → pass through
 
 		return { messages: applyPlan(event.messages as unknown as PiMessage[], ops) as unknown as AgentMessage[] };
+	});
+
+	// ── model swap: keep the GUI's context window (and budget) in lockstep ───────
+	// `/model` fires `model_select` immediately, carrying the NEW model. Adopt its
+	// context window and push it to the GUI right away (a view-only sync with no
+	// blocks) so the budget tracks the swap without waiting for the next model call.
+	// No plan is awaited — this never touches a model call.
+	pi.on("model_select", (event) => {
+		applyModel(event?.model as { id?: string; contextWindow?: number } | undefined);
+		const ws = client;
+		if (ws && ws.readyState === 1) {
+			send(ws, { type: "sync", reqId: ++reqSeq, full: false, blocks: [], contextWindow });
+		}
 	});
 
 	// ── committed streaming: push blocks the instant pi finishes a message ──────

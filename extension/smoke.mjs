@@ -58,7 +58,9 @@ const pi = {
 accordionLive(pi);
 const ctx = {
 	ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
-	getModel: () => ({ id: "test/model", contextWindow: 1000 }),
+	// Mirror the REAL pi ExtensionContext: `model` is a property (getter), not a
+	// `getModel()` method; `getContextUsage()` is the method.
+	model: { id: "test/model", contextWindow: 1000 },
 	getContextUsage: () => ({ tokens: 42, contextWindow: 1000 }),
 };
 handlers.session_start({}, ctx);
@@ -189,6 +191,28 @@ else if (!messageEndSync.blocks?.some((b) => b.id === "a:resp-ghi:p0"))
 
 // Record how many blocks the GUI has seen so far (sentCount reflects this)
 const blockCountAfterMessageEnd = messageEndSync ? messageEndSync.blocks.length : 0;
+
+// ── model_select: a /model swap pushes the new context window to the GUI ──────
+// `/model` fires model_select with the NEW model. The extension must adopt its
+// contextWindow and push it immediately to the connected GUI as a view-only sync
+// (no blocks, no plan awaited) so the budget tracks the swap before the next turn.
+let modelSwapSync = null;
+await new Promise((resolve, reject) => {
+	const timeout = setTimeout(() => reject(new Error("model_select sync timed out")), 2000);
+	ws.removeAllListeners("message");
+	ws.on("message", (data) => {
+		const m = JSON.parse(data.toString());
+		if (m.type === "sync" && m.contextWindow === 2000) {
+			modelSwapSync = m;
+			clearTimeout(timeout);
+			resolve();
+		}
+	});
+	handlers.model_select({ model: { id: "test/model-2", contextWindow: 2000 }, previousModel: undefined, source: "set" });
+});
+if (!modelSwapSync) fails.push("model_select did not push a sync carrying the new contextWindow (2000)");
+else if (modelSwapSync.blocks.length !== 0)
+	fails.push(`model_select push must carry no blocks (got ${modelSwapSync.blocks.length})`);
 
 // ── Phase 3 (tool loop): TWO messages finish before the next `context` ───────
 // The critical case the single-message test above does NOT cover: in a tool turn
@@ -820,7 +844,7 @@ if (fails.length) {
 console.log(
 	`SMOKE PASS — registry(port ${PORT}, model ✓, tokens ✓) ✓  no-GUI passthrough ✓  focus request ✓  ` +
 		`hello ✓  attach-flush(${seen.flushBlocks} blocks on connect) ✓  plan applied per-block ✓  backstop ✓  ` +
-		`message_end committed-streaming ✓  tool-loop (2 msgs/turn) ✓  no-dup after context ✓  ` +
+		`message_end committed-streaming ✓  model-swap window-push ✓  tool-loop (2 msgs/turn) ✓  no-dup after context ✓  ` +
 		`empty-leading-part dedup ✓  agent_end live-view ✓  shutdown cleanup ✓  ` +
 		`stream(start/end/abort) ✓  no-content-on-frame ✓  delta-dropped ✓  ` +
 		`message_end ghost-sweep ✓  agent_end ghost-sweep ✓  ` +

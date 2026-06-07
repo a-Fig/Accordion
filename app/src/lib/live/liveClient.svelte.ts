@@ -124,12 +124,15 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				session.store.setBudget(prevBudget);
 				session.store.setProtect(prevProtect);
 			}
-			// Update contextWindow from the sync (refreshed each context hook). Apply to
-			// budget automatically the first time we learn it (before the user can adjust).
+			// Update contextWindow from the sync (refreshed each context hook, and pushed
+			// immediately on a `/model` swap). Snap the budget to the window the FIRST time
+			// we learn it (before the user can adjust) AND whenever the window CHANGES — a
+			// changed window means a different model, so the old budget no longer fits.
 			const cw = msg.contextWindow;
 			if (typeof cw === "number" && cw > 0) {
+				const prev = session.store.contextWindow;
 				session.store.setContextWindow(cw);
-				if (!budgetLive) {
+				if (!budgetLive || (prev !== null && prev !== cw)) {
 					session.store.setBudget(cw);
 					budgetLive = true;
 				}
