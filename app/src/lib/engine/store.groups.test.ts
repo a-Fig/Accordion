@@ -135,6 +135,27 @@ describe("group fold/unfold/delete lifecycle", () => {
 		expect(s.liveTokens).toBe(full);
 	});
 
+	it("a folded group controls its members — pin/fold/unfold on a member is refused (no silent swallow)", () => {
+		const s = makeStore();
+		const g = s.createGroup("a:r1:p0", "r:c1")!; // folded by default
+		const before = s.liveTokens;
+		// A human pin on a collapsed member used to be RECORDED but ignored by the group's
+		// wire state (the override was a lie). It must now be refused outright.
+		s.pin("r:c1");
+		expect(s.get("r:c1")!.override).toBeNull();
+		expect(s.pinnedCount).toBe(0);
+		// fold/unfold likewise no-op while the group owns the block.
+		s.fold("a:r1:p1");
+		s.unfold("a:r1:p0");
+		expect(s.get("a:r1:p1")!.override).toBeNull();
+		expect(s.get("a:r1:p0")!.override).toBeNull();
+		expect(s.liveTokens).toBe(before); // accounting untouched by the refused actions
+		// Unfolding the group hands control back: per-block overrides apply again.
+		s.unfoldGroup(g.id);
+		s.pin("r:c1");
+		expect(s.get("r:c1")!.override).toBe("pinned");
+	});
+
 	it("dissolves a group if the protected tail later grows over it (ADR 0006 watch item)", () => {
 		const s = makeStore();
 		const full = s.liveTokens;

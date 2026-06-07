@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { untrack } from "svelte";
+	import { untrack, onDestroy } from "svelte";
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block, Group } from "../../engine/types";
 	import { ghosts, type Ghost } from "../../live/ghostState.svelte";
@@ -166,6 +166,7 @@
 		clearTimeout(scrollTimer);
 		scrollTimer = setTimeout(() => (scrolling = false), 140);
 	}
+	onDestroy(() => clearTimeout(scrollTimer));
 
 	function fit() {
 		if (!stage || zoom !== "grid") return;
@@ -301,6 +302,25 @@
 	const overlayGroup = $derived(selectedGroupId ? store.groupById(selectedGroupId) : undefined);
 	const overlayMembers = $derived(overlayGroup ? store.groupMembers(overlayGroup) : []);
 
+	// A pending range-select / open overlay is bound to the CURRENT session and the grid
+	// view. When the session prop swaps, stale ids must never survive into createGroup
+	// (another session may reuse an id); when we leave the grid the toolbar/overlay are gone
+	// anyway. Clear on either change.
+	$effect(() => {
+		void store;
+		untrack(() => {
+			clearRange();
+			closeOverlay();
+		});
+	});
+	$effect(() => {
+		if (zoom !== "grid")
+			untrack(() => {
+				clearRange();
+				closeOverlay();
+			});
+	});
+
 	function findId(e: Event): string | null {
 		const el = (e.target as HTMLElement).closest<HTMLElement>("[data-id]");
 		return el?.dataset.id ?? null;
@@ -319,6 +339,11 @@
 
 		const gid = findGroupId(e);
 		if (gid) {
+			// During an active range-select, a group tile is not a valid range target (groups
+			// can't nest or overlap), so shift-clicking one must NOT hijack the gesture by
+			// opening the overlay — ignore it and let the user pick a plain block to close the
+			// range.
+			if (e.shiftKey && rangeAnchorId) return;
 			// A FOLDED group tile → open the fan-out overlay. An OPEN group's dull parent has
 			// its own band controls (Re-fold / Delete), so a single click there is a no-op.
 			const grp = store.groupById(gid);
@@ -364,9 +389,38 @@
 	}
 
 	// ---- arrow-key traversal between neighboring blocks -------------------
-	function focusBlock(idx: number) {
-		const b = store.blocks[idx];
+	// Focusable STOPS in display order: a FOLDED group is ONE stop (its first member), so an
+	// arrow press crosses a collapsed range in a single step instead of one blind press per
+	// hidden member (the members have no tile to scroll to). Mirrors the grid display-list.
+	// Only the GRID collapses a folded group to one tile; Turns/Chains still render every
+	// member as its own ribbon tile, so the group-skip applies in grid view only.
+	const foldedGroupOf = (b: Block): Group | undefined => {
+		if (zoom !== "grid") return undefined;
+		const g = store.groupOf(b);
+		return g?.folded ? g : undefined;
+	};
+	const navOrder = $derived.by<number[]>(() => {
+		const blocks = store.blocks;
+		const out: number[] = [];
+		for (let i = 0; i < blocks.length; i++) {
+			const g = foldedGroupOf(blocks[i]);
+			if (g && blocks[i].id !== g.memberIds[0]) continue; // hidden member — not a stop
+			out.push(i);
+		}
+		return out;
+	});
+	function focusStop(blockIdx: number) {
+		const b = store.blocks[blockIdx];
 		if (!b) return;
+		const g = foldedGroupOf(b);
+		if (g) {
+			// Select the group's first member (Inspector context) and scroll its parent tile —
+			// the folded-group tile carries data-group, not data-id.
+			if (g.memberIds[0] !== selectedId) onselect(g.memberIds[0]);
+			const esc = g.id.replace(/"/g, '\\"');
+			stage?.querySelector<HTMLElement>(`[data-group="${esc}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+			return;
+		}
 		if (b.id !== selectedId) onselect(b.id);
 		const esc = b.id.replace(/"/g, '\\"');
 		stage?.querySelector<HTMLElement>(`[data-id="${esc}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -375,22 +429,32 @@
 		const key = e.key;
 		if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "ArrowUp" && key !== "ArrowDown") return;
 		e.preventDefault();
-		const n = store.blocks.length;
-		if (n === 0) return;
-		const idx = selectedId ? store.blocks.findIndex((b) => b.id === selectedId) : -1;
-		if (idx === -1) {
+		const order = navOrder;
+		if (!order.length) return;
+		// Map the current selection to a position in `order`. A selection sitting on a hidden
+		// group member maps to its group's stop (the first member).
+		let pos = -1;
+		if (selectedId) {
+			const sel = store.blocks.findIndex((b) => b.id === selectedId);
+			if (sel !== -1) {
+				const g = foldedGroupOf(store.blocks[sel]);
+				const repId = g ? g.memberIds[0] : selectedId;
+				pos = order.findIndex((i) => store.blocks[i].id === repId);
+			}
+		}
+		if (pos === -1) {
 			// nothing selected yet — enter from the matching edge
-			focusBlock(key === "ArrowLeft" || key === "ArrowUp" ? n - 1 : 0);
+			focusStop(order[key === "ArrowLeft" || key === "ArrowUp" ? order.length - 1 : 0]);
 			return;
 		}
-		const step = zoom === "grid" ? cols : 1; // ↑/↓ jump a full row in the grid
-		let t = idx;
-		if (key === "ArrowRight") t = idx + 1;
-		else if (key === "ArrowLeft") t = idx - 1;
-		else if (key === "ArrowDown") t = idx + step;
-		else t = idx - step;
-		t = Math.max(0, Math.min(n - 1, t));
-		if (t !== idx) focusBlock(t);
+		const step = zoom === "grid" ? cols : 1; // ↑/↓ jump a full row (in tile/stop space)
+		let p = pos;
+		if (key === "ArrowRight") p = pos + 1;
+		else if (key === "ArrowLeft") p = pos - 1;
+		else if (key === "ArrowDown") p = pos + step;
+		else p = pos - step;
+		p = Math.max(0, Math.min(order.length - 1, p));
+		if (p !== pos) focusStop(order[p]);
 	}
 </script>
 
@@ -483,7 +547,7 @@
 									{@const gface = faceFor(store.groupLiveTokens(g))}
 									<div
 										class="cell face f{gface} group-tile"
-										class:sel={selectedGroupId === g.id}
+										class:sel={selectedGroupId === g.id || (selectedId !== null && g.memberIds.includes(selectedId))}
 										data-group={g.id}
 										title={groupTip(g)}
 									></div>

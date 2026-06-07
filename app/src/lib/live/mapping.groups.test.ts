@@ -126,6 +126,39 @@ describe("applyPlan — group collapse", () => {
 		expect(applyPlan(src, [], [{ id: "g:x", memberIds: ["u:1000"], summaryText: "" }])).toBe(src); // no summary
 	});
 
+	it("guards summaryText type/whitespace — a blank or non-string summary never reaches the model", () => {
+		// The shared safety boundary can't trust the peer's field types: a whitespace-only,
+		// numeric, or object summaryText would emit a provider-invalid text part. All ⇒ passthrough.
+		const src = msgs();
+		expect(applyPlan(src, [], [{ id: "g:x", memberIds: ["u:1000"], summaryText: "   " }])).toBe(src);
+		expect(applyPlan(src, [], [{ id: "g:x", memberIds: ["u:1000"], summaryText: 42 as unknown as string }])).toBe(src);
+		expect(applyPlan(src, [], [{ id: "g:x", memberIds: ["u:1000"], summaryText: {} as unknown as string }])).toBe(src);
+	});
+
+	it("balanced-in ⇒ balanced-out, no emptied message, for EVERY contiguous range (provider-safety property)", () => {
+		// Brute-force every contiguous message range over the non-protected region (m0..m5).
+		// The output must NEVER orphan a tool pair or emit an empty message, whatever is grouped.
+		const idsByMsg = [
+			["u:1000"], // m0
+			["a:resp_a:p0", "a:resp_a:p1", "a:resp_a:p2"], // m1 (carries call_1)
+			["r:call_1"], // m2
+			["u:2000"], // m3
+			["a:resp_b:p0", "a:resp_b:p1"], // m4 (carries call_2)
+			["r:call_2"], // m5
+		]; // m6,m7 are the protected backstop
+		for (let lo = 0; lo < idsByMsg.length; lo++) {
+			for (let hi = lo; hi < idsByMsg.length; hi++) {
+				const memberIds = idsByMsg.slice(lo, hi + 1).flat();
+				const out = applyPlan(msgs(), [], [G(memberIds, "{#p FOLDED} recap")]);
+				expect(toolBalance(out).balanced, `range ${lo}..${hi} orphaned a tool pair`).toBe(true);
+				for (const m of out) {
+					const nonEmpty = typeof m.content === "string" ? m.content.length > 0 : Array.isArray(m.content) && m.content.length > 0;
+					expect(nonEmpty, `range ${lo}..${hi} produced an empty message`).toBe(true);
+				}
+			}
+		}
+	});
+
 	it("two adjacent groups each collapse to their own entry (no cross-merge)", () => {
 		const out = applyPlan(
 			msgs(),

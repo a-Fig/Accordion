@@ -115,7 +115,14 @@ export function resolveUnfold(store: AccordionStore, codes: string[]): { restore
 		// a positional-id block that was never on the wire.
 		const matches = store.blocks.filter((b) => store.isFolded(b) && FOLDABLE_KINDS.has(b.kind) && isDurableId(b.id) && foldCode(b.id) === code);
 		for (const b of matches) {
-			store.unfold(b.id, "agent");
+			// A member of a FOLDED group is controlled by the group, not per-block overrides —
+			// `store.unfold` would no-op there (ADR 0006 §2). Route it through `unfoldGroup` so
+			// the reported restore is never a lie. (In practice a collapsed member is removed
+			// from the wire, so the agent only ever holds the group code — but keep the honesty
+			// guarantee LOCAL to this resolver rather than relying on that.)
+			const grp = store.groupOf(b);
+			if (grp?.folded) store.unfoldGroup(grp.id, "agent");
+			else store.unfold(b.id, "agent");
 			restored.push({ code, kind: b.kind, label: blockLabel(b) });
 			hit = true;
 		}

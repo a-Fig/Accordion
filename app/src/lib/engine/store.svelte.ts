@@ -374,9 +374,20 @@ export class AccordionStore {
 		if (this.log.length > 80) this.log.pop();
 	}
 
+	/**
+	 * A block inside a FOLDED group is controlled by its parent tile, not per-block
+	 * overrides: the group's collapse already decides its fate (ADR 0006 §2). Refuse
+	 * fold/unfold/pin/unpin here so a human pin is never silently swallowed by the
+	 * group's wire state (the override would be recorded but `groupWire` would ignore
+	 * it). Unfold the group first to act on a member. No-op while the group is OPEN.
+	 */
+	private inFoldedGroup(id: string): boolean {
+		return this.groupAt.get(id)?.folded ?? false;
+	}
+
 	fold(id: string, by: Actor = "you"): void {
 		const b = this.get(id);
-		if (!b || b.override === "pinned") return;
+		if (!b || b.override === "pinned" || this.inFoldedGroup(id)) return;
 		// Protected working tail is never folded — not even by an explicit user action.
 		// (Pin it or widen the budget instead; protection is the safety pillar.)
 		if (this.isProtected(b)) return;
@@ -387,7 +398,7 @@ export class AccordionStore {
 	}
 	unfold(id: string, by: Actor = "you"): void {
 		const b = this.get(id);
-		if (!b) return;
+		if (!b || this.inFoldedGroup(id)) return;
 		b.override = "unfolded";
 		b.by = by;
 		this.emit(by, "unfolded", label(b));
@@ -400,7 +411,7 @@ export class AccordionStore {
 	}
 	pin(id: string): void {
 		const b = this.get(id);
-		if (!b) return;
+		if (!b || this.inFoldedGroup(id)) return;
 		b.override = "pinned";
 		b.by = "you";
 		this.emit("you", "pinned", label(b));

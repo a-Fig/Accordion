@@ -310,10 +310,15 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 	// Defense in depth (matches the GUI's `computeFoldOps`/`computeGroupOps`): refuse any op
 	// whose id is NOT durable or whose digest is empty, and any group with no summary/members.
 	const safeOps = ops.filter((o) => isDurableId(o.id) && o.digestText);
-	const safeGroups = (groups ?? []).filter((g) => g && g.summaryText && Array.isArray(g.memberIds) && g.memberIds.length);
+	// summaryText must be a NON-EMPTY string: a number/object/whitespace value would emit a
+	// provider-invalid text part. This is the shared safety boundary, so it cannot trust the
+	// peer's field types (the GUI always sends a tagged string; a buggy/old peer might not).
+	const safeGroups = (groups ?? []).filter(
+		(g) => g && typeof g.summaryText === "string" && g.summaryText.trim() && Array.isArray(g.memberIds) && g.memberIds.length,
+	);
 	if (!safeOps.length && !safeGroups.length) return messages;
 
-	const protectFrom = messages.length - PROTECT_RECENT_MSGS;
+	const protectFrom = Math.max(0, messages.length - PROTECT_RECENT_MSGS);
 	const byId = new Map(safeOps.map((o) => [o.id, o] as const));
 
 	// ── Phase A: decide which whole messages each group may remove ───────────────
