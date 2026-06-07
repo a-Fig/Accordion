@@ -533,6 +533,11 @@ export class AccordionStore {
 		}
 		if (memberIds.length < 2) return null;
 		const g: Group = { id: `g:${memberIds[0]}`, memberIds, folded: true };
+		// A group must actually collapse something. If EVERY member is a split tool-pair half
+		// (its partner sits outside the range), nothing folds into the summary — the tile would
+		// hide live blocks for zero benefit. That isn't a fold; refuse it (ADR 0006 §4: a folded
+		// group replaces its blocks WITH the parent summary).
+		if (this.classifyGroup(g).carrier === null) return null;
 		this.groups = [...this.groups, g];
 		this.emit(by, "grouped", `${memberIds.length} blocks`);
 		this.refold();

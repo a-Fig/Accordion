@@ -39,7 +39,10 @@ interface Group { id: string; memberIds: string[]; folded: boolean }
 The "new kind of block" the owner pictured is purely the **UI tile**. Invariants enforced
 at creation: members are **contiguous** in block order, **non-overlapping** (a block is in
 ≤1 group), **flat** (no nesting — a member is always a block, never a group), at least two
-members, and **entirely older than the protected tail** (`protectedFromIndex`). The group
+members, **entirely older than the protected tail** (`protectedFromIndex`), and **collapse
+at least one member** — a group whose every member is a split tool-pair half (nothing folds
+into the summary) is refused, since a folded group must *replace* its blocks with the parent
+summary, not hide live blocks behind a zero-saving tile. The group
 id is `g:<firstMemberDurableId>`; its unfold handle is `foldCode(group.id)` (ADR 0005).
 
 **Rejected: a synthetic group-`Block` in the array.** It would pollute every block-indexed

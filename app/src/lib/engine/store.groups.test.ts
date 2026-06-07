@@ -45,12 +45,12 @@ describe("createGroup — validation & message snapping", () => {
 		expect(s.groups.length).toBe(1);
 	});
 
-	it("snaps a mid-message selection outward to the whole assistant message", () => {
+	it("snaps a mid-message selection outward to whole messages (start pulls in sibling parts)", () => {
 		const s = makeStore();
-		// select only the text part of the assistant message; snapping must pull in its
-		// sibling thinking + tool_call parts (same a:r1 message key).
-		const g = s.createGroup("a:r1:p1", "a:r1:p1")!;
-		expect(g.memberIds).toEqual(["a:r1:p0", "a:r1:p1", "a:r1:p2"]);
+		// select from the assistant's TEXT part through its tool result; the START must snap
+		// outward to the whole assistant message (pull in the sibling thinking + tool_call).
+		const g = s.createGroup("a:r1:p1", "r:c1")!;
+		expect(g.memberIds).toEqual(["a:r1:p0", "a:r1:p1", "a:r1:p2", "r:c1"]);
 	});
 
 	it("snaps whole assistant messages for LOADED/parsed id shapes (<eid>:<i>, no `p`)", () => {
@@ -69,15 +69,35 @@ describe("createGroup — validation & message snapping", () => {
 		const s = new AccordionStore(parsed);
 		s.setBudget(1_000_000);
 		s.setProtect(0);
-		// selecting just the middle text part must snap to the whole assistant message…
-		const g = s.createGroup("evt9:1", "evt9:1")!;
+		// selecting the middle text part through the result must snap the START outward to the
+		// whole assistant message — proving messageKey groups the bare-index `<eid>:<i>` parts.
+		const g = s.createGroup("evt9:1", "evt9:r")!;
 		expect(g).not.toBeNull();
-		expect(g.memberIds).toEqual(["evt9:0", "evt9:1", "evt9:2"]); // …NOT the sibling result evt9:r
+		expect(g.memberIds).toEqual(["evt9:0", "evt9:1", "evt9:2", "evt9:r"]);
 	});
 
 	it("refuses a range that reaches into the protected tail", () => {
 		const s = makeStore(); // protectedFromIndex = 7 (u:3)
 		expect(s.createGroup("a:r2:p0", "u:3")).toBeNull();
+		expect(s.groups.length).toBe(0);
+	});
+
+	it("refuses a group that would collapse NOTHING (every member a split tool-pair half)", () => {
+		const blocks: Block[] = [
+			b("u:1", "user", 1, 0, 500),
+			b("a:rA:p0", "tool_call", 1, 1, 100, "c1"), // call c1 — its result is OUTSIDE the range
+			b("a:rB:p0", "tool_call", 1, 2, 100, "c2"), // call c2 — its result is OUTSIDE the range
+			b("r:c1", "tool_result", 1, 3, 500, "c1"),
+			b("r:c2", "tool_result", 1, 4, 500, "c2"),
+			b("u:2", "user", 2, 5, 100),
+		];
+		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks, lineCount: 0, skipped: 0 };
+		const s = new AccordionStore(parsed);
+		s.setBudget(1_000_000);
+		s.setProtect(0);
+		// Both members are tool_calls whose results sit after the range → all stragglers, nothing
+		// collapses → a folder tile that hides live blocks for zero savings. Refused.
+		expect(s.createGroup("a:rA:p0", "a:rB:p0")).toBeNull();
 		expect(s.groups.length).toBe(0);
 	});
 
