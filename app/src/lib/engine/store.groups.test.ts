@@ -82,6 +82,94 @@ describe("createGroup — validation & message snapping", () => {
 		expect(s.groups.length).toBe(0);
 	});
 
+	// ── Reviewer-flagged claim (PR review): "if the selection ENDS on a block whose
+	// message extends into the protected tail, the hi-snap pushes hi >= protectedFromIndex
+	// and the group is rejected even though the user's original selection was entirely in
+	// the older slice." Proposed fix: stop the snap at `protectedFromIndex - 1`.
+	//
+	// These two tests establish the governing model fact and show the proposed fix is wrong:
+	// whenever the hi-snap crosses the boundary it is because the SNAPPED MESSAGE STRADDLES
+	// it (has at least one part at index >= protectedFromIndex, hence partly protected). A
+	// group must snap to WHOLE messages (ADR 0006 §1/§4: never collapse a message's parts in
+	// half), so the only group that could contain that message must include its protected
+	// part — there is NO fully-valid (whole-message, no-protected-part) selection there.
+	// Rejecting is therefore CORRECT, not a bug. Stopping at `protectedFromIndex - 1` would
+	// instead admit a HALF-message group (older parts grouped, the protected tail-half left
+	// out) — exactly the invariant the snap exists to prevent.
+	describe("reviewer claim — boundary-crossing snap always means a partly-protected message", () => {
+		// A multi-part assistant message that STRADDLES the protected boundary.
+		//   0 u:1        user        500
+		//   1 a:rX:p0    thinking    800   ┐
+		//   2 a:rX:p1    text        600   │ one assistant message (key a:rX), 3 parts
+		//   3 a:rX:p2    text       8000   ┘  ← this part sits inside the protected tail
+		//   4 u:2        user         100  (newest)
+		// With protectTokens = 8000, the protected tail walks back summing full tokens:
+		// u:2 (100) + a:rX:p2 (8000) reaches 8000 at index 3 → protectedFromIndex = 3.
+		// So a:rX:p2 (index 3) is PROTECTED while a:rX:p0/p1 (indices 1,2) are older.
+		function straddleStore(): AccordionStore {
+			const blocks: Block[] = [
+				b("u:1", "user", 1, 0, 500),
+				b("a:rX:p0", "thinking", 1, 1, 800),
+				b("a:rX:p1", "text", 1, 2, 600),
+				b("a:rX:p2", "text", 1, 3, 8000),
+				b("u:2", "user", 2, 4, 100),
+			];
+			const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks, lineCount: 0, skipped: 0 };
+			const s = new AccordionStore(parsed);
+			s.setBudget(1_000_000);
+			s.setProtect(8000);
+			return s;
+		}
+
+		it("the straddling message genuinely has a protected part (the model fact)", () => {
+			const s = straddleStore();
+			expect(s.protectedFromIndex).toBe(3); // index 3 (a:rX:p2) and later are protected
+			expect(s.isProtected(s.get("a:rX:p2")!)).toBe(true); // the message's last part IS protected
+			expect(s.isProtected(s.get("a:rX:p0")!)).toBe(false); // its earlier parts are older
+			expect(s.isProtected(s.get("a:rX:p1")!)).toBe(false);
+		});
+
+		it("a selection ending mid-straddling-message is REJECTED — and that is correct", () => {
+			const s = straddleStore();
+			// The "entirely in the older slice" selection the reviewer describes: u:1 .. a:rX:p1
+			// (indices 0..2, all older than the boundary at 3). The hi-snap pulls a:rX:p1's
+			// sibling a:rX:p2 (index 3) into the range — but a:rX:p2 IS protected, so the only
+			// whole-message group here would include protected content. Refuse it.
+			expect(s.createGroup("u:1", "a:rX:p1")).toBeNull();
+			expect(s.groups.length).toBe(0);
+			// There is NO valid group that touches this message without reaching protection:
+			// snapping to the whole message always pulls in the protected part.
+			expect(s.createGroup("a:rX:p0", "a:rX:p1")).toBeNull();
+		});
+
+		it("a selection on a WHOLE non-straddling message older than the tail still groups fine", () => {
+			// Sanity: the rejection above is specific to the straddle, not a blanket block on
+			// groups near the tail. Give the message that ends just before the boundary a
+			// clean partner so a real, fully-older group exists and is accepted.
+			//   0 u:1     user      500
+			//   1 a:rA:p0 text      600
+			//   2 u:2     user      600
+			//   3 a:rB:p0 text      400
+			//   4 u:3     user     8000  ← protected tail (protectedFromIndex = 4)
+			const blocks: Block[] = [
+				b("u:1", "user", 1, 0, 500),
+				b("a:rA:p0", "text", 1, 1, 600),
+				b("u:2", "user", 2, 2, 600),
+				b("a:rB:p0", "text", 2, 3, 400),
+				b("u:3", "user", 3, 4, 8000),
+			];
+			const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks, lineCount: 0, skipped: 0 };
+			const s = new AccordionStore(parsed);
+			s.setBudget(1_000_000);
+			s.setProtect(8000);
+			expect(s.protectedFromIndex).toBe(4); // only u:3 protected
+			// u:2 .. a:rB:p0 (indices 2..3) — whole messages, entirely older than index 4.
+			const g = s.createGroup("u:2", "a:rB:p0");
+			expect(g).not.toBeNull();
+			expect(g!.memberIds).toEqual(["u:2", "a:rB:p0"]);
+		});
+	});
+
 	it("refuses a group that would collapse NOTHING (every member a split tool-pair half)", () => {
 		const blocks: Block[] = [
 			b("u:1", "user", 1, 0, 500),

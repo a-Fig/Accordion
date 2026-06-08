@@ -39,8 +39,12 @@ export function nextVacated(
 		return v;
 	}
 
-	// The tail widened (blocks returned to protection): there's no hole to hold.
-	if (drained < 0) return 0;
+	// The tail widened (blocks returned to protection). A returning block re-enters at
+	// the FRONT/oldest end of the protected grid — exactly where the leading holes are —
+	// so it consumes one existing hole rather than displacing the surviving tiles. Refill
+	// one hole per returning block, clamped at 0; dropping all holes here would slide the
+	// remaining protected tiles up and reflow the grid (the very thing this prevents).
+	if (drained < 0) return Math.max(0, prevVacated + drained);
 
 	// No boundary movement → leave the holes exactly as they are.
 	return prevVacated;

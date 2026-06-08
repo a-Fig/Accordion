@@ -38,8 +38,24 @@ describe("nextVacated — drain-without-reflow bookkeeping", () => {
 		expect(nextVacated(3, 40, 45, 12, 8)).toBe(0);
 	});
 
-	it("resyncs to no holes when the tail widens (boundary moves back)", () => {
-		expect(nextVacated(4, 20, 15, 10, 10)).toBe(0);
+	it("refills leading holes one-for-one when the tail widens (no reflow)", () => {
+		// Layout model: the protected grid renders `vacated` leading placeholder cells,
+		// THEN the protected tiles in conversation order (oldest protected block first).
+		// Holes live at the FRONT/oldest end; a returning block (boundary decreases) also
+		// re-enters at the FRONT/oldest end — so it must consume an existing hole, leaving
+		// `prevVacated + drained` holes (drained < 0). Anything else slides the surviving
+		// protected tiles → the reflow drain.ts exists to prevent.
+		//
+		// Sequence: cols=10, start with 4 accumulated holes from departures (boundary 24),
+		// then the tail widens by 2 (boundary 24→22, two blocks return). The two returners
+		// fill two of the four holes → 2 holes should remain, NOT 0.
+		expect(nextVacated(4, 24, 22, 10, 10)).toBe(2);
+		// Widening by exactly the hole count consumes them all → 0 (floored, never negative).
+		expect(nextVacated(4, 24, 20, 10, 10)).toBe(0);
+		// Widening past the hole count cannot go negative → clamp at 0.
+		expect(nextVacated(4, 24, 18, 10, 10)).toBe(0);
+		// No holes outstanding, tail widens → still 0.
+		expect(nextVacated(0, 24, 22, 10, 10)).toBe(0);
 	});
 
 	it("never loops or returns negative when cols is zero", () => {
