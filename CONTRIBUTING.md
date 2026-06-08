@@ -115,8 +115,9 @@ Add this repo's extension to `~/.pi/agent/settings.json`:
 
 Then run `pi` in any project. It advertises itself in `~/.accordion/sessions/` and shows
 up in the app's **Sessions** sidebar within ~1s — click it (or run `/accordion` in that
-terminal to foreground the app on it) and its context populates live. Today the app
-*reads* the session but returns an empty fold plan, so the agent's context is unchanged.
+terminal to foreground the app on it) and its context populates live. Folding is preview-only
+by default; use the header's **Folding** toggle to opt in to steering the live agent's
+context.
 
 ---
 

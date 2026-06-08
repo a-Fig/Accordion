@@ -44,7 +44,8 @@ standalone HTML visualizer — not the focus; touch only if asked. Don't confuse
     at least the newest block; `0` if the whole session is smaller than the window).
     `isProtected(b)` and `protectedTokens` are the reads. `refold()` only builds fold
     candidates from blocks with `i < protectedFromIndex` — i.e. older than the tail. Manual
-    `fold()`/`pin()` are unaffected; protection constrains the automatic folder only.
+    `fold()` is also refused in the protected tail, and a folded block that later becomes
+    protected heals back to live; `pin()` remains allowed because it keeps content open.
     `setProtect(n)` resizes the tail and re-folds — wired to a header slider (0–60k).
 - `tokens.ts` (chars/4 estimate) · `digest.ts` (what a kind collapses to when folded).
 

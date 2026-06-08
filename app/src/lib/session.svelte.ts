@@ -38,12 +38,14 @@ export const isTauriEnv =
 
 export async function loadSample() {
 	cancelPendingLoad();
+	const token = _loadToken;
 	_stopPolling();
 	session.error = "";
 	try {
 		const res = await fetch("/sample-session.jsonl");
 		if (!res.ok) throw new Error(`fetch failed (${res.status})`);
 		const text = await res.text();
+		if (token !== _loadToken) return; // a newer selection superseded this sample load — drop it
 		session.store = new AccordionStore(parse(text));
 		session.filePath = null;
 		session.readOnly = false;
@@ -125,8 +127,7 @@ export async function loadFilePath(path: string): Promise<void> {
 	}
 }
 
-async function _load(path: string, readFn: (p: string) => Promise<string>) {
-	const token = _loadToken;
+async function _load(path: string, readFn: (p: string) => Promise<string>, token: number) {
 	const text = await readFn(path);
 	if (token !== _loadToken) return; // a newer selection superseded this load — drop it
 	const prevBudget = session.store?.budget;
@@ -149,23 +150,24 @@ async function _openWithReader(path: string, readFn: (p: string) => Promise<stri
 	cancelPendingLoad(); // invalidate any in-flight load
 	_stopPolling();      // stop tailing the previous file before loading the new one
 	const token = _loadToken;
-	await _load(path, readFn);
+	await _load(path, readFn, token);
 	if (token !== _loadToken) return; // superseded during the read — don't arm readOnly/poll
 	session.readOnly = true;
-	_startPolling(path, readFn);
+	_startPolling(path, readFn, token);
 }
 
-function _startPolling(path: string, readFn: (p: string) => Promise<string>) {
+function _startPolling(path: string, readFn: (p: string) => Promise<string>, token: number) {
 	_stopPolling();
 	session.live = true;
 	_pollInterval = setInterval(async () => {
 		try {
 			const text = await readFn(path);
+			if (token !== _loadToken) return; // this poll belongs to a file/session that was superseded
 			if (text.length !== _lastLen) {
-				await _load(path, readFn);
+				await _load(path, readFn, token);
 			}
 		} catch {
-			_stopPolling();
+			if (token === _loadToken) _stopPolling();
 		}
 	}, 1500);
 }
