@@ -13,30 +13,7 @@
  */
 import type { Block, BlockKind, Actor, SessionMeta, ParsedSession, Group } from "./types";
 import { digest, digestTokens, groupDigest, groupDigestTokens } from "./digest";
-
-/**
- * The "message key" of a block id — the id with its assistant-part suffix removed, so
- * every part of one assistant message shares a key while a user/result/summary block is
- * its own key. Group creation snaps to whole messages on this key so a group never
- * collapses a message's parts in half (ADR 0006 §2/§4) — making GUI accounting message-exact.
- *
- * Two id regimes share this store, and both must collapse to the message:
- *  • LIVE wire (`live/mapping.ts`): assistant part = `a:<anchor>:p<j>` / `m<i>:p<j>` — the
- *    `p` prefix on the index disambiguates it.
- *  • LOADED / demo (`engine/parse.ts`): assistant part = `<eid>:<j>` — a BARE numeric index,
- *    no `p`. We must strip that too, or every part of a loaded assistant message snaps to its
- *    own key and the whole-message invariant silently degrades to per-part (breaks the Demo
- *    session). The catch: live SCALAR durable ids `u:<ts>` / `s:<ts>` / `r:<numericCallId>`
- *    also end in `:<digits>` and are each their OWN message — never strip those (a single
- *    lowercase type-letter + colon + digits is the tell).
- */
-function messageKey(id: string): string {
-	const live = id.match(/^(.*):p(?:\d+|\?)$/);
-	if (live) return live[1];
-	const parsed = id.match(/^(.+):\d+$/);
-	if (parsed && !/^[a-z]:\d+$/.test(id)) return parsed[1];
-	return id;
-}
+import { messageKey } from "./ids";
 
 /** Classification of a folded group's members for accounting + the wire (ADR 0006 §4/§5). */
 interface GroupShape {
@@ -77,7 +54,8 @@ export class AccordionStore {
 	 * The protected working tail: the most recent blocks whose combined full size
 	 * reaches this many tokens are NEVER auto-folded. The automatic folder and the
 	 * future Conductor only ever operate on context older than this window — the
-	 * recent ~N tokens stay verbatim. (Manual fold by the user is still allowed.)
+	 * recent ~N tokens stay verbatim. Protection is absolute: manual folds are
+	 * refused there too.
 	 */
 	protectTokens = $state(20_000);
 	log = $state<LogEntry[]>([]);

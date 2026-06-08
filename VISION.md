@@ -54,9 +54,9 @@ Three parties operate the same accordion. Not all of them can do everything — 
 
 One slice of context is special: the most recent stretch of the conversation. The agent's latest reasoning, the tool results it just saw, the turn it's mid-way through — this is its working memory, and silently summarizing any of it would undercut the work in progress and the trust the whole tool depends on.
 
-So Accordion reserves a **protected working tail**: the newest ~20k tokens of context (configurable) are **never auto-folded**. Both the automatic folder and the Conductor are held back from this window — they only ever operate on context older than it. The guarantee is token-based, not turn-based: it always covers a real, recent slice of the conversation regardless of how the turns happen to divide.
+So Accordion reserves a **protected working tail**: the newest ~20k tokens of context (configurable) are never folded. The automatic folder, the Conductor, manual folds, and groups are all held back from this window — they only ever operate on context older than it. The guarantee is token-based, not turn-based: it always covers a real, recent slice of the conversation regardless of how the turns happen to divide.
 
-This is a constraint on *automation only*. You and the agent may still fold something inside the tail by hand if you choose; the promise is specifically that nothing automatic will reach in and collapse recent context behind your back. Recent reasoning stays intact, always.
+This protection is absolute. Recent reasoning stays intact, always.
 
 ## Folding the folds
 

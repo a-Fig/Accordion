@@ -29,7 +29,7 @@ Accordion shows the agent's context as a list of **sections** — one per turn �
 
 Nothing is ever deleted — folding only changes what the agent is *shown*, never what's *stored* — so every fold is instantly reversible, with no database or search index behind it.
 
-And the recent past is always safe: the most recent ~20k tokens of context are **never auto-folded**, so the agent's working tail — its latest reasoning — stays at full fidelity. You and the agent can still fold inside that window by hand; only the automatic system is held back.
+And the recent past is always safe: the most recent ~20k tokens of context are protected, so the agent's working tail — its latest reasoning — stays at full fidelity. That tail is an absolute no-fold zone: automatic folding, manual folding, and group creation all stop before it.
 
 ## Three hands on the same controls
 
@@ -73,14 +73,15 @@ Drag any session `.jsonl` onto the window, or use the bundled sample. Everything
 - **A live link** (`extension/accordion.ts` + `app/src/lib/live/`). A pi extension
   streams a running session's context to the app over a local WebSocket; the app
   **auto-discovers** every running pi (the "pull" model) and shows it in a Sessions
-  sidebar — click to watch its context update live.
-- Reversible, provider-safe folding in the app (content substitution, never removal),
-  with deterministic digest summaries.
+  sidebar — click to watch its context update live. Live steering is **opt-in**: by
+  default folds are preview-only, and the header toggle arms applying them to the agent.
+- Reversible, provider-safe folding in the app (content substitution for blocks, true
+  range collapse for manually created groups), with deterministic digest summaries and
+  `{#code FOLDED}` handles the live agent can ask to unfold.
 
-Honest about what's **not** there yet: the app currently *reads* a live session but does
-**not** yet steer it — it returns an empty fold plan, so the agent's context is unchanged.
-No autonomous Conductor on a live session, no agent-driven control, no hierarchical
-folding, no LLM-generated summaries, no replay — that's the build ahead. There's also an
+Honest about what's **not** there yet: there is no autonomous Conductor on a live session,
+no agent-driven pinning, no nested/hierarchical groups, no LLM-generated summaries, no
+replay — that's the build ahead. There's also an
 older terminal-only POC (`src/accordion.ts`, `/expand` · `/collapse` · `/accordion`) that
 predates the app.
 
@@ -110,8 +111,9 @@ setup, and platform gotchas) is in **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 - [x] Core fold/unfold engine — reversible, tool-pair safe
 - [x] Rolling automatic folding + manual expansion, protected working tail
 - [x] The separate window — desktop app: Map view, budget, inspector
-- [x] Live link to a running pi session + auto-discovery *(view only — empty fold plan)*
-- [ ] Steer a live session — apply the fold plan to what the agent is shown
+- [x] Live link to a running pi session + auto-discovery
+- [x] Opt-in live steering — apply the fold plan to what the agent is shown
+- [x] Agent-driven unfold from `{#code FOLDED}` tags
 - [ ] LLM-generated summaries, computed once and cached
 - [ ] The Conductor — automatic fold/unfold between turns, based on context
 - [ ] Hierarchical folding — fold the folds, for million-turn sessions
