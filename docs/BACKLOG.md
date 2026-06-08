@@ -2,6 +2,29 @@
 
 Parked ideas with enough context to pick up cold. Newest first.
 
+## Let `/accordion` launch the Accordion app when needed (pinned 2026-06-08)
+
+**Goal:** make the slash command a one-step affordance: if the Accordion GUI is already
+open, focus/connect as it does today; if it is not open, start it and let the existing
+`~/.accordion/focus.json` request select the current pi session once the app boots.
+
+**Current behavior:** `extension/accordion.ts` deliberately only writes the focus request;
+`docs/adr/0002-pull-connection-model.md` records launch/deep-link behavior as deferred.
+The app polls/consumes `focus.json` and can focus the right session, but something else
+must start the app.
+
+**Likely direction:** keep the pull model and add a small best-effort launcher to the
+extension command:
+- write the focus request first, as today;
+- if a GUI is already attached, do nothing else;
+- otherwise spawn the installed Accordion app as a detached child and return immediately;
+- prefer an explicit `ACCORDION_APP_PATH`/setting or well-known platform install paths.
+
+**Caveat:** "no GUI attached" is not exactly "app is not running" — the app may be open
+but not connected to this session. Pair this with single-instance app behavior, an app
+presence heartbeat, or a launch mechanism that focuses an existing instance to avoid
+duplicate windows.
+
 ## Scale the tile grid beyond DOM — virtualize first, canvas/WebGL only if needed (pinned 2026-06-07)
 
 **Goal:** keep the Map grid smooth as sessions grow past today's ~982 tiles. The grid
