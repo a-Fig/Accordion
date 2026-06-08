@@ -9,8 +9,10 @@ about **how to work in the code**, not what the product is.
 The active surface is the **desktop app** in `app/` — a Tauri 2 + SvelteKit window
 that visualizes an agent's context window. A **single route** (`routes/+page.svelte`):
 the **Map** app, an abstraction-first view. In the desktop app it's a shell — a
-**`SessionsSidebar`** (live pi sessions via the pull model, minimizable to a slim icon
-rail, plus a pinned **Demo session** that loads the bundled sample) + the session view:
+**`SessionsSidebar`** (a top **source switcher** — live pi sessions via the pull model,
+*or* read-only **Claude Code** transcripts browsed from `~/.claude/projects`; minimizable
+to a slim icon rail, plus a pinned **Demo session** that loads the bundled sample) + the
+session view:
 `MapHeader` (composition strip + budget) + `ContextMap` + `Inspector` (on-demand text
 panel). The old **Classic** view (summary/timeline of `BlockCard`s) was removed; its
 components (`ContextSummary` / `ContextTimeline` / `Timeline` / `BlockCard`) are gone.
@@ -76,6 +78,22 @@ plan the app returns. Decisions live in ADRs: [0001](docs/adr/0001-pi-live-integ
 - **Native discovery (Rust):** `app/src-tauri/src/lib.rs` — `list_sessions`,
   `reap_session`, `take_focus_request`, `focus_window`. A browser tab can't read the
   registry, which is why discovery is desktop-only (browser dev has a manual-port box).
+
+**Read-only Claude Code browsing (separate from the live link).** The source switcher's
+*Claude Code* mode lists static transcripts under `~/.claude/projects/<proj>/*.jsonl`.
+Two Rust commands own this (`lib.rs`): `list_claude_sessions` (walks the projects dir,
+skips nested `subagents/`, newest-50 by mtime, head-reads ≤96 KB to pull a title —
+`ai-title`→`summary`→first-user-msg — plus cwd/project) and `read_claude_session` (a
+path-confined read used to load **and tail** the file — the JS `fs` plugin's scope does
+*not* cover programmatic reads of `~/.claude`, only dialog-picked files, so Rust owns
+that access). App side: `live/claude.ts` (the `ClaudeCodeSession` type + guard) and
+`live/claudeDiscovery.svelte.ts` (a 3 s poll that runs only while the CC tab is active).
+A CC session loads through the engine like the demo, so local fold/unfold/pin/peek all
+work as a personal lens — but `session.readOnly` is set (the `MapHeader` shows a
+**READ-ONLY** badge) and there is no wire to steer. **Known limitation:** an *actively
+appended* CC session re-runs `_load` on each tail tick, which rebuilds the store and
+drops manual folds; static transcripts (the common case) never re-load. The durable fix
+is an incremental `appendBlocks` tail like the WS path.
 
 **Invariants (don't break):** discovery I/O is best-effort and **never blocks or alters
 a model call**; no GUI / reply timeout / empty plan ⇒ messages pass through untouched;

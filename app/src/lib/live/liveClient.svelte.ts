@@ -10,7 +10,7 @@
  * It drives the SAME `session` object the rest of the UI already renders, so
  * "live mode" needs no new view: populating `session.store` is enough.
  */
-import { session } from "../session.svelte";
+import { session, cancelPendingLoad } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import { wireToBlock } from "./mapping";
 import { computeFoldOps, computeGroupOps, resolveUnfold } from "./plan";
@@ -50,6 +50,7 @@ function computePlan(): { ops: FoldOp[]; groups: GroupOp[] } {
 
 export function connectLive(port: number = DEFAULT_PORT): void {
 	if (typeof window === "undefined" || typeof WebSocket === "undefined") return;
+	cancelPendingLoad(); // invalidate any pending file/CC load that would otherwise clobber the live store
 	disconnectLive(); // drop any prior socket
 	manualClose = false;
 	live.status = "connecting";
@@ -89,6 +90,11 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			session.error = "";
 			session.live = true;
 			session.filePath = null;
+			// A live pi session is steerable, never a read-only recording. Reset here —
+			// alongside the authoritative store rebuild — so the READ-ONLY badge can never
+			// stick when attaching after viewing a Claude Code transcript, regardless of
+			// which caller reached connectLive.
+			session.readOnly = false;
 				// Safety (review Q5b): every new live attach starts DISARMED - folding is
 				// opt-in per session, never silently carried from a previously armed agent.
 				folding.enabled = false;

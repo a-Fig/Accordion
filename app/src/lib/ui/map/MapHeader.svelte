@@ -5,7 +5,7 @@
 	import { folding, setFolding } from "$lib/live/folding.svelte";
 	import { live } from "$lib/live/liveClient.svelte";
 
-	let { store }: { store: AccordionStore } = $props();
+	let { store, readOnly = false }: { store: AccordionStore; readOnly?: boolean } = $props();
 
 	const LADDER: { kind: BlockKind; label: string }[] = [
 		{ kind: "tool_result", label: "tool results" },
@@ -56,6 +56,14 @@
 			{/if}
 		</div>
 		<div class="ctl">
+			{#if readOnly}
+				<span
+					class="ro-badge"
+					role="status"
+					aria-label="Read-only session"
+					title="Viewing a recording — folds are local and do not affect any agent."
+				>READ-ONLY</span>
+			{/if}
 			{#if live.status === "connected"}
 				<button
 					class="fold-arm"
@@ -249,6 +257,23 @@
 	.fold-arm.on .dot {
 		background: var(--accent);
 		box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent);
+	}
+
+	.ro-badge {
+		display: inline-flex;
+		align-items: center;
+		align-self: center;
+		font-size: 9px;
+		font-weight: 700;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
+		color: var(--faint);
+		background: var(--panel-2);
+		border: 1px solid var(--line);
+		padding: 3px 8px;
+		border-radius: 999px;
+		white-space: nowrap;
+		user-select: none;
 	}
 
 	.bar {

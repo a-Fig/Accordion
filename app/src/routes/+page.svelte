@@ -1,10 +1,12 @@
 <script lang="ts">
 	import { onMount } from "svelte";
-	import { session, isTauriEnv, loadSample, openFile } from "$lib/session.svelte.ts";
+	import { session, isTauriEnv, loadSample, openFile, loadFilePath } from "$lib/session.svelte.ts";
 	import { connectLive, disconnectLive, live } from "$lib/live/liveClient.svelte";
 	import { discovery, startDiscovery, stopDiscovery, selectSession, DEMO_ID } from "$lib/live/discovery.svelte";
+	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery, selectClaude } from "$lib/live/claudeDiscovery.svelte";
 	import { DEFAULT_PORT } from "$lib/live/protocol";
 	import type { SessionEntry } from "$lib/live/registry";
+	import type { ClaudeCodeSession } from "$lib/live/claude";
 	import SessionsSidebar from "$lib/ui/live/SessionsSidebar.svelte";
 	import MapHeader from "$lib/ui/map/MapHeader.svelte";
 	import ContextMap from "$lib/ui/map/ContextMap.svelte";
@@ -12,6 +14,21 @@
 
 	let selectedId = $state<string | null>(null);
 	let manualPort = $state(DEFAULT_PORT);
+
+	// Which session source the sidebar lists: live pi vs read-only Claude Code.
+	const SRC_KEY = "accordion.sidebar.source";
+	let source = $state<"pi" | "claude">(
+		typeof localStorage !== "undefined" && localStorage.getItem(SRC_KEY) === "claude" ? "claude" : "pi",
+	);
+	$effect(() => {
+		if (typeof localStorage !== "undefined") localStorage.setItem(SRC_KEY, source);
+	});
+	// Claude Code discovery scans 50 file-heads every 3s — run it only while its tab
+	// is the active source; pi discovery (cheap registry reads) always runs.
+	$effect(() => {
+		if (isTauriEnv && source === "claude") startClaudeDiscovery();
+		else stopClaudeDiscovery();
+	});
 
 	const selected = $derived(
 		session.store && selectedId ? session.store.blocks.find((b) => b.id === selectedId) ?? null : null,
@@ -35,6 +52,8 @@
 
 	function selectAndConnect(s: SessionEntry): void {
 		if (discovery.selected === s.sessionId && live.status === "connected") return;
+		session.readOnly = false; // a live pi session is steerable, not read-only
+		selectClaude(null);
 		selectSession(s.sessionId);
 		connectLive(s.port);
 	}
@@ -43,8 +62,18 @@
 	// sample transcript instead of dialing a live pi over the socket.
 	function selectDemo(): void {
 		disconnectLive();
+		selectClaude(null);
 		selectSession(DEMO_ID);
 		loadSample();
+	}
+
+	// A Claude Code transcript: load it read-only and tail it for appends. There is
+	// no live socket to steer — folds here are a personal lens (see MapHeader badge).
+	function selectClaudeSession(s: ClaudeCodeSession): void {
+		disconnectLive();
+		selectSession(null);
+		selectClaude(s.sessionId);
+		loadFilePath(s.filePath);
 	}
 
 	function onFocusRequest(sessionId: string): void {
@@ -56,6 +85,7 @@
 		startDiscovery(onFocusRequest);
 		return () => {
 			stopDiscovery();
+			stopClaudeDiscovery();
 			disconnectLive();
 		};
 	});
@@ -66,12 +96,17 @@
 <div class="shell" class:railed={isTauriEnv}>
 	{#if isTauriEnv}
 		<SessionsSidebar
+			{source}
+			onsource={(s) => (source = s)}
 			sessions={discovery.sessions}
 			selected={discovery.selected}
 			connected={live.status === "connected"}
 			{demoSelected}
 			onselect={selectAndConnect}
 			ondemo={selectDemo}
+			claudeSessions={claudeDiscovery.sessions}
+			claudeSelected={claudeDiscovery.selected}
+			onselectclaude={selectClaudeSession}
 		/>
 	{/if}
 
@@ -104,7 +139,7 @@
 					</div>
 				</header>
 
-				<MapHeader store={s} />
+				<MapHeader store={s} readOnly={session.readOnly} />
 
 				<div class="main" class:open={!!selected}>
 					<div class="canvas">
