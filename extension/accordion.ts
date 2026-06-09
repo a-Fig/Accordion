@@ -82,7 +82,7 @@ function cleanExplicitPath(value: unknown): string | null {
 	// quote pair makes common copied Windows paths ("C:\\...\\Accordion.exe") work.
 	if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
 	if (s === "~") return os.homedir();
-	if (s.startsWith(`~${path.sep}`) || s.startsWith("~/") || s.startsWith("~\\")) return path.join(os.homedir(), s.slice(2));
+	if (s.startsWith("~/") || s.startsWith("~\\")) return path.join(os.homedir(), s.slice(2));
 	return s;
 }
 
@@ -122,28 +122,28 @@ function repoAppCandidates(): string[] {
 	}
 }
 
-function resolveAccordionApp(pi: ExtensionAPI): { path: string; source: LaunchSource } | LaunchResult {
+function resolveAccordionApp(pi: ExtensionAPI): LaunchResult {
 	const flagPath = cleanExplicitPath(pi.getFlag(ACCORDION_APP_FLAG));
 	if (flagPath) {
-		if (isLaunchableFile(flagPath)) return { path: flagPath, source: "cli" };
+		if (isLaunchableFile(flagPath)) return { ok: true, path: flagPath, source: "cli" };
 		return { ok: false, reason: "explicit-invalid", path: flagPath, source: "cli" };
 	}
 
 	const envPath = cleanExplicitPath(process.env[ACCORDION_APP_ENV]);
 	if (envPath) {
-		if (isLaunchableFile(envPath)) return { path: envPath, source: "env" };
+		if (isLaunchableFile(envPath)) return { ok: true, path: envPath, source: "env" };
 		return { ok: false, reason: "explicit-invalid", path: envPath, source: "env" };
 	}
 
 	for (const candidate of [...windowsInstallCandidates(), ...repoAppCandidates()]) {
-		if (isLaunchableFile(candidate)) return { path: candidate, source: "default" };
+		if (isLaunchableFile(candidate)) return { ok: true, path: candidate, source: "default" };
 	}
 	return { ok: false, reason: "not-found" };
 }
 
 async function launchAccordionApp(pi: ExtensionAPI): Promise<LaunchResult> {
 	const resolved = resolveAccordionApp(pi);
-	if ("ok" in resolved && resolved.ok === false) return resolved;
+	if (!resolved.ok) return resolved;
 	try {
 		const child = spawn(resolved.path, [], { detached: true, stdio: "ignore", shell: false });
 		// Catch immediate async launch failures without waiting for the app to boot. Some
@@ -174,7 +174,7 @@ async function launchAccordionApp(pi: ExtensionAPI): Promise<LaunchResult> {
 
 function launchResultLine(result: LaunchResult | null): { text: string; type: "info" | "warning" } {
 	if (!result) return { text: "Accordion focus requested for this session.", type: "info" };
-	if (result.ok) return { text: "Opening Accordion for this session…", type: "info" };
+	if (result.ok) return { text: "Launching/focusing Accordion for this session…", type: "info" };
 	if (result.reason === "explicit-invalid") {
 		const source = result.source === "cli" ? `--${ACCORDION_APP_FLAG}` : ACCORDION_APP_ENV;
 		return {
@@ -782,11 +782,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// focus.json and foreground the window. If it is not attached, launching the desktop
 			// app is the only cross-process nudge we have; the app's single-instance guard turns
 			// that into "focus the existing window" when it is already running elsewhere.
-			const launch = attached() ? null : await launchAccordionApp(pi);
+			const wasAttached = attached();
+			const launch = wasAttached ? null : await launchAccordionApp(pi);
 			const action = launchResultLine(launch);
 			const lines = [
 				action.text,
-				`Live link: ${attached() ? "attached" : "detached"} · port ${port || "starting"} · streamed ${sentCount} blocks`,
+				`Live link: ${wasAttached ? "attached" : "detached"} · port ${port || "starting"} · streamed ${sentCount} blocks`,
 			];
 			ctx.ui.notify(lines.join("\n"), action.type);
 		},

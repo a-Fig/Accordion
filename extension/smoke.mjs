@@ -172,6 +172,19 @@ await new Promise((resolve, reject) => {
 	});
 });
 
+// With a GUI attached, /accordion should only write focus.json and report the
+// snapshotted attached state. It must NOT try the launcher path, even when the
+// explicit ACCORDION_APP_PATH remains invalid from the detached smoke above.
+if (accordionCmd) {
+	await Promise.resolve(accordionCmd("", ctx));
+	const note = notifications.at(-1);
+	if (note?.type !== "info" || !note.message.includes("Accordion focus requested for this session."))
+		fails.push("/accordion did not skip launch while the GUI was already attached");
+	if (!note?.message.includes("Live link: attached")) fails.push("/accordion did not report the snapshotted attached live-link state");
+	if (note?.message.includes("ACCORDION_APP_PATH does not point to an executable"))
+		fails.push("/accordion tried invalid ACCORDION_APP_PATH despite an attached GUI");
+}
+
 // ── Phase 3: message_end committed streaming ─────────────────────────────────
 // A new assistant message arriving via message_end must reach the GUI as a sync
 // BEFORE any subsequent `context` hook fires. Then a subsequent `context` that
