@@ -237,6 +237,8 @@ export class AccordionStore {
 	protectedFromIndex = $derived.by(() => {
 		if (!this.blocks.length) return 0;
 		const target = this.protectTokens;
+		// Protection disabled: every block is foldable.
+		if (target === 0) return this.blocks.length;
 		const cap = target * PROTECT_OVERFLOW_CAP;
 		// Always absorb the newest block unconditionally — it is indivisible and the
 		// protected tail must never be empty while a session has blocks.

@@ -686,6 +686,7 @@
 						</div>
 					</section>
 				{/if}
+				{#if protectedTiles.length}
 				<section class="box prot">
 					<div class="rail" title="{protTok.toLocaleString()} tokens · protected working tail">
 						<span class="tok"><AnimatedNumber value={protTok} format={k} /></span>
@@ -698,6 +699,7 @@
 						{/each}
 					</div>
 				</section>
+				{/if}
 			</div>
 		{:else}
 			<!-- TRANSCRIPT: the concretion. Blocks in conversation order, full text when live,

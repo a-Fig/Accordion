@@ -117,7 +117,7 @@ describe("protected working tail is never folded", () => {
 describe("appendBlocks is idempotent by id", () => {
 	it("drops a re-sent id and preserves its existing fold state", () => {
 		const s = makeStore(3);
-		s.setProtect(0); // blocks 0,1 foldable (newest is always protected)
+		s.setProtect(0); // protection disabled: all 3 blocks foldable
 		s.fold(s.blocks[0].id); // user folds block m0:p0
 		expect(s.isFolded(s.blocks[0])).toBe(true);
 

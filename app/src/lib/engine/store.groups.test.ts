@@ -31,7 +31,7 @@ function makeStore(): AccordionStore {
 	const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks: session(), lineCount: 0, skipped: 0 };
 	const s = new AccordionStore(parsed);
 	s.setBudget(1_000_000); // never auto-fold — isolate group behavior
-	s.setProtect(0); // only the newest block (u:3) is protected
+	s.setProtect(1); // protect only the newest block (u:3): target=1, newest=100 ≥ 1
 	return s;
 }
 
