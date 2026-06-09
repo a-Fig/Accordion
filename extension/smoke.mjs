@@ -19,6 +19,10 @@ import * as path from "node:path";
 // ACCORDION_HOME at module load) so we never touch the real ~/.accordion.
 const HOME = path.join(os.tmpdir(), `accordion-smoke-${process.pid}`);
 process.env.ACCORDION_HOME = HOME;
+// Prevent the /accordion command smoke assertion from launching a real developer
+// build via the repo-local default candidates. An explicit-but-missing path must
+// stop fallback, which is also one of the launcher contract's safety rules.
+process.env.ACCORDION_APP_PATH = path.join(HOME, "missing-accordion-app.exe");
 const SESSIONS_DIR = path.join(HOME, ".accordion", "sessions");
 const FOCUS_PATH = path.join(HOME, ".accordion", "focus.json");
 
@@ -45,8 +49,12 @@ function readOnlyEntry() {
 const handlers = {};
 let accordionCmd = null;
 let unfoldTool = null; // captured registerTool def for the `unfold` tool (M3)
+const flags = new Map();
+const notifications = [];
 const pi = {
 	on: (name, fn) => (handlers[name] = fn),
+	registerFlag: (name, def) => flags.set(name, def?.default),
+	getFlag: (name) => flags.get(name),
 	registerCommand: (name, def) => {
 		if (name === "accordion") accordionCmd = def.handler;
 	},
@@ -57,7 +65,7 @@ const pi = {
 };
 accordionLive(pi);
 const ctx = {
-	ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
+	ui: { setStatus() {}, notify(message, type) { notifications.push({ message, type }); }, theme: { fg: (_c, s) => s } },
 	// Mirror the REAL pi ExtensionContext: `model` is a property (getter), not a
 	// `getModel()` method; `getContextUsage()` is the method.
 	model: { id: "test/model", contextWindow: 1000 },
@@ -91,6 +99,9 @@ if (accordionCmd) {
 		const req = JSON.parse(fs.readFileSync(FOCUS_PATH, "utf8"));
 		if (req.sessionId !== entry.sessionId) fails.push("focus request sessionId mismatch");
 	}
+	const note = notifications.at(-1);
+	if (note?.type !== "warning" || !note.message.includes("ACCORDION_APP_PATH does not point to an executable"))
+		fails.push("/accordion did not warn for an invalid explicit ACCORDION_APP_PATH");
 } else {
 	fails.push("accordion command was not registered");
 }
@@ -160,6 +171,19 @@ await new Promise((resolve, reject) => {
 		}
 	});
 });
+
+// With a GUI attached, /accordion should only write focus.json and report the
+// snapshotted attached state. It must NOT try the launcher path, even when the
+// explicit ACCORDION_APP_PATH remains invalid from the detached smoke above.
+if (accordionCmd) {
+	await Promise.resolve(accordionCmd("", ctx));
+	const note = notifications.at(-1);
+	if (note?.type !== "info" || !note.message.includes("Accordion focus requested for this session."))
+		fails.push("/accordion did not skip launch while the GUI was already attached");
+	if (!note?.message.includes("Live link: attached")) fails.push("/accordion did not report the snapshotted attached live-link state");
+	if (note?.message.includes("ACCORDION_APP_PATH does not point to an executable"))
+		fails.push("/accordion tried invalid ACCORDION_APP_PATH despite an attached GUI");
+}
 
 // ── Phase 3: message_end committed streaming ─────────────────────────────────
 // A new assistant message arriving via message_end must reach the GUI as a sync

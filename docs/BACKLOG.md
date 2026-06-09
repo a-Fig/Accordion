@@ -2,28 +2,111 @@
 
 Parked ideas with enough context to pick up cold. Newest first.
 
-## Let `/accordion` launch the Accordion app when needed (pinned 2026-06-08)
+## Public launch: official website, installer flow, and pi extension distribution (pinned 2026-06-09)
 
-**Goal:** make the slash command a one-step affordance: if the Accordion GUI is already
-open, focus/connect as it does today; if it is not open, start it and let the existing
-`~/.accordion/focus.json` request select the current pi session once the app boots.
+**Goal:** bring Accordion from a local/dev tool to a polished public product that other pi
+users can discover, install, understand, and use for their own sessions.
 
-**Current behavior:** `extension/accordion.ts` deliberately only writes the focus request;
-`docs/adr/0002-pull-connection-model.md` records launch/deep-link behavior as deferred.
-The app polls/consumes `focus.json` and can focus the right session, but something else
-must start the app.
+**Product outcome:** a user should be able to land on an official Accordion website,
+understand what the app does, install the desktop app, install/enable the pi extension,
+run `/accordion`, and see their own pi session live in the app without needing repo
+knowledge.
 
-**Likely direction:** keep the pull model and add a small best-effort launcher to the
-extension command:
-- write the focus request first, as today;
-- if a GUI is already attached, do nothing else;
-- otherwise spawn the installed Accordion app as a detached child and return immediately;
-- prefer an explicit `ACCORDION_APP_PATH`/setting or well-known platform install paths.
+**Scope:**
 
-**Caveat:** "no GUI attached" is not exactly "app is not running" — the app may be open
-but not connected to this session. Pair this with single-instance app behavior, an app
-presence heartbeat, or a launch mechanism that focuses an existing instance to avoid
-duplicate windows.
+- **Official website**
+  - Build a public landing/docs site for Accordion.
+  - Explain the core idea: visual context map, folding, protected tail, live pi
+    integration, read-only transcript browsing, and the unfold flow.
+  - Include screenshots/GIFs/video of:
+    - `/accordion` opening the app;
+    - session sidebar;
+    - context map;
+    - folding/unfolding;
+    - saved transcript browsing.
+  - Provide clear install/setup instructions.
+  - Include troubleshooting for:
+    - app does not launch;
+    - extension not loaded;
+    - no live sessions visible;
+    - Windows path/installer issues;
+    - `ACCORDION_APP_PATH` / `--accordion-app`.
+
+- **Installable desktop app**
+  - Finalize release builds/installers for Windows first.
+  - Verify installed executable layout matches `/accordion` launcher defaults.
+  - Decide whether app binary should be `Accordion.exe` instead of `app.exe`.
+  - Add signing/notarization plan as needed for public trust.
+  - Define release artifact naming/versioning.
+
+- **pi extension distribution**
+  - Package the Accordion pi extension so users can install it as a pi extension/package,
+    not by cloning the repo and manually pointing at `extension/accordion.ts`.
+  - Document the install command and settings entry.
+  - Decide whether app/extension protocol compatibility should be checked at runtime.
+  - Make `/accordion` the primary affordance after install.
+
+- **First-run/user onboarding**
+  - If the app opens with no sessions, explain:
+    - “Run `/accordion` inside pi.”
+    - “Make sure the Accordion extension is installed/enabled.”
+  - If the extension runs but the app is not installed/found, show actionable setup
+    instructions.
+  - Consider an in-app setup checklist.
+
+- **Release/readiness polish**
+  - Update README to point users to the website.
+  - Add a changelog/release-notes path.
+  - Confirm current app/extension protocol versioning is documented.
+  - Add a smoke test or manual release checklist for:
+    - fresh install;
+    - `/accordion` launch;
+    - single-instance focus;
+    - live session attach;
+    - fold/unfold round-trip;
+    - saved transcript browsing.
+
+**Likely sequence:**
+
+1. Define public positioning and install story.
+2. Stabilize Windows installer/output names.
+3. Package/distribute the pi extension.
+4. Build the website.
+5. Add screenshots/demo assets.
+6. Run fresh-machine install smoke.
+7. Publish first public release.
+
+**Open questions:**
+
+- Is the website static docs/landing only, or should it also host downloads/releases?
+- Where should binaries be hosted first: GitHub Releases, the website, or both?
+- Should the public brand be “Accordion for pi” or just “Accordion”?
+- Should app and extension ship together as one release, or be separately versioned?
+- What is the minimum supported pi version?
+- Do we want telemetry/update checks, or fully manual releases for now?
+
+**Non-goals for first public launch:**
+
+- Cloud sync.
+- Hosted sessions.
+- Multi-machine live attach.
+- Browser-only runtime.
+- Full macOS/Linux installer polish unless explicitly prioritized.
+
+## Follow-up: harden `/accordion` app launch beyond Windows-first defaults (pinned 2026-06-08)
+
+**Status:** the core one-step behavior is implemented: `/accordion` writes the existing
+focus request, best-effort launches/reinvokes the Tauri desktop app when detached, and
+the app uses single-instance behavior to focus an existing window instead of duplicating
+it. The focus file remains the only session handoff, so the pull model is intact.
+
+**Remaining follow-ups:**
+- verify packaged Windows install paths once the installer name/layout is finalized;
+- consider macOS/Linux default path searches if/when those builds are distributed;
+- add deeper unit coverage for launcher path precedence and spawn-error reporting if the
+  launcher grows beyond today's small helper.
+
+**Deferred:** deep links (`accordion://`) and browser/Vite launch remain out of scope.
 
 ## Scale the tile grid beyond DOM — virtualize first, canvas/WebGL only if needed (pinned 2026-06-07)
 
