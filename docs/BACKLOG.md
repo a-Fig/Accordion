@@ -2,6 +2,97 @@
 
 Parked ideas with enough context to pick up cold. Newest first.
 
+## Public launch: official website, installer flow, and pi extension distribution (pinned 2026-06-09)
+
+**Goal:** bring Accordion from a local/dev tool to a polished public product that other pi
+users can discover, install, understand, and use for their own sessions.
+
+**Product outcome:** a user should be able to land on an official Accordion website,
+understand what the app does, install the desktop app, install/enable the pi extension,
+run `/accordion`, and see their own pi session live in the app without needing repo
+knowledge.
+
+**Scope:**
+
+- **Official website**
+  - Build a public landing/docs site for Accordion.
+  - Explain the core idea: visual context map, folding, protected tail, live pi
+    integration, read-only transcript browsing, and the unfold flow.
+  - Include screenshots/GIFs/video of:
+    - `/accordion` opening the app;
+    - session sidebar;
+    - context map;
+    - folding/unfolding;
+    - saved transcript browsing.
+  - Provide clear install/setup instructions.
+  - Include troubleshooting for:
+    - app does not launch;
+    - extension not loaded;
+    - no live sessions visible;
+    - Windows path/installer issues;
+    - `ACCORDION_APP_PATH` / `--accordion-app`.
+
+- **Installable desktop app**
+  - Finalize release builds/installers for Windows first.
+  - Verify installed executable layout matches `/accordion` launcher defaults.
+  - Decide whether app binary should be `Accordion.exe` instead of `app.exe`.
+  - Add signing/notarization plan as needed for public trust.
+  - Define release artifact naming/versioning.
+
+- **pi extension distribution**
+  - Package the Accordion pi extension so users can install it as a pi extension/package,
+    not by cloning the repo and manually pointing at `extension/accordion.ts`.
+  - Document the install command and settings entry.
+  - Decide whether app/extension protocol compatibility should be checked at runtime.
+  - Make `/accordion` the primary affordance after install.
+
+- **First-run/user onboarding**
+  - If the app opens with no sessions, explain:
+    - “Run `/accordion` inside pi.”
+    - “Make sure the Accordion extension is installed/enabled.”
+  - If the extension runs but the app is not installed/found, show actionable setup
+    instructions.
+  - Consider an in-app setup checklist.
+
+- **Release/readiness polish**
+  - Update README to point users to the website.
+  - Add a changelog/release-notes path.
+  - Confirm current app/extension protocol versioning is documented.
+  - Add a smoke test or manual release checklist for:
+    - fresh install;
+    - `/accordion` launch;
+    - single-instance focus;
+    - live session attach;
+    - fold/unfold round-trip;
+    - saved transcript browsing.
+
+**Likely sequence:**
+
+1. Define public positioning and install story.
+2. Stabilize Windows installer/output names.
+3. Package/distribute the pi extension.
+4. Build the website.
+5. Add screenshots/demo assets.
+6. Run fresh-machine install smoke.
+7. Publish first public release.
+
+**Open questions:**
+
+- Is the website static docs/landing only, or should it also host downloads/releases?
+- Where should binaries be hosted first: GitHub Releases, the website, or both?
+- Should the public brand be “Accordion for pi” or just “Accordion”?
+- Should app and extension ship together as one release, or be separately versioned?
+- What is the minimum supported pi version?
+- Do we want telemetry/update checks, or fully manual releases for now?
+
+**Non-goals for first public launch:**
+
+- Cloud sync.
+- Hosted sessions.
+- Multi-machine live attach.
+- Browser-only runtime.
+- Full macOS/Linux installer polish unless explicitly prioritized.
+
 ## Follow-up: harden `/accordion` app launch beyond Windows-first defaults (pinned 2026-06-08)
 
 **Status:** the core one-step behavior is implemented: `/accordion` writes the existing
