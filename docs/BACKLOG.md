@@ -2,28 +2,20 @@
 
 Parked ideas with enough context to pick up cold. Newest first.
 
-## Let `/accordion` launch the Accordion app when needed (pinned 2026-06-08)
+## Follow-up: harden `/accordion` app launch beyond Windows-first defaults (pinned 2026-06-08)
 
-**Goal:** make the slash command a one-step affordance: if the Accordion GUI is already
-open, focus/connect as it does today; if it is not open, start it and let the existing
-`~/.accordion/focus.json` request select the current pi session once the app boots.
+**Status:** the core one-step behavior is implemented: `/accordion` writes the existing
+focus request, best-effort launches/reinvokes the Tauri desktop app when detached, and
+the app uses single-instance behavior to focus an existing window instead of duplicating
+it. The focus file remains the only session handoff, so the pull model is intact.
 
-**Current behavior:** `extension/accordion.ts` deliberately only writes the focus request;
-`docs/adr/0002-pull-connection-model.md` records launch/deep-link behavior as deferred.
-The app polls/consumes `focus.json` and can focus the right session, but something else
-must start the app.
+**Remaining follow-ups:**
+- verify packaged Windows install paths once the installer name/layout is finalized;
+- consider macOS/Linux default path searches if/when those builds are distributed;
+- add deeper unit coverage for launcher path precedence and spawn-error reporting if the
+  launcher grows beyond today's small helper.
 
-**Likely direction:** keep the pull model and add a small best-effort launcher to the
-extension command:
-- write the focus request first, as today;
-- if a GUI is already attached, do nothing else;
-- otherwise spawn the installed Accordion app as a detached child and return immediately;
-- prefer an explicit `ACCORDION_APP_PATH`/setting or well-known platform install paths.
-
-**Caveat:** "no GUI attached" is not exactly "app is not running" — the app may be open
-but not connected to this session. Pair this with single-instance app behavior, an app
-presence heartbeat, or a launch mechanism that focuses an existing instance to avoid
-duplicate windows.
+**Deferred:** deep links (`accordion://`) and browser/Vite launch remain out of scope.
 
 ## Scale the tile grid beyond DOM — virtualize first, canvas/WebGL only if needed (pinned 2026-06-07)
 

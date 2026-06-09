@@ -41,9 +41,15 @@ that lists every live session and attaches to the one you pick.
   `take_focus_request`, `focus_window` in `src-tauri/src/lib.rs`) and surfaced to the
   Svelte sidebar via `invoke`. This is *why* the desktop app — not the browser — is
   the real runtime (browser dev stays a UI-iteration loop with a manual port input).
-- **`/accordion` = select + foreground, not launch.** It writes a focus request the
-  (already-open) app consumes to foreground itself and select that session. It never
-  spawns anything — the app being open is the precondition that defines "pull".
+- **`/accordion` = focus this session; launch is only a convenience.** It writes a
+  focus request the app consumes to foreground itself and select that session. The
+  focus request remains the sole session handoff. The command may also best-effort
+  launch/reinvoke the desktop app so the same one-step affordance works when the
+  app is not already visible; the desktop app's single-instance behavior prevents
+  duplicate windows. This does **not** change the pull model: the app still
+  discovers sessions from the registry and chooses which loopback WebSocket to dial.
+  The executable path is resolved from `--accordion-app`, then `ACCORDION_APP_PATH`,
+  then well-known Windows install paths and repo-local Tauri build outputs.
 
 ## Safety / robustness invariants
 
@@ -76,8 +82,9 @@ that lists every live session and attaches to the one you pick.
 
 ## Rejected alternatives
 
-- **Push (extension spawns the app)** — rejected: gives the extension process-spawn
-  power for a convenience, and can't reliably start the dev server in browser mode.
+- **Push as the transport model** — rejected: the extension still does not push a
+  session into a GUI or start the browser/dev server. A later convenience launcher
+  only starts/focuses the installed desktop app; discovery and attach stay pull-based.
 - **Keep fixed port 4317** — rejected: caps the tool at one session, the core defect.
 - **pid-based liveness in Rust** — rejected: needs a cross-platform process-probe dep
   on an already-fragile Windows toolchain; the heartbeat timestamp is a simpler,

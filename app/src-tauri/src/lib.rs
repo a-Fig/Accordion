@@ -22,9 +22,10 @@ static HEAD_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, String, String)>>,
 > = std::sync::OnceLock::new();
 
-fn head_cache(
-) -> std::sync::MutexGuard<'static, std::collections::HashMap<std::path::PathBuf, (u64, String, String)>>
-{
+fn head_cache() -> std::sync::MutexGuard<
+    'static,
+    std::collections::HashMap<std::path::PathBuf, (u64, String, String)>,
+> {
     HEAD_CACHE
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
         .lock()
@@ -179,7 +180,12 @@ fn list_claude_sessions() -> Vec<Value> {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             let size = meta.len();
-            files.push(FileInfo { path, folder_name: folder_name.clone(), mtime_ms, size });
+            files.push(FileInfo {
+                path,
+                folder_name: folder_name.clone(),
+                mtime_ms,
+                size,
+            });
         }
     }
 
@@ -274,9 +280,8 @@ fn list_claude_sessions() -> Vec<Value> {
 
                 if title.is_none() && first_user_text.is_none() && obj_type == "user" {
                     if let Some(msg) = obj.get("message") {
-                        let text_from_content = if let Some(s) = msg
-                            .get("content")
-                            .and_then(|v| v.as_str())
+                        let text_from_content = if let Some(s) =
+                            msg.get("content").and_then(|v| v.as_str())
                         {
                             // Plain string content.
                             Some(s.to_string())
@@ -364,8 +369,8 @@ fn read_claude_session(path: String) -> Result<String, String> {
     let projects_root = home.join(".claude").join("projects");
     // Canonicalize both sides so symlinks / `..` / mixed separators can't escape the
     // root (canonicalize requires the file to exist, which is what we want anyway).
-    let root = fs::canonicalize(&projects_root)
-        .map_err(|e| format!("projects root unavailable: {e}"))?;
+    let root =
+        fs::canonicalize(&projects_root).map_err(|e| format!("projects root unavailable: {e}"))?;
     let target = fs::canonicalize(&path).map_err(|e| format!("cannot resolve path: {e}"))?;
     if !target.starts_with(&root) {
         return Err(format!("forbidden path (outside projects root): {path}"));
@@ -376,18 +381,25 @@ fn read_claude_session(path: String) -> Result<String, String> {
     fs::read_to_string(&target).map_err(|e| format!("read failed: {e}"))
 }
 
-/// Bring the main window to the foreground (used when a focus request fires).
-#[tauri::command]
-fn focus_window(app: tauri::AppHandle) {
+fn focus_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
 }
 
+/// Bring the main window to the foreground (used when a focus request fires).
+#[tauri::command]
+fn focus_window(app: tauri::AppHandle) {
+    focus_main_window(&app);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            focus_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())

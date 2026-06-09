@@ -16,8 +16,9 @@
  *   ~/.accordion/focus.json                     (FocusRequest)
  *
  * which the app consumes (read-once, then delete) to foreground itself and select
- * that session. The app being already open is a precondition (that is the whole
- * point of "pull"); the focus request never launches anything.
+ * that session. This remains the only session handoff path. `/accordion` may
+ * best-effort launch/reinvoke the desktop app as a convenience, but the app still
+ * discovers and pulls the session through this registry contract.
  *
  * This file is the SINGLE SOURCE OF TRUTH for the directory layout and the JSON
  * shapes. It is imported by:

@@ -11,7 +11,9 @@
  * descriptor to ~/.accordion/sessions/<id>.json (see ../app/src/lib/live/registry).
  * The app watches that directory, lists every live session, and connects to the
  * one the user picks. `/accordion` writes a one-shot focus request so the app
- * foregrounds itself on this session. The extension never launches the app.
+ * foregrounds itself on this session; as a convenience, the command can also
+ * best-effort launch/reinvoke the desktop app (single-instance keeps that from
+ * becoming duplicate windows).
  *
  * Safety:
  *   • No GUI connected, or the plan reply times out → pass messages through
@@ -31,6 +33,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -61,7 +64,142 @@ const REGISTRY_ROOT = path.join(HOME, REGISTRY_DIR);
 const SESSIONS_DIR = path.join(REGISTRY_ROOT, SESSIONS_SUBDIR);
 const FOCUS_PATH = path.join(REGISTRY_ROOT, FOCUS_FILE);
 
+const ACCORDION_APP_FLAG = "accordion-app";
+const ACCORDION_APP_ENV = "ACCORDION_APP_PATH";
+
+type LaunchSource = "cli" | "env" | "default";
+type LaunchResult =
+	| { ok: true; path: string; source: LaunchSource }
+	| { ok: false; reason: "explicit-invalid"; path: string; source: Extract<LaunchSource, "cli" | "env"> }
+	| { ok: false; reason: "not-found" }
+	| { ok: false; reason: "spawn-failed"; path: string; source: LaunchSource; error: unknown };
+
+function cleanExplicitPath(value: unknown): string | null {
+	if (typeof value !== "string") return null;
+	let s = value.trim();
+	if (!s) return null;
+	// This is still a path-only override, not shell parsing. Stripping one matching
+	// quote pair makes common copied Windows paths ("C:\\...\\Accordion.exe") work.
+	if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1).trim();
+	if (s === "~") return os.homedir();
+	if (s.startsWith(`~${path.sep}`) || s.startsWith("~/") || s.startsWith("~\\")) return path.join(os.homedir(), s.slice(2));
+	return s;
+}
+
+function isLaunchableFile(p: string): boolean {
+	try {
+		return fs.statSync(p).isFile();
+	} catch {
+		return false;
+	}
+}
+
+function windowsInstallCandidates(): string[] {
+	if (process.platform !== "win32") return [];
+	const roots = [
+		process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Programs", "Accordion"),
+		process.env.ProgramFiles && path.join(process.env.ProgramFiles, "Accordion"),
+		process.env["ProgramFiles(x86)"] && path.join(process.env["ProgramFiles(x86)"], "Accordion"),
+		process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Accordion"),
+	].filter((s): s is string => !!s);
+	const names = ["Accordion.exe", "app.exe"];
+	const out: string[] = [];
+	for (const root of roots) for (const name of names) out.push(path.join(root, name));
+	return out;
+}
+
+function repoAppCandidates(): string[] {
+	try {
+		const here = path.dirname(fileURLToPath(import.meta.url));
+		const repo = path.resolve(here, "..");
+		const ext = process.platform === "win32" ? ".exe" : "";
+		return [
+			path.join(repo, "app", "src-tauri", "target", "release", `app${ext}`),
+			path.join(repo, "app", "src-tauri", "target", "debug", `app${ext}`),
+		];
+	} catch {
+		return [];
+	}
+}
+
+function resolveAccordionApp(pi: ExtensionAPI): { path: string; source: LaunchSource } | LaunchResult {
+	const flagPath = cleanExplicitPath(pi.getFlag(ACCORDION_APP_FLAG));
+	if (flagPath) {
+		if (isLaunchableFile(flagPath)) return { path: flagPath, source: "cli" };
+		return { ok: false, reason: "explicit-invalid", path: flagPath, source: "cli" };
+	}
+
+	const envPath = cleanExplicitPath(process.env[ACCORDION_APP_ENV]);
+	if (envPath) {
+		if (isLaunchableFile(envPath)) return { path: envPath, source: "env" };
+		return { ok: false, reason: "explicit-invalid", path: envPath, source: "env" };
+	}
+
+	for (const candidate of [...windowsInstallCandidates(), ...repoAppCandidates()]) {
+		if (isLaunchableFile(candidate)) return { path: candidate, source: "default" };
+	}
+	return { ok: false, reason: "not-found" };
+}
+
+async function launchAccordionApp(pi: ExtensionAPI): Promise<LaunchResult> {
+	const resolved = resolveAccordionApp(pi);
+	if ("ok" in resolved && resolved.ok === false) return resolved;
+	try {
+		const child = spawn(resolved.path, [], { detached: true, stdio: "ignore", shell: false });
+		// Catch immediate async launch failures without waiting for the app to boot. Some
+		// spawn failures arrive on the child "error" event rather than throwing from spawn().
+		return await new Promise<LaunchResult>((resolve) => {
+			let settled = false;
+			const ok: LaunchResult = { ok: true, path: resolved.path, source: resolved.source };
+			const timer = setTimeout(() => finish(ok), 150);
+			const finish = (result: LaunchResult) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				child.off("spawn", onSpawn);
+				child.unref();
+				resolve(result);
+			};
+			const onSpawn = () => finish(ok);
+			const onError = (error: unknown) => finish({ ok: false, reason: "spawn-failed", path: resolved.path, source: resolved.source, error });
+			child.once("spawn", onSpawn);
+			// Leave this listener installed even after a timeout success; if the OS reports a
+			// late error, onError no-ops via `settled` and avoids an unhandled error event.
+			child.once("error", onError);
+		});
+	} catch (error) {
+		return { ok: false, reason: "spawn-failed", path: resolved.path, source: resolved.source, error };
+	}
+}
+
+function launchResultLine(result: LaunchResult | null): { text: string; type: "info" | "warning" } {
+	if (!result) return { text: "Accordion focus requested for this session.", type: "info" };
+	if (result.ok) return { text: "Opening Accordion for this session…", type: "info" };
+	if (result.reason === "explicit-invalid") {
+		const source = result.source === "cli" ? `--${ACCORDION_APP_FLAG}` : ACCORDION_APP_ENV;
+		return {
+			text: `Accordion focus request written, but ${source} does not point to an executable: ${result.path}`,
+			type: "warning",
+		};
+	}
+	if (result.reason === "spawn-failed") {
+		return {
+			text: `Accordion focus request written, but launching failed for ${result.path}. Set ${ACCORDION_APP_ENV} or --${ACCORDION_APP_FLAG} to the Accordion executable.`,
+			type: "warning",
+		};
+	}
+	return {
+		text: `Accordion focus request written, but I couldn't find the desktop app. Open Accordion manually, or set ${ACCORDION_APP_ENV} / --${ACCORDION_APP_FLAG}.`,
+		type: "warning",
+	};
+}
+
 export default function accordionLive(pi: ExtensionAPI): void {
+	pi.registerFlag(ACCORDION_APP_FLAG, {
+		description: "Path to the Accordion desktop app executable for /accordion launch/focus",
+		type: "string",
+	});
+
 	let wss: WebSocketServer | null = null;
 	let client: WebSocket | null = null; // the GUI (one driver at a time in M1)
 	let sessionId = "";
@@ -170,7 +308,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 	}
 
-	/** /accordion writes a one-shot request for the (already-open) app to focus us. */
+	/** /accordion writes a one-shot request for the app to focus us once it is open. */
 	function writeFocusRequest(): void {
 		if (!sessionId) return;
 		try {
@@ -637,16 +775,20 @@ export default function accordionLive(pi: ExtensionAPI): void {
 
 	// ── /accordion : focus the app on this session + show status ────────────────
 	pi.registerCommand("accordion", {
-		description: "Focus the Accordion app on this pi session (and show live-link status)",
+		description: "Open/focus Accordion on this pi session",
 		handler: async (_args: string, ctx: ExtensionCommandContext) => {
 			writeFocusRequest();
+			// If the app is already attached to THIS session, its discovery poll will consume
+			// focus.json and foreground the window. If it is not attached, launching the desktop
+			// app is the only cross-process nudge we have; the app's single-instance guard turns
+			// that into "focus the existing window" when it is already running elsewhere.
+			const launch = attached() ? null : await launchAccordionApp(pi);
+			const action = launchResultLine(launch);
 			const lines = [
-				`Accordion live link — port ${port || "(starting)"}`,
-				`GUI: ${attached() ? "ATTACHED — folding driven by the app" : "detached — passthrough, native /compact allowed"}`,
-				`blocks streamed this connection: ${sentCount}`,
-				`Asked the Accordion app to focus this session (open it if it isn't running).`,
+				action.text,
+				`Live link: ${attached() ? "attached" : "detached"} · port ${port || "starting"} · streamed ${sentCount} blocks`,
 			];
-			ctx.ui.notify(lines.join("\n"), "info");
+			ctx.ui.notify(lines.join("\n"), action.type);
 		},
 	});
 
