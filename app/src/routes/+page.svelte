@@ -11,6 +11,7 @@
 	import MapHeader from "$lib/ui/map/MapHeader.svelte";
 	import ContextMap from "$lib/ui/map/ContextMap.svelte";
 	import Inspector from "$lib/ui/map/Inspector.svelte";
+	import Icon from "$lib/ui/Icon.svelte";
 
 	let selectedId = $state<string | null>(null);
 	let manualPort = $state(DEFAULT_PORT);
@@ -89,6 +90,8 @@
 			disconnectLive();
 		};
 	});
+
+	const isLive = $derived(live.status === "connected" || session.live);
 </script>
 
 <svelte:head><title>Accordion</title></svelte:head>
@@ -116,25 +119,43 @@
 			<div class="app">
 				<header class="topbar">
 					<div class="brand">
-						<span class="logo">🪗</span>
-						<div class="titles">
-							<div class="t1">
+						<span class="brand-icon">
+							<Icon name="accordion" size={20} stroke={1.75} />
+						</span>
+						<span class="wordmark">Accordion</span>
+						<div class="divider"></div>
+						<div class="session-meta">
+							<span class="meta-title tnum">
 								{session.filePath ? baseName(session.filePath) : s.meta.title}
-								{#if live.status === "connected"}<span class="live-dot" title="Live — connected to pi"></span>
-								{:else if session.live}<span class="live-dot" title="Live — polling for changes"></span>{/if}
-							</div>
-							<div class="t2 mono">
-								{s.meta.model || s.meta.format}
-								{#if s.meta.cwd}· {baseName(s.meta.cwd)}{/if}
-								· {s.blocks.length} blocks
-							</div>
+							</span>
+							{#if isLive}
+								<span class="live-chip">
+									<span class="live-dot" title={live.status === "connected" ? "Live — connected to pi" : "Live — polling for changes"}></span>
+									<span class="live-label">LIVE</span>
+								</span>
+							{/if}
 						</div>
+					</div>
+					<div class="meta-row">
+						<span class="meta-chip mono tnum">{s.meta.model || s.meta.format}</span>
+						{#if s.meta.cwd}
+							<span class="meta-sep">·</span>
+							<span class="meta-chip mono tnum">{baseName(s.meta.cwd)}</span>
+						{/if}
+						<span class="meta-sep">·</span>
+						<span class="meta-chip mono tnum">{s.blocks.length} blocks</span>
 					</div>
 					<div class="nav-row">
 						{#if live.status === "connected"}
-							<button class="nav" onclick={disconnectLive}>Disconnect</button>
+							<button class="nav-btn" onclick={disconnectLive}>
+								<Icon name="x" size={13} />
+								Disconnect
+							</button>
 						{:else if isTauriEnv}
-							<button class="nav" onclick={openFile}>Open…</button>
+							<button class="nav-btn" onclick={openFile}>
+								<Icon name="folder" size={13} />
+								Open…
+							</button>
 						{/if}
 					</div>
 				</header>
@@ -152,20 +173,32 @@
 			</div>
 		{:else}
 			<div class="fallback">
-				<span class="hero-logo">🪗</span>
-				<h1>Accordion</h1>
-				{#if isTauriEnv}
-					<p class="sub">
+				<div class="hero-plate">
+					<span class="hero-icon">
+						<Icon name="accordion" size={40} stroke={1.5} />
+					</span>
+				</div>
+				<h1 class="hero-title">Accordion</h1>
+				<p class="sub">
+					{#if isTauriEnv}
 						{#if discovery.sessions.length}
 							Pick a live pi session on the left to watch its context.
 						{:else}
-							Start <code>pi</code> in a project — it appears in the sidebar automatically.
+							Context-window visualizer for pi and Claude Code sessions.
 						{/if}
-					</p>
-					<button class="btn-open" onclick={openFile}>Open session file…</button>
+					{:else}
+						Context-window visualizer for pi and Claude Code sessions.
+					{/if}
+				</p>
+				{#if isTauriEnv}
+					<div class="action-group">
+						<button class="btn-primary" onclick={openFile}>
+							<Icon name="folder" size={14} />
+							Open session file…
+						</button>
+					</div>
 					<p class="hint">Or try the <strong>Demo session</strong> at the bottom of the sidebar.</p>
 				{:else}
-					<p class="sub">Context-window visualizer for pi and Claude Code sessions</p>
 					<p class="hint">
 						Live session discovery is a desktop feature — run <code>npm run tauri dev</code>. In the browser you can
 						dial a known port or load the sample.
@@ -173,14 +206,18 @@
 					<div class="port-row">
 						<input class="port" type="number" min="1" max="65535" bind:value={manualPort} aria-label="pi port" />
 						<button
-							class="btn-open"
+							class="btn-primary"
 							onclick={() => connectLive(manualPort)}
 							disabled={live.status === "connecting"}
 						>
+							<Icon name="activity" size={14} />
 							{live.status === "connecting" ? "Connecting…" : "Connect to port"}
 						</button>
 					</div>
-					<button class="btn-ghost" onclick={loadSample}>Load sample (982 blocks)</button>
+					<button class="btn-ghost" onclick={loadSample}>
+						<Icon name="file-text" size={13} />
+						Load sample (982 blocks)
+					</button>
 				{/if}
 				{#if live.status === "error"}<p class="err">{live.detail}</p>{/if}
 				{#if session.error}<p class="err">{session.error}</p>{/if}
@@ -190,6 +227,7 @@
 </div>
 
 <style>
+	/* ── Layout shell ─────────────────────────────────────────── */
 	.shell {
 		height: 100vh;
 		display: flex;
@@ -207,137 +245,76 @@
 		display: flex;
 		flex-direction: column;
 	}
-	.fallback {
-		height: 100%;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		justify-content: center;
-		gap: 12px;
-		padding: 24px;
-		text-align: center;
-	}
-	.fallback .err {
-		color: var(--danger);
-		font-size: 13px;
-	}
-	.hero-logo {
-		font-size: 48px;
-		line-height: 1;
-	}
-	.fallback h1 {
-		font-size: 22px;
-		font-weight: 700;
-		margin: 0;
-	}
-	.sub {
-		font-size: 13px;
-		color: var(--muted);
-		margin: 0;
-		max-width: 440px;
-	}
-	.sub code,
-	.hint code {
-		background: var(--panel-2);
-		padding: 1px 5px;
-		border-radius: 4px;
-	}
-	.port-row {
-		display: flex;
-		gap: 8px;
-		align-items: center;
-	}
-	.port {
-		width: 96px;
-		padding: 9px 10px;
-		border: 1px solid var(--line);
-		border-radius: var(--radius-sm);
-		background: var(--panel);
-		color: var(--text);
-		font-size: 13px;
-	}
-	.btn-open {
-		background: var(--accent);
-		color: #fff;
-		border: none;
-		padding: 10px 24px;
-		border-radius: var(--radius-sm);
-		font-size: 14px;
-		font-weight: 600;
-		cursor: pointer;
-		transition: opacity 120ms ease;
-	}
-	.btn-open:hover {
-		opacity: 0.85;
-	}
-	.btn-open:disabled {
-		opacity: 0.5;
-		cursor: default;
-	}
-	.btn-ghost {
-		background: transparent;
-		border: 1px solid var(--line);
-		color: var(--muted);
-		padding: 7px 18px;
-		border-radius: var(--radius-sm);
-		font-size: 13px;
-		cursor: pointer;
-		transition: color 120ms ease, border-color 120ms ease;
-	}
-	.btn-ghost:hover {
-		color: var(--text);
-		border-color: var(--muted);
-	}
-	.hint {
-		font-size: 11px;
-		color: var(--faint);
-		margin: 0;
-		max-width: 440px;
-		line-height: 1.5;
-	}
-	.hint strong {
-		color: var(--muted);
-		font-weight: 600;
-	}
+
+	/* ── Topbar ───────────────────────────────────────────────── */
 	.topbar {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
-		padding: 10px 16px;
-		border-bottom: 1px solid var(--line);
+		gap: var(--sp-3);
+		padding: 0 var(--sp-4);
+		height: 44px;
+		border-bottom: 1px solid var(--line-soft);
 		background: var(--panel);
+		box-shadow: var(--shadow-1);
 		flex: 0 0 auto;
 	}
+
+	/* Brand cluster: icon + wordmark + divider + session title */
 	.brand {
 		display: flex;
 		align-items: center;
-		gap: 11px;
+		gap: var(--sp-2);
+		min-width: 0;
+		flex: 1;
+	}
+	.brand-icon {
+		color: var(--accent);
+		display: flex;
+		align-items: center;
+		flex: 0 0 auto;
+	}
+	.wordmark {
+		font-size: var(--fs-md);
+		font-weight: 700;
+		color: var(--text);
+		letter-spacing: -0.02em;
+		flex: 0 0 auto;
+		line-height: 1;
+	}
+	.divider {
+		width: 1px;
+		height: 16px;
+		background: var(--line);
+		flex: 0 0 auto;
+		margin: 0 var(--sp-1);
+	}
+	.session-meta {
+		display: flex;
+		align-items: center;
+		gap: var(--sp-2);
 		min-width: 0;
 	}
-	.logo {
-		font-size: 22px;
-	}
-	.titles {
-		min-width: 0;
-	}
-	.t1 {
-		font-weight: 600;
-		font-size: 14px;
+	.meta-title {
+		font-size: var(--fs-sm);
+		font-weight: 500;
+		color: var(--muted);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
-		max-width: 52vw;
-		display: flex;
+		max-width: 38vw;
+	}
+
+	/* Live chip */
+	.live-chip {
+		display: inline-flex;
 		align-items: center;
-		gap: 7px;
+		gap: 4px;
+		flex: 0 0 auto;
 	}
-	.t2 {
-		font-size: 11px;
-		color: var(--muted);
-	}
-	@keyframes livepulse {
-		0%, 100% { opacity: 1; transform: scale(1); }
-		50% { opacity: .5; transform: scale(.82); }
+	@keyframes livehalo {
+		0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); }
+		50%       { box-shadow: 0 0 0 4px transparent; }
 	}
 	.live-dot {
 		display: inline-block;
@@ -346,29 +323,66 @@
 		border-radius: 50%;
 		background: var(--ok);
 		flex: 0 0 auto;
-		animation: livepulse var(--dur-slow) ease-in-out infinite;
+		animation: livehalo 2s ease-in-out infinite;
 	}
+	.live-label {
+		font-size: var(--fs-xs);
+		font-weight: 600;
+		color: var(--ok);
+		letter-spacing: 0.06em;
+		line-height: 1;
+	}
+
+	/* Meta chips row (model · cwd · blocks) */
+	.meta-row {
+		display: flex;
+		align-items: center;
+		gap: var(--sp-1);
+		flex: 0 0 auto;
+	}
+	.meta-chip {
+		font-size: var(--fs-xs);
+		color: var(--faint);
+		white-space: nowrap;
+	}
+	.meta-sep {
+		font-size: var(--fs-xs);
+		color: var(--faint);
+		opacity: 0.5;
+		user-select: none;
+	}
+
+	/* Nav buttons */
 	.nav-row {
 		display: flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--sp-2);
 		flex: 0 0 auto;
 	}
-	.nav {
-		font-size: 12px;
-		color: var(--accent);
-		text-decoration: none;
-		padding: 5px 10px;
+	.nav-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--sp-1);
+		font-size: var(--fs-sm);
+		font-weight: 500;
+		color: var(--muted);
+		background: var(--panel-3);
 		border: 1px solid var(--line);
 		border-radius: var(--radius-sm);
-		white-space: nowrap;
-		background: transparent;
+		padding: 5px var(--sp-3);
 		cursor: pointer;
-		transition: background 120ms ease;
+		white-space: nowrap;
+		transition: color var(--dur-fast) var(--ease-out),
+		            background var(--dur-fast) var(--ease-out),
+		            border-color var(--dur-fast) var(--ease-out);
 	}
-	.nav:hover {
-		background: var(--panel-2);
+	.nav-btn:hover {
+		color: var(--text);
+		background: var(--panel-4);
+		border-color: var(--line-strong);
 	}
+
+	/* ── Main grid (canvas + inspector) ──────────────────────── */
 	.main {
 		flex: 1;
 		min-height: 0;
@@ -383,5 +397,153 @@
 		min-width: 0;
 		min-height: 0;
 		overflow: hidden;
+	}
+
+	/* ── Fallback / empty state ───────────────────────────────── */
+	.fallback {
+		height: 100%;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		gap: var(--sp-3);
+		padding: var(--sp-5);
+		text-align: center;
+	}
+
+	/* Hero icon plate */
+	.hero-plate {
+		width: 80px;
+		height: 80px;
+		border-radius: var(--radius-lg);
+		background: var(--accent-soft);
+		border: 1px solid rgba(110, 168, 254, 0.2);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--accent);
+		box-shadow: var(--shadow-2);
+		margin-bottom: var(--sp-1);
+	}
+	.hero-icon {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.hero-title {
+		font-size: var(--fs-2xl);
+		font-weight: 700;
+		color: var(--text);
+		letter-spacing: -0.03em;
+		margin: 0;
+		line-height: 1.1;
+	}
+	.sub {
+		font-size: var(--fs-base);
+		color: var(--muted);
+		margin: 0;
+		max-width: 400px;
+		line-height: 1.55;
+	}
+	.hint code {
+		font-family: var(--mono);
+		font-size: var(--fs-xs);
+		background: var(--panel-2);
+		color: var(--muted);
+		padding: 1px 5px;
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--line);
+	}
+
+	/* Action group */
+	.action-group {
+		display: flex;
+		gap: var(--sp-2);
+		align-items: center;
+		margin-top: var(--sp-1);
+	}
+
+	/* Primary CTA */
+	.btn-primary {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--sp-2);
+		background: var(--accent-soft);
+		color: var(--accent);
+		border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+		padding: 9px var(--sp-4);
+		border-radius: var(--radius-sm);
+		font-size: var(--fs-md);
+		font-weight: 600;
+		cursor: pointer;
+		transition: background var(--dur-fast) var(--ease-out),
+		            border-color var(--dur-fast) var(--ease-out),
+		            color var(--dur-fast) var(--ease-out);
+	}
+	.btn-primary:hover {
+		background: rgba(110, 168, 254, 0.22);
+		border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+		color: var(--accent-hover);
+	}
+	.btn-primary:disabled {
+		opacity: 0.45;
+		cursor: default;
+	}
+
+	/* Ghost secondary */
+	.btn-ghost {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--sp-1);
+		background: transparent;
+		border: 1px solid var(--line);
+		color: var(--faint);
+		padding: 7px var(--sp-3);
+		border-radius: var(--radius-sm);
+		font-size: var(--fs-sm);
+		font-weight: 500;
+		cursor: pointer;
+		transition: color var(--dur-fast) var(--ease-out),
+		            border-color var(--dur-fast) var(--ease-out);
+	}
+	.btn-ghost:hover {
+		color: var(--muted);
+		border-color: var(--line-strong);
+	}
+
+	/* Port row (browser dev mode) */
+	.port-row {
+		display: flex;
+		gap: var(--sp-2);
+		align-items: center;
+	}
+	.port {
+		width: 96px;
+		padding: 9px var(--sp-3);
+		border: 1px solid var(--line);
+		border-radius: var(--radius-sm);
+		background: var(--panel);
+		color: var(--text);
+		font-family: var(--mono);
+		font-size: var(--fs-sm);
+	}
+
+	.hint {
+		font-size: var(--fs-xs);
+		color: var(--faint);
+		margin: 0;
+		max-width: 400px;
+		line-height: 1.6;
+	}
+	.hint strong {
+		color: var(--muted);
+		font-weight: 600;
+	}
+
+	.fallback .err {
+		font-size: var(--fs-sm);
+		color: var(--danger);
+		margin: 0;
 	}
 </style>

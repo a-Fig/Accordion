@@ -2,6 +2,7 @@
 	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
+	import Icon from "$lib/ui/Icon.svelte";
 	import { relTime } from "$lib/utils";
 
 	let {
@@ -84,46 +85,56 @@
 
 <aside class="rail" class:collapsed>
 	{#if collapsed}
-		<!-- Slim icon rail: sessions stay glanceable; click a dot to switch, logo to expand. -->
-		<button class="icon logo-btn" title="Expand sidebar  (Ctrl/Cmd+B)" onclick={() => (collapsed = false)}>
-			🪗
+		<!-- Slim icon rail -->
+		<button
+			class="rail-btn logo-btn"
+			title="Expand sidebar  (Ctrl/Cmd+B)"
+			aria-label="Expand sidebar"
+			onclick={() => (collapsed = false)}
+		>
+			<Icon name="accordion" size={18} class="accent-icon" />
 		</button>
-		<!-- Tiny source toggle -->
+
+		<!-- Tiny source toggle pill -->
 		<button
 			class="src-pill"
 			title="Switch source (pi / Claude Code)"
+			aria-label="Switch source"
 			onclick={() => onsource(source === "pi" ? "claude" : "pi")}
-		>{source === "pi" ? "pi" : "CC"}</button>
+		>
+			{source === "pi" ? "pi" : "CC"}
+		</button>
+
 		{#if source === "pi"}
 			<div class="icon-list">
 				{#each sessions as s (s.sessionId)}
 					{@const isSel = s.sessionId === selected}
 					<button
-						class="icon dot-btn"
+						class="rail-btn dot-btn"
 						class:sel={isSel}
 						title={label(s)}
 						aria-label={label(s)}
 						onclick={() => onselect(s)}
 					>
-						<span class="dot" class:on={isSel && connected}></span>
+						<span class="status-dot" class:on={isSel && connected}></span>
 					</button>
 				{/each}
 			</div>
 			<button
-				class="icon dot-btn demo-icon"
+				class="rail-btn dot-btn demo-icon"
 				class:sel={demoSelected}
 				title="Demo session (bundled sample)"
 				aria-label="Demo session"
 				onclick={ondemo}
 			>
-				<span class="dot demo"></span>
+				<span class="status-dot demo-dot"></span>
 			</button>
 		{:else}
 			<div class="icon-list">
 				{#each railCCSessions as s (s.sessionId)}
 					{@const isSel = s.sessionId === claudeSelected}
 					<button
-						class="icon dot-btn"
+						class="rail-btn dot-btn"
 						class:sel={isSel}
 						title={s.title || s.project}
 						aria-label={s.title || s.project}
@@ -135,24 +146,42 @@
 			</div>
 		{/if}
 	{:else}
+		<!-- Expanded sidebar -->
 		<div class="head">
-			<span class="logo">🪗</span>
+			<span class="logo-wrap" aria-hidden="true">
+				<Icon name="accordion" size={16} class="accent-icon" />
+			</span>
+			<span class="wordmark">Accordion</span>
+
 			<!-- Segmented source switcher -->
 			<div class="seg" role="group" aria-label="Session source">
 				<button
 					class="seg-pill"
 					class:seg-active={source === "pi"}
 					onclick={() => onsource("pi")}
-				>pi</button>
+				>
+					<Icon name="terminal" size={11} />
+					<span>pi</span>
+				</button>
 				<button
 					class="seg-pill"
 					class:seg-active={source === "claude"}
 					onclick={() => onsource("claude")}
-				>Claude Code</button>
+				>
+					<Icon name="message-square" size={11} />
+					<span>Claude Code</span>
+				</button>
 			</div>
-			<span class="count">{activeCount}</span>
-			<button class="collapse" title="Collapse sidebar  (Ctrl/Cmd+B)" aria-label="Collapse sidebar" onclick={() => (collapsed = true)}>
-				«
+
+			<span class="count tnum" aria-label="{activeCount} sessions">{activeCount}</span>
+
+			<button
+				class="collapse-btn"
+				title="Collapse sidebar  (Ctrl/Cmd+B)"
+				aria-label="Collapse sidebar"
+				onclick={() => (collapsed = true)}
+			>
+				<Icon name="chevrons-left" size={14} />
 			</button>
 		</div>
 
@@ -160,8 +189,9 @@
 			<div class="scroll">
 				{#if sessions.length === 0}
 					<div class="empty">
-						<p>No live pi sessions.</p>
-						<p class="hint">Start <code>pi</code> in a project — it shows up here on its own.</p>
+						<Icon name="terminal" size={20} class="empty-icon" />
+						<p class="empty-msg">No live pi sessions</p>
+						<p class="empty-hint">Start <code>pi</code> in a project — it shows up here on its own.</p>
 					</div>
 				{:else}
 					<ul class="list">
@@ -170,7 +200,7 @@
 							{@const isSel = s.sessionId === selected}
 							<li>
 								<button class="row" class:sel={isSel} onclick={() => onselect(s)} title={s.cwd}>
-									<span class="dot" class:on={isSel && connected}></span>
+									<span class="status-dot" class:on={isSel && connected}></span>
 									<span class="body">
 										<span class="t1">{label(s)}</span>
 										<span class="t2 mono">{shortModel(s.model)}</span>
@@ -178,7 +208,7 @@
 									{#if p !== null}
 										<span class="usage" title={`${s.tokens} / ${s.contextWindow} tokens`}>
 											<span class="bar"><span class="fill" class:hot={p >= 80} style:width={`${p}%`}></span></span>
-											<span class="pct mono"><AnimatedNumber value={s.tokens ?? 0} format={fmtTokens} /></span>
+											<span class="pct tnum"><AnimatedNumber value={s.tokens ?? 0} format={fmtTokens} /></span>
 										</span>
 									{/if}
 								</button>
@@ -188,10 +218,10 @@
 				{/if}
 			</div>
 
-			<!-- Bundled demo, pinned at the foot of the list and clearly not live. -->
+			<!-- Bundled demo, pinned at the foot -->
 			<div class="demo-foot">
 				<button class="row demo" class:sel={demoSelected} onclick={ondemo} title="Bundled sample session — a static demo transcript">
-					<span class="dot demo"></span>
+					<span class="status-dot demo-dot"></span>
 					<span class="body">
 						<span class="t1">Demo session</span>
 						<span class="t2">Bundled sample · static</span>
@@ -204,8 +234,9 @@
 			<div class="scroll">
 				{#if claudeSessions.length === 0}
 					<div class="empty">
-						<p>No recent Claude Code sessions.</p>
-						<p class="hint">Sessions under <code>~/.claude/projects</code> appear here.</p>
+						<Icon name="message-square" size={20} class="empty-icon" />
+						<p class="empty-msg">No recent sessions</p>
+						<p class="empty-hint">Sessions under <code>~/.claude/projects</code> appear here.</p>
 					</div>
 				{:else}
 					<ul class="list">
@@ -218,12 +249,15 @@
 									onclick={() => onselectclaude(s)}
 									title={s.filePath}
 								>
-									<span class="cc-mark" class:cc-sel={isSel}></span>
+									<Icon name="file-text" size={13} class="cc-icon" />
 									<span class="body">
 										<span class="t1">{s.title || s.project || s.sessionId}</span>
 										<span class="t2">{s.project}</span>
 									</span>
-									<span class="rel-time" title={new Date(s.mtime).toLocaleString()}>{relTime(s.mtime)}</span>
+									<span class="cc-meta">
+										<span class="ro-badge"><Icon name="eye" size={9} />READ</span>
+										<span class="rel-time tnum" title={new Date(s.mtime).toLocaleString()}>{relTime(s.mtime)}</span>
+									</span>
 								</button>
 							</li>
 						{/each}
@@ -238,6 +272,7 @@
 </aside>
 
 <style>
+	/* ===== Rail shell ===== */
 	.rail {
 		width: 232px;
 		flex: 0 0 auto;
@@ -247,17 +282,17 @@
 		border-right: 1px solid var(--line);
 		background: var(--panel);
 		overflow: hidden;
-		transition: width 160ms ease;
+		transition: width 160ms var(--ease-out);
 	}
 	.rail.collapsed {
 		width: 52px;
 		align-items: center;
-		gap: 4px;
-		padding: 8px 0;
+		gap: var(--sp-1);
+		padding: var(--sp-2) 0;
 	}
 
-	/* ---- collapsed icon rail ---- */
-	.icon {
+	/* ===== Collapsed icon rail ===== */
+	.rail-btn {
 		width: 38px;
 		height: 38px;
 		display: flex;
@@ -268,14 +303,23 @@
 		background: transparent;
 		cursor: pointer;
 		flex: 0 0 auto;
-		transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+		color: var(--muted);
+		transition:
+			background var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out);
 	}
-	.icon:hover {
+	.rail-btn:hover {
 		background: var(--panel-2);
+		color: var(--text);
 	}
 	.logo-btn {
-		font-size: 18px;
-		margin-bottom: 2px;
+		color: var(--accent);
+		margin-bottom: var(--sp-1);
+	}
+	.logo-btn:hover {
+		color: var(--accent-hover);
+		background: var(--accent-soft);
 	}
 	.icon-list {
 		flex: 1;
@@ -284,187 +328,286 @@
 		display: flex;
 		flex-direction: column;
 		align-items: center;
-		gap: 2px;
+		gap: var(--sp-1);
 		overflow-y: auto;
 		overflow-x: hidden;
 	}
 	.dot-btn.sel {
-		background: var(--panel-2);
-		border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+		background: var(--accent-soft);
+		border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+		color: var(--accent);
 	}
 	.demo-icon {
 		margin-top: auto;
+		border-style: dashed;
+		border-color: var(--line-strong);
+	}
+	.demo-icon:hover {
+		border-color: var(--accent);
 	}
 
-	/* ---- collapsed source pill ---- */
+	/* ===== Collapsed source pill ===== */
 	.src-pill {
-		font-size: 9px;
+		font-size: var(--fs-xs);
 		font-weight: 700;
 		letter-spacing: 0.05em;
 		text-transform: uppercase;
 		color: var(--muted);
 		background: var(--panel-2);
 		border: 1px solid var(--line);
-		border-radius: 999px;
-		padding: 1px 6px;
+		border-radius: var(--radius-pill);
+		padding: 2px var(--sp-2);
 		cursor: pointer;
 		line-height: 1.5;
-		transition: color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+		transition:
+			color var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
 	}
 	.src-pill:hover {
 		color: var(--text);
 		border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+		background: var(--panel-3);
 	}
 
-	/* ---- expanded header ---- */
+	/* ===== Expanded header ===== */
 	.head {
 		display: flex;
 		align-items: center;
-		gap: 8px;
-		padding: 10px 14px;
+		gap: var(--sp-2);
+		padding: 10px var(--sp-3);
 		border-bottom: 1px solid var(--line);
 		flex: 0 0 auto;
 	}
-	.logo {
-		font-size: 16px;
+	.logo-wrap {
 		flex: 0 0 auto;
+		color: var(--accent);
+		display: flex;
+		align-items: center;
+	}
+	.wordmark {
+		font-size: var(--fs-sm);
+		font-weight: 700;
+		color: var(--text);
+		letter-spacing: 0.02em;
+		white-space: nowrap;
+		overflow: hidden;
+		/* fade out when collapsing so text doesn't squash/reflow */
+		opacity: 1;
+		transition: opacity 80ms var(--ease-out);
+	}
+	.rail.collapsed .wordmark {
+		opacity: 0;
 	}
 
-	/* Segmented source switcher */
+	/* Segmented source switcher — exact spec from design system */
 	.seg {
 		display: flex;
-		gap: 2px;
+		gap: 3px;
 		background: var(--panel-2);
 		border: 1px solid var(--line);
-		border-radius: 999px;
-		padding: 2px;
+		border-radius: var(--radius-sm);
+		padding: 3px;
+		flex: 0 0 auto;
 	}
 	.seg-pill {
-		font-size: 10px;
-		font-weight: 600;
-		letter-spacing: 0.03em;
+		display: flex;
+		align-items: center;
+		gap: var(--sp-1);
+		font-size: var(--fs-xs);
+		font-weight: 500;
+		letter-spacing: 0.01em;
 		color: var(--muted);
 		background: transparent;
-		border: 1px solid transparent;
-		border-radius: 999px;
-		padding: 2px 8px;
+		border: none;
+		border-radius: calc(var(--radius-sm) - 2px);
+		padding: var(--sp-1) var(--sp-2);
 		cursor: pointer;
 		line-height: 1.4;
-		transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
 		white-space: nowrap;
+		transition:
+			background var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out),
+			box-shadow var(--dur-fast) var(--ease-out);
 	}
 	.seg-pill:hover {
 		color: var(--text);
 	}
 	.seg-pill.seg-active {
-		background: color-mix(in srgb, var(--accent) 18%, var(--panel));
-		border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+		background: var(--panel-4);
 		color: var(--text);
+		font-weight: 600;
+		box-shadow: var(--shadow-1);
 	}
 
 	.count {
 		margin-left: auto;
-		font-size: 11px;
+		font-size: var(--fs-xs);
 		color: var(--faint);
 		background: var(--panel-2);
-		border-radius: 999px;
-		padding: 1px 8px;
+		border: 1px solid var(--line);
+		border-radius: var(--radius-pill);
+		padding: 1px var(--sp-2);
+		flex: 0 0 auto;
+		line-height: 1.6;
 	}
-	.collapse {
+	.collapse-btn {
 		background: transparent;
 		border: none;
 		color: var(--faint);
-		font-size: 15px;
-		line-height: 1;
-		padding: 2px 4px;
-		border-radius: 5px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 24px;
+		height: 24px;
+		border-radius: var(--radius-sm);
+		padding: 0;
 		cursor: pointer;
-		transition: color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+		flex: 0 0 auto;
+		transition:
+			color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
 	}
-	.collapse:hover {
+	.collapse-btn:hover {
 		color: var(--text);
 		background: var(--panel-2);
 	}
 
+	/* ===== Scroll region ===== */
 	.scroll {
 		flex: 1;
 		min-height: 0;
 		overflow-y: auto;
 	}
+
+	/* ===== Empty states ===== */
 	.empty {
-		padding: 18px 14px;
-		color: var(--muted);
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		padding: var(--sp-6) var(--sp-4) var(--sp-4);
+		gap: var(--sp-2);
+		text-align: center;
 	}
-	.empty p {
-		margin: 0 0 8px;
-		font-size: 12px;
-	}
-	.empty .hint {
+	:global(.empty-icon) {
 		color: var(--faint);
-		font-size: 11px;
-		line-height: 1.5;
+		opacity: 0.5;
+	}
+	.empty-msg {
+		margin: 0;
+		font-size: var(--fs-sm);
+		color: var(--faint);
+		font-weight: 500;
+	}
+	.empty-hint {
+		margin: 0;
+		color: var(--faint);
+		font-size: var(--fs-xs);
+		line-height: 1.6;
+		opacity: 0.75;
 	}
 	.empty code {
 		background: var(--panel-2);
 		padding: 1px 5px;
 		border-radius: 4px;
+		font-family: var(--mono);
 	}
+
+	/* ===== Session list ===== */
 	.list {
 		list-style: none;
 		margin: 0;
-		padding: 6px;
+		padding: var(--sp-2) var(--sp-2) var(--sp-1);
 	}
 	.row {
+		position: relative;
 		width: 100%;
 		display: flex;
 		align-items: center;
-		gap: 9px;
-		padding: 9px 10px;
-		border: 1px solid transparent;
+		gap: var(--sp-2);
+		padding: var(--sp-2) var(--sp-3);
+		border: none;
 		border-radius: var(--radius-sm);
 		background: transparent;
 		cursor: pointer;
 		text-align: left;
-		transition: background var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+		color: inherit;
+		transition:
+			background var(--dur-fast) var(--ease-out);
+	}
+	/* Left-edge accent for selected rows — inset, no layout shift */
+	.row::before {
+		content: '';
+		position: absolute;
+		left: 0;
+		top: 20%;
+		bottom: 20%;
+		width: 2px;
+		border-radius: 0 2px 2px 0;
+		background: var(--accent);
+		opacity: 0;
+		transition: opacity var(--dur-fast) var(--ease-out);
 	}
 	.row:hover {
 		background: var(--panel-2);
 	}
 	.row.sel {
-		background: var(--panel-2);
-		border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+		background: var(--accent-soft);
 	}
-	.dot {
-		width: 8px;
-		height: 8px;
+	.row.sel::before {
+		opacity: 1;
+	}
+
+	/* ===== Status dot ===== */
+	.status-dot {
+		width: 7px;
+		height: 7px;
 		border-radius: 50%;
 		flex: 0 0 auto;
 		background: var(--faint);
+		opacity: 0.5;
+		transition: background var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), opacity var(--dur-fast) var(--ease-out);
 	}
-	@keyframes dotpulse {
-		0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
-		50%       { box-shadow: 0 0 0 5px color-mix(in srgb, var(--ok) 10%, transparent); }
+	@keyframes halo-pulse {
+		0%, 100% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 28%, transparent); }
+		50%       { box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 10%, transparent); }
 	}
-	.dot.on {
+	.status-dot.on {
 		background: var(--ok);
-		box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent);
-		animation: dotpulse var(--dur-slow) ease-in-out infinite;
+		opacity: 1;
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 28%, transparent);
+		animation: halo-pulse var(--dur-slow) ease-in-out infinite;
 	}
-	.dot.demo {
+	.demo-dot {
 		background: transparent;
-		border: 1px dashed var(--muted);
+		border: 1.5px dashed var(--muted);
+		opacity: 0.7;
 	}
 
-	/* Claude Code calm hollow-square marker */
+	/* ===== Claude Code leading icon ===== */
+	:global(.cc-icon) {
+		color: var(--faint);
+		flex: 0 0 auto;
+		opacity: 0.7;
+	}
+	.row.sel :global(.cc-icon) {
+		color: var(--accent);
+		opacity: 1;
+	}
+
+	/* Claude Code selection marker (collapsed rail) */
 	.cc-mark {
-		width: 8px;
-		height: 8px;
+		width: 7px;
+		height: 7px;
 		border-radius: 1px;
 		flex: 0 0 auto;
 		background: transparent;
 		border: 1.5px solid var(--muted);
-		opacity: 0.55;
-		transition: opacity var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+		opacity: 0.45;
+		transition:
+			opacity var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out),
+			background var(--dur-fast) var(--ease-out);
 	}
 	.cc-mark.cc-sel {
 		border-color: var(--accent);
@@ -472,6 +615,7 @@
 		background: color-mix(in srgb, var(--accent) 20%, transparent);
 	}
 
+	/* ===== Row body ===== */
 	.body {
 		min-width: 0;
 		display: flex;
@@ -480,7 +624,7 @@
 		flex: 1;
 	}
 	.t1 {
-		font-size: 13px;
+		font-size: var(--fs-sm);
 		font-weight: 600;
 		color: var(--text);
 		white-space: nowrap;
@@ -488,12 +632,14 @@
 		text-overflow: ellipsis;
 	}
 	.t2 {
-		font-size: 10.5px;
-		color: var(--muted);
+		font-size: var(--fs-xs);
+		color: var(--faint);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
 	}
+
+	/* ===== Usage bar ===== */
 	.usage {
 		display: flex;
 		flex-direction: column;
@@ -502,40 +648,69 @@
 		flex: 0 0 auto;
 	}
 	.bar {
-		width: 38px;
-		height: 4px;
-		border-radius: 999px;
-		background: var(--panel);
-		border: 1px solid var(--line);
+		width: 36px;
+		height: 3px;
+		border-radius: var(--radius-pill);
+		background: var(--panel-3);
 		overflow: hidden;
 	}
 	.fill {
 		display: block;
 		height: 100%;
 		background: var(--accent);
+		border-radius: var(--radius-pill);
 		transition: width var(--dur-mid) var(--ease-out);
 	}
 	.fill.hot {
 		background: var(--danger);
 	}
 	.pct {
-		font-size: 10px;
+		font-size: var(--fs-xs);
 		color: var(--faint);
 	}
 
-	/* Relative time badge for CC rows */
-	.rel-time {
+	/* ===== CC meta (rel-time + read-only badge) ===== */
+	.cc-meta {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		gap: 3px;
 		flex: 0 0 auto;
-		font-size: 10px;
+	}
+	.ro-badge {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		font-size: var(--fs-xs);
+		font-weight: 600;
+		letter-spacing: 0.05em;
+		text-transform: uppercase;
+		color: var(--faint);
+		opacity: 0.65;
+	}
+	.rel-time {
+		font-size: var(--fs-xs);
 		color: var(--faint);
 		white-space: nowrap;
 	}
 
-	/* ---- demo foot ---- */
+	/* ===== Demo footer ===== */
 	.demo-foot {
 		flex: 0 0 auto;
-		padding: 6px;
+		padding: var(--sp-1) var(--sp-2);
 		border-top: 1px solid var(--line);
+	}
+	/* demo row: dashed border treatment */
+	.row.demo {
+		border: 1px dashed var(--line-strong);
+	}
+	.row.demo:hover {
+		border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+		background: var(--panel-2);
+	}
+	.row.demo.sel {
+		border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+		background: var(--accent-soft);
 	}
 	.badge {
 		flex: 0 0 auto;
@@ -545,17 +720,23 @@
 		color: var(--faint);
 		background: var(--panel-2);
 		border: 1px solid var(--line);
-		border-radius: 4px;
-		padding: 1px 5px;
+		border-radius: var(--radius-sm);
+		padding: 1px var(--sp-1);
 	}
 
-	/* ---- CC foot note ---- */
+	/* ===== CC footer note ===== */
 	.cc-foot {
 		flex: 0 0 auto;
-		padding: 8px 14px;
+		padding: var(--sp-2) var(--sp-4);
 		border-top: 1px solid var(--line);
-		font-size: 10px;
+		font-size: var(--fs-xs);
 		color: var(--faint);
 		text-align: center;
+		letter-spacing: 0.02em;
+	}
+
+	/* ===== Accent icon helper (applied via class prop on Icon) ===== */
+	:global(.accent-icon) {
+		color: var(--accent);
 	}
 </style>

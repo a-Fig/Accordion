@@ -7,6 +7,7 @@
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 	import { buildDisplay, segmentDisplay, type DisplayRow } from "$lib/engine/display";
 	import { chainsOf } from "./chains";
+	import Icon from "$lib/ui/Icon.svelte";
 
 	let {
 		store,
@@ -476,45 +477,86 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <div class="map">
 	<div class="toolbar">
+		<!-- Zoom-mode segmented control -->
 		<div class="seg">
-			<button class:on={zoom === "grid"} onclick={() => (zoom = "grid")}>Grid</button>
-			<button class:on={zoom === "turns"} onclick={() => (zoom = "turns")}>Turns</button>
-			<button class:on={zoom === "chains"} onclick={() => (zoom = "chains")}>Chains</button>
+			<button class:on={zoom === "grid"} onclick={() => (zoom = "grid")}>
+				<Icon name="layout-grid" size={13} /><span>Grid</span>
+			</button>
+			<button class:on={zoom === "turns"} onclick={() => (zoom = "turns")}>
+				<Icon name="layers" size={13} /><span>Turns</span>
+			</button>
+			<button class:on={zoom === "chains"} onclick={() => (zoom = "chains")}>
+				<Icon name="git-merge" size={13} /><span>Chains</span>
+			</button>
 		</div>
 
+		<div class="tb-divider"></div>
+
 		{#if zoom === "grid"}
-			<span class="tiers">
-				<span class="tlbl">tokens</span>
-				{#each FACES as f}
-					<i class="die face f{f.f}" title="face {f.f} · {f.hint} tokens"></i>
-				{/each}
-			</span>
+			<!-- Token-tier legend -->
+			<div class="tiers">
+				<span class="tlbl">WEIGHT</span>
+				<div class="tier-strip">
+					{#each FACES as f}
+						<i class="die face f{f.f}" title="face {f.f} · ≥{f.hint} tok"></i>
+					{/each}
+				</div>
+			</div>
+
+			<div class="tb-divider"></div>
+
+			<!-- Live/folded legend -->
+			<div class="legend">
+				<span class="sw-pair"><i class="sw solid"></i><span class="sw-lbl">live</span></span>
+				<span class="sw-pair"><i class="sw hatch"></i><span class="sw-lbl">folded</span></span>
+			</div>
+
+			<div class="tb-divider"></div>
+
+			<!-- Density control -->
+			<div class="density">
+				<button onclick={() => (nudge -= 1)} aria-label="Smaller tiles" title="Smaller tiles">
+					<Icon name="minus" size={12} />
+				</button>
+				<button class="density-readout" onclick={() => (nudge = 0)} title="Reset density">{cell}px</button>
+				<button onclick={() => (nudge += 1)} aria-label="Larger tiles" title="Larger tiles">
+					<Icon name="plus" size={12} />
+				</button>
+			</div>
+
 			<span class="grow"></span>
+
+			<!-- Range-select chip / hint -->
 			{#if rangeCount >= 2}
-				<span class="range-bar" class:err={groupErr}>
+				<div class="range-bar" class:err={groupErr}>
 					<span class="range-chip">
-						<b>{rangeCount}</b> blocks <span class="arrow">→</span> group
-						<span class="dim">· Enter to create</span>
+						<Icon name="corner-down-right" size={11} />
+						<b>{rangeCount}</b> blocks → group
+						<span class="dim">· Enter</span>
 					</span>
+					{#if groupErr}<span class="range-err">overlaps a group or protected tail</span>{/if}
 					<button class="group-btn" onclick={handleCreateGroup}>Group</button>
-					{#if groupErr}<span class="range-err">overlaps a group or the protected tail</span>{/if}
-					<button class="range-clear" onclick={clearRange} title="Clear selection (Esc)">✕</button>
-				</span>
+					<button class="range-clear" onclick={clearRange} title="Clear selection (Esc)">
+						<Icon name="x" size={11} />
+					</button>
+				</div>
 			{:else if rangeAnchorId}
-				<span class="range-hint dim">shift-click another block to complete range</span>
+				<span class="range-hint dim">shift-click to complete range</span>
 			{/if}
-			<span class="legend"><i class="sw solid"></i>live <i class="sw hatch"></i>folded
-				<span class="dim">· ←→↑↓ move</span></span>
-			<span class="density">
-				<button onclick={() => (nudge -= 1)} aria-label="Smaller tiles" title="Smaller">−</button>
-				<button onclick={() => (nudge = 0)} class="reset" title="Reset density">{cell}px</button>
-				<button onclick={() => (nudge += 1)} aria-label="Larger tiles" title="Larger">+</button>
-			</span>
 		{:else}
+			<!-- Turns / Chains mode info -->
 			<span class="count mono">{units.length} {zoom} · {store.blocks.length} blocks</span>
+
+			<div class="tb-divider"></div>
+
+			<!-- Live/folded legend -->
+			<div class="legend">
+				<span class="sw-pair"><i class="sw solid"></i><span class="sw-lbl">live</span></span>
+				<span class="sw-pair"><i class="sw hatch"></i><span class="sw-lbl">folded</span></span>
+			</div>
+
 			<span class="grow"></span>
-			<span class="legend"><i class="sw solid"></i>live <i class="sw hatch"></i>folded
-				<span class="dim">· click = inspect · dbl-click = fold</span></span>
+			<span class="dim" style="font-size:var(--fs-xs)">click = inspect · dbl-click = fold</span>
 		{/if}
 	</div>
 
@@ -604,15 +646,25 @@
 										<div class="band-actions">
 											{#if live}
 												<!-- UNFOLDED row: Re-fold returns to a COLLAPSED tile (clears peek); Delete drops the group. -->
-												<button class="band-btn" onclick={(e) => { e.stopPropagation(); collapseGroup(g.id); }}>Re-fold</button>
-												<button class="band-btn danger" onclick={(e) => { e.stopPropagation(); leavePeek(g.id); store.deleteGroup(g.id); }}>Delete</button>
+												<button class="band-btn" onclick={(e) => { e.stopPropagation(); collapseGroup(g.id); }} title="Re-fold group">
+													<Icon name="chevrons-down-up" size={12} />Re-fold
+												</button>
+												<button class="band-btn danger" onclick={(e) => { e.stopPropagation(); leavePeek(g.id); store.deleteGroup(g.id); }} title="Delete group">
+													<Icon name="trash-2" size={12} />Delete
+												</button>
 											{:else}
 												<!-- PEEK row: the ONLY wire-changing button is "Unfold to context" (store.unfoldGroup);
 												     it also clears the peek entry so re-folding later returns to a clean COLLAPSED tile.
 												     "Collapse" is pure UI (leavePeek). Delete drops the group + its stale peek entry. -->
-												<button class="band-btn primary" onclick={(e) => { e.stopPropagation(); leavePeek(g.id); store.unfoldGroup(g.id); }}>Unfold to context</button>
-												<button class="band-btn" onclick={(e) => { e.stopPropagation(); leavePeek(g.id); }}>Collapse</button>
-												<button class="band-btn danger tertiary" onclick={(e) => { e.stopPropagation(); leavePeek(g.id); store.deleteGroup(g.id); }}>Delete</button>
+												<button class="band-btn primary" onclick={(e) => { e.stopPropagation(); leavePeek(g.id); store.unfoldGroup(g.id); }} title="Unfold blocks into context">
+													<Icon name="chevrons-up-down" size={12} />Unfold to context
+												</button>
+												<button class="band-btn" onclick={(e) => { e.stopPropagation(); leavePeek(g.id); }} title="Collapse preview">
+													<Icon name="chevrons-down-up" size={12} />Collapse
+												</button>
+												<button class="band-btn danger tertiary" onclick={(e) => { e.stopPropagation(); leavePeek(g.id); store.deleteGroup(g.id); }} title="Delete group">
+													<Icon name="trash-2" size={12} />Delete
+												</button>
 											{/if}
 										</div>
 									</div>
@@ -675,72 +727,114 @@
 	.toolbar {
 		display: flex;
 		align-items: center;
-		gap: 14px;
-		padding: 9px 16px;
-		border-bottom: 1px solid var(--line);
-		flex: 0 0 auto;
-		font-size: 11px;
-		color: var(--muted);
-	}
-	.seg {
-		display: inline-flex;
+		gap: var(--sp-3);
+		padding: var(--sp-2) var(--sp-4);
 		background: var(--panel);
-		border: 1px solid var(--line);
-		border-radius: 7px;
-		padding: 2px;
-		gap: 2px;
-	}
-	.seg button {
-		background: transparent;
-		border: none;
+		border-bottom: 1px solid var(--line-soft);
+		flex: 0 0 auto;
+		font-size: var(--fs-xs);
 		color: var(--muted);
-		font-size: 12px;
-		font-weight: 600;
-		padding: 4px 13px;
-		border-radius: 5px;
-		transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+		min-height: 40px;
 	}
-	.seg button:hover {
-		color: var(--text);
-	}
-	.seg button.on {
-		background: var(--panel-3);
-		color: var(--text);
-		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+	/* subtle vertical divider between toolbar clusters */
+	.tb-divider {
+		width: 1px;
+		height: 18px;
+		background: var(--line-soft);
+		flex: 0 0 auto;
 	}
 	.grow {
 		flex: 1;
 	}
 	.count {
-		font-size: 11px;
+		font-size: var(--fs-xs);
 	}
 	.dim {
 		color: var(--faint);
 	}
 
+	/* ---- segmented control (matches sidebar source-switcher spec) ---- */
+	.seg {
+		display: inline-flex;
+		background: var(--panel-2);
+		border: 1px solid var(--line);
+		border-radius: var(--radius-sm);
+		padding: 3px;
+		gap: 3px;
+		flex: 0 0 auto;
+	}
+	.seg button {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--sp-1);
+		background: transparent;
+		border: none;
+		color: var(--muted);
+		font-size: var(--fs-xs);
+		font-weight: 500;
+		padding: var(--sp-1) var(--sp-2);
+		border-radius: calc(var(--radius-sm) - 2px);
+		transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+		white-space: nowrap;
+	}
+	.seg button:hover {
+		color: var(--text);
+		background: var(--panel-3);
+	}
+	.seg button.on {
+		background: var(--panel-4);
+		color: var(--text);
+		font-weight: 600;
+		box-shadow: var(--shadow-1);
+	}
+
+	/* ---- token-tier legend ---- */
 	.tiers {
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
+		gap: var(--sp-2);
 	}
 	.tlbl {
+		font-size: 9px;
+		font-weight: 600;
+		letter-spacing: 0.07em;
 		color: var(--faint);
-		margin-right: 4px;
+		text-transform: uppercase;
+	}
+	.tier-strip {
+		display: inline-flex;
+		align-items: center;
+		gap: 3px;
+		background: var(--panel-2);
+		border: 1px solid var(--line-soft);
+		border-radius: var(--radius-sm);
+		padding: 3px 6px;
 	}
 	.die {
 		box-sizing: border-box;
-		width: 17px;
-		height: 17px;
+		width: 16px;
+		height: 16px;
 		background: var(--panel-3);
 		border: 1px solid var(--line);
 		border-radius: 3px;
 		display: inline-block;
+		flex: 0 0 auto;
 	}
 
+	/* ---- live/folded legend ---- */
 	.legend {
 		display: inline-flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--sp-3);
+	}
+	.sw-pair {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+	}
+	.sw-lbl {
+		font-size: var(--fs-xs);
+		color: var(--faint);
 	}
 	.sw {
 		width: 12px;
@@ -748,106 +842,125 @@
 		border-radius: 2px;
 		display: inline-block;
 		background: var(--k-thinking);
-		vertical-align: -1px;
+		flex: 0 0 auto;
 	}
 	.sw.hatch {
 		opacity: 0.55;
 		background-image: repeating-linear-gradient(45deg, rgba(0, 0, 0, 0.55) 0 1.5px, transparent 1.5px 4px);
 	}
 
+	/* ---- density control ---- */
 	.density {
 		display: inline-flex;
 		align-items: center;
-		background: var(--panel);
+		background: var(--panel-2);
 		border: 1px solid var(--line);
-		border-radius: 7px;
+		border-radius: var(--radius-sm);
 		overflow: hidden;
 	}
 	.density button {
+		display: flex;
+		align-items: center;
+		justify-content: center;
 		background: transparent;
 		border: none;
 		color: var(--muted);
-		font-size: 12px;
-		padding: 3px 9px;
-		min-width: 26px;
+		padding: 4px 8px;
+		min-width: 28px;
 		transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
 	}
 	.density button:hover {
-		background: var(--panel-3);
+		background: var(--panel-4);
 		color: var(--text);
 	}
-	.density .reset {
-		font-size: 10px;
-		color: var(--faint);
-		min-width: 40px;
-		border-left: 1px solid var(--line);
-		border-right: 1px solid var(--line);
+	.density-readout {
+		background: transparent;
+		border: none;
+		border-left: 1px solid var(--line-soft);
+		border-right: 1px solid var(--line-soft);
+		font-size: var(--fs-xs);
 		font-variant-numeric: tabular-nums;
+		color: var(--faint);
+		min-width: 36px;
+		text-align: center;
+		padding: 4px 6px;
+		cursor: pointer;
+		user-select: none;
+		transition: color var(--dur-fast) var(--ease-out);
+	}
+	.density-readout:hover {
+		color: var(--muted);
 	}
 
-	/* ---- range selection toolbar affordances — a warm "building" chip ---- */
+	/* ---- range selection toolbar affordances — warm amber "building" chip ---- */
 	.range-bar {
 		display: inline-flex;
 		align-items: center;
-		gap: 6px;
+		gap: var(--sp-2);
 	}
-	/* The counter chip: reads the live selection count and tells the user how to commit.
-	   Warm amber border so it reads as forming a NEW object (not hiding one). */
+	/* Counter chip: pill shape, amber family, signals "forming a new object". */
 	.range-chip {
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
-		font-size: 11px;
+		gap: 5px;
+		font-size: var(--fs-xs);
 		color: var(--text);
-		background: color-mix(in srgb, var(--group-accent) 12%, var(--panel));
-		border: 1px solid color-mix(in srgb, var(--group-accent) 55%, transparent);
-		border-radius: 6px;
-		padding: 3px 9px;
+		background: color-mix(in srgb, var(--group-accent) 12%, var(--panel-2));
+		border: 1px solid color-mix(in srgb, var(--group-accent) 50%, transparent);
+		border-radius: var(--radius-pill);
+		padding: 3px 10px;
 		white-space: nowrap;
+		font-variant-numeric: tabular-nums;
+		animation: chip-in var(--dur-mid) var(--ease-out);
+	}
+	@keyframes chip-in {
+		from { opacity: 0; transform: scale(0.92); }
+		to   { opacity: 1; transform: scale(1); }
 	}
 	.range-chip b {
 		font-variant-numeric: tabular-nums;
 		color: var(--group-accent);
 		font-weight: 800;
 	}
-	.range-chip .arrow {
-		color: var(--group-accent);
-		font-weight: 700;
-	}
 	.range-bar.err .range-chip {
 		border-color: color-mix(in srgb, var(--danger) 60%, transparent);
 	}
 	.group-btn {
 		background: var(--group-accent);
-		color: #1a0f06;
+		color: var(--group-ink);
 		border: none;
-		border-radius: 6px;
-		font-size: 11px;
+		border-radius: var(--radius-sm);
+		font-size: var(--fs-xs);
 		font-weight: 700;
 		padding: 4px 12px;
 		cursor: pointer;
+		transition: filter var(--dur-fast) var(--ease-out);
 	}
 	.group-btn:hover {
-		filter: brightness(1.08);
+		filter: brightness(1.1);
 	}
 	.range-clear {
+		display: flex;
+		align-items: center;
+		justify-content: center;
 		background: transparent;
 		border: 1px solid var(--line);
 		color: var(--muted);
-		border-radius: 5px;
-		font-size: 10px;
-		padding: 3px 7px;
+		border-radius: var(--radius-sm);
+		padding: 4px 6px;
 		cursor: pointer;
+		transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
 	}
 	.range-clear:hover {
 		color: var(--text);
 		background: var(--panel-3);
+		border-color: var(--line-strong);
 	}
 	.range-hint {
-		font-size: 10px;
+		font-size: var(--fs-xs);
 	}
 	.range-err {
-		font-size: 10px;
+		font-size: var(--fs-xs);
 		color: var(--danger, #f87171);
 		white-space: nowrap;
 	}
@@ -875,22 +988,22 @@
 	.boxes {
 		display: flex;
 		flex-direction: column;
-		gap: 16px;
+		gap: var(--sp-4);
 		width: 100%;
 		/* promote the scroll content to its own GPU layer: once painted, scrolling
 		   is a cheap layer translation rather than a repaint of the tiles. */
 		transform: translateZ(0);
 	}
 	.box {
-		border-radius: 14px;
-		border: 1.5px solid var(--line);
+		border-radius: var(--radius-lg);
+		border: 1px solid var(--line);
 		background: var(--panel-2);
-		padding: 12px;
+		padding: var(--sp-3);
 		display: flex;
 		align-items: stretch;
-		gap: 8px;
+		gap: var(--sp-2);
 	}
-	/* left rail: a small vertical token tally for the group */
+	/* left rail: a small vertical token tally for the box */
 	.rail {
 		flex: 0 0 auto;
 		display: flex;
@@ -899,22 +1012,30 @@
 		writing-mode: vertical-rl;
 		transform: rotate(180deg);
 		font-variant-numeric: tabular-nums;
-		font-size: 11px;
-		letter-spacing: 0.04em;
+		font-size: 9px;
+		font-weight: 600;
+		letter-spacing: 0.06em;
+		text-transform: uppercase;
 		color: var(--faint);
 		user-select: none;
+		gap: 4px;
 	}
 	.rail .tok {
 		font-weight: 700;
+		font-size: var(--fs-xs);
+		letter-spacing: 0.04em;
+		text-transform: none;
 	}
+	/* prot rail uses an accent tint to signal the protected-tail identity */
 	.box.prot .rail {
-		color: color-mix(in srgb, var(--accent) 70%, var(--muted));
+		color: color-mix(in srgb, var(--accent) 65%, var(--muted));
 	}
-	/* the protected box: a meaningfully thicker, accented frame implies protection */
+	/* the protected box: meaningfully thicker, accented frame = protection signal.
+	   Keep this visually distinct — it's a key part of the visual grammar. */
 	.box.prot {
-		border: 4px solid var(--accent-dim, var(--accent));
+		border: 3px solid var(--accent-dim);
 		background: var(--panel);
-		box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+		box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent), var(--shadow-1);
 	}
 
 	/* ---- the older box's content: a vertical stack of tile-grids and open-group bands
@@ -1102,47 +1223,53 @@
 	}
 	.band-actions {
 		display: flex;
-		gap: 4px;
+		align-items: center;
+		gap: var(--sp-1);
 		flex: 0 0 auto;
 	}
 	.band-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
 		background: var(--panel-3);
 		border: 1px solid var(--line);
 		color: var(--muted);
-		font-size: 10px;
-		border-radius: 5px;
-		padding: 3px 8px;
+		font-size: var(--fs-xs);
+		border-radius: var(--radius-sm);
+		padding: 4px 9px;
 		cursor: pointer;
 		white-space: nowrap;
+		transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
 	}
 	.band-btn:hover {
 		color: var(--text);
-		background: var(--panel);
+		background: var(--panel-4);
+		border-color: var(--line-strong);
 	}
-	/* "Unfold to context" — the primary, warm/amber action (the only one that changes the
-	   wire). Filled so it clearly outranks Collapse/Delete. */
+	/* "Unfold to context" — warm amber primary (the ONLY wire-changing action in peek mode).
+	   Keep the --group-accent family; do NOT recolor to accent-blue. */
 	.band-btn.primary {
-		background: var(--group-accent);
-		border-color: color-mix(in srgb, var(--group-accent) 70%, #000);
-		color: #1a0f06;
-		font-weight: 700;
+		background: color-mix(in srgb, var(--group-accent) 22%, var(--panel-3));
+		border-color: color-mix(in srgb, var(--group-accent) 55%, transparent);
+		color: var(--group-accent);
+		font-weight: 600;
 	}
 	.band-btn.primary:hover {
-		background: var(--group-accent);
-		filter: brightness(1.08);
-		color: #1a0f06;
+		background: color-mix(in srgb, var(--group-accent) 32%, var(--panel-3));
+		border-color: var(--group-accent);
+		color: var(--group-accent-light);
 	}
 	/* Delete is tertiary in the peek row — quieter until hovered. */
 	.band-btn.tertiary {
-		opacity: 0.7;
+		opacity: 0.65;
 	}
 	.band-btn.tertiary:hover {
 		opacity: 1;
 	}
 	.band-btn.danger:hover {
-		color: #f87171;
-		border-color: #f87171;
-		background: var(--panel-3);
+		color: var(--danger);
+		border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+		background: color-mix(in srgb, var(--danger) 10%, var(--panel-3));
 	}
 
 	/* ---- ghost tiles: third visual state — "forming" ----
@@ -1212,45 +1339,46 @@
 		display: grid;
 		grid-template-columns: 112px minmax(0, 1fr);
 		align-items: center;
-		gap: 12px;
+		gap: var(--sp-3);
 		margin-bottom: 5px;
 	}
 	.gutter {
 		display: grid;
-		grid-template-columns: 34px 1fr;
+		grid-template-columns: 36px 1fr;
 		align-items: center;
-		gap: 6px 8px;
+		gap: 4px 8px;
 		grid-template-areas: "label bar" "label tok";
 	}
 	.ul {
 		grid-area: label;
-		font-size: 13px;
-		font-weight: 700;
+		font-size: var(--fs-sm);
+		font-weight: 600;
 		color: var(--text);
 	}
 	.sizebar {
 		grid-area: bar;
-		height: 4px;
+		height: 3px;
 		background: var(--panel-3);
-		border-radius: 999px;
+		border-radius: var(--radius-pill);
 		overflow: hidden;
 	}
 	.sizebar i {
 		display: block;
 		height: 100%;
 		background: var(--faint);
-		border-radius: 999px;
+		border-radius: var(--radius-pill);
 	}
 	.uk {
 		grid-area: tok;
-		font-size: 10px;
+		font-size: var(--fs-xs);
+		font-variant-numeric: tabular-nums;
 		color: var(--muted);
 	}
 	.ribbon {
 		display: flex;
 		height: 26px;
 		min-width: 3px;
-		border-radius: 4px;
+		border-radius: var(--radius-sm);
 		overflow: hidden;
 		background: var(--panel-2);
 		box-shadow: inset 0 0 0 1px var(--line-soft);

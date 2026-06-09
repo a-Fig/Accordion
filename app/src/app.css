@@ -3,42 +3,68 @@
  * so its colors are first-class tokens used by every component. */
 
 :root {
-	--bg: #0e1014;
-	--panel: #15181f;
-	--panel-2: #1a1e27;
-	--panel-3: #20252f;
-	--line: #2a3040;
-	--line-soft: #21262f;
+	/* ===== Surfaces — refined cool-dark elevation ladder ===== */
+	--bg: #0b0d12;
+	--panel: #14171f;
+	--panel-2: #1a1e28;
+	--panel-3: #232834;
+	--panel-4: #2c3340;        /* NEW: active/highest control */
+	--line: #2c3342;
+	--line-soft: #20252f;
+	--line-strong: #3a4252;    /* NEW: emphasized border */
 
-	--text: #e7eaf0;
-	--muted: #8a92a3;
-	--faint: #5b6273;
+	--text: #eef1f6;
+	--muted: #9aa3b4;          /* bumped for AA contrast on panels */
+	--faint: #828b9e;          /* AA-compliant on panel-2 */
 
 	--accent: #6ea8fe;
+	--accent-hover: #8bbcff;   /* NEW */
 	--accent-dim: #2d4a7a;
+	--accent-soft: rgba(110, 168, 254, 0.14); /* NEW: tint fills */
 	--danger: #ff6b6b;
 	--ok: #46d39a;
 	--warn: #f0b450;
 
-	/* block kinds — the spine of the whole visualization */
+	/* block kinds — DO NOT CHANGE (visual-grammar contract) */
 	--k-user: #6ea8fe;
 	--k-text: #aab2c2;
 	--k-thinking: #b483e0;
 	--k-tool_call: #34d3c2;
 	--k-tool_result: #f0a35e;
 
-	/* multiblock folds (groups) — a warm "folder" family, deliberately NOT a block
-	 * kind color so a group reads as a different KIND of object. Dark brown body,
-	 * lighter brown edge, amber for the "building / act on it" affordances. */
-	--group: #6f4a32;          /* COLLAPSED parent tile fill — warm dark brown */
-	--group-edge: #9c6b43;     /* parent tile inset ring — lighter warm brown */
-	--group-accent: #d39455;   /* amber — creation ring, counter chip, "Unfold to context" primary, open-row left edge */
-	--group-band: rgba(211, 148, 85, 0.07); /* open-row faint warm tint background */
+	/* multiblock folds (groups) — DO NOT CHANGE */
+	--group: #6f4a32;
+	--group-edge: #9c6b43;
+	--group-accent: #d39455;
+	--group-band: rgba(211, 148, 85, 0.07);
+	--group-ink: #1a0f06;           /* dark text on amber group button */
+	--group-accent-light: #ffda9e;  /* hover tint for amber group button */
 
-	--radius: 9px;
+	/* ===== Radii ===== */
+	--radius: 10px;
 	--radius-sm: 6px;
-	--mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
-	--sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+	--radius-lg: 14px;         /* NEW */
+	--radius-pill: 999px;      /* NEW */
+
+	/* ===== Spacing 4/8 rhythm (NEW) ===== */
+	--sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px;
+	--sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
+
+	/* ===== Type scale (NEW) ===== */
+	--fs-xs: 11px; --fs-sm: 12px; --fs-base: 13px;
+	--fs-md: 14px; --fs-lg: 16px; --fs-xl: 19px; --fs-2xl: 24px;
+
+	/* ===== Elevation — consistent, dark-tuned (NEW) ===== */
+	--shadow-1: 0 1px 2px rgba(0,0,0,.4);
+	--shadow-2: 0 4px 12px rgba(0,0,0,.45), 0 1px 2px rgba(0,0,0,.4);
+	--shadow-3: 0 12px 32px rgba(0,0,0,.5), 0 2px 8px rgba(0,0,0,.4);
+
+	/* ===== Focus ring (NEW — accessibility) ===== */
+	--focus: #8bbcff;
+	--focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px var(--focus);
+
+	--mono: "JetBrains Mono Variable", ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+	--sans: "Inter Variable", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 
 	--dur-fast: 120ms;
 	--dur-mid: 200ms;
@@ -66,7 +92,9 @@ body {
 	font-size: 14px;
 	line-height: 1.45;
 	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
 	text-rendering: optimizeLegibility;
+	font-feature-settings: "cv01","ss01";
 	overflow: hidden; /* the app manages its own scroll regions */
 }
 
@@ -99,6 +127,18 @@ button {
 .mono {
 	font-family: var(--mono);
 	font-variant-numeric: tabular-nums;
+}
+
+/* tabular-nums utility */
+.tnum {
+	font-variant-numeric: tabular-nums;
+}
+
+/* accessible focus ring — zero specificity so components can override per-element radius */
+:where(button, a, input, select, textarea, [tabindex]):focus-visible {
+	outline: none;
+	box-shadow: var(--focus-ring);
+	border-radius: var(--radius-sm);
 }
 
 @media (prefers-reduced-motion: reduce) {
