@@ -100,6 +100,32 @@
 	let dpr = 1;
 	let ro: ResizeObserver | null = null;
 
+	// DPR-change watcher — handles browser zoom / display migration without a CSS resize.
+	// We keep a reference to the active mql + its handler so onDestroy can clean up,
+	// and so setupDprWatch() can remove the previous listener before re-arming (exactly
+	// one active listener at any time — no leak on repeated re-arms).
+	let dprMql: MediaQueryList | null = null;
+	let dprMqlHandler: (() => void) | null = null;
+
+	function setupDprWatch() {
+		// Remove previous listener before creating the new one.
+		if (dprMql !== null && dprMqlHandler !== null) {
+			dprMql.removeEventListener("change", dprMqlHandler);
+		}
+		const mql = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+		const handler = () => {
+			// devicePixelRatio has changed — rebuild the backing store + sprites.
+			resizeCanvas();
+			scheduleRedraw();
+			// Re-arm for the *new* dpr value (a resolution query only fires for its
+			// specific dppx, so we must create a fresh one for each new value).
+			setupDprWatch();
+		};
+		mql.addEventListener("change", handler);
+		dprMql = mql;
+		dprMqlHandler = handler;
+	}
+
 	// ---------------------------------------------------------------------------
 	// Derived geometry
 	// ---------------------------------------------------------------------------
@@ -208,8 +234,10 @@
 
 		const g = geo;
 
-		// Clear entire canvas
-		ctx.clearRect(0, 0, canvas.width, canvas.height);
+		// Clear in CSS px — ctx.setTransform(dpr,0,0,dpr,0,0) means all draw/clear
+		// coords are CSS px, NOT physical px.  canvas.width/height are physical, so
+		// using them here would over-clear at dpr>1 and under-clear at dpr<1.
+		ctx.clearRect(0, 0, g.canvasWidth, Math.max(1, g.canvasHeight));
 
 		for (let i = 0; i < specs.length; i++) {
 			drawOneTile(ctx, i, g);
@@ -435,11 +463,22 @@
 			ro.observe(canvas.parentElement);
 			containerWidth = canvas.parentElement.clientWidth;
 		}
+
+		// Watch for DPR changes that don't change CSS geometry (browser zoom, display
+		// migration).  resizeCanvas() reads window.devicePixelRatio fresh, so routing
+		// through it is sufficient — no separate dpr update needed here.
+		setupDprWatch();
 	});
 
 	onDestroy(() => {
 		ro?.disconnect();
 		stopGhostLoop();
+		// Detach the active DPR listener to prevent it firing after unmount.
+		if (dprMql !== null && dprMqlHandler !== null) {
+			dprMql.removeEventListener("change", dprMqlHandler);
+			dprMql = null;
+			dprMqlHandler = null;
+		}
 	});
 
 	// Whenever geo or canvas changes, resize the canvas backing store.

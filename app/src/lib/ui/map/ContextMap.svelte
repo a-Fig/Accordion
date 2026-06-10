@@ -628,6 +628,17 @@
 		for (const ref of Object.values(canvasRefs)) {
 			if (ref) centers.push(...ref.allTileCenters());
 		}
+		// Also include open-group band member tiles (DOM .cell[data-id] — canvas tiles have
+		// no data-id, so there is no overlap). getBoundingClientRect() returns client coords,
+		// the same space allTileCenters() uses (canvasRect.left + x).
+		if (stage) {
+			for (const el of stage.querySelectorAll<HTMLElement>("[data-id]")) {
+				const id = el.dataset.id;
+				if (!id) continue;
+				const r = el.getBoundingClientRect();
+				centers.push({ id, cx: r.left + r.width / 2, cy: r.top + r.height / 2 });
+			}
+		}
 		const cur = centers.find((c) => c.id === selectedId);
 		if (!cur) return "nocenter";
 		// Half a row's worth of vertical slack defines "a different row" and "same row".
@@ -868,6 +879,7 @@
 						</div>
 					</section>
 				{/if}
+				{#if protSpecs.length}
 				<section class="box prot">
 					<div class="rail" title="{protTok.toLocaleString()} tokens · protected working tail">
 						<span class="tok"><AnimatedNumber value={protTok} format={k} /></span>
@@ -888,6 +900,7 @@
 						/>
 					</div>
 				</section>
+				{/if}
 			</div>
 		{:else}
 			<!-- TRANSCRIPT: the concretion. Blocks in conversation order, full text when live,
