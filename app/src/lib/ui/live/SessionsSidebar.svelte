@@ -154,18 +154,6 @@
 			</span>
 			<span class="wordmark">Accordion</span>
 
-			<!-- Segmented source switcher -->
-			<SegControl
-				options={[
-					{ id: "pi", label: "pi", icon: "terminal" },
-					{ id: "claude", label: "Claude Code", icon: "message-square" },
-				]}
-				value={source}
-				onchange={(v) => onsource(v as "pi" | "claude")}
-				ariaLabel="Session source"
-				iconSize={11}
-			/>
-
 			<span class="count tnum" aria-label="{activeCount} sessions">{activeCount}</span>
 
 			<button
@@ -176,6 +164,21 @@
 			>
 				<Icon name="chevrons-left" size={14} />
 			</button>
+		</div>
+
+		<!-- Source switcher on its own row so the header stays slim and the collapse
+		     button is never clipped in the narrow (232px) rail. -->
+		<div class="source-row">
+			<SegControl
+				options={[
+					{ id: "pi", label: "pi", icon: "terminal" },
+					{ id: "claude", label: "Claude Code", icon: "message-square" },
+				]}
+				value={source}
+				onchange={(v) => onsource(v as "pi" | "claude")}
+				ariaLabel="Session source"
+				iconSize={11}
+			/>
 		</div>
 
 		{#if source === "pi"}
@@ -369,6 +372,14 @@
 		align-items: center;
 		gap: var(--sp-2);
 		padding: 10px var(--sp-3);
+		border-bottom: 1px solid var(--line);
+		flex: 0 0 auto;
+	}
+	/* Source switcher gets its own row beneath the header (keeps the collapse
+	   button in the header from being pushed out of the 232px rail). */
+	.source-row {
+		display: flex;
+		padding: var(--sp-2) var(--sp-3);
 		border-bottom: 1px solid var(--line);
 		flex: 0 0 auto;
 	}
