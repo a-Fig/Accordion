@@ -209,5 +209,4 @@ Environment gotchas (Windows, this repo's usual setup):
 ## Working style
 
 Be candid — no undue praise, no overselling. The owner reviews by screenshot and
-makes the design calls; surface tradeoffs plainly and let them decide. Only commit /
-push when explicitly asked.
+makes the design calls; surface tradeoffs plainly and let them decide.
