@@ -385,6 +385,33 @@
 		);
 	}
 
+	/**
+	 * Client-space centers of every real (non-vacated, non-ghost) tile in this
+	 * segment. One getBoundingClientRect for the canvas + analytic per-tile math,
+	 * so it's cheap to call across all segments on a keypress. Used by the
+	 * integrator for geometry-aware vertical (↑/↓) arrow navigation, which must
+	 * cross independent grids (older box / bands / protected tail) by screen
+	 * position rather than by a flat index step.
+	 */
+	export function allTileCenters(): { id: string; cx: number; cy: number }[] {
+		if (!canvas) return [];
+		const canvasRect = canvas.getBoundingClientRect();
+		const g = geo;
+		const out: { id: string; cx: number; cy: number }[] = [];
+		for (let i = 0; i < specs.length; i++) {
+			const s = specs[i];
+			if (!s.id || s.kind === "vacated" || s.kind === "ghost") continue;
+			const r = tileRectCss(i, g);
+			if (!r) continue;
+			out.push({
+				id: s.id,
+				cx: canvasRect.left + r.x + r.w / 2,
+				cy: canvasRect.top + r.y + r.h / 2,
+			});
+		}
+		return out;
+	}
+
 	// ---------------------------------------------------------------------------
 	// Effects
 	// ---------------------------------------------------------------------------

@@ -222,7 +222,11 @@
 	// protected canvas) so stale/removed segments never leave dangling positional refs.
 	// Svelte 5 sets bind:this=undefined on component destroy, so after unmount each key
 	// holds undefined — the guards in scrollIdIntoView and onScroll skip those safely.
-	type CanvasInstance = { tileClientRect: (id: string) => DOMRect | null; clearHover: () => void };
+	type CanvasInstance = {
+		tileClientRect: (id: string) => DOMRect | null;
+		clearHover: () => void;
+		allTileCenters: () => { id: string; cx: number; cy: number }[];
+	};
 	let canvasRefs = $state<Record<string, CanvasInstance | undefined>>({});
 
 	// ---- single- vs double-click disambiguation -------------------------------
@@ -604,10 +608,64 @@
 		if (b.id !== selectedId) onselect(b.id);
 		scrollIdIntoView(b.id);
 	}
+	/**
+	 * Geometry-aware vertical (↑/↓) move. The grid is NOT one uniform matrix — it is
+	 * split into independent sub-grids (the older box, which open-group bands split
+	 * further, and the protected tail, which also starts with `vacated` placeholder
+	 * cells that shift its columns). A flat "± cols" step therefore lands in the wrong
+	 * column at every boundary — most visibly at the protected/unprotected seam. So we
+	 * pick the tile that is visually above/below using rendered client positions.
+	 *
+	 * Returns:
+	 *   "moved"    — selected the tile above/below; caller is done.
+	 *   "edge"     — current tile has no neighbour in that direction; stay put.
+	 *   "nocenter" — current selection has no canvas tile (e.g. an open-group band
+	 *                member) or nothing is selected; caller falls back to linear nav.
+	 */
+	function tryVerticalNav(down: boolean): "moved" | "edge" | "nocenter" {
+		if (view !== "map" || !selectedId) return "nocenter";
+		const centers: { id: string; cx: number; cy: number }[] = [];
+		for (const ref of Object.values(canvasRefs)) {
+			if (ref) centers.push(...ref.allTileCenters());
+		}
+		const cur = centers.find((c) => c.id === selectedId);
+		if (!cur) return "nocenter";
+		// Half a row's worth of vertical slack defines "a different row" and "same row".
+		const slack = (cell + GAP) * 0.5;
+		// Nearest row in the target direction (handles arbitrary box gaps / partial rows).
+		let rowY = down ? Infinity : -Infinity;
+		for (const c of centers) {
+			const dy = c.cy - cur.cy;
+			if (down ? dy > slack : dy < -slack) {
+				if (down ? c.cy < rowY : c.cy > rowY) rowY = c.cy;
+			}
+		}
+		if (!isFinite(rowY)) return "edge";
+		// Within that row, the tile nearest the current column.
+		let best: { id: string; cx: number; cy: number } | null = null;
+		let bestDx = Infinity;
+		for (const c of centers) {
+			if (Math.abs(c.cy - rowY) > slack) continue;
+			const dx = Math.abs(c.cx - cur.cx);
+			if (dx < bestDx) {
+				bestDx = dx;
+				best = c;
+			}
+		}
+		if (!best) return "edge";
+		if (best.id !== selectedId) onselect(best.id);
+		scrollIdIntoView(best.id);
+		return "moved";
+	}
 	function onKey(e: KeyboardEvent) {
 		const key = e.key;
 		if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "ArrowUp" && key !== "ArrowDown") return;
 		e.preventDefault();
+		if (key === "ArrowUp" || key === "ArrowDown") {
+			const r = tryVerticalNav(key === "ArrowDown");
+			// "moved"/"edge" are terminal; "nocenter" falls through to linear nav below.
+			if (r === "moved" || r === "edge") return;
+		}
 		const order = navOrder;
 		if (!order.length) return;
 		// Map the current selection to a position in `order`. A selection sitting on a hidden
