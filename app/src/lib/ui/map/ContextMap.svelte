@@ -628,12 +628,18 @@
 		for (const ref of Object.values(canvasRefs)) {
 			if (ref) centers.push(...ref.allTileCenters());
 		}
-		// Also include open-group band member tiles (DOM .cell[data-id] — canvas tiles have
-		// no data-id, so there is no overlap). getBoundingClientRect() returns client coords,
-		// the same space allTileCenters() uses (canvasRect.left + x).
+		// Also include the DOM tiles of OPEN groups (canvas tiles have no data-* attrs, so
+		// there is no overlap): the band MEMBER tiles (`.group-band [data-id]` = block id)
+		// AND the visible open-group PARENT tile (`.group-tile-open[data-group]` = group id,
+		// a selectable stop when selectedId is the group id). We target `.group-tile-open`
+		// specifically, NOT plain `[data-group]`, so we don't grab the outer `.group-band`
+		// wrapper (its rect is the whole band, not the parent tile). getBoundingClientRect()
+		// returns client coords, the same space allTileCenters() uses (canvasRect.left + x).
 		if (stage) {
-			for (const el of stage.querySelectorAll<HTMLElement>("[data-id]")) {
-				const id = el.dataset.id;
+			for (const el of stage.querySelectorAll<HTMLElement>(
+				".group-band [data-id], .group-tile-open[data-group]",
+			)) {
+				const id = el.dataset.id ?? el.dataset.group;
 				if (!id) continue;
 				const r = el.getBoundingClientRect();
 				centers.push({ id, cx: r.left + r.width / 2, cy: r.top + r.height / 2 });
