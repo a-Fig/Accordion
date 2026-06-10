@@ -2,12 +2,16 @@
 	import { untrack, onDestroy } from "svelte";
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block, Group } from "../../engine/types";
-	import { ghosts, type Ghost } from "../../live/ghostState.svelte";
+	import type { BlockKind } from "../../engine/types";
+	import { ghosts } from "../../live/ghostState.svelte";
 	import { nextVacated } from "./drain";
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 	import { buildDisplay, segmentDisplay, type DisplayRow } from "$lib/engine/display";
 	import Icon from "$lib/ui/Icon.svelte";
 	import SegControl from "$lib/ui/SegControl.svelte";
+	import TileCanvas from "./TileCanvas.svelte";
+	import type { TileSpec } from "./tileDraw";
+	import { faceFor as faceForLib } from "./tileDraw";
 
 	let {
 		store,
@@ -42,9 +46,8 @@
 		{ f: 5, lbl: "up to 15k tok" },
 		{ f: 6, lbl: "past 15k tok" },
 	] as const;
-	function faceFor(tok: number): number {
-		return tok > 15000 ? 6 : tok > 5000 ? 5 : tok > 1500 ? 4 : tok > 500 ? 3 : tok > 100 ? 2 : 1;
-	}
+	// Use the canonical faceFor from tileDraw (single source of truth).
+	const faceFor = faceForLib;
 	// Legend hover: reveal a face's token range the instant the cursor crosses a die
 	// (pointerenter per die — no native-title delay), so values surface even mid-move.
 	let hoveredFace = $state<number | null>(null);
@@ -95,6 +98,87 @@
 	// multi-line band gets natural height instead of overflowing one fixed-height grid track.
 	const segments = $derived(segmentDisplay(displayRows));
 
+	// ---- TileSpec arrays for each canvas segment (reactive, $derived) -----------
+	// Each change to selectedId / rangeSet / fold state / blocks produces new spec
+	// arrays → the canvases redraw once. This is the performance win.
+
+	/** Build specs for a "tiles" segment (collapsed groups + plain blocks). */
+	function buildTilesSpecs(rows: DisplayRow[]): TileSpec[] {
+		const out: TileSpec[] = [];
+		for (const row of rows) {
+			if (row.type === "block") {
+				const b = row.block;
+				out.push({
+					id: b.id,
+					kind: b.kind,
+					face: faceFor(b.tokens),
+					folded: store.isFolded(b),
+					pinned: b.override === "pinned",
+					selected: b.id === selectedId,
+					inrange: rangeSet.has(b.id),
+				});
+			} else {
+				// collapsed group tile
+				const g = row.group;
+				out.push({
+					id: g.id,
+					kind: "group",
+					face: faceFor(store.groupLiveTokens(g)),
+					folded: false,
+					pinned: false,
+					selected: selectedId === g.id,
+					inrange: false,
+				});
+			}
+		}
+		return out;
+	}
+
+	// One spec array per "tiles" segment in the older box, derived reactively.
+	// We access `selectedId` and `rangeSet` and store fold state so changes
+	// automatically trigger a redraw.
+	const olderSegmentSpecs = $derived.by<TileSpec[][]>(() => {
+		return segments.map((seg) => {
+			if (seg.kind !== "tiles") return [] as TileSpec[];
+			return buildTilesSpecs(seg.rows);
+		});
+	});
+
+	// Spec array for the protected box (vacated + protected tiles + ghosts).
+	const protSpecs = $derived.by<TileSpec[]>(() => {
+		const out: TileSpec[] = [];
+		// vacated placeholder cells
+		for (let i = 0; i < vacated; i++) {
+			out.push({ id: "", kind: "vacated", face: 1, folded: false, pinned: false, selected: false, inrange: false });
+		}
+		// protected tiles
+		for (const { b } of protectedTiles) {
+			out.push({
+				id: b.id,
+				kind: b.kind,
+				face: faceFor(b.tokens),
+				folded: store.isFolded(b),
+				pinned: b.override === "pinned",
+				selected: b.id === selectedId,
+				inrange: false, // protected tiles can't be in a range
+			});
+		}
+		// ghost tiles
+		for (const g of ghosts) {
+			out.push({
+				id: "",
+				kind: "ghost",
+				face: 1,
+				folded: false,
+				pinned: false,
+				selected: false,
+				inrange: false,
+				colorKind: g.kind as BlockKind,
+			});
+		}
+		return out;
+	});
+
 	let stage = $state<HTMLDivElement>();
 	let cell = $state(20);
 	let cols = $state(40);
@@ -108,25 +192,38 @@
 	// everything) do we reclaim the space — so the tiles move once per row, not on
 	// every single departure. `vacated` is the number of leading placeholder cells.
 	let vacated = $state(0);
-	const vacatedCells = $derived(Array.from({ length: vacated }, (_, i) => i));
 	let _prevBoundary = 0;
 	let _prevCols = 0;
 	let _prevStore: AccordionStore | null = null;
 	let _prevProtect = -1;
 
-	// ---- scroll smoothness: while the stage is actively scrolling, suppress
-	//      per-tile :hover. Otherwise ~1k tiles sliding under a STATIONARY cursor
-	//      each fire :hover in/out → a repaint per tile per frame (a repaint storm
-	//      that has nothing to do with the user actually hovering). We flip the
-	//      grid to pointer-events:none during scroll, then restore ~140ms after it
-	//      settles — so scrolling is pure layer compositing, no paint.
-	let scrolling = $state(false);
-	let scrollTimer: ReturnType<typeof setTimeout> | undefined;
+	// ---- scroll smoothness -------------------------------------------------------
+	// On scroll, clear the canvas hover state and tooltip immediately so the
+	// tooltip doesn't freeze pointing at stale content (no pointermove fires
+	// during a wheel-scroll while hovering).
 	function onScroll() {
-		if (!scrolling) scrolling = true;
-		clearTimeout(scrollTimer);
-		scrollTimer = setTimeout(() => (scrolling = false), 140);
+		tooltip = null;
+		for (const ref of Object.values(canvasRefs)) {
+			ref?.clearHover();
+		}
 	}
+
+	// ---- custom tooltip (replaces native title on canvas tiles) -----------------
+	// Canvas tiles can't carry per-tile `title` attributes. We show a lightweight
+	// absolutely-positioned tooltip div at the tile's clientRect, built from the same
+	// tip()/groupTip() strings as the old DOM tiles.
+	type TooltipInfo = { text: string; rect: DOMRect };
+	let tooltip = $state<TooltipInfo | null>(null);
+
+	// ---- TileCanvas refs for arrow-key scroll -----------------------------------
+	// We need tileClientRect(id) from each canvas to scroll the focused tile into view.
+	// The older box has one canvas per "tiles" segment; the prot box has one canvas.
+	// Keyed by stable string key (segment index string for older segments, "prot" for the
+	// protected canvas) so stale/removed segments never leave dangling positional refs.
+	// Svelte 5 sets bind:this=undefined on component destroy, so after unmount each key
+	// holds undefined — the guards in scrollIdIntoView and onScroll skip those safely.
+	type CanvasInstance = { tileClientRect: (id: string) => DOMRect | null; clearHover: () => void };
+	let canvasRefs = $state<Record<string, CanvasInstance | undefined>>({});
 
 	// ---- single- vs double-click disambiguation -------------------------------
 	// A plain click INSPECTS (opens the panel); a double-click FOLDS. The browser
@@ -151,7 +248,6 @@
 		}, DBL_GUARD);
 	}
 	onDestroy(() => {
-		clearTimeout(scrollTimer);
 		clearPendingClick();
 	});
 
@@ -295,17 +391,13 @@
 	});
 
 	// ---- hit-testing helpers --------------------------------------------------
+	// The canvas tiles are resolved before reaching these handlers (TileCanvas fires
+	// onhit/ondbl with the resolved id/kind). The open-group BANDS still use DOM .cell
+	// elements (only a handful), so we keep DOM resolveHit for those.
+	//
 	// A member tile (data-id) nested inside a group band (data-group) must take
 	// precedence over the enclosing band so clicks on members 2..N are reachable.
-	// The parent group tile itself has data-group but NO data-id (it renders with
-	// only `data-group={g.id}`), so it still routes to the group handler.
-	//
-	// Resolution: find both candidates from the click target, then apply:
-	//   • data-id found AND (no data-group, OR data-group contains the data-id el)
-	//     → it's a block click (the data-id is the more specific / deeper element).
-	//   • Otherwise, data-group found → it's a group click.
-	//
-	// Returns { kind: "block", id } | { kind: "group", gid } | { kind: "none" }.
+	// The parent group tile itself has data-group but NO data-id.
 	type HitResult =
 		| { kind: "block"; id: string }
 		| { kind: "group"; gid: string }
@@ -314,12 +406,6 @@
 		const t = e.target as HTMLElement;
 		const idEl = t.closest<HTMLElement>("[data-id]");
 		const groupEl = t.closest<HTMLElement>("[data-group]");
-		// A block click: a data-id element exists and is either outside any group
-		// container, or is INSIDE one (groupEl.contains(idEl) — the data-id is the
-		// more-specific descendant). The open band carries data-group, so a member
-		// tile's data-id sits inside it; the contains() check is what lets the member
-		// win over the band. A click on the band background (no data-id) falls through
-		// to the group below → toggle peek / collapse, never a dead no-op.
 		const isBlockClick = !!idEl && (!groupEl || groupEl.contains(idEl));
 		if (isBlockClick && idEl!.dataset.id) return { kind: "block", id: idEl!.dataset.id };
 		if (groupEl?.dataset.group) return { kind: "group", gid: groupEl.dataset.group };
@@ -336,49 +422,23 @@
 		leavePeek(gid);
 	}
 
-	function onClick(e: MouseEvent) {
-		// A 2nd+ click in a double/triple sequence: cancel the pending single-click inspect
-		// and let onDbl handle the fold. Fires the instant the 2nd click lands, so a fold
-		// never flashes the panel even if the clicks are slower than DBL_GUARD.
-		if (e.detail > 1) {
-			clearPendingClick();
-			return;
-		}
-		const hit = resolveHit(e);
+	// ---- Shared click logic (used by both canvas callbacks and DOM band handlers) ----
 
-		if (hit.kind === "group") {
-			const gid = hit.gid;
-			// During an active range-select, a group tile is not a valid range target (groups
-			// can't nest or overlap), so shift-clicking one must NOT hijack the gesture — ignore
-			// it and let the user pick a plain block to close the range.
-			if (e.shiftKey && rangeAnchorId) return;
-			// Defer the select+peek so a double-click (which COLLAPSES the group) doesn't flash
-			// the Inspector / a peek-open first.
-			deferClick(() => {
-				const grp = store.groupById(gid);
-				// Select the GROUP id so the Inspector shows group mode. Call unconditionally so the
-				// parent's toggle (selectedId === id ? null : id) can DESELECT on a re-click — matching
-				// block behavior; the togglePeek below keeps the peek band in sync per click.
-				// Length guard: createGroup enforces >= 2 members, so an empty group is an invariant
-				// violation — but read defensively so a bad state never sets selection to undefined.
-				if (grp && grp.memberIds.length > 0) onselect(gid);
-				// A FOLDED parent tile toggles PEEK (open-for-viewing, wire UNCHANGED). An UNFOLDED
-				// group's dull parent already shows its state in the Inspector, so a plain
-				// click there only selects it — peek on folded groups is preserved.
-				if (grp?.folded) togglePeek(gid);
-			});
-			return;
-		}
+	function handleGroupClick(gid: string, shiftKey: boolean) {
+		// During an active range-select, a group tile is not a valid range target — ignore.
+		if (shiftKey && rangeAnchorId) return;
+		deferClick(() => {
+			const grp = store.groupById(gid);
+			if (grp && grp.memberIds.length > 0) onselect(gid);
+			if (grp?.folded) togglePeek(gid);
+		});
+	}
 
-		if (hit.kind !== "block") return;
-		const id = hit.id;
+	function handleBlockClick(id: string, shiftKey: boolean) {
 		const bl = store.get(id);
-
-		// Range-select → groups is a map-only gesture; in transcript a click only inspects.
-		if (view === "map" && e.shiftKey && rangeAnchorId) {
-			clearPendingClick(); // a deliberate range gesture — act now, drop any pending inspect
-			// Extend the range — but only to a groupable block. A protected-tail block, or one
-			// already in a group, can't complete a valid range; hint instead of a phantom span.
+		// Range-select is a map-only gesture.
+		if (view === "map" && shiftKey && rangeAnchorId) {
+			clearPendingClick();
 			if (!bl || store.isProtected(bl) || store.groupOf(bl)) {
 				groupErr = true;
 				return;
@@ -387,10 +447,6 @@
 			groupErr = false;
 			return;
 		}
-
-		// Plain click on a block: inspect, and (map only) anchor a range if this block could
-		// actually start one (older + ungrouped). DEFERRED so a double-click folds the block
-		// without opening the side panel first.
 		deferClick(() => {
 			onselect(id);
 			rangeAnchorId = view === "map" && bl && !store.isProtected(bl) && !store.groupOf(bl) ? id : null;
@@ -399,16 +455,79 @@
 		});
 	}
 
-	function onDbl(e: MouseEvent) {
-		clearPendingClick(); // cancel the pending single-click inspect/peek — this is a fold
-		const hit = resolveHit(e);
-		if (hit.kind === "group") {
-			// Double-click a parent (collapsed / peek / unfolded) → COLLAPSE. Never unfolds —
-			// going live is deliberate via the "Unfold to context" button only.
-			collapseGroup(hit.gid);
+	// ---- Canvas callbacks -------------------------------------------------------
+
+	function onCanvasHit(
+		e: { id: string; kind: TileSpec["kind"]; shiftKey: boolean; index: number },
+		_ev: MouseEvent,
+	) {
+		if (e.kind === "group") {
+			handleGroupClick(e.id, e.shiftKey);
+		} else {
+			handleBlockClick(e.id, e.shiftKey);
+		}
+	}
+
+	function onCanvasDbl(
+		e: { id: string; kind: TileSpec["kind"]; shiftKey: boolean; index: number },
+		_ev: MouseEvent,
+	) {
+		clearPendingClick();
+		if (e.kind === "group") {
+			collapseGroup(e.id);
+		} else {
+			store.toggle(e.id);
+		}
+	}
+
+	function onCanvasHover(ev: { spec: TileSpec; clientRect: DOMRect } | null) {
+		if (!ev) {
+			tooltip = null;
 			return;
 		}
-		if (hit.kind === "block") store.toggle(hit.id);
+		const { spec, clientRect } = ev;
+		if (spec.kind === "vacated" || spec.kind === "ghost") {
+			tooltip = null;
+			return;
+		}
+		let text: string;
+		if (spec.kind === "group") {
+			const g = store.groupById(spec.id);
+			text = g ? groupTip(g) : spec.id;
+		} else {
+			const b = store.get(spec.id);
+			if (!b) { tooltip = null; return; }
+			const prot = store.isProtected(b);
+			text = tip(b, prot);
+		}
+		tooltip = { text, rect: clientRect };
+	}
+
+	// ---- DOM event handlers (stage level — for open-group bands and transcript) ----
+
+	function onClick(e: MouseEvent) {
+		// A 2nd+ click in a double/triple sequence: cancel the pending single-click inspect
+		// and let onDbl handle the fold. Fires the instant the 2nd click lands.
+		if (e.detail > 1) {
+			clearPendingClick();
+			return;
+		}
+		const hit = resolveHit(e);
+		if (hit.kind === "group") {
+			handleGroupClick(hit.gid, e.shiftKey);
+		} else if (hit.kind === "block") {
+			handleBlockClick(hit.id, e.shiftKey);
+		}
+	}
+
+	function onDbl(e: MouseEvent) {
+		clearPendingClick();
+		const hit = resolveHit(e);
+		if (hit.kind === "group") {
+			collapseGroup(hit.gid);
+		} else if (hit.kind === "block") {
+			store.toggle(hit.id);
+		}
 	}
 
 	function onKeydown(e: KeyboardEvent) {
@@ -447,21 +566,43 @@
 		}
 		return out;
 	});
+	function scrollIdIntoView(id: string) {
+		if (!stage) return;
+		// Search all TileCanvas instances for a tile with this id.
+		for (const ref of Object.values(canvasRefs)) {
+			if (!ref) continue;
+			const rect = ref.tileClientRect(id);
+			if (rect) {
+				const stageRect = stage.getBoundingClientRect();
+				const relTop = rect.top - stageRect.top + stage.scrollTop;
+				const relBot = relTop + rect.height;
+				const visTop = stage.scrollTop;
+				const visBot = stage.scrollTop + stage.clientHeight;
+				if (relTop < visTop) {
+					stage.scrollTop = relTop - 8;
+				} else if (relBot > visBot) {
+					stage.scrollTop = relBot - stage.clientHeight + 8;
+				}
+				return;
+			}
+		}
+		// Fallback: open-group band members are still DOM nodes.
+		const esc = id.replace(/"/g, '\\"');
+		stage?.querySelector<HTMLElement>(`[data-id="${esc}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+		stage?.querySelector<HTMLElement>(`[data-group="${esc}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+	}
+
 	function focusStop(blockIdx: number) {
 		const b = store.blocks[blockIdx];
 		if (!b) return;
 		const g = collapsedGroupOf(b);
 		if (g) {
-			// Select the GROUP id so the Inspector shows group mode, and scroll the
-			// folded-group tile (carries data-group, not data-id).
 			if (g.id !== selectedId) onselect(g.id);
-			const esc = g.id.replace(/"/g, '\\"');
-			stage?.querySelector<HTMLElement>(`[data-group="${esc}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+			scrollIdIntoView(g.id);
 			return;
 		}
 		if (b.id !== selectedId) onselect(b.id);
-		const esc = b.id.replace(/"/g, '\\"');
-		stage?.querySelector<HTMLElement>(`[data-id="${esc}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+		scrollIdIntoView(b.id);
 	}
 	function onKey(e: KeyboardEvent) {
 		const key = e.key;
@@ -601,7 +742,6 @@
 		class="stage"
 		class:isgrid={view === "map"}
 		class:istranscript={view === "transcript"}
-		class:scrolling
 		bind:this={stage}
 		role="toolbar"
 		tabindex="0"
@@ -612,15 +752,9 @@
 		onscroll={onScroll}
 	>
 		{#if view === "map"}
-			{#snippet ghostTile(g: Ghost)}
-				<div
-					class="cell ghost k-{g.kind}"
-					title="{g.kind} · forming…"
-				></div>
-			{/snippet}
 			{#snippet tile(t: { b: Block; face: number }, prot: boolean, forceFold = false)}
-				<!-- forceFold: a PEEK member is shown DULL (the `.folded` grammar) regardless of
-				     its own state — it's being previewed, not put live. -->
+				<!-- Band member tiles are still DOM .cell elements (only a handful).
+				     forceFold: a PEEK member is shown DULL regardless of its own state. -->
 				<div
 					class="cell face f{t.face} k-{t.b.kind}"
 					class:folded={forceFold || store.isFolded(t.b)}
@@ -638,35 +772,25 @@
 							<span class="tok"><AnimatedNumber value={olderTok} format={k} /></span>
 						</div>
 						<div class="stack">
-							{#each segments as seg (seg.kind === "band" ? "band-" + seg.row.group.id : "tiles-" + (seg.rows[0].type === "block" ? seg.rows[0].block.id : seg.rows[0].group.id))}
+							{#each segments as seg, segIdx (seg.kind === "band" ? "band-" + seg.row.group.id : "tiles-" + (seg.rows[0].type === "block" ? seg.rows[0].block.id : seg.rows[0].group.id))}
 								{#if seg.kind === "tiles"}
-									<div class="grid">
-										{#each seg.rows as row (row.type === "block" ? row.block.id : row.group.id)}
-											{#if row.type === "block"}
-												{@const t = { b: row.block, face: faceFor(row.block.tokens) }}
-												{@render tile(t, false)}
-											{:else}
-												{@const g = row.group}
-												{@const gface = faceFor(store.groupLiveTokens(g))}
-												<!-- COLLAPSED: one folder tile standing in for the range. -->
-												<div
-													class="cell face f{gface} group-tile"
-													class:sel={selectedId === g.id}
-													data-group={g.id}
-													title={groupTip(g)}
-												></div>
-											{/if}
-										{/each}
-									</div>
+									<!-- Canvas replaces the DOM .grid for tile segments -->
+									<TileCanvas
+										bind:this={canvasRefs[String(segIdx)]}
+										specs={olderSegmentSpecs[segIdx] ?? []}
+										{cols}
+										{cell}
+										gap={4}
+										onhit={onCanvasHit}
+										ondbl={onCanvasDbl}
+										onhover={onCanvasHover}
+									/>
 								{:else}
 									{@const g = seg.row.group}
 									{@const live = seg.row.live}
-									<!-- OPEN GROUP — its own full-width row at natural height (NOT a grid track, so the
-									     band can't overflow/overlap the tiles). live=false → PEEK (dull preview, wire
-									     unchanged); live=true → UNFOLDED (members live). Accented left edge = one group.
-									     data-group on the band itself: clicking the band background/padding resolves to
-									     the group (toggle peek / collapse), while a member tile's data-id still wins via
-									     groupEl.contains(idEl) in resolveHit — so no region of the band is a dead no-op. -->
+									<!-- OPEN GROUP — its own full-width row at natural height (NOT a grid track).
+									     data-group on the band itself: clicking the band background routes to the group.
+									     Member tiles are still DOM .cell elements — resolveHit handles them. -->
 									<div class="group-band" class:live data-group={g.id}>
 										<div
 											class="cell face f{faceFor(store.groupLiveTokens(g))} group-tile group-tile-open"
@@ -690,12 +814,20 @@
 					<div class="rail" title="{protTok.toLocaleString()} tokens · protected working tail">
 						<span class="tok"><AnimatedNumber value={protTok} format={k} /></span>
 					</div>
-					<div class="grid">
-						{#each vacatedCells as i (i)}<div class="cell vacated"></div>{/each}
-						{#each protectedTiles as t (t.b.id)}{@render tile(t, true)}{/each}
-						{#each ghosts as g (g.contentIndex)}
-							{@render ghostTile(g)}
-						{/each}
+					<!-- Single canvas for prot box: vacated placeholders + protected tiles + ghosts.
+					     The wrapper div takes flex: 1 (matching the old .grid) so the canvas
+					     fills the box horizontally after the token rail. -->
+					<div class="canvas-fill">
+						<TileCanvas
+							bind:this={canvasRefs["prot"]}
+							specs={protSpecs}
+							{cols}
+							{cell}
+							gap={4}
+							onhit={onCanvasHit}
+							ondbl={onCanvasDbl}
+							onhover={onCanvasHover}
+						/>
 					</div>
 				</section>
 			</div>
@@ -745,6 +877,17 @@
 			</div>
 		{/if}
 	</div>
+	<!-- Custom tooltip for canvas tiles (fixed in viewport, not clipped by scroll). -->
+	{#if tooltip}
+		{@const TARG = tooltip.rect}
+		<div
+			class="tile-tip"
+			style:left="{TARG.left + TARG.width / 2}px"
+			style:top="{TARG.bottom + 8}px"
+		>
+			{tooltip.text}
+		</div>
+	{/if}
 </div>
 
 <style>
@@ -1091,9 +1234,15 @@
 		box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent), var(--shadow-1);
 	}
 
-	/* ---- the older box's content: a vertical stack of tile-grids and open-group bands
-	   (paragraph-like). Splitting at each open group keeps every grid uniform and lets bands
-	   size to their content. The protected box has no groups, so it uses a bare .grid. ---- */
+	/* canvas-fill: flex wrapper for TileCanvas inside a box (fills the space after the rail). */
+	.canvas-fill {
+		flex: 1;
+		min-width: 0;
+	}
+
+	/* ---- the older box's content: a vertical stack of canvas segments and open-group bands
+	   (paragraph-like). Splitting at each open group keeps every canvas segment uniform and
+	   lets bands size to their content. ---- */
 	.stack {
 		flex: 1;
 		min-width: 0;
@@ -1101,26 +1250,9 @@
 		flex-direction: column;
 		gap: 8px;
 	}
-	/* ---- grid: uniform squares, conversation order (no dense backfill) ---- */
-	.grid {
-		display: grid;
-		grid-template-columns: repeat(var(--cols), var(--cell));
-		grid-auto-rows: var(--cell);
-		gap: 4px;
-		align-content: start;
-		justify-content: center;
-		flex: 1;
-		min-width: 0;
-	}
-	/* Inside the stack each grid is natural height (a column child must not grow vertically). */
-	.stack .grid {
-		flex: 0 0 auto;
-	}
-	/* while scrolling, make tiles transparent to the pointer so a stationary cursor
-	   doesn't trigger :hover on every tile that slides past it (repaint storm). */
-	.stage.scrolling .grid {
-		pointer-events: none;
-	}
+
+	/* ---- band member tiles: still DOM .cell elements (only a handful per open group) ---- */
+	/* Base cell: shared by band member tiles and group-tile-open. */
 	.cell {
 		box-sizing: border-box;
 		border-radius: 3px;
@@ -1128,7 +1260,6 @@
 		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.22);
 	}
 	.cell:hover {
-		/* instant (no transition) so scrolling past tiles doesn't animate a repaint storm */
 		filter: brightness(1.22);
 		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3);
 		z-index: 2;
@@ -1150,23 +1281,7 @@
 	.cell.pinned {
 		box-shadow: inset 0 0 0 2px #fff;
 	}
-	/* vacated slot: a block left the protected tail but we hold its place (no reflow)
-	   until the whole leading row empties. Reads as an empty outline, not a tile. */
-	.cell.vacated {
-		background: transparent;
-		border: 1px dashed color-mix(in srgb, var(--accent) 30%, transparent);
-		box-shadow: none;
-		cursor: default;
-		pointer-events: none;
-	}
-	.cell.vacated:hover {
-		filter: none;
-		box-shadow: none;
-	}
-
-	/* pending range selection highlight — a warm "building" treatment so the range reads
-	   as forming a NEW object, not hiding one. Bold amber inset ring + a dark inset for
-	   contrast; the faint warm fill is an inset box-shadow (no per-tile gradient/filter). */
+	/* inrange, sel for band member tiles */
 	.cell.inrange {
 		box-shadow: inset 0 0 0 2px var(--group-accent),
 		            inset 0 0 0 3px rgba(0, 0, 0, 0.4),
@@ -1175,26 +1290,56 @@
 	.cell.inrange:hover {
 		filter: brightness(1.22);
 	}
-
 	@keyframes pop {
 		0%   { transform: scale(1); }
 		45%  { transform: scale(1.08); }
 		100% { transform: scale(1); }
 	}
 	.cell.sel {
-		/* inset-only: an outset ring would clip against neighbouring tiles in the dense grid */
 		box-shadow: inset 0 0 0 2px var(--accent), inset 0 0 0 3px rgba(0, 0, 0, 0.55);
 		filter: brightness(1.18);
 		z-index: 3;
 		animation: pop var(--dur-fast) var(--ease-spring);
 	}
 
-	/* ---- group tile: the single "folder" tile representing a folded group ---- */
+	/* ---- face pip SVGs — kept for the 6 toolbar dice and band member .face tiles ---- */
+	.face {
+		position: relative;
+	}
+	.face::before {
+		content: "";
+		position: absolute;
+		inset: 0;
+		border-radius: inherit;
+		background-repeat: no-repeat;
+		background-position: center;
+		background-size: 100% 100%;
+		pointer-events: none;
+	}
+	.f1::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='50' cy='50' r='11'/></g></svg>");
+	}
+	.f2::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+	}
+	.f3::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='50' cy='50' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+	}
+	.f4::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='28' r='11'/><circle cx='28' cy='72' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+	}
+	.f5::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='28' r='11'/><circle cx='50' cy='50' r='11'/><circle cx='28' cy='72' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+	}
+	.f6::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='26' r='11'/><circle cx='72' cy='26' r='11'/><circle cx='28' cy='50' r='11'/><circle cx='72' cy='50' r='11'/><circle cx='28' cy='74' r='11'/><circle cx='72' cy='74' r='11'/></g></svg>");
+	}
+
+	/* ---- group tile styles — for .group-tile-open in the open-group band ---- */
+	/* The collapsed group tile in tile grids is now drawn on canvas (no DOM .group-tile
+	   needed there). Only .group-tile-open (the dull parent inside the band) remains DOM. */
 	.group-tile {
-		/* Warm dark-brown body so a group reads as a different KIND of object — not a block
-		   kind, not the accent-blue. The folder/stack hint is INSET ONLY (CLAUDE.md: outset
-		   box-shadows clip): a lighter inset top-left highlight + a darker inset bottom-right
-		   edge fakes a raised, stacked sheet. The dice pips (.face::before) sit on top. */
+		/* Kept for .group-tile-open which also uses this base. */
 		background: var(--group);
 		box-shadow:
 			inset 0 0 0 1px var(--group-edge),
@@ -1216,10 +1361,8 @@
 		animation: pop var(--dur-fast) var(--ease-spring);
 	}
 
-	/* dull parent tile inside an open row (peek or unfolded) — recessed; one element per
-	   group, so a single `filter` here is acceptable (not the 982-grid). */
+	/* dull parent tile inside an open row (peek or unfolded) */
 	.group-tile-open {
-		/* In the flex band (no longer a grid cell) the tile has no intrinsic size — pin it. */
 		width: var(--cell);
 		height: var(--cell);
 		flex: 0 0 auto;
@@ -1274,66 +1417,21 @@
 		height: var(--cell);
 		flex: 0 0 auto;
 	}
-	/* ---- ghost tiles: third visual state — "forming" ----
-	   A ghost is a presentation-only pulsing placeholder. It is NOT a block, NOT
-	   selectable, and NOT foldable. It uses the same kind color as a real tile but
-	   in a clearly distinct state: reduced opacity pulsing via a compositor-only
-	   opacity animation (transform/opacity only — no filter/box-shadow/gradients,
-	   per CLAUDE.md perf rules). There are at most a few ghosts at a time so one
-	   cheap keyframe each is fine.                                                  */
-	.cell.ghost {
-		cursor: default;
-		/* Compositor-only animation: opacity pulse — no filter, no box-shadow. */
-		animation: ghost-pulse 1.4s ease-in-out infinite;
-		/* Dashed inset ring marks it visually as "not yet real." */
-		box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.35);
-		/* pointer-events: none so it never hijacks clicks/hovers on real tiles */
+	/* ---- custom canvas tile tooltip (replaces native title attribute) ---- */
+	.tile-tip {
+		position: fixed;
+		transform: translateX(-50%);
+		background: var(--panel-4);
+		color: var(--text);
+		border: 1px solid var(--line-strong);
+		border-radius: var(--radius-sm);
+		padding: 4px 10px;
+		font-size: var(--fs-xs);
 		pointer-events: none;
-	}
-	.cell.ghost:hover {
-		/* Override the inherited :hover brightness — ghosts are not interactive. */
-		filter: none;
-		box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.35);
-	}
-	@keyframes ghost-pulse {
-		0%, 100% { opacity: 0.55; transform: scale(1); }
-		50%       { opacity: 0.85; transform: scale(0.93); }
-	}
-
-	/* ---- dice-face pips: token weight read as a die face 1–6 ----
-	   Each face is ONE cached SVG image (decoded once, blitted cheaply) instead
-	   of live radial gradients — gradients re-rasterize on every repaint and
-	   tanked interaction across 982 tiles. Pips scale with the tile via the SVG. */
-	.face {
-		position: relative;
-	}
-	.face::before {
-		content: "";
-		position: absolute;
-		inset: 0;
-		border-radius: inherit;
-		background-repeat: no-repeat;
-		background-position: center;
-		background-size: 100% 100%;
-		pointer-events: none;
-	}
-	.f1::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='50' cy='50' r='11'/></g></svg>");
-	}
-	.f2::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
-	}
-	.f3::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='50' cy='50' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
-	}
-	.f4::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='28' r='11'/><circle cx='28' cy='72' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
-	}
-	.f5::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='28' r='11'/><circle cx='50' cy='50' r='11'/><circle cx='28' cy='72' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
-	}
-	.f6::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='26' r='11'/><circle cx='72' cy='26' r='11'/><circle cx='28' cy='50' r='11'/><circle cx='72' cy='50' r='11'/><circle cx='28' cy='74' r='11'/><circle cx='72' cy='74' r='11'/></g></svg>");
+		box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+		z-index: 100;
+		max-width: 280px;
+		white-space: pre-wrap;
 	}
 
 	/* ---- transcript (the readable, scrollable concretion) ---- */
