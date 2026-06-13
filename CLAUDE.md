@@ -135,6 +135,35 @@ each model call — so an assistant reply is only seen at the *next* model call 
 next user turn for a plain reply; immediately for tool-using turns). Closing that gap
 (a post-turn view sync) is a planned follow-up.
 
+## Conductors — pluggable context strategy ([ADR 0007](docs/adr/0007-conductor-protocol.md))
+
+*Which* blocks to fold / replace / group / restore / pin is owned by a **conductor**, an
+interchangeable strategy behind one contract. Accordion imposes no strategy of its own — no
+conductor attached ⇒ raw context. The contract has two homes (both dependency-free /
+Node-safe): `app/src/lib/engine/conductor.ts` (the in-process shape — `ContextSnapshot`, the
+`Command` union `fold·replace·group·restore·pin`, `ClampReport`) and
+`app/src/lib/live/conductorProtocol.ts` (the WebSocket messages, which *import*
+`Command`/`ClampReport` so there is one definition). The host enforces exactly one floor —
+**provider-validity** (the message stays sendable); human overrides always win; an unsafe
+command is clamped to nearest-safe and **reported**, never silently dropped.
+
+- **The built-in folder is just the default conductor** — `engine/conductor.builtin.ts`
+  (`BuiltinConductor`), attached by `AccordionStore` on construction; `store.attach(c)` /
+  `store.detach()` swap it. Its byte-identical output is pinned by a golden test
+  (`conductor.builtin.test.ts`) — don't break it.
+- **External conductors** host a WS endpoint; Accordion **dials as a client** (the webview
+  can't host a server). App side: `live/conductorClient.svelte.ts` (`RemoteRunner` bridges
+  the async WS ↔ the synchronous `conduct()`), `live/conductorDiscovery.svelte.ts` (polls
+  Rust `list_conductors` + hand-configured URLs), switched via the header
+  `ui/map/ConductorMenu.svelte` dropdown. Local discovery files live at
+  `~/.accordion/conductors/<id>.json` (15 s heartbeat).
+- **Writing one:** the developer reference is
+  [docs/conductor-protocol.md](docs/conductor-protocol.md) — topology, lifecycle, every
+  message shape, the command set + safety rules, and a runnable reference conductor.
+  External implementations live in the top-level **`conductors/`** directory — one
+  subdirectory per conductor, any language; `conductors/recency-folder/` is the runnable
+  starter (see [conductors/README.md](conductors/README.md)).
+
 ## Visual grammar (consistent across ALL views)
 
 - **kind = color** — `user #6ea8fe · text #aab2c2 · thinking #b483e0 · tool_call #34d3c2 · tool_result #f0a35e` (vars `--k-*` in `app.css`).

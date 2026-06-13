@@ -265,6 +265,12 @@ declares it wants full content, and on each `context/update` folds the oldest
 non-`protected` `tool_result` blocks until the live estimate is under budget — the spirit
 of the built-in (oldest-first, results decay fastest), in ~35 lines.
 
+> A **runnable copy** of this conductor — with the `~/.accordion/conductors/` heartbeat
+> wired up so the desktop app auto-discovers it — lives at
+> [`conductors/recency-folder/`](../conductors/recency-folder/) (`cd` in, `npm install`,
+> `npm start`). New conductors get their own subdirectory under
+> [`conductors/`](../conductors/).
+
 ```js
 // recency-folder.js — run: node recency-folder.js   (npm i ws)
 // Advertise it for auto-discovery by writing this JSON to
