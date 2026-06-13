@@ -11,6 +11,7 @@
 	 * never attaches anything itself. The actual attach/detach is driven by an $effect in
 	 * +page.svelte that tracks `conductorState.activeId`.
 	 */
+	import { tick } from "svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import { conductorState, setActiveConductor } from "$lib/live/conductor.svelte";
 	import { conductorLink, BUILTIN_ID, NONE_ID } from "$lib/live/conductorClient.svelte";
@@ -36,7 +37,14 @@
 	const configuredIds = $derived(new Set(conductorDiscovery.configured.map((c) => c.id)));
 
 	const activeId = $derived(conductorState.activeId);
-	const isRemote = $derived(activeId !== BUILTIN_ID && activeId !== NONE_ID);
+	// "Remote" chrome (accent + status dot) only when the selected external actually resolves
+	// to a known entry. A selected-but-undiscovered remote (e.g. a cfg: id restored from
+	// localStorage before discovery, or one that went offline) falls back to the built-in in
+	// the engine — so the trigger must NOT wear remote accent + a dot next to a "Built-in"
+	// label. Gating on the list keeps label/accent/dot honest and in lockstep with attach.
+	const isRemote = $derived(
+		activeId !== BUILTIN_ID && activeId !== NONE_ID && externals.some((c) => c.id === activeId),
+	);
 	// Resolve the SELECTED id to a label. A remote not yet discovered falls back to "Built-in".
 	const activeLabel = $derived(
 		activeId === BUILTIN_ID
@@ -77,11 +85,13 @@
 		removeConfiguredConductor(id);
 	}
 
-	function openAddPanel(): void {
+	async function openAddPanel(): Promise<void> {
 		showAdd = true;
 		urlError = "";
-		// Focus the input on the next frame, once it's in the DOM.
-		queueMicrotask(() => urlInputEl?.focus());
+		// Wait for Svelte to mount the input before focusing — a bare microtask can race the
+		// framework's own DOM flush and silently no-op (urlInputEl still undefined).
+		await tick();
+		urlInputEl?.focus();
 	}
 
 	function submitUrl(): void {
