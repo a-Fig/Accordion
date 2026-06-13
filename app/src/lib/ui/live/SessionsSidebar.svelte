@@ -1,12 +1,10 @@
 <script lang="ts">
-	import type { SessionEntry, ConductorEntry } from "$lib/live/registry";
+	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import SegControl from "$lib/ui/SegControl.svelte";
 	import { relTime } from "$lib/utils";
-	import { BUILTIN_ID, NONE_ID } from "$lib/live/conductorClient.svelte";
-	import { conductorDiscovery, addConfiguredConductor, removeConfiguredConductor } from "$lib/live/conductorDiscovery.svelte";
 
 	let {
 		source = "pi",
@@ -20,9 +18,6 @@
 		claudeSessions = [],
 		claudeSelected = null,
 		onselectclaude = () => {},
-		conductor = BUILTIN_ID,
-		conductors = [],
-		onconductor = () => {},
 	}: {
 		source?: "pi" | "claude";
 		onsource?: (s: "pi" | "claude") => void;
@@ -35,11 +30,6 @@
 		claudeSessions?: ClaudeCodeSession[];
 		claudeSelected?: string | null;
 		onselectclaude?: (s: ClaudeCodeSession) => void;
-		/** Active conductor id (BUILTIN_ID / NONE_ID / a ConductorEntry id). */
-		conductor?: string;
-		/** External conductors available to switch to (discovered + configured). */
-		conductors?: ConductorEntry[];
-		onconductor?: (id: string) => void;
 	} = $props();
 
 	const STORE_KEY = "accordion.sidebar.collapsed";
@@ -92,45 +82,6 @@
 
 	const activeCount = $derived(source === "pi" ? sessions.length : claudeSessions.length);
 	const railCCSessions = $derived(claudeSessions.slice(0, 12));
-
-	// ---- conductor switcher (ADR 0007) ------------------------------------
-	// The built-in is always present and prepended; "Raw" (no conductor) is always last.
-	// The middle is the discovered + configured externals passed in via `conductors`.
-	const conductorOptions = $derived([
-		{ id: BUILTIN_ID, label: "Built-in" },
-		...conductors.map((c) => ({ id: c.id, label: c.label })),
-		{ id: NONE_ID, label: "Raw" },
-	]);
-	const configuredList = $derived(conductorDiscovery.configured);
-
-	let showAddConductor = $state(false);
-	let urlDraft = $state("");
-	let urlError = $state("");
-
-	function addConductorUrl(): void {
-		const e = addConfiguredConductor(urlDraft);
-		if (e) {
-			onconductor(e.id); // connect to it straight away
-			urlDraft = "";
-			urlError = "";
-			showAddConductor = false;
-		} else {
-			urlError = "Enter a ws:// or wss:// URL"; // invalid scheme — don't fail silently
-		}
-	}
-
-	/** Collapsed-rail cycle: advance to the next conductor in the list. */
-	function cycleConductor(): void {
-		const ids = conductorOptions.map((o) => o.id);
-		const i = ids.indexOf(conductor);
-		onconductor(ids[(i + 1) % ids.length]);
-	}
-	function conductorAbbrev(id: string): string {
-		if (id === BUILTIN_ID) return "BLT";
-		if (id === NONE_ID) return "RAW";
-		const c = conductors.find((x) => x.id === id);
-		return (c?.label ?? "EXT").slice(0, 3).toUpperCase();
-	}
 </script>
 
 <aside class="rail" class:collapsed>
@@ -153,17 +104,6 @@
 			onclick={() => onsource(source === "pi" ? "claude" : "pi")}
 		>
 			{source === "pi" ? "pi" : "CC"}
-		</button>
-
-		<!-- Tiny conductor pill: shows the active strategy, click cycles through them. -->
-		<button
-			class="src-pill cond-pill"
-			class:raw={conductor === NONE_ID}
-			title={"Conductor: " + conductorAbbrev(conductor) + " — click to cycle"}
-			aria-label="Switch conductor"
-			onclick={cycleConductor}
-		>
-			{conductorAbbrev(conductor)}
 		</button>
 
 		{#if source === "pi"}
@@ -240,67 +180,6 @@
 				iconSize={11}
 			/>
 		</div>
-
-		<!-- Conductor switcher (ADR 0007): which context-management strategy is steering. -->
-		<div class="conductor-row">
-			<span class="cond-label" title="Active context-management strategy">
-				<Icon name="sliders-horizontal" size={12} /> Conductor
-			</span>
-			<div class="cond-controls">
-				<SegControl
-					options={conductorOptions}
-					value={conductor}
-					onchange={(v) => onconductor(v)}
-					ariaLabel="Active conductor"
-					iconSize={11}
-				/>
-				<button
-					class="cond-add"
-					class:on={showAddConductor}
-					title="Connect a conductor by ws:// URL"
-					aria-label="Add conductor URL"
-					onclick={() => (showAddConductor = !showAddConductor)}
-				>
-					<Icon name="plus" size={13} />
-				</button>
-			</div>
-		</div>
-
-		{#if showAddConductor}
-			<div class="cond-add-panel">
-				<div class="cond-add-row">
-					<input
-						class="cond-url"
-						type="text"
-						placeholder="ws://127.0.0.1:port"
-						bind:value={urlDraft}
-						oninput={() => (urlError = "")}
-						onkeydown={(e) => {
-							if (e.key === "Enter") addConductorUrl();
-						}}
-					/>
-					<button class="cond-url-add" onclick={addConductorUrl}>Connect</button>
-				</div>
-				{#if urlError}<p class="cond-url-error">{urlError}</p>{/if}
-				{#if configuredList.length}
-					<ul class="cond-configured">
-						{#each configuredList as c (c.id)}
-							<li>
-								<span class="cond-url-label" title={c.url}>{c.label}</span>
-								<button
-									class="cond-rm"
-									title="Forget this conductor"
-									aria-label="Forget conductor"
-									onclick={() => removeConfiguredConductor(c.id)}
-								>
-									<Icon name="x" size={11} />
-								</button>
-							</li>
-						{/each}
-					</ul>
-				{/if}
-			</div>
-		{/if}
 
 		{#if source === "pi"}
 			<div class="scroll">
@@ -486,13 +365,6 @@
 		border-color: color-mix(in srgb, var(--accent) 45%, transparent);
 		background: var(--panel-3);
 	}
-	/* Collapsed-rail conductor pill: same chrome as the source pill, dimmed when raw. */
-	.cond-pill {
-		letter-spacing: 0.04em;
-	}
-	.cond-pill.raw {
-		color: var(--faint);
-	}
 
 	/* ===== Expanded header ===== */
 	.head {
@@ -510,140 +382,6 @@
 		padding: var(--sp-2) var(--sp-3);
 		border-bottom: 1px solid var(--line);
 		flex: 0 0 auto;
-	}
-	/* Conductor switcher — same rhythm as .source-row, stacking a label over the controls. */
-	.conductor-row {
-		display: flex;
-		flex-direction: column;
-		gap: var(--sp-1);
-		padding: var(--sp-2) var(--sp-3);
-		border-bottom: 1px solid var(--line);
-		flex: 0 0 auto;
-	}
-	.cond-label {
-		display: inline-flex;
-		align-items: center;
-		gap: 5px;
-		font-size: var(--fs-xs);
-		font-weight: 600;
-		letter-spacing: 0.03em;
-		text-transform: uppercase;
-		color: var(--muted);
-	}
-	.cond-controls {
-		display: flex;
-		align-items: center;
-		gap: var(--sp-2);
-		flex-wrap: wrap;
-	}
-	.cond-add {
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		width: 26px;
-		height: 26px;
-		flex: 0 0 auto;
-		border: 1px solid var(--line);
-		border-radius: var(--radius-sm);
-		background: var(--panel-2);
-		color: var(--muted);
-		cursor: pointer;
-		transition:
-			color var(--dur-fast) var(--ease-out),
-			border-color var(--dur-fast) var(--ease-out),
-			background var(--dur-fast) var(--ease-out);
-	}
-	.cond-add:hover {
-		color: var(--text);
-		border-color: var(--line-strong);
-		background: var(--panel-3);
-	}
-	.cond-add.on {
-		color: var(--accent);
-		border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
-		background: var(--accent-soft);
-	}
-	.cond-add-panel {
-		display: flex;
-		flex-direction: column;
-		gap: var(--sp-2);
-		padding: var(--sp-2) var(--sp-3);
-		border-bottom: 1px solid var(--line);
-		flex: 0 0 auto;
-	}
-	.cond-add-row {
-		display: flex;
-		gap: var(--sp-2);
-	}
-	.cond-url {
-		flex: 1 1 auto;
-		min-width: 0;
-		font-size: var(--fs-xs);
-		font-family: ui-monospace, "JetBrains Mono Variable", monospace;
-		color: var(--text);
-		background: var(--panel-2);
-		border: 1px solid var(--line);
-		border-radius: var(--radius-sm);
-		padding: 4px var(--sp-2);
-	}
-	.cond-url:focus {
-		outline: none;
-		border-color: var(--accent);
-	}
-	.cond-url-add {
-		flex: 0 0 auto;
-		font-size: var(--fs-xs);
-		font-weight: 600;
-		color: var(--accent);
-		background: var(--accent-soft);
-		border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
-		border-radius: var(--radius-sm);
-		padding: 4px var(--sp-2);
-		cursor: pointer;
-	}
-	.cond-url-add:hover {
-		background: color-mix(in srgb, var(--accent) 20%, var(--panel));
-	}
-	.cond-url-error {
-		margin: 0;
-		font-size: var(--fs-xs);
-		color: var(--faint);
-	}
-	.cond-configured {
-		list-style: none;
-		margin: 0;
-		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-	}
-	.cond-configured li {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: var(--sp-2);
-		font-size: var(--fs-xs);
-		color: var(--muted);
-	}
-	.cond-url-label {
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-	.cond-rm {
-		flex: 0 0 auto;
-		display: inline-flex;
-		align-items: center;
-		color: var(--faint);
-		background: transparent;
-		border: none;
-		cursor: pointer;
-		padding: 2px;
-		border-radius: var(--radius-sm);
-	}
-	.cond-rm:hover {
-		color: var(--text);
-		background: var(--panel-2);
 	}
 	.logo-wrap {
 		flex: 0 0 auto;

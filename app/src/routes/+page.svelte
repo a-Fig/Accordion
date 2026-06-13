@@ -4,7 +4,7 @@
 	import { connectLive, disconnectLive, live } from "$lib/live/liveClient.svelte";
 	import { discovery, startDiscovery, stopDiscovery, selectSession, DEMO_ID } from "$lib/live/discovery.svelte";
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery, selectClaude } from "$lib/live/claudeDiscovery.svelte";
-	import { conductorState, setActiveConductor } from "$lib/live/conductor.svelte";
+	import { conductorState } from "$lib/live/conductor.svelte";
 	import { startConductorDiscovery, stopConductorDiscovery, allConductors } from "$lib/live/conductorDiscovery.svelte";
 	import { attachConductor } from "$lib/live/conductorClient.svelte";
 	import { DEFAULT_PORT } from "$lib/live/protocol";
@@ -141,9 +141,6 @@
 			claudeSessions={claudeDiscovery.sessions}
 			claudeSelected={claudeDiscovery.selected}
 			onselectclaude={selectClaudeSession}
-			conductor={conductorState.activeId}
-			{conductors}
-			onconductor={setActiveConductor}
 		/>
 	{/if}
 
