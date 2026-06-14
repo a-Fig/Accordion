@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { RemoteRunner, attachConductor, conductorLink } from "./conductorClient.svelte";
+import { RemoteRunner, attachConductor, conductorLink, conductorRetry } from "./conductorClient.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import type { Block, ParsedSession } from "../engine/types";
 import type { ConductorEntry } from "./registry";
@@ -369,5 +369,36 @@ describe("RemoteRunner — stale desired cleared on unexpected disconnect (Bug 3
 
 		// The store must be raw NOW, without any manual conduct() call from the test.
 		expect(store.isFolded(store.get("m0:p0")!)).toBe(false);
+	});
+});
+
+describe("RemoteRunner — conductorRetry tick (bounded auto-recovery)", () => {
+	it("bumps conductorRetry.tick when a greeted runner drops unexpectedly", () => {
+		const store = makeStore(2);
+		const { ws } = connectRunner(store);
+		// Capture baseline — tests must not assert absolute values because earlier tests may have
+		// already bumped the tick; always diff from the captured baseline.
+		const tickBefore = conductorRetry.tick;
+
+		// Complete the handshake so greeted=true.
+		sendHello(ws, "full");
+
+		// Simulate unexpected drop (no runner.close() beforehand).
+		ws.onclose?.();
+
+		expect(conductorRetry.tick).toBe(tickBefore + 1);
+	});
+
+	it("does NOT bump conductorRetry.tick when a runner drops before ever receiving conductor/hello", () => {
+		const store = makeStore(2);
+		const { ws } = connectRunner(store);
+		const tickBefore = conductorRetry.tick;
+
+		// Do NOT send conductor/hello — greeted stays false.
+		// Simulate unexpected drop immediately (e.g. conductor down / unreachable).
+		ws.onclose?.();
+
+		// Tick must remain unchanged — no thrash retry for a never-greeted runner.
+		expect(conductorRetry.tick).toBe(tickBefore);
 	});
 });

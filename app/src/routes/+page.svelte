@@ -6,7 +6,7 @@
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery, selectClaude } from "$lib/live/claudeDiscovery.svelte";
 	import { conductorState } from "$lib/live/conductor.svelte";
 	import { startConductorDiscovery, stopConductorDiscovery, allConductors } from "$lib/live/conductorDiscovery.svelte";
-	import { attachConductor } from "$lib/live/conductorClient.svelte";
+	import { attachConductor, conductorRetry } from "$lib/live/conductorClient.svelte";
 	import { DEFAULT_PORT } from "$lib/live/protocol";
 	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
@@ -46,6 +46,7 @@
 	// `attachConductor` is idempotent, so a poll refreshing the list when we're already
 	// correctly attached is a no-op (no reconnect churn).
 	$effect(() => {
+		void conductorRetry.tick; // re-fire on a remote-drop retry tick (recover a same-process socket drop)
 		const store = session.store;
 		const activeId = conductorState.activeId;
 		const list = conductors;

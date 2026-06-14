@@ -48,6 +48,14 @@ export const conductorLink = $state<{ status: "idle" | "connecting" | "connected
 	detail: "",
 });
 
+/** Bumped when a remote conductor that HAD connected drops unexpectedly. The attach effect
+ *  in +page.svelte reads this, so a same-list socket drop (which changes no discovered-list
+ *  reference) still re-fires the effect → attachConductor tears down the dead runner and
+ *  re-dials if the entry is still advertised (else falls back to the built-in). Gated on
+ *  `greeted` so a conductor that never connected can't thrash-retry; exponential backoff is
+ *  still future work. */
+export const conductorRetry = $state({ tick: 0 });
+
 /**
  * A conductor that lives in another process, reached over a WebSocket. Implements
  * `Conductor` so the engine can attach it like any other strategy; all the async lives
@@ -149,6 +157,12 @@ export class RemoteRunner implements Conductor {
 					conductorLink.status = "error";
 					conductorLink.detail = `disconnected from ${this.entry.label}`;
 				}
+				// A runner that had actually connected (greeted) just suffered a transient loss — schedule
+				// exactly one automatic re-dial by bumping the reactive retry tick the attach effect tracks.
+				// If it never greeted (conductor down / unreachable), do NOT bump, so a re-dial that fails
+				// before connecting can't loop. The re-dialed runner is a fresh instance (greeted=false), so
+				// a second failure-before-connect ends the chain; a genuine reconnect resets it.
+				if (this.greeted) conductorRetry.tick++;
 			}
 		};
 	}
