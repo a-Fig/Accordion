@@ -171,12 +171,18 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				folding.enabled && session.store ? resolveUnfold(session.store, codes) : { restored: [], missing: codes };
 			// Tell an attached remote conductor that the agent pulled blocks back to full — it
 			// didn't initiate this, and may want to adapt (ADR 0007 host/event). Fire-and-forget.
-			if (restored.length)
+			// We send block ids (not fold codes) so the conductor can correlate against the
+			// ViewBlocks it received. A code may map to >1 block on a hash collision — include all.
+			if (restored.length) {
+				// `r.ids` carries the exact ids the resolver touched (group memberIds or
+				// per-block id, including all hash-collision matches). Dedupe across entries.
+				const ids = [...new Set(restored.flatMap((r) => r.ids))];
 				activeRemoteRunner()?.notifyEvent(
 					"agentUnfold",
-					restored.map((r) => r.code),
+					ids,
 					`agent unfolded ${restored.length} block(s)`,
 				);
+			}
 			const reply: UnfoldResultMessage = { type: "unfoldResult", reqId: msg.reqId, restored, missing };
 			try {
 				ws.send(JSON.stringify(reply));

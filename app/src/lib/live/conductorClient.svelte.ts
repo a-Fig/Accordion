@@ -18,20 +18,22 @@
  * `applyCommands`, which clamps every command to provider-validity).
  */
 import type { AccordionStore } from "../engine/store.svelte";
-import type { Conductor, ContextSnapshot, Command } from "../engine/conductor";
-import { BuiltinConductor } from "../engine/conductor.builtin";
+import { BuiltinConductor, inProcessConductor } from "$conductors";
 import { digest } from "../engine/digest";
 import { estTokens, firstLine } from "../engine/tokens";
 import type { ConductorEntry } from "./registry";
 import {
 	CONDUCTOR_PROTOCOL_VERSION,
 	isHostMessage, // (re-exported for symmetry/tests; host parses conductor msgs)
-	type BlockView,
+	isConductorMessage,
+	type Conductor,
+	type ConductorView,
+	type Command,
 	type ContentMode,
 	type ConductorMessage,
 	type HostHelloMessage,
 	type ContextUpdateMessage,
-} from "./conductorProtocol";
+} from "$conductors/contract";
 
 void isHostMessage; // referenced to keep the import meaningful for downstream consumers
 
@@ -46,6 +48,14 @@ export const conductorLink = $state<{ status: "idle" | "connecting" | "connected
 	detail: "",
 });
 
+/** Bumped when a remote conductor that HAD connected drops unexpectedly. The attach effect
+ *  in +page.svelte reads this, so a same-list socket drop (which changes no discovered-list
+ *  reference) still re-fires the effect → attachConductor tears down the dead runner and
+ *  re-dials if the entry is still advertised (else falls back to the built-in). Gated on
+ *  `greeted` so a conductor that never connected can't thrash-retry; exponential backoff is
+ *  still future work. */
+export const conductorRetry = $state({ tick: 0 });
+
 /**
  * A conductor that lives in another process, reached over a WebSocket. Implements
  * `Conductor` so the engine can attach it like any other strategy; all the async lives
@@ -57,6 +67,10 @@ export class RemoteRunner implements Conductor {
 
 	private ws: WebSocket | null = null;
 	private manualClose = false;
+	/** True after an UNEXPECTED socket drop (not a manual close). A dead runner can never
+	 * re-dial, so `attachConductor` must not treat it as "already correctly attached". */
+	private _dead = false;
+	get isDead(): boolean { return this._dead; }
 	/** The conductor's last desired command set; `null` until it has ever spoken (⇒ hold/raw). */
 	private desired: Command[] | null = null;
 	private wants: ContentMode = "full";
@@ -77,9 +91,9 @@ export class RemoteRunner implements Conductor {
 	}
 
 	// ---- Conductor interface ----------------------------------------------
-	conduct(snap: ContextSnapshot): Command[] | null {
+	conduct(view: ConductorView): Command[] | null {
 		if (this.suppressUpdate) this.suppressUpdate = false;
-		else if (this.greeted) this.pushContext(snap); // hold the first push until wants is known
+		else if (this.greeted) this.pushContext(view); // hold the first push until wants is known
 		return this.desired;
 	}
 
@@ -130,19 +144,35 @@ export class RemoteRunner implements Conductor {
 		ws.onclose = () => {
 			if (this.ws !== ws) return;
 			this.ws = null;
-			if (!this.manualClose && conductorLink.status !== "error") {
-				conductorLink.status = "idle";
-				conductorLink.detail = "disconnected";
+			if (!this.manualClose) {
+				// Unexpected drop: clear stale commands so conduct() returns [] (raw) rather
+				// than perpetuating the last known desired state against a dead conductor.
+				this.desired = [];
+				this._dead = true;
+				// Immediately re-run the conductor pass so the store renders raw NOW rather than
+				// waiting for the next unrelated refold. conduct() reads this.desired (now [])
+				// and returns [], which clears all conductor folds in the same tick.
+				this.store.refold();
+				if (conductorLink.status !== "error") {
+					conductorLink.status = "error";
+					conductorLink.detail = `disconnected from ${this.entry.label}`;
+				}
+				// A runner that had actually connected (greeted) just suffered a transient loss — schedule
+				// exactly one automatic re-dial by bumping the reactive retry tick the attach effect tracks.
+				// If it never greeted (conductor down / unreachable), do NOT bump, so a re-dial that fails
+				// before connecting can't loop. The re-dialed runner is a fresh instance (greeted=false), so
+				// a second failure-before-connect ends the chain; a genuine reconnect resets it.
+				if (this.greeted) conductorRetry.tick++;
 			}
 		};
 	}
 
-	close(): void {
+	close(finalStatus?: "idle" | "error", finalDetail?: string): void {
 		this.manualClose = true;
 		const ws = this.ws;
 		this.ws = null;
-		conductorLink.status = "idle";
-		conductorLink.detail = "";
+		conductorLink.status = finalStatus ?? "idle";
+		conductorLink.detail = finalDetail ?? "";
 		try {
 			ws?.close();
 		} catch {
@@ -152,14 +182,13 @@ export class RemoteRunner implements Conductor {
 
 	// ---- inbound ----------------------------------------------------------
 	private handle(msg: unknown): void {
-		if (!msg || typeof msg !== "object") return;
-		const m = msg as ConductorMessage;
+		if (!isConductorMessage(msg)) return;
+		const m: ConductorMessage = msg;
 		switch (m.type) {
 			case "conductor/hello":
 				if (m.conductorProtocol !== CONDUCTOR_PROTOCOL_VERSION) {
-					conductorLink.status = "error";
-					conductorLink.detail = `protocol mismatch — conductor v${m.conductorProtocol}, app v${CONDUCTOR_PROTOCOL_VERSION}`;
-					this.close();
+					const detail = `protocol mismatch — conductor v${m.conductorProtocol}, app v${CONDUCTOR_PROTOCOL_VERSION}`;
+					this.close("error", detail);
 					return;
 				}
 				if (m.wants?.content) this.wants = m.wants.content;
@@ -167,6 +196,16 @@ export class RemoteRunner implements Conductor {
 				this.store.refold(); // first context push, now honouring the declared `wants`
 				break;
 			case "conductor/commands": {
+				// Drop replies to stale snapshots. If the conductor echoed a rev that is
+				// older than the latest context/update we have sent, this reply was computed
+				// against a state we already superseded — applying it would rewind decisions.
+				// If rev is absent, accept as before (backward-compatible with conductors that
+				// do not echo rev).
+				// Liveness tradeoff: a human interaction between our context/update and the
+				// conductor's reply bumps this.rev, so a slow conductor's in-flight reply is
+				// dropped as stale and it must recompute against the newer snapshot — intentional,
+				// because applying a command set computed against an old view could rewind state.
+				if (m.rev !== undefined && m.rev < this.rev) break;
 				this.desired = Array.isArray(m.commands) ? m.commands : [];
 				this.lastRev = m.rev ?? this.rev;
 				// Apply now. We poke the store, which re-enters conduct(); suppress the
@@ -223,35 +262,32 @@ export class RemoteRunner implements Conductor {
 		this.send({ type: "host/event", event, ids, detail });
 	}
 
-	private pushContext(snap: ContextSnapshot): void {
+	/**
+	 * Ship the prebuilt `ConductorView` to the remote almost verbatim — the store already
+	 * built the single public view, so the runner only adjusts content FIDELITY. Under
+	 * `wants:"full"` each block's `text` rides along as-is; otherwise we downgrade — drop the
+	 * full text and substitute a one-line `preview` — so a `shape`/`onDemand` conductor never
+	 * receives text it didn't ask for.
+	 */
+	private pushContext(view: ConductorView): void {
+		const blocks =
+			this.wants === "full"
+				? view.blocks
+				: view.blocks.map((b) => {
+						const { text: _text, ...rest } = b;
+						return { ...rest, preview: firstLine(b.text ?? "", 100) };
+					});
 		const update: ContextUpdateMessage = {
 			type: "context/update",
 			rev: ++this.rev,
-			budget: snap.budget,
-			contextWindow: snap.contextWindow,
-			protectedFromIndex: snap.protectedFromIndex,
-			blocks: snap.blocks.map((b, i) => this.toView(b, i, snap)),
+			budget: view.budget,
+			contextWindow: view.contextWindow,
+			liveTokens: view.liveTokens,
+			protectedFromIndex: view.protectedFromIndex,
+			protectTokens: view.protectTokens,
+			blocks,
 		};
 		this.send(update);
-	}
-
-	private toView(b: ContextSnapshot["blocks"][number], i: number, snap: ContextSnapshot): BlockView {
-		const folded = b.override === "folded" || snap.isInFoldedGroup(b.id);
-		const view: BlockView = {
-			id: b.id,
-			kind: b.kind,
-			turn: b.turn,
-			order: b.order,
-			tokens: b.tokens,
-			toolName: b.toolName,
-			callId: b.callId,
-			isError: b.isError,
-			folded,
-			protected: i >= snap.protectedFromIndex,
-		};
-		if (this.wants === "full") view.text = b.text;
-		else view.preview = firstLine(b.text, 100);
-		return view;
 	}
 
 	private send(msg: object): void {
@@ -283,8 +319,9 @@ export function activeRemoteRunner(): RemoteRunner | null {
 
 /**
  * Attach the conductor identified by `id` to `store`. `null`/`"none"` ⇒ detach (raw);
- * `"builtin"` ⇒ the in-process default folder; anything else ⇒ a remote runner dialed at
- * the matching discovered/configured `ConductorEntry` (falling back to the built-in if the
+ * any id in the in-process registry (`IN_PROCESS_CONDUCTORS` — `"builtin"` and any future
+ * sibling) ⇒ a fresh in-process instance; anything else ⇒ a remote runner dialed at the
+ * matching discovered/configured `ConductorEntry` (falling back to the built-in if the
  * entry isn't available *yet*, so the view is never stranded). Safe to call from an effect
  * that tracks the available list: it is IDEMPOTENT — if we are already correctly attached to
  * `id` on `store` it returns untouched (no reconnect on list churn / heartbeat refresh), and
@@ -292,12 +329,15 @@ export function activeRemoteRunner(): RemoteRunner | null {
  */
 export function attachConductor(store: AccordionStore, id: string | null, available: ConductorEntry[]): void {
 	const norm = id ?? NONE_ID;
-	const isRemoteId = norm !== BUILTIN_ID && norm !== NONE_ID;
-	// Already correctly attached? For a remote that means the live runner's id matches; for
-	// builtin/none, just the id+store. (A remote id that fell back to built-in last time has
-	// activeRemote === null, so this is false → we retry now that it may have appeared.)
+	const inProc = norm === NONE_ID ? null : inProcessConductor(norm);
+	const isRemoteId = norm !== NONE_ID && !inProc;
+	// Already correctly attached? For a remote that means the live runner's id matches AND the
+	// runner is still alive (not dead from an unexpected drop); for in-process/none, just the
+	// id+store. (A remote id that fell back to built-in last time has activeRemote === null, so
+	// this is false → we retry now that it may have appeared. A dead runner is also false →
+	// we tear it down and re-dial so the conductor process can reconnect after a socket drop.)
 	const alreadyCorrect =
-		store === lastStore && norm === lastId && (isRemoteId ? activeRemote?.id === norm : true);
+		store === lastStore && norm === lastId && (isRemoteId ? (activeRemote?.id === norm && !activeRemote.isDead) : true);
 	if (alreadyCorrect) return;
 
 	if (activeRemote) {
@@ -312,8 +352,8 @@ export function attachConductor(store: AccordionStore, id: string | null, availa
 		store.detach();
 		return;
 	}
-	if (norm === BUILTIN_ID) {
-		store.attach(new BuiltinConductor());
+	if (inProc) {
+		store.attach(inProc.create()); // fresh in-process instance (builtin or a sibling)
 		return;
 	}
 	const entry = available.find((e) => e.id === norm);

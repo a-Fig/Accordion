@@ -268,6 +268,26 @@ describe("resolveUnfold", () => {
 		expect(s.get("a:resp1:p0")!.override).toBe(null);
 	});
 
+	it("single-block unfold populates ids with [b.id] (never empty)", () => {
+		order = 0;
+		const blocks = [
+			blk({ id: "a:resp1:p0", kind: "text", tokens: 8000 }),
+			blk({ id: "r:call1", kind: "tool_result", tokens: 8000, toolName: "grep", callId: "call1" }),
+			blk({ id: "u:1000", kind: "user", tokens: 50, text: "hi" }),
+		];
+		const s = makeStore(blocks);
+		s.setProtect(40);
+		s.setBudget(1000);
+		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(true);
+
+		const code = foldCode("a:resp1:p0");
+		const { restored } = resolveUnfold(s, [code]);
+		expect(restored.length).toBeGreaterThanOrEqual(1);
+		// Every restored entry must carry a non-empty ids array with the block id
+		const entry = restored.find((r) => r.code === code)!;
+		expect(entry.ids).toEqual(["a:resp1:p0"]);
+	});
+
 	it("an unfolded block no longer appears in the fold plan (restores at next context)", () => {
 		order = 0;
 		const blocks = [

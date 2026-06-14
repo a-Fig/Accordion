@@ -14,7 +14,7 @@
  */
 import { isTauriEnv } from "../session.svelte";
 import { isLiveConductor, type ConductorEntry, REGISTRY_PROTOCOL } from "./registry";
-import { CONDUCTOR_PROTOCOL_VERSION } from "./conductorProtocol";
+import { CONDUCTOR_PROTOCOL_VERSION } from "$conductors/contract";
 
 export const conductorDiscovery = $state<{
 	discovered: ConductorEntry[];

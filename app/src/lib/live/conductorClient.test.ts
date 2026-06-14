@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { RemoteRunner, attachConductor } from "./conductorClient.svelte";
+import { RemoteRunner, attachConductor, conductorLink, conductorRetry } from "./conductorClient.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import type { Block, ParsedSession } from "../engine/types";
 import type { ConductorEntry } from "./registry";
@@ -78,7 +78,7 @@ function makeStore(n: number): AccordionStore {
 
 const ENTRY: ConductorEntry = {
 	registryProtocol: 1,
-	conductorProtocol: 1,
+	conductorProtocol: 2,
 	id: "remote-test",
 	label: "Remote Test",
 	url: "ws://127.0.0.1:9999",
@@ -107,7 +107,7 @@ function connectRunner(store: AccordionStore): { runner: RemoteRunner; ws: FakeW
 }
 
 function sendHello(ws: FakeWebSocket, content: "full" | "shape" | "onDemand" = "full"): void {
-	ws.emit({ type: "conductor/hello", conductorProtocol: 1, id: "remote-test", label: "Remote Test", wants: { content } });
+	ws.emit({ type: "conductor/hello", conductorProtocol: 2, id: "remote-test", label: "Remote Test", wants: { content } });
 }
 
 describe("RemoteRunner — handshake & context push", () => {
@@ -115,7 +115,7 @@ describe("RemoteRunner — handshake & context push", () => {
 		const { ws } = connectRunner(makeStore(3));
 		const hello = ws.framesOfType("host/hello");
 		expect(hello).toHaveLength(1);
-		expect(hello[0].conductorProtocol).toBe(1);
+		expect(hello[0].conductorProtocol).toBe(2);
 		// No context pushed yet — we wait to learn `wants` so we never leak full text.
 		expect(ws.framesOfType("context/update")).toHaveLength(0);
 
@@ -137,11 +137,12 @@ describe("RemoteRunner — handshake & context push", () => {
 describe("RemoteRunner — commands drive the store", () => {
 	it("applies a fold and reports no clamp for a valid command", () => {
 		const store = makeStore(3);
+		store.setProtect(0); // small fixture (3×1000 tok) is entirely inside the 20k tail — disable protection so a fold is allowed
 		const { ws } = connectRunner(store);
 		ws.emit({ type: "conductor/commands", rev: 1, commands: [{ kind: "fold", ids: ["m0:p0"] }] });
 
 		expect(store.isFolded(store.get("m0:p0")!)).toBe(true);
-		expect(store.get("m0:p0")!.by).toBe("conductor");
+		expect(store.get("m0:p0")!.by).toBe("auto"); // attribution is now uniform across all conductors
 
 		const results = ws.framesOfType("host/commandResult");
 		expect(results.length).toBeGreaterThanOrEqual(1);
@@ -150,6 +151,7 @@ describe("RemoteRunner — commands drive the store", () => {
 
 	it("replaces content and round-trips a clamp report for an unknown id", () => {
 		const store = makeStore(3);
+		store.setProtect(0); // see above — disable protection so the tiny fixture's blocks are foldable
 		const { ws } = connectRunner(store);
 		ws.emit({
 			type: "conductor/commands",
@@ -167,6 +169,7 @@ describe("RemoteRunner — commands drive the store", () => {
 
 	it("holds the last command set when the conductor goes silent", () => {
 		const store = makeStore(3);
+		store.setProtect(0); // see above — disable protection so the tiny fixture's blocks are foldable
 		const { ws } = connectRunner(store);
 		ws.emit({ type: "conductor/commands", commands: [{ kind: "fold", ids: ["m0:p0"] }] });
 		expect(store.isFolded(store.get("m0:p0")!)).toBe(true);
@@ -224,5 +227,178 @@ describe("attachConductor — human-override wiring", () => {
 		expect(ev.ids).toEqual(["m0:p0"]);
 
 		attachConductor(store, "builtin", []); // tear the remote down so it can't leak into other tests
+	});
+});
+
+describe("RemoteRunner — stale-rev guard (Bug 1)", () => {
+	it("drops a conductor/commands reply whose rev is older than the latest context/update sent", () => {
+		const store = makeStore(3);
+		store.setProtect(0);
+		const { runner, ws } = connectRunner(store);
+		sendHello(ws, "full");
+
+		// After conductor/hello, one context/update was sent (rev=1).
+		// A reply for rev=0 (< 1) must be dropped — block must NOT be folded.
+		ws.emit({ type: "conductor/commands", rev: 0, commands: [{ kind: "fold", ids: ["m0:p0"] }] });
+		expect(store.isFolded(store.get("m0:p0")!)).toBe(false);
+
+		// A reply for the current rev (1) must be applied.
+		ws.emit({ type: "conductor/commands", rev: 1, commands: [{ kind: "fold", ids: ["m0:p0"] }] });
+		expect(store.isFolded(store.get("m0:p0")!)).toBe(true);
+
+		runner.close();
+	});
+
+	it("accepts a conductor/commands reply with no rev (backward compat with conductors that don't echo rev)", () => {
+		const store = makeStore(3);
+		store.setProtect(0);
+		const { runner, ws } = connectRunner(store);
+		sendHello(ws, "full");
+
+		// No rev field — must be accepted (backward compatible).
+		ws.emit({ type: "conductor/commands", commands: [{ kind: "fold", ids: ["m0:p0"] }] });
+		expect(store.isFolded(store.get("m0:p0")!)).toBe(true);
+
+		runner.close();
+	});
+});
+
+describe("RemoteRunner — protocol-mismatch status survives teardown (Bug 2)", () => {
+	it("preserves error status and detail after the mismatch branch calls close()", () => {
+		const store = makeStore(2);
+		const { ws } = connectRunner(store);
+		// Do NOT sendHello — we want to test the mismatch branch directly.
+
+		// Emit a conductor/hello with a wrong protocol version.
+		ws.emit({ type: "conductor/hello", conductorProtocol: 999, id: "x", label: "X" });
+
+		// close() must NOT have reset status to "idle" — the error must survive.
+		expect(conductorLink.status).toBe("error");
+		expect(conductorLink.detail).toMatch(/protocol mismatch/);
+	});
+});
+
+describe("attachConductor — dead runner re-dial on repeat attach (Bug 4)", () => {
+	it("creates a NEW socket when attachConductor is called again after an unexpected drop", () => {
+		const store = makeStore(2);
+		attachConductor(store, ENTRY.id, [ENTRY]);
+		const ws1 = FakeWebSocket.last!;
+		ws1.open();
+
+		// Mark the runner dead via an unexpected socket close (no runner.close() beforehand).
+		ws1.onclose?.();
+
+		// The runner should now be flagged dead.
+		expect(conductorLink.status).toBe("error");
+
+		// Calling attachConductor again with the same id+entry must NOT short-circuit:
+		// the dead runner must be torn down and a new socket dialed.
+		attachConductor(store, ENTRY.id, [ENTRY]);
+		const ws2 = FakeWebSocket.last!;
+
+		// A new socket must have been created — not the same stale one.
+		expect(ws2).not.toBe(ws1);
+
+		// Clean up.
+		attachConductor(store, "builtin", []);
+	});
+
+	it("a MANUAL close does NOT set dead — a repeat attach of a different id stays a normal no-op via lastId guard", () => {
+		const store = makeStore(2);
+		attachConductor(store, ENTRY.id, [ENTRY]);
+		const ws1 = FakeWebSocket.last!;
+		ws1.open();
+
+		// Manually switch away — this calls runner.close() which must NOT set _dead.
+		attachConductor(store, "builtin", []);
+
+		// Switch back to the remote entry: a fresh runner (new socket) is created.
+		attachConductor(store, ENTRY.id, [ENTRY]);
+		const ws2 = FakeWebSocket.last!;
+		expect(ws2).not.toBe(ws1);
+
+		// Clean up.
+		attachConductor(store, "builtin", []);
+	});
+});
+
+describe("RemoteRunner — stale desired cleared on unexpected disconnect (Bug 3)", () => {
+	it("clears to raw (conduct returns []) after an unexpected socket close", () => {
+		const store = makeStore(3);
+		store.setProtect(0);
+		const { runner, ws } = connectRunner(store);
+		sendHello(ws, "full");
+
+		// Arm the runner with a fold command (rev=1, matching what was sent).
+		ws.emit({ type: "conductor/commands", rev: 1, commands: [{ kind: "fold", ids: ["m0:p0"] }] });
+		expect(store.isFolded(store.get("m0:p0")!)).toBe(true);
+
+		// Simulate unexpected drop: call onclose without setting manualClose (no runner.close()).
+		ws.onclose?.();
+
+		// The status should be "error" (not "idle") to signal an unexpected drop.
+		expect(conductorLink.status).toBe("error");
+
+		// conduct() should now return [] (clear to raw), not the stale fold command.
+		// We use a minimal ConductorView — the runner only reads its cached `desired`.
+		const view = {
+			budget: 10000,
+			contextWindow: 200000,
+			liveTokens: 3000,
+			protectedFromIndex: 0,
+			protectTokens: 0,
+			blocks: [],
+		};
+		const result = runner.conduct(view as any);
+		expect(result).toEqual([]);
+	});
+
+	it("the STORE goes raw immediately after disconnect — without manually calling conduct()", () => {
+		const store = makeStore(3);
+		store.setProtect(0);
+		const { ws } = connectRunner(store);
+		sendHello(ws, "full");
+
+		// Fold m0:p0 via conductor command.
+		ws.emit({ type: "conductor/commands", rev: 1, commands: [{ kind: "fold", ids: ["m0:p0"] }] });
+		expect(store.isFolded(store.get("m0:p0")!)).toBe(true);
+
+		// Unexpected close — the onclose handler must immediately call store.refold() so the
+		// block flips to raw in the same tick, not waiting for some future unrelated refold.
+		ws.onclose?.();
+
+		// The store must be raw NOW, without any manual conduct() call from the test.
+		expect(store.isFolded(store.get("m0:p0")!)).toBe(false);
+	});
+});
+
+describe("RemoteRunner — conductorRetry tick (bounded auto-recovery)", () => {
+	it("bumps conductorRetry.tick when a greeted runner drops unexpectedly", () => {
+		const store = makeStore(2);
+		const { ws } = connectRunner(store);
+		// Capture baseline — tests must not assert absolute values because earlier tests may have
+		// already bumped the tick; always diff from the captured baseline.
+		const tickBefore = conductorRetry.tick;
+
+		// Complete the handshake so greeted=true.
+		sendHello(ws, "full");
+
+		// Simulate unexpected drop (no runner.close() beforehand).
+		ws.onclose?.();
+
+		expect(conductorRetry.tick).toBe(tickBefore + 1);
+	});
+
+	it("does NOT bump conductorRetry.tick when a runner drops before ever receiving conductor/hello", () => {
+		const store = makeStore(2);
+		const { ws } = connectRunner(store);
+		const tickBefore = conductorRetry.tick;
+
+		// Do NOT send conductor/hello — greeted stays false.
+		// Simulate unexpected drop immediately (e.g. conductor down / unreachable).
+		ws.onclose?.();
+
+		// Tick must remain unchanged — no thrash retry for a never-greeted runner.
+		expect(conductorRetry.tick).toBe(tickBefore);
 	});
 });

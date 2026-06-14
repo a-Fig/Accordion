@@ -13,6 +13,7 @@
 	 */
 	import { tick } from "svelte";
 	import Icon from "$lib/ui/Icon.svelte";
+	import { IN_PROCESS_CONDUCTORS, inProcessConductor } from "$conductors";
 	import { conductorState, setActiveConductor } from "$lib/live/conductor.svelte";
 	import { conductorLink, BUILTIN_ID, NONE_ID } from "$lib/live/conductorClient.svelte";
 	import {
@@ -43,15 +44,16 @@
 	// the engine — so the trigger must NOT wear remote accent + a dot next to a "Built-in"
 	// label. Gating on the list keeps label/accent/dot honest and in lockstep with attach.
 	const isRemote = $derived(
-		activeId !== BUILTIN_ID && activeId !== NONE_ID && externals.some((c) => c.id === activeId),
+		!inProcessConductor(activeId) && activeId !== NONE_ID && externals.some((c) => c.id === activeId),
 	);
-	// Resolve the SELECTED id to a label. A remote not yet discovered falls back to "Built-in".
+	// Resolve the SELECTED id to a label. An in-process id (built-in or a sibling) resolves to its
+	// registry label; Raw is Raw; otherwise a discovered remote's label, falling back to "Built-in"
+	// for a remote not yet discovered.
 	const activeLabel = $derived(
-		activeId === BUILTIN_ID
-			? "Built-in"
-			: activeId === NONE_ID
+		inProcessConductor(activeId)?.label ??
+			(activeId === NONE_ID
 				? "Raw"
-				: (externals.find((c) => c.id === activeId)?.label ?? "Built-in"),
+				: (externals.find((c) => c.id === activeId)?.label ?? "Built-in")),
 	);
 
 	function toggle(): void {
@@ -158,20 +160,22 @@
 
 	{#if open}
 		<div class="cond-pop" role="menu" aria-label="Conductors">
-			<!-- Built-in -->
-			<button
-				type="button"
-				class="cond-item"
-				class:active={activeId === BUILTIN_ID}
-				role="menuitemradio"
-				aria-checked={activeId === BUILTIN_ID}
-				onclick={() => select(BUILTIN_ID)}
-			>
-				<span class="cond-check">
-					{#if activeId === BUILTIN_ID}<Icon name="check" size={13} />{/if}
-				</span>
-				<span class="cond-item-label">Built-in</span>
-			</button>
+			<!-- In-process conductors (registry-driven — Built-in + any compiled-in sibling) -->
+			{#each IN_PROCESS_CONDUCTORS as c (c.id)}
+				<button
+					type="button"
+					class="cond-item"
+					class:active={activeId === c.id}
+					role="menuitemradio"
+					aria-checked={activeId === c.id}
+					onclick={() => select(c.id)}
+				>
+					<span class="cond-check">
+						{#if activeId === c.id}<Icon name="check" size={13} />{/if}
+					</span>
+					<span class="cond-item-label">{c.label}</span>
+				</button>
+			{/each}
 
 			<!-- Discovered + configured externals -->
 			{#each externals as c (c.id)}

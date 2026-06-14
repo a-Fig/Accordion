@@ -78,11 +78,26 @@ export interface Block {
  * agent-unfold handle is `foldCode(id)`. Invariants (enforced at creation, store.createGroup):
  * contiguous · non-overlapping · flat (members are blocks, never groups) · ≥2 members ·
  * entirely older than the protected tail. `memberIds` is in conversation (block) order.
+ *
+ * `by` is provenance: who created the group. A HUMAN group (`by:"you"`) is durable — it
+ * survives every conductor pass untouched. A conductor/auto group (`by:"auto"`/`"conductor"`,
+ * or absent) is owned by the active strategy: it is cleared at the start of each conductor
+ * pass and rebuilt from that pass's `group` commands, so a conductor that stops asking for a
+ * group (returns `[]`, or is detached) no longer strands it folded. Optional only so legacy /
+ * test-constructed literals stay valid; `createGroup` always sets it (default `"you"`).
  */
 export interface Group {
 	id: string;
 	memberIds: string[];
 	folded: boolean;
+	/**
+	 * Who created this group. `"you"` or absent ⇒ preserved (treated as human/legacy): never
+	 * touched by a conductor pass. `"auto"` or `"conductor"` ⇒ conductor-owned: cleared at the
+	 * start of each conductor pass (`clearConductorState`) and rebuilt from that pass's `group`
+	 * commands, so a group the conductor stops asking for is not left stranded. `createGroup`
+	 * always sets it (default `"you"`).
+	 */
+	by?: Actor;
 }
 
 export interface SessionMeta {

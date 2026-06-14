@@ -3,27 +3,159 @@
 A **conductor** is an interchangeable context-management strategy for Accordion. Between
 turns it reads the agent's context and decides what to fold, replace, group, restore, or
 pin — keeping the live context useful and within budget. Accordion ships one (the built-in
-budget folder); this document is for writing your own, in any language.
+budget folder); this document is for writing your own.
 
-The design and rationale are in [ADR 0007](adr/0007-conductor-protocol.md). The contract is
-defined in two files you can read or copy from directly:
+Conductors are **first-party** — every one lives in this repo (or a fork). There is no
+sandbox or trust boundary; the contract exists to make a conductor cheap to write, with the
+built-in as the worked example. The host enforces one floor (provider-validity) plus two
+guardrails (human overrides win; unsafe commands are clamped and reported) — these stop a
+*bug* from corrupting the session or fighting the human, not an adversary.
 
-- `app/src/lib/engine/conductor.ts` — the in-process shape (`ContextSnapshot`, the
-  `Command` union, `ClampReport`).
-- `app/src/lib/live/conductorProtocol.ts` — the WebSocket messages (this document's
-  reference), which *import* `Command` / `ClampReport` from the contract so there is one
+The design and rationale are in [ADR 0007](adr/0007-conductor-protocol.md), refined by
+[ADR 0008](adr/0008-conductor-first-party-one-view.md). The contract is defined in two files
+you can read or copy from directly:
+
+- `conductors/contract/conductor.ts` — the in-process shape (`ConductorView`, the `Command`
+  union, `ClampReport`, the `Conductor` interface). **This is the primary surface.**
+- `conductors/contract/protocol.ts` — the WebSocket messages (the escape hatch), which
+  *import* `Command` / `ClampReport` / `ViewBlock` from the contract so there is one
   definition, not two.
+
+---
+
+# Part 1 — The in-process contract (the main way)
+
+The whole contract is one pure idea:
+
+```ts
+conduct(view: ConductorView): Command[] | null
+```
+
+The easiest conductor is a TypeScript class implementing this method, dropped in
+`conductors/<name>/` and registered with one line in `conductors/index.ts`
+(`IN_PROCESS_CONDUCTORS`). It then appears in the header switcher and is selectable per
+session. The built-in (`conductors/builtin/builtin.ts`) is a ~15-line example of exactly
+this; read it to see the surface in action. (For the step-by-step + a minimal example, see
+[`conductors/README.md`](../conductors/README.md).)
+
+## The view you receive — `ConductorView`
+
+`conduct()` is handed a read-only `ConductorView`: pure, serializable data the host owns.
+Treat everything in it as immutable.
+
+| field                | type           | meaning                                                                                  |
+|----------------------|----------------|------------------------------------------------------------------------------------------|
+| `blocks`             | `ViewBlock[]`  | every block, in conversation order — your whole field of view                            |
+| `budget`             | number         | token budget for the live context window                                                 |
+| `contextWindow`      | number \| null | the model's total context window as reported by the host, or `null` if unknown           |
+| `liveTokens`         | number         | live token cost at the moment the view is built — **the baseline you fold down from**     |
+| `protectedFromIndex` | number         | index of the first block in the host's protected working tail (`blocks.length` ⇒ no tail) |
+| `protectTokens`      | number         | the protected-tail token target driving `protectedFromIndex`                              |
+
+`liveTokens` already reflects the human's overrides and any folded groups but **no conductor
+folds** — the host clears the previous conductor pass before building the view, so it is a
+clean baseline. `protectedFromIndex` / `protectTokens` surface the host's protected working
+tail as *policy*: you may honour it (the built-in treats it as a hard "don't fold past here"
+line) or ignore it, but folding into the tail may be reverted by host healing.
+
+A **`ViewBlock`** is one block as every conductor sees it — identical in-process and on the
+wire:
+
+| field          | type     | notes                                                                            |
+|----------------|----------|----------------------------------------------------------------------------------|
+| `id`           | string   | durable block id — what every command references                                 |
+| `kind`         | string   | `user` · `text` · `thinking` · `tool_call` · `tool_result`                       |
+| `turn`         | number   | 1-based user turn                                                                 |
+| `order`        | number   | global 0-based position in the conversation                                      |
+| `tokens`       | number   | full token cost at full fidelity                                                 |
+| `foldedTokens` | number   | token cost **if folded** (the digest size) — precomputed so you needn't estimate |
+| `toolName`     | string?  | for `tool_call` / `tool_result`                                                  |
+| `callId`       | string?  | pairing key (a call and its result share it)                                     |
+| `isError`      | boolean? | tool-result error flag                                                            |
+| `held`         | boolean  | a human override (pin / manual fold / manual unfold) owns this block             |
+| `folded`       | boolean  | currently rendered folded in the view                                            |
+| `protected`    | boolean  | inside the host's protected working tail                                         |
+| `grouped`      | boolean  | member of a folded group (the host owns it)                                      |
+| `text`         | string?  | full content (in-process always; on the wire under `wants:"full"`)               |
+| `preview`      | string?  | one-line taste (on the wire under `wants:"shape"` / `"onDemand"`)                |
+
+The four booleans fold the host's policy into plain flags so you never call an engine
+helper: skip a block when `held`, `protected`, or `grouped`, and read `foldedTokens` for the
+saving a fold would buy.
+
+## What you return — the command set
+
+`conduct()` returns one of:
+
+- **`Command[]`** — your *complete desired state*. The host resets to the raw baseline and
+  applies the whole batch, so to change one block you re-send your whole intention.
+- **`[]`** — explicitly clear to raw (nothing folded).
+- **`null`** — *hold*: the host keeps the last applied state untouched. Used by an async
+  (remote) conductor still thinking; it must never block a model call. (An in-process
+  conductor is synchronous and normally always has a definite answer — the built-in never
+  returns `null`.)
+
+Every command is **content substitution, never structural removal** — a block is never
+spliced out, only its content changes. That is what guarantees a `tool_call`/`tool_result`
+pair can never orphan.
+
+| command   | shape                                | effect                                                                 |
+|-----------|--------------------------------------|------------------------------------------------------------------------|
+| `fold`    | `{ kind:"fold", ids, digest? }`      | Collapse blocks to a digest. No `digest` → the host's per-kind digest + the `{#code FOLDED}` agent-recovery tag. A `digest` string → exactly that text is shown and the agent receives it. |
+| `replace` | `{ kind:"replace", id, content }`    | Substitute a block's content with arbitrary text. `content: ""` is the safe form of **delete** — the block stays in place (pairing intact) but contributes almost nothing. |
+| `group`   | `{ kind:"group", ids }`              | Collapse a **contiguous** run into one summary entry (summary-on-head, the rest emptied — never removed). The group covers the run from the **first to the last** named id, snapped outward to whole messages — blocks *between* the first and last are swept in even if unnamed. For a non-contiguous set, issue one `group` per run, or empty/replace blocks individually. |
+| `restore` | `{ kind:"restore", ids }`            | Return blocks to full, live content (undo a fold/replace). No-op on a human-held block. |
+| `pin`     | `{ kind:"pin", ids }`                | Assert blocks stay live and open — e.g. force live a block an earlier command in the same batch folded. Never overrides a *human* pin. |
+
+## Guardrails the host enforces (and reports)
+
+The host clamps each command to the one floor it keeps — **provider-validity, the message
+stays sendable** — and reports anything it couldn't apply verbatim. Nothing is silently
+dropped; nothing throws.
+
+- **Content substitution only.** There is no remove. `replace(id, "")` is how you "delete".
+- **Human-held blocks are refused.** A `fold` / `replace` / `restore` / `pin` touching a
+  block the human pinned, manually folded, or manually unfolded (`held: true`) comes back as
+  a `human-override` `ClampReport` and is not applied. The human always wins.
+- **A `group` over a human-held block is refused wholesale** — the entire group, not just
+  the held member. Re-issue the group around the held block, or leave it.
+- **`group` validity.** The ids must be a contiguous, currently-ungrouped, ≥2-member run,
+  entirely older than the protected tail. Otherwise: `invalid-group`.
+- **Grouped members are off-limits.** A block already inside a folded group (`grouped:
+  true`) is owned by the group overlay; folding it individually double-counts → a `grouped`
+  report. Leave grouped blocks alone.
+
+A **`ClampReport`** is `{ command, ids, reason, detail }`. `reason` is one of:
+
+| reason           | meaning                                                                       |
+|------------------|-------------------------------------------------------------------------------|
+| `unknown-id`     | no block with that id exists (vanished in a resync, or never existed)          |
+| `human-override` | a human pin / manual fold / manual unfold owns the block — the human wins      |
+| `grouped`        | the block is inside a folded group; the group overlay owns it                  |
+| `invalid-group`  | a `group`'s ids were not a valid contiguous, ungrouped, ≥2-member run          |
+| `protected`      | the block is inside the protected working tail; protection is absolute — the host won't fold it |
+| `noop`           | the command was a no-op (e.g. restoring an already-live block)                 |
+
+In-process, `conduct()` returns and the host applies synchronously; the clamp reports are
+available to the host immediately (the built-in never trips one). Out of process, they come
+back as a `host/commandResult` frame (Part 2).
+
+---
+
+# Part 2 — Out-of-process (the WebSocket escape hatch)
+
+Reach for the wire **only** when an in-process TypeScript class won't do: you need a
+separate process, a long-running model, or a non-JS language. The contract is identical —
+the same `ConductorView` in, the same `Command[]` out — just serialized to JSON over a
+WebSocket. `conductors/recency-folder/` is the runnable reference.
 
 ## Topology — you host, Accordion connects
 
 You host a WebSocket endpoint. Accordion connects to it as a **client** and dials out.
 (Accordion is a webview; it cannot host a server. It is already a client to the pi
 extension — this mirrors that exactly.) One JSON message per WebSocket frame; the shapes
-are below.
-
-Trust is full once connected. The only thing the host enforces on your commands is
-**provider-validity** — the outgoing message must stay sendable. Everything else (what to
-fold, recency, summaries, tags) is your strategy.
+are below. You *declare* the content fidelity you want (`wants.content`) — a bandwidth/own-
+preference choice, not a security boundary, since trust is full once connected.
 
 ## How Accordion finds you
 
@@ -31,13 +163,13 @@ Two ways:
 
 **1. Advertise a registry file** (local conductors — auto-discovered). Write a JSON file
 at `~/.accordion/conductors/<id>.json` matching the `ConductorEntry` shape, refresh it on a
-heartbeat (Accordion treats an entry older than 15 s as dead and reaps it), and delete it on
-shutdown. The fields (see `registry.ts`):
+heartbeat (Accordion treats an entry older than 15 s as offline and hides it from the
+conductor list — the descriptor file is not deleted), and delete it on shutdown. The fields (see `registry.ts`):
 
 | field              | type     | meaning                                                     |
 |--------------------|----------|-------------------------------------------------------------|
 | `registryProtocol` | number   | must equal `1` (the `REGISTRY_PROTOCOL` constant)           |
-| `conductorProtocol`| number   | the conductor wire version you speak (`1` today)            |
+| `conductorProtocol`| number   | the conductor wire version you speak (`2` today)            |
 | `id`               | string   | stable conductor id (also the file's basename)              |
 | `label`            | string   | human-facing name shown in the switcher                     |
 | `url`              | string   | the `ws://` endpoint Accordion dials                        |
@@ -50,7 +182,7 @@ Sample `~/.accordion/conductors/recency-folder.json`:
 ```json
 {
   "registryProtocol": 1,
-  "conductorProtocol": 1,
+  "conductorProtocol": 2,
   "id": "recency-folder",
   "label": "Recency folder",
   "url": "ws://127.0.0.1:7700",
@@ -86,7 +218,8 @@ in the app — no registry file needed. Use this when you run off-box or do not 
 2. **Declare intent.** Reply with `conductor/hello` — your `id`, `label`, and the content
    fidelity you want (`wants.content`, default `"full"`).
 3. **Receive context.** On every change (a block streamed in, the budget or protect tail
-   moved) Accordion sends `context/update` with the full block list and a monotonic `rev`.
+   moved) Accordion sends `context/update` — a full `ConductorView` payload with a monotonic
+   `rev`.
 4. **Reply with your complete desired state.** Send `conductor/commands` with the full
    batch of commands (not a diff) and echo the `rev` you are responding to.
 5. **Read what was clamped.** Accordion replies `host/commandResult` with one
@@ -99,7 +232,8 @@ re-applies the whole batch each time. To change one block, re-send your whole in
 
 ## Message reference
 
-All shapes are exact (from `conductorProtocol.ts`). `CONDUCTOR_PROTOCOL_VERSION` is `1`.
+All shapes are exact (from `conductors/contract/protocol.ts`). `CONDUCTOR_PROTOCOL_VERSION`
+is `2`.
 
 ### host → conductor
 
@@ -108,14 +242,16 @@ All shapes are exact (from `conductorProtocol.ts`). `CONDUCTOR_PROTOCOL_VERSION`
 ```json
 {
   "type": "host/hello",
-  "conductorProtocol": 1,
+  "conductorProtocol": 2,
   "session": { "title": "fix the parser", "model": "google/gemini-2.5-flash-lite", "cwd": "/home/me/proj" },
   "budget": 70000,
   "contextWindow": 1000000
 }
 ```
 
-**`context/update`** — the context changed; carries the full block list each time.
+**`context/update`** — the context changed; the payload **is a `ConductorView`** (the same
+view the in-process built-in receives) plus a monotonic `rev` to echo back. Carries the full
+block list each time.
 
 ```json
 {
@@ -123,31 +259,17 @@ All shapes are exact (from `conductorProtocol.ts`). `CONDUCTOR_PROTOCOL_VERSION`
   "rev": 7,
   "budget": 70000,
   "contextWindow": 1000000,
+  "liveTokens": 92000,
   "protectedFromIndex": 940,
-  "blocks": [ /* BlockView[] */ ]
+  "protectTokens": 20000,
+  "blocks": [ /* ViewBlock[] — see the ViewBlock table in Part 1 */ ]
 }
 ```
 
-`protectedFromIndex` is the first index of the host's protected working tail — host
-*policy* you may honour or ignore. The host does not enforce it as a floor, but folding
-into the tail may be reverted by host healing while the built-in is the active policy.
-
-A **`BlockView`** is a serialisable projection of an engine block:
-
-| field       | type    | notes                                                                  |
-|-------------|---------|------------------------------------------------------------------------|
-| `id`        | string  | durable block id — what every command references                       |
-| `kind`      | string  | `user` · `text` · `thinking` · `tool_call` · `tool_result`             |
-| `turn`      | number  | 1-based user turn (0 = preamble)                                       |
-| `order`     | number  | global 0-based position in the conversation                            |
-| `tokens`    | number  | full token cost at full fidelity                                       |
-| `toolName`  | string? | for `tool_call` / `tool_result`                                        |
-| `callId`    | string? | pairing key (a call and its result share it)                           |
-| `isError`   | boolean?| tool-result error flag                                                 |
-| `folded`    | boolean | currently folded in the host view (by a prior command or a human)      |
-| `protected` | boolean | inside the host's protected working tail                               |
-| `text`      | string? | full content — present only under `wants:"full"`                       |
-| `preview`   | string? | one-line taste — present under `wants:"shape"`/`"onDemand"` in place of `text` |
+`liveTokens` is the baseline to fold down from; `protectedFromIndex` / `protectTokens` are
+the host's protected-tail *policy* you may honour or ignore (folding into the tail may be
+reverted by host healing). Each `block` is a `ViewBlock` — its `text` is present under
+`wants:"full"`, replaced by a one-line `preview` under `wants:"shape"` / `"onDemand"`.
 
 **`host/commandResult`** — what the host clamped from your last batch.
 
@@ -161,11 +283,9 @@ A **`BlockView`** is a serialisable projection of an engine block:
 }
 ```
 
-`reason` is one of: `unknown-id` (no such block — vanished in a resync or never existed),
-`human-override` (a human pin/fold/unfold owns it — human wins), `grouped` (inside a folded
-group the group overlay owns), `invalid-group` (a `group`'s ids were not a contiguous,
-ungrouped, ≥2-member run), `noop` (already in the requested state). Commands are never
-silently dropped — every clamp is reported.
+`reason` is one of the `ClampReason`s tabled in Part 1 (`unknown-id`, `human-override`,
+`grouped`, `invalid-group`, `protected`, `noop`). Commands are never silently dropped — every
+clamp is reported.
 
 **`cap/result`** — answer to a `cap/request` you sent (same `reqId`).
 
@@ -183,14 +303,18 @@ On failure: `{ "type": "cap/result", "reqId": "r1", "ok": false, "error": "unkno
 
 `event` is `"agentUnfold"` (the live agent pulled blocks back to full via its `unfold`
 tool) or `"humanOverride"` (the human pinned/folded/unfolded by hand — their choice always
-wins). Treat both as facts about the current state to fold into your next batch.
+wins). `ids` are **block ids** in both cases — the same ids that appear in `ViewBlock.id`,
+so you can correlate them directly against the blocks you received in `context/update`. For
+`agentUnfold`, all block ids that mapped to the restored fold codes are included (a short
+hash can rarely collide → multiple ids per code are possible). Treat both events as facts
+about the current state to fold into your next batch.
 
 ### conductor → host
 
 **`conductor/hello`** — your opening frame.
 
 ```json
-{ "type": "conductor/hello", "conductorProtocol": 1, "id": "recency-folder", "label": "Recency folder", "wants": { "content": "full" } }
+{ "type": "conductor/hello", "conductorProtocol": 2, "id": "recency-folder", "label": "Recency folder", "wants": { "content": "full" } }
 ```
 
 `wants.content`: `"full"` (every block's text — the default), `"shape"` (structure +
@@ -228,48 +352,24 @@ tokenizer). The host answers with a `cap/result` carrying the same `reqId`.
 | `getContent`   | `ids[0]`         | full text of that block (for `wants:"onDemand"`)                 |
 | `getDigest`    | `ids[0]`         | the engine's per-kind folded digest (incl. the `{#code FOLDED}` tag) |
 
-## The command set
+## A reference conductor (Node.js, on the wire)
 
-Every command is **content substitution, never structural removal** — a block is never
-spliced out, only its content changes. That is what guarantees a `tool_call`/`tool_result`
-pair can never orphan.
+A minimal, copy-paste-runnable conductor (`npm i ws`). It hosts a WS server, declares it
+wants full content, and on each `context/update` folds the oldest non-`protected`
+`tool_result` blocks until the live estimate is under budget — the spirit of the built-in
+(oldest-first, results decay fastest), in ~35 lines.
 
-| command   | shape                                | effect                                                                 |
-|-----------|--------------------------------------|------------------------------------------------------------------------|
-| `fold`    | `{ kind:"fold", ids, digest? }`      | Collapse blocks to a digest. No `digest` → the host's per-kind digest + the `{#code FOLDED}` agent-recovery tag. A `digest` string → exactly that text is shown and the agent receives it. |
-| `replace` | `{ kind:"replace", id, content }`    | Substitute a block's content with arbitrary text. `content: ""` is the safe form of **delete** — the block stays in place (pairing intact) but contributes almost nothing. |
-| `group`   | `{ kind:"group", ids }`              | Collapse a **contiguous** run into one summary entry (summary-on-head, the rest emptied — never removed). Non-contiguous selections are not representable; empty/replace individually instead. |
-| `restore` | `{ kind:"restore", ids }`            | Return blocks to full, live content (undo a fold/replace). No-op on a human-held block. |
-| `pin`     | `{ kind:"pin", ids }`                | Assert blocks stay live and open — e.g. force live a block an earlier command in the same batch folded. Never overrides a *human* pin. |
-
-### Safety rules you must expect
-
-- **Content substitution only.** There is no remove. `replace(id, "")` is how you "delete".
-- **Human-held blocks are refused.** A `fold` / `replace` / `restore` / `pin` touching a
-  block the human pinned, manually folded, or manually unfolded comes back as a
-  `human-override` `ClampReport` and is not applied. The human always wins.
-- **A `group` over a human-held block is refused wholesale** — the entire group, not just
-  the held member (`invalid-group` / `human-override`). Re-issue the group around the held
-  block, or leave it.
-- **`group` validity.** The ids must be a contiguous, currently-ungrouped, ≥2-member run,
-  entirely older than the protected tail. Otherwise: `invalid-group`.
-- **Grouped members are off-limits.** A block already inside a folded group is owned by the
-  group overlay; folding it individually double-counts. `BlockView` does not flag group
-  membership directly in v1 — leave blocks you grouped alone and watch for a `grouped`
-  report.
-
-## A reference conductor
-
-A minimal, copy-paste-runnable conductor in Node.js (`npm i ws`). It hosts a WS server,
-declares it wants full content, and on each `context/update` folds the oldest
-non-`protected` `tool_result` blocks until the live estimate is under budget — the spirit
-of the built-in (oldest-first, results decay fastest), in ~35 lines.
+> A **runnable copy** of this conductor — with the `~/.accordion/conductors/` heartbeat
+> wired up so the desktop app auto-discovers it — lives at
+> [`conductors/recency-folder/`](../conductors/recency-folder/) (`cd` in, `npm install`,
+> `npm start`). New conductors get their own subdirectory under
+> [`conductors/`](../conductors/).
 
 ```js
 // recency-folder.js — run: node recency-folder.js   (npm i ws)
 // Advertise it for auto-discovery by writing this JSON to
 // ~/.accordion/conductors/recency-folder.json (refresh heartbeatAt every few seconds):
-//   { "registryProtocol":1, "conductorProtocol":1, "id":"recency-folder",
+//   { "registryProtocol":1, "conductorProtocol":2, "id":"recency-folder",
 //     "label":"Recency folder", "url":"ws://127.0.0.1:7700",
 //     "pid":<pid>, "startedAt":<ms>, "heartbeatAt":<ms> }
 import { WebSocketServer } from "ws";
@@ -278,7 +378,7 @@ const wss = new WebSocketServer({ host: "127.0.0.1", port: 7700 });
 
 wss.on("connection", (ws) => {
   ws.send(JSON.stringify({
-    type: "conductor/hello", conductorProtocol: 1,
+    type: "conductor/hello", conductorProtocol: 2,
     id: "recency-folder", label: "Recency folder", wants: { content: "full" },
   }));
 
@@ -287,13 +387,16 @@ wss.on("connection", (ws) => {
     if (msg.type !== "context/update") return; // ignore hello/result/event for this demo
 
     // Fold oldest, non-protected, not-yet-folded tool_results until under budget.
-    let live = msg.blocks.reduce((n, b) => n + (b.folded ? 0 : b.tokens), 0);
+    // Use the host-supplied liveTokens as the baseline (already accounts for human
+    // folds, folded-group carriers, and digest residue). Each fold saves the
+    // difference between full and folded cost (foldedTokens is precomputed).
+    let live = msg.liveTokens;
     const ids = [];
     for (const b of msg.blocks) {          // blocks arrive in conversation order (oldest first)
       if (live <= msg.budget) break;
       if (b.kind !== "tool_result" || b.folded || b.protected) continue;
       ids.push(b.id);
-      live -= b.tokens;                    // approximate; the host clamps + re-counts exactly
+      live -= (b.tokens - b.foldedTokens); // host clamps + re-counts exactly
     }
 
     ws.send(JSON.stringify({
@@ -306,8 +409,7 @@ wss.on("connection", (ws) => {
 console.log("recency-folder listening on ws://127.0.0.1:7700");
 ```
 
-This is intentionally crude (it estimates token savings as the whole block, where the host
-counts the digest residue; it ignores `host/commandResult` and `host/event`). A real
+This is intentionally minimal (it ignores `host/commandResult` and `host/event`). A real
 conductor reads the clamp reports, respects `human-override`, and may use `countTokens` for
 exact accounting. But it is correct against the real message shapes and Accordion will
 attach to it, fold tiles, and report back.

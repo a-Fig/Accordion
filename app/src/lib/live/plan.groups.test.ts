@@ -65,6 +65,18 @@ describe("resolveUnfold — group code", () => {
 		expect(computeGroupOps(s)).toEqual([]);
 	});
 
+	it("group unfold populates ids with the group's memberIds (not empty)", () => {
+		const s = makeStore();
+		const g = s.createGroup("a:r1:p0", "r:c1")!;
+		// The group covers: a:r1:p0, a:r1:p1, a:r1:p2, r:c1 (snapped to whole messages)
+		const { restored } = resolveUnfold(s, [foldCode(g.id)]);
+		expect(restored.length).toBe(1);
+		// ids must be the group's memberIds — never empty — so the conductor notification
+		// for agentUnfold carries the actual block ids rather than []
+		expect(restored[0].ids).toEqual(g.memberIds);
+		expect(restored[0].ids.length).toBeGreaterThan(0);
+	});
+
 	it("reports an unknown code as missing and changes nothing", () => {
 		const s = makeStore();
 		const g = s.createGroup("a:r1:p0", "r:c1")!;

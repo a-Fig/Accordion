@@ -1,5 +1,12 @@
 # ADR 0007 — The Conductor protocol: an interchangeable context-management contract
 
+> **Superseded in part by [ADR 0008](0008-conductor-first-party-one-view.md):** conductors
+> are first-party (not untrusted third parties), the contract moved to `conductors/contract/`,
+> the built-in to `conductors/builtin/`, there is one public `ConductorView` for all
+> conductors, and the in-process path is now primary (WebSocket demoted to an escape hatch).
+> The core contract below — `conduct → Command[]`, content-substitution commands, clamp
+> reports, human-overrides-win — still stands.
+
 **Status:** accepted (Milestone 1 — the engine seam)
 **Date:** 2026-06-13
 **Builds on:** [ADR 0001](0001-pi-live-integration.md) (the live link / "GUI drives, thin

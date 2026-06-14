@@ -110,7 +110,7 @@ export function resolveUnfold(store: AccordionStore, codes: string[]): { restore
 		for (const g of store.groups) {
 			if (g.folded && foldCode(g.id) === code) {
 				store.unfoldGroup(g.id, "agent");
-				restored.push({ code, kind: "text", label: `group · ${g.memberIds.length} blocks` });
+				restored.push({ code, kind: "text", label: `group · ${g.memberIds.length} blocks`, ids: g.memberIds });
 				hit = true;
 			}
 		}
@@ -126,9 +126,13 @@ export function resolveUnfold(store: AccordionStore, codes: string[]): { restore
 			// from the wire, so the agent only ever holds the group code — but keep the honesty
 			// guarantee LOCAL to this resolver rather than relying on that.)
 			const grp = store.groupOf(b);
-			if (grp?.folded) store.unfoldGroup(grp.id, "agent");
+			const grpFolded = grp?.folded ?? false;
+			if (grpFolded) store.unfoldGroup(grp!.id, "agent");
 			else store.unfold(b.id, "agent");
-			restored.push({ code, kind: b.kind, label: blockLabel(b) });
+			// ids reflects the ACTUAL restore set: if routed through unfoldGroup the whole group
+			// is restored, not just the single member block (honesty guarantee). Captured before
+			// the unfold call so the pre-unfold folded state is used for the branch decision.
+			restored.push({ code, kind: b.kind, label: blockLabel(b), ids: grpFolded ? grp!.memberIds : [b.id] });
 			hit = true;
 		}
 		if (!hit) missing.push(code);

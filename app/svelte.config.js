@@ -12,6 +12,13 @@ const config = {
     adapter: adapter({
       fallback: "index.html",
     }),
+    // Every conductor — built-in included — lives in the top-level `conductors/` dir and
+    // imports the contract as a sibling. The app reaches it through this alias (relative to
+    // this SvelteKit project root, `app/`). Lands in `.svelte-kit/tsconfig.json` for
+    // svelte-check; vite.config.js mirrors it for vitest + the production build.
+    alias: {
+      $conductors: "../conductors",
+    },
   },
 };
 

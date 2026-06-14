@@ -17,8 +17,8 @@
  * The code is a short HASH of the durable block id, not the id itself: a raw id is a
  * UUID/timestamp (`a:f2965ed9-…-d93e8c55c59e:p0`) — unreadable line-noise repeated on
  * every folded block. The hash is a pure function of the id, so it needs no state and
- * is globally stable (same block → same code, every session). A 4-char base36 space
- * (~1.68M) keeps collisions rare; the rare collision is handled by `resolveUnfold`
+ * is globally stable (same block → same code, every session). A 6-char base36 space
+ * (~2.2B) keeps collisions rare; the rare collision is handled by `resolveUnfold`
  * unfolding every folded block that shares the code (cheap and harmless).
  */
 import type { Block, BlockKind, Group } from "./types";

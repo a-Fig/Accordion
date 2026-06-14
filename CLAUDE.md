@@ -135,6 +135,53 @@ each model call — so an assistant reply is only seen at the *next* model call 
 next user turn for a plain reply; immediately for tool-using turns). Closing that gap
 (a post-turn view sync) is a planned follow-up.
 
+## Conductors — pluggable context strategy ([ADR 0007](docs/adr/0007-conductor-protocol.md), [0008](docs/adr/0008-conductor-first-party-one-view.md))
+
+*Which* blocks to fold / replace / group / restore / pin is owned by a **conductor**, an
+interchangeable strategy behind one contract: `conduct(view) → Command[] | null` (`Command[]`
+= complete desired state, `[]` = clear to raw, `null` = hold last state). Accordion imposes
+no strategy of its own — no conductor attached ⇒ raw context. Conductors are **first-party**
+(every one ships in this repo or a fork — no sandbox, no trust boundary); the interface
+exists to make them cheap to write, with the built-in as the worked example. The contract
+lives in the top-level **`conductors/contract/`** (both halves dependency-free / Node-safe,
+re-exported by `conductors/contract/index.ts`, imported via the `$conductors` alias):
+`conductor.ts` (the in-process shape — `ConductorView`, `ViewBlock`, the `Command` union
+`fold·replace·group·restore·pin`, `ClampReport`, the `Conductor` interface) and `protocol.ts`
+(the WebSocket messages, `CONDUCTOR_PROTOCOL_VERSION = 2`, which *import* the `Command` /
+`ViewBlock` types so there is one definition). The host enforces exactly one floor —
+**provider-validity** (the message stays sendable); human overrides always win; an unsafe
+command is clamped to nearest-safe and **reported**, never silently dropped (bug/UX rails,
+not protection against the conductor).
+
+- **One public view.** Every conductor — built-in included — receives the same pure-data
+  `ConductorView`: top-level `budget`, `contextWindow`, `liveTokens`, `protectedFromIndex`,
+  `protectTokens`, and `blocks: ViewBlock[]` (`id, kind, turn, order, tokens, foldedTokens,
+  toolName?, callId?, isError?, held, folded, protected, grouped, text?, preview?`). The
+  store builds it in `buildView`/`runConductor` (`store.svelte.ts`); there is no privileged
+  richer in-process snapshot.
+- **In-process is the main way.** Drop a TS class implementing `conduct(view)` in
+  `conductors/<name>/` and register one line in `conductors/index.ts`
+  (`IN_PROCESS_CONDUCTORS`: `{ id, label, create: () => new MyConductor() }`) — it appears in
+  the header switcher automatically. The **built-in** folder is the worked reference —
+  `conductors/builtin/builtin.ts` (`BuiltinConductor`, a ~15-line `conduct`), attached by
+  `AccordionStore` on construction; `store.attach(c)` / `store.detach()` swap it. Folds from
+  every conductor are attributed uniformly (`by:"auto"`; no `id === "builtin"` special-case).
+  Its byte-identical output is pinned by a golden test (`conductor.builtin.test.ts`) — don't
+  break it.
+- **WebSocket is a demoted escape hatch** for a separate process / another language. The
+  conductor hosts a WS endpoint; Accordion **dials as a client** (the webview can't host a
+  server). `context/update` carries the full `ConductorView`. App side:
+  `live/conductorClient.svelte.ts` (`RemoteRunner` bridges the async WS ↔ the synchronous
+  `conduct()`), `live/conductorDiscovery.svelte.ts` (polls Rust `list_conductors` +
+  hand-configured URLs), switched via the header `ui/map/ConductorMenu.svelte` dropdown.
+  Local discovery files live at `~/.accordion/conductors/<id>.json` (5 s heartbeat; 15 s stale/reap window).
+- **Writing one:** [conductors/README.md](conductors/README.md) leads with the in-process
+  path + a minimal example; [docs/conductor-protocol.md](docs/conductor-protocol.md) is the
+  full developer reference (the `ConductorView`/`ViewBlock`/`Command` tables first, then the
+  WS lifecycle + message shapes as the escape-hatch half). External (WS) implementations live
+  in `conductors/<name>/`, any language; `conductors/recency-folder/` is the runnable wire
+  starter.
+
 ## Visual grammar (consistent across ALL views)
 
 - **kind = color** — `user #6ea8fe · text #aab2c2 · thinking #b483e0 · tool_call #34d3c2 · tool_result #f0a35e` (vars `--k-*` in `app.css`).

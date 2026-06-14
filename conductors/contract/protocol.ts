@@ -1,8 +1,8 @@
 /*
- * conductorProtocol.ts — the Accordion ↔ Conductor WIRE (ADR 0007).
+ * protocol.ts — the Accordion ↔ Conductor WIRE (ADR 0007).
  *
- * The in-process contract is `engine/conductor.ts` (`conduct(snapshot) → Command[]`).
- * This file is its cross-process form: the JSON messages a conductor running as its own
+ * The in-process contract is `./conductor.ts` (`conduct(view) → Command[]`) — the main
+ * way. This file is the ESCAPE HATCH: the JSON messages a conductor running as its own
  * process — in any language — exchanges with Accordion over a WebSocket.
  *
  * Topology: the CONDUCTOR hosts the WebSocket endpoint and Accordion connects to it as a
@@ -11,19 +11,19 @@
  * `~/.accordion/conductors/<id>.json` (see `registry.ts`); a remote one is a URL the user
  * configures. Either way Accordion dials out.
  *
- * The command vocabulary (`Command`) and clamp reports (`ClampReport`) are imported from
- * the engine contract so the wire and the in-process apply path share ONE definition —
- * there is no separate wire representation of a fold to drift out of sync.
+ * The command vocabulary (`Command`), clamp reports (`ClampReport`), and the per-block
+ * view (`ViewBlock`) are all imported from the sibling contract so the wire and the
+ * in-process apply path share ONE definition — there is no separate wire representation of
+ * a block or a fold to drift out of sync. A `context/update`'s payload IS a `ConductorView`.
  *
  * Keep this dependency-free and runtime-pure (type-only imports, erased at build): a
- * stranger writing a conductor copies these shapes; they should not have to vendor the
- * whole engine. See `docs/conductor-protocol.md` for a copy-paste reference conductor.
+ * conductor author copies these shapes; they should not have to vendor the whole engine.
+ * See `docs/conductor-protocol.md` for a copy-paste reference conductor.
  */
-import type { Command, ClampReport } from "../engine/conductor";
-import type { BlockKind } from "../engine/types";
+import type { Command, ClampReport, ViewBlock } from "./conductor";
 
 /** Bumped on any breaking change to the messages below. Independent of the pi wire's PROTOCOL_VERSION. */
-export const CONDUCTOR_PROTOCOL_VERSION = 1;
+export const CONDUCTOR_PROTOCOL_VERSION = 2;
 
 /**
  * How much of each block's content a conductor wants to receive (declared in
@@ -35,32 +35,8 @@ export const CONDUCTOR_PROTOCOL_VERSION = 1;
  */
 export type ContentMode = "full" | "shape" | "onDemand";
 
-/**
- * One block as the conductor sees it. A serializable projection of an engine `Block`:
- * never carries fold-control state the conductor owns (it decides that), but DOES report
- * the block's current `folded`/`protected` status so the conductor can reason about where
- * things stand. `text` is present only under `wants:"full"`; otherwise `preview` (a short
- * first-line taste) stands in and full text is fetched on demand.
- */
-export interface BlockView {
-	id: string;
-	kind: BlockKind;
-	turn: number;
-	order: number;
-	/** Full token cost of the block at full fidelity. */
-	tokens: number;
-	toolName?: string;
-	callId?: string;
-	isError?: boolean;
-	/** Currently folded in the host view (by a prior command or a human). */
-	folded: boolean;
-	/** Inside the host's protected working tail (host policy; folding here may be healed). */
-	protected: boolean;
-	/** Full content — present only when the conductor asked for `wants:"full"`. */
-	text?: string;
-	/** One-line taste — present under `wants:"shape"`/`"onDemand"` in place of `text`. */
-	preview?: string;
-}
+// One block as the conductor sees it is `ViewBlock`, defined ONCE in `./conductor.ts`
+// and imported above — the in-process built-in and the wire consume the identical shape.
 
 // ─── host → conductor ────────────────────────────────────────────────────────
 
@@ -74,18 +50,22 @@ export interface HostHelloMessage {
 }
 
 /**
- * The context changed (a block streamed in, the budget or protect tail moved). Carries the
- * full block list each time — the conductor's complete field of view — plus a monotonic
- * `rev` it should echo in its reply so the host can spot a reply to a stale snapshot.
+ * The context changed (a block streamed in, the budget or protect tail moved). The payload
+ * IS a `ConductorView` — the same view the in-process built-in folder receives — plus a
+ * monotonic `rev` the conductor echoes in its reply so the host can spot a reply to a stale
+ * snapshot. Carries the full block list each time (the conductor's complete field of view).
  */
 export interface ContextUpdateMessage {
 	type: "context/update";
 	rev: number;
 	budget: number;
 	contextWindow: number | null;
+	liveTokens: number;
 	/** First protected-tail index (host policy the conductor may honour or ignore). */
 	protectedFromIndex: number;
-	blocks: BlockView[];
+	/** The protected-tail token target driving `protectedFromIndex`. */
+	protectTokens: number;
+	blocks: ViewBlock[];
 }
 
 /** What the host clamped from the conductor's last batch (provider-validity floor). */
@@ -108,6 +88,11 @@ export interface CapResultMessage {
  * Something happened that the conductor should know about but did not initiate:
  *  - "agentUnfold"   — the live agent called `unfold` and pulled blocks back to full;
  *  - "humanOverride" — the human pinned/folded/unfolded by hand (their choice always wins).
+ *
+ * `ids` are BLOCK IDS in both cases (the same ids that appear in `ViewBlock.id`), so a
+ * conductor can correlate them directly against the blocks it received in `context/update`.
+ * For `agentUnfold`, all block ids that mapped to the restored fold codes are included (a
+ * short hash can rarely collide, so multiple ids per code are possible).
  */
 export interface HostEventMessage {
 	type: "host/event";

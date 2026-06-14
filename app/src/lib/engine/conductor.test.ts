@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "./store.svelte";
-import { BuiltinConductor } from "./conductor.builtin";
-import type { Conductor, ContextSnapshot, Command } from "./conductor";
+import { BuiltinConductor } from "$conductors";
+import type { Conductor, ConductorView, Command } from "$conductors/contract";
 import type { Block, ParsedSession } from "./types";
 import { BLOCK_OVERHEAD } from "./tokens";
 
@@ -42,9 +42,9 @@ class StubConductor implements Conductor {
 	readonly id = "stub";
 	readonly label = "Stub";
 	cmds: Command[] | null = [];
-	lastSnapshot: ContextSnapshot | null = null;
-	conduct(snap: ContextSnapshot): Command[] | null {
-		this.lastSnapshot = snap;
+	lastSnapshot: ConductorView | null = null;
+	conduct(view: ConductorView): Command[] | null {
+		this.lastSnapshot = view;
 		return this.cmds;
 	}
 }
@@ -97,7 +97,7 @@ describe("conductor seam — human overrides always win", () => {
 		expect(s.isFolded(s.get("m0:p0")!)).toBe(false); // pinned → conductor refused
 		expect(s.get("m0:p0")!.override).toBe("pinned");
 		expect(s.isFolded(s.get("m1:p0")!)).toBe(true); // un-held → conductor folds it
-		expect(s.get("m1:p0")!.by).toBe("conductor");
+		expect(s.get("m1:p0")!.by).toBe("auto"); // attribution is now uniform across all conductors
 	});
 
 	it("a human manual fold survives a conductor pass that folds nothing", () => {
@@ -185,6 +185,48 @@ describe("conductor seam — clamp reports (provider-validity floor)", () => {
 		const reports = s.applyCommands([{ kind: "group", ids: ["m0:p0"] }], "conductor");
 		expect(reports[0].reason).toBe("invalid-group");
 	});
+
+	// (2) MAJOR regression: a conductor must NEVER fold a protected-tail block — protection
+	// is absolute. With protectTokens covering the whole session every block is protected, so
+	// even the newest id must be clamped, not folded.
+	it("clamps a fold of a protected-tail block with reason 'protected' and leaves it live", () => {
+		const s = makeStore([blk(0), blk(1)]);
+		// default protectTokens (20k) > total fixture tokens (2k) → all blocks protected
+		expect(s.protectedFromIndex).toBe(0);
+		const newest = s.blocks[s.blocks.length - 1].id;
+
+		const reports = s.applyCommands([{ kind: "fold", ids: [newest] }], "auto");
+		expect(reports).toHaveLength(1);
+		expect(reports[0].reason).toBe("protected");
+		expect(reports[0].ids).toEqual([newest]);
+		expect(s.isFolded(s.get(newest)!)).toBe(false); // stays live & full
+	});
+
+	it("clamps a replace of a protected-tail block with reason 'protected'", () => {
+		const s = makeStore([blk(0), blk(1)]);
+		const newest = s.blocks[s.blocks.length - 1].id;
+		const reports = s.applyCommands([{ kind: "replace", id: newest, content: "x" }], "auto");
+		expect(reports[0].reason).toBe("protected");
+		expect(s.isFolded(s.get(newest)!)).toBe(false);
+		expect(s.get(newest)!.subst).toBeUndefined();
+	});
+
+	// (3) MINOR regression: restoring/pinning an already-live block must REPORT a noop, not
+	// silently swallow it — the contract documents the reason as reachable.
+	it("reports 'noop' when restoring an already-live block", () => {
+		const s = makeStore([blk(0), blk(1)]);
+		s.setProtect(0);
+		const reports = s.applyCommands([{ kind: "restore", ids: ["m0:p0"] }], "auto");
+		expect(reports).toHaveLength(1);
+		expect(reports[0].reason).toBe("noop");
+	});
+
+	it("reports 'noop' when pinning an already-live block", () => {
+		const s = makeStore([blk(0), blk(1)]);
+		s.setProtect(0);
+		const reports = s.applyCommands([{ kind: "pin", ids: ["m1:p0"] }], "auto");
+		expect(reports[0].reason).toBe("noop");
+	});
 });
 
 describe("conductor seam — group command", () => {
@@ -199,6 +241,74 @@ describe("conductor seam — group command", () => {
 		expect(s.groups[0].folded).toBe(true);
 		expect(s.isFolded(s.get("m0:p0")!)).toBe(true);
 		expect(s.isFolded(s.get("m1:p0")!)).toBe(true);
+	});
+
+	// (1) BLOCKER regression: a conductor group must be cleared once the conductor stops
+	// asking for it — otherwise it strands folded forever (clearConductorState never dropped it).
+	it("clears a conductor group when the conductor returns [] (clear to raw)", () => {
+		const s = makeStore(Array.from({ length: 4 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const stub = new StubConductor();
+		stub.cmds = [{ kind: "group", ids: ["m0:p0", "m1:p0"] }];
+		s.attach(stub);
+		expect(s.groups.length).toBe(1); // group exists
+
+		stub.cmds = []; // conductor now wants raw
+		s.refold();
+		expect(s.groups.length).toBe(0); // group is gone — not stranded
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(false);
+		expect(s.isFolded(s.get("m1:p0")!)).toBe(false);
+	});
+
+	it("clears a conductor group on detach()", () => {
+		const s = makeStore(Array.from({ length: 4 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const stub = new StubConductor();
+		stub.cmds = [{ kind: "group", ids: ["m0:p0", "m1:p0"] }];
+		s.attach(stub);
+		expect(s.groups.length).toBe(1);
+
+		s.detach();
+		expect(s.groups.length).toBe(0); // detaching the conductor removes its group
+		expect(s.blocks.every((b) => !s.isFolded(b))).toBe(true);
+	});
+
+	it("a HUMAN group survives a conductor pass and is logged once", () => {
+		const s = makeStore(Array.from({ length: 4 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		// Human creates a group directly (by:"you" default).
+		const hg = s.createGroup("m0:p0", "m1:p0")!;
+		expect(s.groups.length).toBe(1);
+		expect(hg.by).toBe("you");
+		const humanGroupLogs = s.log.filter((e) => e.action === "grouped").length;
+		expect(humanGroupLogs).toBe(1); // human group logged exactly once
+
+		// A conductor attaches and folds elsewhere — must not disturb the human group.
+		const stub = new StubConductor();
+		stub.cmds = [{ kind: "fold", ids: ["m2:p0"] }];
+		s.attach(stub);
+
+		expect(s.groups.length).toBe(1); // human group preserved
+		expect(s.groups[0].by).toBe("you");
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(true); // still collapsed by its group
+		expect(s.log.filter((e) => e.action === "grouped").length).toBe(1); // no extra "grouped" emit
+
+		// And the conductor going raw still leaves the human group intact.
+		stub.cmds = [];
+		s.refold();
+		expect(s.groups.length).toBe(1);
+		expect(s.groups[0].by).toBe("you");
+	});
+
+	it("a conductor group recreated every pass does NOT spam the activity log", () => {
+		const s = makeStore(Array.from({ length: 4 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const stub = new StubConductor();
+		stub.cmds = [{ kind: "group", ids: ["m0:p0", "m1:p0"] }];
+		s.attach(stub);
+		s.refold();
+		s.refold(); // several passes rebuild the same group each time
+		expect(s.log.filter((e) => e.action === "grouped").length).toBe(0); // conductor groups emit nothing
 	});
 
 	it("refuses to group over a human-held block (human always wins)", () => {
@@ -248,6 +358,27 @@ describe("conductor seam — human takeover clears conductor substitution", () =
 		expect(b.subst).toBeUndefined(); // conductor substitution cleared
 		expect(s.digestOf(b)).toContain("FOLDED"); // engine digest with {#code FOLDED} recovery tag
 		expect(s.digestOf(b)).not.toBe("STALE-CONDUCTOR-TEXT");
+	});
+});
+
+describe("conductor seam — noop clamp report suppression", () => {
+	it("a noop restore report is in lastReports but NOT in store.log for a conductor pass", () => {
+		const s = makeStore([blk(0), blk(1)]);
+		s.setProtect(0);
+		// Attach a stub that always issues a restore on an already-live block (which is a noop).
+		const stub = new StubConductor();
+		stub.cmds = [{ kind: "restore", ids: ["m0:p0"] }]; // m0:p0 is live → noop
+		s.attach(stub);
+
+		// The noop report MUST be present in lastReports (the wire still needs it).
+		expect(s.lastReports.some((r) => r.reason === "noop")).toBe(true);
+
+		// But it must NOT appear in the activity log — suppress noop spam for auto passes.
+		expect(s.log.some((e) => e.action.includes("noop"))).toBe(false);
+
+		// Trigger another pass to confirm it doesn't accumulate across passes.
+		s.refold();
+		expect(s.log.some((e) => e.action.includes("noop"))).toBe(false);
 	});
 });
 

@@ -189,6 +189,8 @@ export interface UnfoldRestored {
 	kind: WireBlock["kind"];
 	/** Short human label for a useful confirmation, e.g. "tool_result read_file · turn 12". */
 	label: string;
+	/** The block ids this restore actually touched (≥1; >1 on a hash collision or a group unfold). */
+	ids: string[];
 }
 
 /**

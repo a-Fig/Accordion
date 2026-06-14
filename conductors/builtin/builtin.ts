@@ -1,5 +1,5 @@
 /*
- * conductor.builtin.ts — Accordion's default conductor.
+ * builtin.ts — Accordion's default conductor.
  *
  * This is the engine's original auto-folder (ADR 0007), lifted verbatim out of
  * `AccordionStore.refold()` into a standalone `Conductor`. It makes no relevance
@@ -8,21 +8,21 @@
  * tool_calls before user intent. Deterministic and explainable; the smarts come from
  * the conductors people plug in over the wire.
  *
- * It is a PURE function of the snapshot — no `$state`, no store reference, no mutation.
- * The host owns the reset, the protected-tail policy, and the command application; this
- * file owns exactly one thing: which blocks to fold, and in what order. Keeping that
- * decision byte-identical to the pre-refactor folder is the whole point of M1, pinned
- * by `conductor.builtin.test.ts`.
+ * It is a PURE function of the view — no `$state`, no store reference, no mutation, no
+ * engine reach-in. It consumes ONLY the public `ConductorView` (the exact surface any
+ * out-of-process conductor gets); that is the whole point — the built-in is the worked
+ * example, not a privileged insider. The host owns the reset, the protected-tail policy,
+ * and the command application; this file owns exactly one thing: which blocks to fold, and
+ * in what order. Keeping that decision byte-identical to the pre-refactor folder is the
+ * whole point of M1, pinned by `conductor.builtin.test.ts`.
  */
-import type { Block, BlockKind } from "./types";
-import { digestTokens } from "./digest";
-import type { Conductor, ContextSnapshot, Command } from "./conductor";
+import type { Conductor, ConductorView, ConductorBlockKind, Command } from "../contract";
 
 /**
  * Lower value → folded sooner. The whole asymmetry the tool is built around. (Was a
  * private const in `store.svelte.ts`; it is the built-in's strategy, so it lives here.)
  */
-const FOLD_RANK: Record<BlockKind, number> = {
+const FOLD_RANK: Record<ConductorBlockKind, number> = {
 	tool_result: 0, // huge, decays fastest → fold first, hardest
 	thinking: 1, // ephemeral reasoning
 	text: 2, // conclusions, medium durable value
@@ -48,25 +48,19 @@ export class BuiltinConductor implements Conductor {
 	 * `autoFolded`/`by:"auto"` — same as before). Never returns `null`: the built-in is
 	 * synchronous and always has a definite answer.
 	 */
-	conduct(snap: ContextSnapshot): Command[] {
-		let live = snap.liveTokens;
-		if (live <= snap.budget) return [];
+	conduct(view: ConductorView): Command[] {
+		let live = view.liveTokens;
+		if (live <= view.budget) return [];
 
-		const cand = snap.blocks
-			.filter(
-				(b, i) =>
-					b.override === null &&
-					i < snap.protectedFromIndex &&
-					!snap.isInFoldedGroup(b.id) &&
-					digestTokens(b) < b.tokens,
-			)
+		const cand = view.blocks
+			.filter((b) => !b.held && !b.protected && !b.grouped && b.foldedTokens < b.tokens)
 			.sort((a, b) => FOLD_RANK[a.kind] - FOLD_RANK[b.kind] || a.order - b.order);
 
 		const ids: string[] = [];
 		for (const b of cand) {
-			if (live <= snap.budget) break;
+			if (live <= view.budget) break;
 			ids.push(b.id);
-			live += digestTokens(b) - b.tokens;
+			live += b.foldedTokens - b.tokens;
 		}
 		return ids.length ? [{ kind: "fold", ids }] : [];
 	}
