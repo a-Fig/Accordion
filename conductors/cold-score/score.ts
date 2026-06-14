@@ -33,8 +33,9 @@ export interface ScoreCtx {
 	/** The current turn number (highest turn in the session). */
 	currentTurn: number;
 	/**
-	 * Map of block id → sorted array of turns at which it was recalled
-	 * (lexically pre-unfolded by the conductor since ingestion).
+	 * Map of block id → array of turns (append order) at which it was recalled
+	 * (lexically pre-unfolded by the conductor since ingestion). `activation` sums over
+	 * the entries order-independently, so the array is not kept sorted.
 	 */
 	recalls: ReadonlyMap<string, readonly number[]>;
 	/**

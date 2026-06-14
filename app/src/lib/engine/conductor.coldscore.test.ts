@@ -22,6 +22,7 @@ import { ColdScoreConductor } from "$conductors/cold-score/cold-score";
 import { BuiltinConductor } from "$conductors";
 import { HYSTERESIS } from "$conductors/cold-score/cold-score";
 import type { Block, ParsedSession } from "./types";
+import type { ConductorView, ViewBlock } from "$conductors/contract";
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -393,5 +394,157 @@ describe("ColdScoreConductor — built-in unaffected by conductor swap", () => {
 		s.detach();
 		expect(s.foldedCount).toBe(0);
 		expect(s.liveTokens).toBe(s.fullTokens);
+	});
+});
+
+// ── 8. Two-pass black-box: pre-unfold+re-fold must NOT write hysteresis ────────
+//
+// This test pins the bug fixed in the cold-score conductor where the lexical
+// pre-unfold step (Step 2b) used to record a recall AND set a cooldown for block X
+// IMMEDIATELY upon keeping it live — even though the relaxed pass (Step 4) might
+// subsequently RE-FOLD X under budget pressure. The result was that a block that
+// ended up FOLDED after pass 1 still carried:
+//   (a) a cooldown → shielding it from Step 3's re-clamp in pass 2
+//   (b) a recall   → inflating its cold-score activation in pass 2 (warmer = folds later)
+//
+// The buggy cooldown effect is the most directly observable: on pass 2 the tail again
+// references block X. Step 2b sees X is on cooldown (coolUntil > T) and SKIPS the
+// pre-unfold entirely. X stays folded. The budget can then be met without touching Y
+// (the only other candidate), so Y stays live. With the FIX, X carries no cooldown;
+// Step 2b correctly pre-unfolds X; Step 3 folds Y instead to stay within budget; X ends
+// up live. The final fold-id sets are disjoint — the two-pass sequence is fully
+// deterministic and distinguishes fixed from buggy code.
+//
+// Pass-1 setup (called via conduct() directly, no store):
+//   budget=700, liveTokens=1700
+//   X  = tool_result, turn=1, order=0, tokens=500, foldedTokens=10, text has SIGNAL_PATH
+//   Y  = tool_result, turn=1, order=1, tokens=500, foldedTokens=10
+//   Z  = tool_result, turn=1, order=2, tokens=500, foldedTokens=10
+//   P  = text, turn=10, protected, tokens=200, foldedTokens=10, text has SIGNAL_PATH
+//
+// Step 2a folds X,Y,Z to meet budget (live 1700 → 230 ≤ 700; P stays live, it's protected).
+// Step 2b: X is in the fold set and matches P's SIGNAL_PATH → pre-unfolded; live goes back over.
+// Step 3: no remaining unfrozen candidates (Y,Z already folded) → nothing.
+// Step 4: X is the only non-folded candidate → re-folded. Final fold set = {X,Y,Z}.
+// FIX: no recall or cooldown recorded for X (re-folded in relaxed pass).
+// BUG: recall[X]=[10] and coolUntil[X]=15 recorded immediately in step 2b.
+//
+// Pass-2 setup (same instance, same turn T=10):
+//   budget=800, liveTokens=1200
+//   X  = tool_result, turn=1, order=0, tokens=500, foldedTokens=10, text has SIGNAL_PATH
+//   Y  = tool_result, turn=1, order=1, tokens=500, foldedTokens=10
+//   P  = text, turn=10, protected, tokens=200, foldedTokens=10, text has SIGNAL_PATH
+//
+// Step 2a: fold X (coldest/lowest order): live=1200-490=710 ≤ 800. Stop. folded={X}.
+// Step 2b:
+//   FIX  — coolUntil[X]=0 ≤ T=10 → X is pre-unfolded; live=1200; preUnfolded={X}.
+//           Step 3: live=1200 > 800; fold Y (only non-preUnfolded candidate): live=710 ≤ 800.
+//           Final fold set = {Y}. X is LIVE, Y is FOLDED.
+//   BUG  — coolUntil[X]=15 > T=10 → X is skipped in step 2b; preUnfolded={}.
+//           Step 3: live=710 ≤ 800 → nothing. Step 4: nothing.
+//           Final fold set = {X}. X is FOLDED, Y is LIVE.
+
+describe("ColdScoreConductor — two-pass hysteresis: re-folded blocks must not gain warmth/cooldown", () => {
+	// ── Helpers for direct conduct() calls (no AccordionStore needed) ─────────
+
+	function makeViewBlock(
+		id: string,
+		kind: ViewBlock["kind"],
+		turn: number,
+		order: number,
+		tokens: number,
+		foldedTokens: number,
+		opts: { protected?: boolean; text?: string } = {},
+	): ViewBlock {
+		return {
+			id,
+			kind,
+			turn,
+			order,
+			tokens,
+			foldedTokens,
+			held: false,
+			folded: false,
+			protected: opts.protected ?? false,
+			grouped: false,
+			text: opts.text,
+		};
+	}
+
+	function makeView(blocks: ViewBlock[], budget: number, liveTokens: number): ConductorView {
+		return {
+			blocks,
+			budget,
+			liveTokens,
+			contextWindow: null,
+			protectedFromIndex: blocks.findIndex((b) => b.protected),
+			protectTokens: 0,
+		};
+	}
+
+	it("re-folded-under-budget block carries no cooldown and is correctly pre-unfolded on the next pass", () => {
+		const SIGNAL_PATH = "src/widget/foo.ts";
+
+		// ── Pass 1 ────────────────────────────────────────────────────────────
+		// Budget tighter than even folding all three foldable blocks can satisfy (because P
+		// is protected and cannot be folded). The preliminary clamp folds X,Y,Z. The
+		// lexical step pre-unfolds X (matches SIGNAL_PATH in P). The relaxed pass must
+		// re-fold X because the budget still can't be met without it. Final fold set = {X,Y,Z}.
+		const p1X = makeViewBlock("m0:p0", "tool_result", 1, 0, 500, 10, { text: `reading ${SIGNAL_PATH}` });
+		const p1Y = makeViewBlock("m1:p0", "tool_result", 1, 1, 500, 10);
+		const p1Z = makeViewBlock("m2:p0", "tool_result", 1, 2, 500, 10);
+		const p1P = makeViewBlock("m3:p0", "text", 10, 3, 200, 10, {
+			protected: true,
+			text: `now working on ${SIGNAL_PATH}`,
+		});
+
+		// liveTokens = 500+500+500+200 = 1700; budget = 700
+		// After folding X,Y,Z: live = 700-490+490+490 = 700... wait, let's be precise:
+		// live starts at 1700. Fold X: 1700-490=1210. Fold Y: 1210-490=720. Fold Z: 720-490=230.
+		// Pre-unfold X: 230+490=720. Step 3: nothing new to fold (Y,Z already folded).
+		// Step 4: fold X: 720-490=230. Final live=230. folded={X,Y,Z}. Budget=700 is irrelevant here
+		// (budget constraint satisfied as best as possible given protected P is off-limits).
+		const pass1View = makeView([p1X, p1Y, p1Z, p1P], 700, 1700);
+
+		const conductor = new ColdScoreConductor();
+		const pass1Result = conductor.conduct(pass1View);
+
+		// Pass 1: X must be in the fold set (re-folded by the relaxed pass after pre-unfold)
+		const pass1Ids = new Set(
+			pass1Result.length > 0 && pass1Result[0].kind === "fold" ? pass1Result[0].ids : [],
+		);
+		expect(pass1Ids.has("m0:p0"), "pass 1: X should be folded (re-folded by relaxed pass)").toBe(true);
+		expect(pass1Ids.has("m1:p0"), "pass 1: Y should also be folded").toBe(true);
+		expect(pass1Ids.has("m2:p0"), "pass 1: Z should also be folded").toBe(true);
+
+		// ── Pass 2 ────────────────────────────────────────────────────────────
+		// Two foldable blocks (X and Y) and one protected tail block (P). Budget can be met
+		// by folding just ONE of X or Y (either saves 490 tokens, bringing live from 1200
+		// to 710 ≤ 800). The FIXED code: X has no cooldown, so step 2b pre-unfolds it again
+		// and step 3 folds Y to close the gap → fold set = {Y}, X is live. The BUGGY code:
+		// X has coolUntil=15 > T=10 so step 2b skips it, X stays folded → fold set = {X}.
+		const p2X = makeViewBlock("m0:p0", "tool_result", 1, 0, 500, 10, { text: `reading ${SIGNAL_PATH}` });
+		const p2Y = makeViewBlock("m1:p0", "tool_result", 1, 1, 500, 10);
+		const p2P = makeViewBlock("m3:p0", "text", 10, 2, 200, 10, {
+			protected: true,
+			text: `now working on ${SIGNAL_PATH}`,
+		});
+
+		// liveTokens = 500+500+200 = 1200; budget = 800
+		// Step 2a: fold X (coldest by order): live=1200-490=710 ≤ 800. folded={X}.
+		// FIX — Step 2b: X matches tail, no cooldown → pre-unfold: live=1200. preUnfolded={X}.
+		//        Step 3: live=1200>800. Y is the only non-preUnfolded candidate → fold Y: live=710. folded={Y}.
+		//        Final: {Y}. X is live.
+		// BUG — Step 2b: coolUntil[X]=15>10 → skip. Step 3,4: live=710≤800 → no change. Final: {X}.
+		const pass2View = makeView([p2X, p2Y, p2P], 800, 1200);
+		const pass2Result = conductor.conduct(pass2View);
+
+		const pass2Ids = new Set(
+			pass2Result.length > 0 && pass2Result[0].kind === "fold" ? pass2Result[0].ids : [],
+		);
+
+		// With the FIX: X is live (pre-unfolded correctly), Y is folded
+		expect(pass2Ids.has("m0:p0"), "pass 2 (fixed): X should NOT be folded — it was pre-unfolded correctly").toBe(false);
+		expect(pass2Ids.has("m1:p0"), "pass 2 (fixed): Y should be folded — stepped up to close budget gap").toBe(true);
 	});
 });

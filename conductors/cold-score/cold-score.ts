@@ -1,8 +1,9 @@
 /*
  * cold-score.ts — the Cold-score conductor.
  *
- * A faithful port of PR #19's C1 DETERMINISTIC layer into the conductor contract
- * (`conduct(view) → Command[]`). It is "the built-in, but with relevance + hysteresis":
+ * A port of PR #19's C1 DETERMINISTIC layer into the conductor contract
+ * (`conduct(view) → Command[]`) — faithful to its algorithm, with one deliberate refinement
+ * (see `currentTurn`). It is "the built-in, but with relevance + hysteresis":
  *
  *   1. ACT-R cold-score ranking (Anderson & Schooler power-law of forgetting) replaces
  *      the built-in's flat FOLD_RANK — kind-major, so with no recalls the ordering is
@@ -65,7 +66,7 @@ export class ColdScoreConductor implements Conductor {
 	readonly label = "Cold-score";
 
 	// ---- cross-pass hysteresis state (instance memory) ----------------------
-	/** block id → sorted turns at which it was lexically pre-unfolded (warms the score). */
+	/** block id → turns (append order) at which it was lexically pre-unfolded (warms the score). */
 	private recalls = new Map<string, number[]>();
 	/** block id → turn until which a block may NOT be auto-refolded (post lexical unfold). */
 	private coolUntil = new Map<string, number>();
@@ -154,7 +155,11 @@ export class ColdScoreConductor implements Conductor {
 		}
 
 		// Step 2b: LEXICAL PRE-UNFOLD — keep live any just-folded block referenced by an
-		// identifier in the protected tail (a relevance signal). Records a recall + cooldown.
+		// identifier in the protected tail (a relevance signal). The recall + cooldown are NOT
+		// recorded here: a block kept live now can still be re-folded by the relaxed pass (Step 4)
+		// under budget pressure, and a re-folded block must not carry warmth. The persistent
+		// bookkeeping is deferred until AFTER the final fold set is known (see end of pass).
+		const preUnfolded = new Set<string>();
 		const tailText = this.buildTailText(view.blocks);
 		const tailIds = extractIdentifiers(tailText);
 		const lexCandidates = candidates.filter((b) => folded.has(b.id));
@@ -172,8 +177,7 @@ export class ColdScoreConductor implements Conductor {
 				// inflate their warmth artificially.
 				if ((this.coolUntil.get(bid) ?? 0) > T) continue;
 				unmarkFold(b); // keep it live
-				this.coolUntil.set(bid, T + HYSTERESIS.unfoldCooldownTurns);
-				this.recordRecall(bid, T);
+				preUnfolded.add(bid); // shielded from Step 3 re-clamp; persisted only if it survives
 				unfolded++;
 			}
 		}
@@ -182,7 +186,9 @@ export class ColdScoreConductor implements Conductor {
 		// budget, fold MORE candidates (coldest first), EXCLUDING blocks on cooldown.
 		if (live > view.budget) {
 			const reclamp = sortCandidates(
-				candidates.filter((b) => !folded.has(b.id) && (this.coolUntil.get(b.id) ?? 0) <= T),
+				candidates.filter(
+					(b) => !folded.has(b.id) && !preUnfolded.has(b.id) && (this.coolUntil.get(b.id) ?? 0) <= T,
+				),
 				ctx,
 			);
 			for (const b of reclamp) {
@@ -202,6 +208,16 @@ export class ColdScoreConductor implements Conductor {
 				if (live <= view.budget) break;
 				markFold(b);
 			}
+		}
+
+		// Persist hysteresis ONLY for pre-unfolded blocks that actually stayed live. A block the
+		// relaxed pass had to re-fold under budget pressure must carry NEITHER a recall (which
+		// would falsely warm it next pass) NOR a cooldown (which would falsely shield it from the
+		// Step 3 re-clamp) — record only the survivors.
+		for (const bid of preUnfolded) {
+			if (folded.has(bid)) continue; // re-folded by the relaxed pass — do not warm
+			this.coolUntil.set(bid, T + HYSTERESIS.unfoldCooldownTurns);
+			this.recordRecall(bid, T);
 		}
 
 		// Emit a single fold command for the final fold set, or nothing if it is empty.
@@ -225,7 +241,12 @@ export class ColdScoreConductor implements Conductor {
 	}
 }
 
-/** Highest turn across the blocks (0 for an empty session). */
+/**
+ * The conductor's notion of "now" — the HIGHEST turn across the blocks (0 for an empty
+ * session). Deliberately the max, not the last block's turn: robust to a resync that appends
+ * an older-turn block. PR #19's runtime used the last block's turn, which coincides with the
+ * max whenever turns are monotonic (the normal case).
+ */
 function currentTurn(blocks: ViewBlock[]): number {
 	let t = 0;
 	for (const b of blocks) if (b.turn > t) t = b.turn;

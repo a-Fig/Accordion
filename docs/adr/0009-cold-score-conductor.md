@@ -110,17 +110,25 @@ contains a matching identifier is un-folded (kept live), subject to:
 - A skip if the block is already on cooldown — re-recording a recall for an identifier
   that has persisted across turns would artificially inflate warmth.
 
-Restoring a block records a recall entry for it at the current turn (warming it in the
-ACT-R model) and sets `coolUntil[id] = T + unfoldCooldownTurns` (default: 5 turns).
+A pre-unfolded block is recorded as a recall at the current turn (warming it in the ACT-R
+model) and put on cooldown (`coolUntil[id] = T + unfoldCooldownTurns`, default 5 turns) — but
+**only if it actually stays live through the rest of the pass.** A block the relaxed pass
+(Step 4) has to re-fold under budget pressure is recorded as neither: warming or cooling a
+block that ends up folded would falsely protect it on the next pass, so the bookkeeping is
+deferred until the final fold set is known. Within the pass, a freshly pre-unfolded block is
+shielded from the Step 3 re-clamp regardless.
 
 **Step 3 — re-clamp respecting cooldowns.**
 If the pre-unfolds pushed tokens back over budget, fold additional candidates (cold-score
-order) excluding any block whose `coolUntil > T`. This respects the freshly set cooldowns.
+order) excluding any block that is on cooldown (`coolUntil > T`) or was just pre-unfolded
+this pass.
 
 **Step 4 — relaxed pass.**
 If still over budget, fold remaining candidates including cooled-down ones. **Budget is the
-hard guarantee; hysteresis is best-effort.** The built-in's invariant — "under budget" — is
-preserved.
+hard guarantee whenever the available fold candidates can achieve it; hysteresis is
+best-effort.** Like the built-in, the conductor cannot fold below the protected tail plus the
+non-foldable kinds, so an extreme budget can still leave live > budget — the relaxed pass
+simply folds everything it is allowed to.
 
 **Return:** `[foldCommand?]` — never `null` (synchronous, always definite). The conductor
 emits only `fold` commands; no `group` commands are produced.
@@ -167,9 +175,12 @@ warmth credit only matters if the agent un-holds and the conductor needs to inde
 decide to keep the block warm — a rare second-order effect. Accepted trade-off; fixing it
 would require a recall-history field in `ViewBlock` (a future `ConductorView` extension).
 
-**Budget remains the hard floor.** The relaxed pass (Step 4) ensures the conductor always
-meets budget even when every candidate is on cooldown. The host's provider-validity clamp
-and human-override rules remain a backstop (ADR 0007/0008) but should never fire for a
+**Budget is the floor the pipeline drives toward.** The relaxed pass (Step 4) folds every
+candidate it is allowed to — including cooled-down ones — so the conductor reaches budget
+whenever the foldable candidates can achieve it. This is the built-in's exact limitation, not
+a new one: a large protected tail or many non-foldable `tool_call`/`user` blocks can still
+leave live > budget, since those are never folded. The host's provider-validity clamp and
+human-override rules remain a backstop (ADR 0007/0008) but should never fire for a
 well-behaved budget fold.
 
 **The `text` field is required for lexical matching.** `ViewBlock.text` is present in
