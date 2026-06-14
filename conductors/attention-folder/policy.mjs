@@ -44,14 +44,21 @@ export const DEFAULT_CFG = {
 
 /**
  * Effective rendered token cost of the context if `foldSet` were applied on top of the
- * host's own folds. A block contributes its `foldedTokens` when it is folded by a human
- * (`b.folded`, since the view is cleared of OUR folds), is in a host group (`b.grouped`),
- * or is in `foldSet`; otherwise its full `tokens`.
+ * host's own folds. A block contributes its `foldedTokens` when it is rendered folded
+ * (`b.folded` — the host sets this for human folds AND for collapsed group members; the view
+ * is cleared of OUR folds) or is in `foldSet`; otherwise its full `tokens`.
+ *
+ * We deliberately do NOT discount on `b.grouped` alone. A *straggler* — a member of a folded
+ * group whose tool-pair partner sits outside the group — is `grouped:true` but renders LIVE at
+ * full tokens on the host (store.svelte.ts `groupWire`). Discounting it would make us read a
+ * lower fullness than the host's real one and HOLD past the high-water mark — the exact band
+ * violation this conductor exists to prevent. Collapsed members already carry `folded:true`, so
+ * they are accounted without the `grouped` term.
  */
 export function renderedTokens(blocks, foldSet) {
 	let t = 0;
 	for (const b of blocks) {
-		const folded = b.folded || b.grouped || foldSet.has(b.id);
+		const folded = b.folded || foldSet.has(b.id);
 		t += folded ? b.foldedTokens : b.tokens;
 	}
 	return t;

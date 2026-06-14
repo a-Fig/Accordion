@@ -306,3 +306,25 @@ test("best-effort when low-water unreachable: no throw, epoch with available fol
 	// rendered may be > lowWater — that's the best-effort guarantee
 	assert.ok(result.rendered > 0.7 * result.cap, "rendered stays above low-water (best-effort, not a failure)");
 });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// 13. Straggler (grouped but rendered LIVE) must count at FULL tokens
+// ──────────────────────────────────────────────────────────────────────────────
+test("straggler (grouped:true, folded:false) is NOT discounted — counts full tokens", () => {
+	// A straggler is a member of a folded group whose tool-pair partner sits OUTSIDE the group:
+	// the host renders it live at full tokens yet flags it grouped:true. renderedTokens must count
+	// it full — discounting it would read fullness low and HOLD past the high-water mark.
+	const straggler = blk({ id: "strag", tokens: 40_000, foldedTokens: 50, grouped: true, folded: false, order: 0 });
+	const collapsed = blk({ id: "coll", tokens: 40_000, foldedTokens: 50, grouped: true, folded: true, order: 1 });
+	const live = blk({ id: "live", tokens: 30_000, foldedTokens: 50, order: 2 });
+
+	// straggler full (40k) + collapsed folded (50) + live full (30k) = 70_050 (NOT 30_100)
+	assert.equal(renderedTokens([straggler, collapsed, live], new Set()), 40_000 + 50 + 30_000);
+
+	// Band: 40k(strag) + 50(coll) + 30k(live) + 25k(live2) = 95_050 > 90_000 → epoch.
+	const live2 = blk({ id: "live2", tokens: 25_000, foldedTokens: 50, order: 3 });
+	const v = view([straggler, collapsed, live, live2], { contextWindow: 100_000 });
+	const result = decideFolds(v, new Map(), new Set(), new Set(), DEFAULT_CFG);
+	assert.equal(result.action, "epoch", "straggler's full tokens must push fullness over high-water → epoch");
+	assert.ok(!result.foldSet.has("strag"), "a grouped straggler must never be folded");
+});

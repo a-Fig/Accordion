@@ -10,6 +10,7 @@ final readout token pays to each earlier block's token span. VATP-corrected
 CLI:
     python probe.py --in <input.json> --out <output.json>
                     [--device cuda|cpu] [--window 2048]
+                    [--batch N] [--attn-impl eager|sdpa]
 
 Input  JSON: { "tail": "<query text>",
                "blocks": [{"id": "...", "text": "..."}, ...] }
@@ -724,7 +725,7 @@ def main() -> int:
                 scaling = scaling  # unchanged
             # Re-window only the blocks of THIS failed window and prepend them.
             sub_blocks = [
-                {"id": bid, "text": next(b["text"] for b in blocks if b["id"] == bid)}
+                {"id": bid, "text": next((b["text"] for b in blocks if b["id"] == bid), "")}
                 for bid in win["spans"].keys()
                 if bid != ANCHOR_ID
             ]

@@ -10,7 +10,7 @@
 // Higher score = more attention/relevance to the current work tail = keep live longer.
 // The policy folds the LOWEST scores first.
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,12 +32,7 @@ export function resolvePython() {
 	const win = join(HERE, "probe", ".venv", "Scripts", "python.exe");
 	const nix = join(HERE, "probe", ".venv", "bin", "python");
 	for (const p of [win, nix]) {
-		try {
-			readFileSync(p);
-			return p;
-		} catch {
-			/* not there */
-		}
+		if (existsSync(p)) return p;
 	}
 	return "python";
 }
@@ -61,10 +56,15 @@ function capTailNewest(text, cap) {
  *
  * @returns {Promise<Map<string,number>>} resolves to id→score; rejects on spawn/exit error.
  */
-export function scoreCandidates({ tailText, candidates, python = resolvePython(), script = PROBE_SCRIPT, batch = 24, attnImpl = "sdpa", timeoutMs = 180_000, log = () => {} }) {
+export function scoreCandidates({ tailText, candidates, python = resolvePython(), script = PROBE_SCRIPT, batch = 24, attnImpl = "sdpa", timeoutMs = 180_000, signal, log = () => {} }) {
 	return new Promise((resolvePromise, reject) => {
 		if (!candidates.length) {
 			resolvePromise(new Map());
+			return;
+		}
+		// External abort (the WebSocket connection dropped): don't even start.
+		if (signal?.aborted) {
+			reject(new Error("probe aborted before start"));
 			return;
 		}
 
@@ -73,29 +73,51 @@ export function scoreCandidates({ tailText, candidates, python = resolvePython()
 			blocks: candidates.map((c) => ({ id: c.id, text: capHeadTail(c.text || "", BLOCK_CHAR_CAP) })),
 		};
 
+		// Create the temp dir, then guard EVERY setup step. A throw before the settle machinery
+		// is wired below (writeFile ENOSPC/EACCES, a synchronous spawn failure) would otherwise
+		// reject the promise while leaking the dir on disk — one per failed scoring epoch.
 		const dir = mkdtempSync(join(tmpdir(), "attn-cond-"));
 		const inPath = join(dir, "in.json");
 		const outPath = join(dir, "out.json");
-		writeFileSync(inPath, JSON.stringify(payload), "utf8");
-
-		const args = [script, "--in", inPath, "--out", outPath, "--batch", String(batch), "--attn-impl", attnImpl];
+		let proc;
+		try {
+			writeFileSync(inPath, JSON.stringify(payload), "utf8");
+			const args = [script, "--in", inPath, "--out", outPath, "--batch", String(batch), "--attn-impl", attnImpl];
+			proc = spawn(python, args, { stdio: ["ignore", "ignore", "pipe"] });
+		} catch (e) {
+			try {
+				rmSync(dir, { recursive: true, force: true });
+			} catch {
+				/* best-effort */
+			}
+			reject(new Error(`probe setup failed: ${e.message}`));
+			return;
+		}
 		const t0 = Date.now();
-		const proc = spawn(python, args, { stdio: ["ignore", "ignore", "pipe"] });
 
 		let stderr = "";
 		proc.stderr.on("data", (d) => {
 			stderr += d.toString();
 		});
 
-		// Single-settle guard + watchdog. A hung probe (driver wedge, download stall) would
-		// otherwise emit neither close nor error and the promise would never settle — which, in
-		// the conductor, would leave scoringInFlight stuck true and silently disable all future
-		// scoring. The timeout kills the child and rejects so the caller can recover.
+		// Single-settle guard + watchdog + external abort. A hung probe (driver wedge, download
+		// stall) would otherwise emit neither close nor error and the promise would never settle —
+		// which, in the conductor, would leave scoringInFlight stuck true and silently disable all
+		// future scoring. The timeout (or an abort from a dropped connection) kills the child and
+		// rejects so the caller can recover and the GPU isn't held by an abandoned job.
+		const kill = () => {
+			try {
+				proc.kill();
+			} catch {
+				/* already gone */
+			}
+		};
 		let settled = false;
 		const done = (fn, arg) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			if (signal) signal.removeEventListener("abort", onAbort);
 			try {
 				rmSync(dir, { recursive: true, force: true });
 			} catch {
@@ -104,13 +126,14 @@ export function scoreCandidates({ tailText, candidates, python = resolvePython()
 			fn(arg);
 		};
 		const timer = setTimeout(() => {
-			try {
-				proc.kill();
-			} catch {
-				/* already gone */
-			}
+			kill();
 			done(reject, new Error(`probe timed out after ${timeoutMs}ms`));
 		}, timeoutMs);
+		const onAbort = () => {
+			kill();
+			done(reject, new Error("probe aborted (connection closed)"));
+		};
+		if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
 		proc.on("error", (err) => done(reject, new Error(`probe spawn failed: ${err.message}`)));
 

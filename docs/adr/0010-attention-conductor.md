@@ -171,11 +171,13 @@ The scoring recipe for each window:
    `Which earlier sections are most relevant to the current work? Answer:` prompt. The
    anchor is always placed immediately before the tail.
 
-2. **Forward pass.** The model runs a single forward on the assembled window (or a padded
-   batch of windows when `--batch > 1` with `--attn-impl sdpa`). The forward is
-   **early-aborted** after layer 23's pre-hook fires (the `_StopForward` exception),
-   skipping the final norm and the 151,936-token lm_head projection — dead-compute removal
-   that reduces both wall time and peak VRAM.
+2. **Forward pass.** In production the model runs a padded **batch** of windows
+   (`--batch 24 --attn-impl sdpa` — the defaults the conductor always passes). The batched
+   forward is **early-aborted** after layer 23's pre-hook fires (the `_StopForward` exception),
+   skipping the final norm and the 151,936-token lm_head projection — dead-compute removal that
+   cuts both wall time and peak VRAM. (The eager single-window path, `--batch 1`, is the
+   byte-identical reproduction baseline; it runs the full forward without the abort, and the
+   conductor never takes it.)
 
 3. **Attention readout.** For each probed layer, the last-token query is recomputed
    against all keys using the captured hidden states and rotary embeddings. The raw

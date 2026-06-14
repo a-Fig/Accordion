@@ -87,6 +87,7 @@ function freshState() {
 		respectLive: new Set(), // ids the AGENT pulled live (M3 self-unfold); never re-fold
 		scoringInFlight: false,
 		rescoreNeeded: true, // score on the first warm approach, and after every epoch
+		abort: new AbortController(), // fired on disconnect → kills any in-flight probe child
 	};
 }
 
@@ -112,7 +113,7 @@ function maybeScore(ws, state, view, fullness) {
 	const ids = candidates.map((c) => c.id);
 	log(`scoring ${candidates.length} candidates (fullness ${(fullness * 100).toFixed(0)}%)…`);
 
-	scoreCandidates({ tailText, candidates, log })
+	scoreCandidates({ tailText, candidates, signal: state.abort.signal, log })
 		.then((scores) => {
 			for (const [id, v] of scores) state.scores.set(id, v);
 			state.attempted = new Set(ids); // mark this run's candidates attempted (even if unscored)
@@ -161,8 +162,13 @@ wss.on("connection", (ws) => {
 		}
 
 		if (msg.type === "host/commandResult") {
-			// The host applied our batch for this rev — it is now the live state. (We ignore the
-			// clamp reports this cut; the next view reflects any human-override clamps anyway.)
+			// The host applied our batch for this rev — it is now the live state. We deliberately
+			// ignore `msg.reports`: this conductor only ever emits `fold` ids drawn from
+			// foldCandidates/the prune loop (never held/protected/grouped/missing), which are EXACTLY
+			// the host's four clamp conditions, and the host drops stale replies — so an emitted fold
+			// is structurally unclampable and `reports` is always empty here. If this conductor ever
+			// emits `replace`/`group`, or folds outside that guard, revisit: a silently-clamped id
+			// recorded here as applied would never be retried.
 			if (msg.rev === state.pendingRev) state.confirmedApplied = state.pendingSet;
 			return;
 		}
@@ -206,7 +212,12 @@ wss.on("connection", (ws) => {
 		maybeScore(ws, state, view, decision.fullness);
 	});
 
-	ws.on("close", () => log("Accordion disconnected"));
+	ws.on("close", () => {
+		// Kill any in-flight probe: it's scoring a context nobody is listening to, and on
+		// Accordion's reconnect a fresh probe would otherwise stack on the same GPU.
+		state.abort.abort();
+		log("Accordion disconnected");
+	});
 });
 
 log(`${LABEL} listening on ${URL}`);
