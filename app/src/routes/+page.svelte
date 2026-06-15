@@ -127,11 +127,8 @@
 		};
 	});
 
-	// Two distinct states — keep them separate (they contradict otherwise):
-	//  • LIVE     = connected to a pi session over the socket; folds steer the agent.
-	//  • WATCHING = tailing a read-only Claude Code transcript; folds are a local lens.
 	const isLive = $derived(live.status === "connected");
-	const isWatching = $derived(session.live && session.readOnly && live.status !== "connected");
+	const isWatching = $derived(session.readOnly && !isLive);
 </script>
 
 <svelte:head><title>Accordion</title></svelte:head>
@@ -170,13 +167,13 @@
 							</span>
 							{#if isLive}
 								<span class="live-chip" class:steering={folding.enabled}>
-									<span class="live-dot" title="Live — connected to pi; folds steer the agent"></span>
-									<span class="live-label">LIVE</span>
+									<span class="live-dot" title={folding.enabled ? "Connected to pi; actively steering the agent's context" : "Connected to pi; passively watching the session"}></span>
+									<span class="live-label">{folding.enabled ? "listening & steering" : "listening"}</span>
 								</span>
 							{:else if isWatching}
-								<span class="live-chip watching">
-									<span class="live-dot" title="Watching — tailing a read-only Claude Code transcript; folds are a local lens"></span>
-									<span class="live-label">WATCHING</span>
+								<span class="live-chip">
+									<span class="live-dot" title="Tailing a read-only transcript; folds are a local lens"></span>
+									<span class="live-label">watching</span>
 								</span>
 							{/if}
 						</div>
