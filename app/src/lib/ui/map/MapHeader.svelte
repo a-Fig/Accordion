@@ -169,27 +169,29 @@
 
 			<span
 				class="kl protect-read"
-				title="Actual protected tail: {fmt(store.protectedTokens)} tokens; target: {fmt(store.protectTokens)} tokens — drag the amber handle on the bar to change it"
+				title="Actual protected tail: {fmt(store.protectedTokens)} tokens; target: {fmt(store.protectTokens)} tokens — click the value or drag the amber handle to change it"
 			>
 				<Icon name="lock" size={11} />
 				<span class="kl-text">protect</span>
 				<EditableNumber
 					value={store.protectTokens}
 					format={k}
+					label="Protected tail target in thousands of tokens"
 					oncommit={(n) => store.setProtect(Math.max(0, Math.min(PROT_MAX, n)))}
 				/>
-				{#if store.protectedTokens !== store.protectTokens}
+				{#if Math.abs(store.protectedTokens - store.protectTokens) > 500}
 					<span class="kl-target tnum">({k(store.protectedTokens)} actual)</span>
 				{/if}
 			</span>
 
-			<label class="knob">
+			<div class="knob">
 				<span class="kl">
 					<Icon name="target" size={11} />
 					<span class="kl-text">budget</span>
 					<EditableNumber
 						value={store.budget}
 						format={k}
+						label="Context budget in thousands of tokens"
 						oncommit={(n) => store.setBudget(Math.max(BUDGET_MIN, Math.min(budgetMax, n)))}
 					/>
 				</span>
@@ -203,7 +205,7 @@
 					aria-label="Context budget"
 					style:background-size="{budgetPct}% 100%"
 				/>
-			</label>
+			</div>
 
 			<button
 				class="reset-btn"

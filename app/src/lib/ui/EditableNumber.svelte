@@ -1,9 +1,10 @@
 <script lang="ts">
   import { tick } from 'svelte';
 
-  let { value, format, oncommit }: {
+  let { value, format, label, oncommit }: {
     value: number;
     format: (n: number) => string;
+    label?: string;
     oncommit: (n: number) => void;
   } = $props();
 
@@ -14,10 +15,12 @@
   function toEditString(n: number): string {
     const k = n / 1000;
     if (Number.isInteger(k)) return String(k);
-    return k.toFixed(1).replace(/\.0$/, '');
+    const s = k.toPrecision(4);
+    return parseFloat(s).toString();
   }
 
-  async function startEdit() {
+  async function startEdit(e: MouseEvent | KeyboardEvent) {
+    e.stopPropagation();
     inputValue = toEditString(value);
     editing = true;
     await tick();
@@ -33,7 +36,7 @@
     const raw = inputValue.replace(/,/g, '').trim();
     if (!raw) return;
     const n = parseFloat(raw);
-    if (isNaN(n) || !isFinite(n)) return;
+    if (isNaN(n) || !isFinite(n) || n < 0) return;
     oncommit(Math.round(n * 1000));
   }
 
@@ -48,26 +51,32 @@
 </script>
 
 {#if editing}
-  <input
-    bind:this={inputEl}
-    bind:value={inputValue}
-    class="edit-input mono tnum"
-    inputmode="decimal"
-    style:width="{inputValue.length + 1}ch"
-    onkeydown={onkeydown}
-    onblur={commit}
-  />
+  <span class="edit-wrap">
+    <input
+      bind:this={inputEl}
+      bind:value={inputValue}
+      class="edit-input mono tnum"
+      inputmode="decimal"
+      aria-label={label}
+      style:width="{Math.max(2, inputValue.length) + 1}ch"
+      onkeydown={onkeydown}
+      onblur={commit}
+    /><span class="edit-suffix">k</span>
+  </span>
 {:else}
-  <b
+  <button
     class="mono tnum kl-val clickable"
-    role="button"
-    tabindex="0"
-    onclick={startEdit}
-    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); startEdit(); } }}
-  >{format(value)}</b>
+    type="button"
+    onclick={(e) => startEdit(e)}
+  >{format(value)}</button>
 {/if}
 
 <style>
+  .edit-wrap {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0;
+  }
   .edit-input {
     background: transparent;
     border: none;
@@ -82,6 +91,16 @@
     text-transform: none;
     letter-spacing: 0;
     line-height: inherit;
+    min-width: 2ch;
+  }
+  .edit-suffix {
+    color: var(--faint);
+    font-size: inherit;
+    font-family: inherit;
+    font-weight: 500;
+    pointer-events: none;
+    user-select: none;
+    margin-left: 1px;
   }
   .kl-val {
     color: var(--muted);
@@ -90,6 +109,16 @@
     letter-spacing: 0;
   }
   .clickable {
+    all: unset;
     cursor: text;
+    font: inherit;
+    color: inherit;
+    font-weight: 600;
+    color: var(--muted);
+  }
+  .clickable:focus-visible {
+    outline: 1.5px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
   }
 </style>
