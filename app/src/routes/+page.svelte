@@ -5,7 +5,7 @@
 	import { discovery, startDiscovery, stopDiscovery, selectSession, DEMO_ID } from "$lib/live/discovery.svelte";
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery, selectClaude } from "$lib/live/claudeDiscovery.svelte";
 	import { conductorState } from "$lib/live/conductor.svelte";
-	import { startConductorDiscovery, stopConductorDiscovery, allConductors } from "$lib/live/conductorDiscovery.svelte";
+	import { startConductorDiscovery, stopConductorDiscovery, allConductors, isLaunching } from "$lib/live/conductorDiscovery.svelte";
 	import { attachConductor, conductorRetry } from "$lib/live/conductorClient.svelte";
 	import { DEFAULT_PORT } from "$lib/live/protocol";
 	import type { SessionEntry } from "$lib/live/registry";
@@ -45,12 +45,19 @@
 	// (e.g. a remote id restored from localStorage on launch) gets attached once it appears.
 	// `attachConductor` is idempotent, so a poll refreshing the list when we're already
 	// correctly attached is a no-op (no reconnect churn).
+	//
+	// Flash suppression: if the active id is a launchable that is still launching (started
+	// but not yet discovered), hold — do NOT fall back to built-in while the process is
+	// booting. Once discovery sees the heartbeat, isLaunching clears, conductors changes,
+	// and this effect re-runs to attach the real RemoteRunner.
 	$effect(() => {
 		void conductorRetry.tick; // re-fire on a remote-drop retry tick (recover a same-process socket drop)
 		const store = session.store;
 		const activeId = conductorState.activeId;
 		const list = conductors;
 		if (!store) return;
+		// Suppress the built-in fallback while the process is still starting up.
+		if (isLaunching(activeId) && !list.some((c) => c.id === activeId)) return;
 		attachConductor(store, activeId, list);
 	});
 

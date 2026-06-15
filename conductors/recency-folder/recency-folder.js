@@ -25,7 +25,9 @@ const URL = `ws://127.0.0.1:${PORT}`;
 
 // ── Auto-discovery: advertise a heartbeat file under ~/.accordion/conductors/ ──
 // Accordion's desktop discovery polls this directory; an entry older than 15 s is reaped.
-const REG_DIR = join(homedir(), ".accordion", "conductors");
+// Base honors ACCORDION_HOME (falling back to homedir) — this MUST mirror the Rust
+// registry_root() resolver (app/src-tauri/src/lib.rs) so discovery agrees on the directory.
+const REG_DIR = join(process.env.ACCORDION_HOME || homedir(), ".accordion", "conductors");
 const REG_FILE = join(REG_DIR, `${ID}.json`);
 const startedAt = Date.now();
 

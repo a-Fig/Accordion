@@ -40,7 +40,10 @@ function log(msg) {
 }
 
 // ── Auto-discovery: advertise a heartbeat file under ~/.accordion/conductors/ ──
-const REG_DIR = join(homedir(), ".accordion", "conductors");
+// Base honors ACCORDION_HOME (falling back to homedir) — this MUST mirror the Rust
+// registry_root() resolver (app/src-tauri/src/lib.rs) so the app reads heartbeats from the
+// same dir the conductor writes them to. Diverge and the launched conductor never gets discovered.
+const REG_DIR = join(process.env.ACCORDION_HOME || homedir(), ".accordion", "conductors");
 const REG_FILE = join(REG_DIR, `${ID}.json`);
 const startedAt = Date.now();
 
