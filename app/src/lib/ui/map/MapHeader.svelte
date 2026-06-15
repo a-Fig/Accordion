@@ -2,6 +2,7 @@
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { BlockKind } from "../../engine/types";
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
+	import EditableNumber from "$lib/ui/EditableNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import ConductorMenu from "./ConductorMenu.svelte";
 	import { folding, setFolding } from "$lib/live/folding.svelte";
@@ -168,21 +169,31 @@
 
 			<span
 				class="kl protect-read"
-				title="Actual protected tail: {fmt(store.protectedTokens)} tokens; target: {fmt(store.protectTokens)} tokens — drag the amber handle on the bar to change it"
+				title="Actual protected tail: {fmt(store.protectedTokens)} tokens; target: {fmt(store.protectTokens)} tokens — click the value or drag the amber handle to change it"
 			>
 				<Icon name="lock" size={11} />
 				<span class="kl-text">protect</span>
-				<b class="mono tnum kl-val">{k(store.protectedTokens)}</b>
-				{#if store.protectedTokens !== store.protectTokens}
-					<span class="kl-target tnum">/{k(store.protectTokens)}</span>
+				<EditableNumber
+					value={store.protectTokens}
+					format={k}
+					label="Protected tail target in thousands of tokens"
+					oncommit={(n) => store.setProtect(Math.max(0, Math.min(PROT_MAX, n)))}
+				/>
+				{#if Math.abs(store.protectedTokens - store.protectTokens) > 500}
+					<span class="kl-target tnum">({k(store.protectedTokens)} actual)</span>
 				{/if}
 			</span>
 
-			<label class="knob">
+			<div class="knob">
 				<span class="kl">
 					<Icon name="target" size={11} />
 					<span class="kl-text">budget</span>
-					<b class="mono tnum kl-val">{k(store.budget)}</b>
+					<EditableNumber
+						value={store.budget}
+						format={k}
+						label="Context budget in thousands of tokens"
+						oncommit={(n) => store.setBudget(Math.max(BUDGET_MIN, Math.min(budgetMax, n)))}
+					/>
 				</span>
 				<input
 					type="range"
@@ -194,7 +205,7 @@
 					aria-label="Context budget"
 					style:background-size="{budgetPct}% 100%"
 				/>
-			</label>
+			</div>
 
 			<button
 				class="reset-btn"
