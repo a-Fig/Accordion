@@ -311,6 +311,11 @@ let activeRemote: RemoteRunner | null = null;
 // discovery poll refreshing the list must never tear down and reconnect a healthy remote).
 let lastStore: AccordionStore | null = null;
 let lastId: string | null = null;
+// True when the last attach was the built-in STAND-IN for a selected remote that wasn't
+// discovered yet. Without this, the guard below never matches that case, so every discovery
+// poll re-attaches a fresh built-in → refold → unbounded churn that can pin the reactive
+// scheduler (effect_update_depth_exceeded). Cleared whenever we attach anything real.
+let lastFallback = false;
 
 /** The remote runner currently attached, if any (so callers can route host events to it). */
 export function activeRemoteRunner(): RemoteRunner | null {
@@ -336,8 +341,15 @@ export function attachConductor(store: AccordionStore, id: string | null, availa
 	// id+store. (A remote id that fell back to built-in last time has activeRemote === null, so
 	// this is false → we retry now that it may have appeared. A dead runner is also false →
 	// we tear it down and re-dial so the conductor process can reconnect after a socket drop.)
+	// Is the selected remote actually discoverable right now? (Only meaningful for a remote id.)
+	const entry = isRemoteId ? available.find((e) => e.id === norm) : undefined;
 	const alreadyCorrect =
-		store === lastStore && norm === lastId && (isRemoteId ? (activeRemote?.id === norm && !activeRemote.isDead) : true);
+		store === lastStore &&
+		norm === lastId &&
+		(isRemoteId
+			? // a live runner for this id, OR a STABLE built-in stand-in while the remote is still absent
+			  (activeRemote?.id === norm && !activeRemote.isDead) || (lastFallback && !entry)
+			: true);
 	if (alreadyCorrect) return;
 
 	if (activeRemote) {
@@ -347,6 +359,7 @@ export function attachConductor(store: AccordionStore, id: string | null, availa
 	store.onHumanOverride = null;
 	lastStore = store;
 	lastId = norm;
+	lastFallback = false;
 
 	if (norm === NONE_ID) {
 		store.detach();
@@ -356,9 +369,9 @@ export function attachConductor(store: AccordionStore, id: string | null, availa
 		store.attach(inProc.create()); // fresh in-process instance (builtin or a sibling)
 		return;
 	}
-	const entry = available.find((e) => e.id === norm);
 	if (!entry) {
 		store.attach(new BuiltinConductor()); // selected remote not available yet — fall back
+		lastFallback = true; // stand-in attached once; don't re-attach until the remote appears
 		return;
 	}
 	const runner = new RemoteRunner(entry, store);
