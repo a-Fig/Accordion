@@ -1,0 +1,6 @@
+{
+  "id": "attention-folder",
+  "label": "Attention folder",
+  "command": "node",
+  "args": ["attention-folder.mjs"]
+}

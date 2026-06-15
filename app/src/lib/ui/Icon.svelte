@@ -33,6 +33,8 @@
 		| 'message-square'
 		| 'sliders-horizontal'
 		| 'activity'
+		| 'play'
+		| 'square'
 		| 'accordion';
 
 	// Raw inner SVG markup for each icon (Lucide 24×24 path geometry).
@@ -73,6 +75,8 @@
 		'message-square': `<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>`,
 		'sliders-horizontal': `<line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="12" x2="3" y2="12"/><line x1="21" y1="18" x2="3" y2="18"/><circle cx="9" cy="6" r="2" fill="none"/><circle cx="15" cy="12" r="2" fill="none"/><circle cx="9" cy="18" r="2" fill="none"/>`,
 		'activity': `<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>`,
+		'play': `<polygon points="5 3 19 12 5 21 5 3"/>`,
+		'square': `<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>`,
 		// Custom accordion brand mark: 4 vertical bellows folds on a 24×24 grid.
 		// A rounded rect outline (the body) with three interior zig-zag fold lines
 		// suggesting a compressed bellows / accordion. Reads crisply at 16–28px.

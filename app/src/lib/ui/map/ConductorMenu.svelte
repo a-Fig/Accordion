@@ -21,21 +21,50 @@
 		conductorDiscovery,
 		addConfiguredConductor,
 		removeConfiguredConductor,
+		launchable,
+		launchConductor,
+		stopConductor,
+		isLaunching,
+		launchFailures,
 	} from "$lib/live/conductorDiscovery.svelte";
+	import { mergeExternalConductors, type ExternalRow } from "$lib/live/conductorMerge";
+	import { isTauriEnv } from "$lib/session.svelte";
 
 	let open = $state(false);
 	let showAdd = $state(false);
 	let urlDraft = $state("");
 	let urlError = $state("");
+	/** Per-id inline launch error text (cleared when the menu closes). */
+	let launchErrors = $state<Record<string, string>>({});
 
 	let rootEl = $state<HTMLDivElement>();
 	let triggerEl = $state<HTMLButtonElement>();
 	let urlInputEl = $state<HTMLInputElement>();
 
-	// The externals available to switch to (discovered + configured, deduped).
-	const externals = $derived(allConductors());
-	// The ids of CONFIGURED (hand-entered) conductors — only these get a "Forget" button.
+	// ── Merged external row list ────────────────────────────────────────────────
+	// Uses the pure `mergeExternalConductors` helper (also unit-tested separately).
+	// Three sources merged and deduped by id, in priority order:
+	//  • running   — discovered; may also be launchable or configured
+	//  • stopped   — in launchable list, NOT yet discovered
+	//  • configured — hand-entered URL, NOT discovered and NOT launchable
+	// (ExternalRow type is re-exported from conductorMerge.ts)
+	const externalRows = $derived.by((): ExternalRow[] => {
+		// Read all reactive sources so Svelte tracks each one.
+		const discovered = conductorDiscovery.discovered;
+		const configured = conductorDiscovery.configured;
+		const launchableList = launchable;
+		// isLaunching is also reactive (reads launchingSet), so touch it here to stay subscribed.
+		const _anyLaunching = launchableList.some((c) => isLaunching(c.id));
+		void _anyLaunching;
+		return mergeExternalConductors(discovered, launchableList, configured, new Set(
+			launchableList.filter((c) => isLaunching(c.id)).map((c) => c.id),
+		));
+	});
+
+	// Ids of CONFIGURED entries — needed for the allConductors() isRemote check and Forget.
 	const configuredIds = $derived(new Set(conductorDiscovery.configured.map((c) => c.id)));
+	// The externals available to switch to (for isRemote / activeLabel — still using allConductors()).
+	const externals = $derived(allConductors());
 
 	const activeId = $derived(conductorState.activeId);
 	// "Remote" chrome (accent + status dot) only when the selected external actually resolves
@@ -64,6 +93,7 @@
 	function closeMenu(): void {
 		open = false;
 		closeAddPanel();
+		launchErrors = {};
 	}
 
 	function closeAddPanel(): void {
@@ -86,6 +116,40 @@
 		if (conductorState.activeId === id) setActiveConductor(BUILTIN_ID);
 		removeConfiguredConductor(id);
 	}
+
+	function handleStop(id: string, e: MouseEvent): void {
+		e.stopPropagation();
+		if (conductorState.activeId === id) setActiveConductor(BUILTIN_ID);
+		void stopConductor(id);
+	}
+
+	async function handleLaunch(id: string, e: MouseEvent): Promise<void> {
+		e.stopPropagation();
+		const prevActive = conductorState.activeId;
+		// Select first so the attach effect is armed; the flash-suppression guard in
+		// +page.svelte holds the built-in fallback while isLaunching(id) is true.
+		setActiveConductor(id);
+		try {
+			await launchConductor(id);
+		} catch (err) {
+			// Revert selection and show the error inline — but ONLY if the user is still on the id
+			// we launched. They may have picked another conductor while the launch was in flight;
+			// stomping their newer selection back to prevActive would be wrong.
+			if (conductorState.activeId === id) setActiveConductor(prevActive);
+			launchErrors = { ...launchErrors, [id]: String(err) };
+		}
+	}
+
+	// Watchdog-driven revert: when a launch silently fails (process spawned but never connected),
+	// the discovery module records it in `launchFailures` and clears the launching flag. Surface
+	// that by falling the selection back to the built-in — but, as in the reject path above, only
+	// if the user is still parked on the failed id (don't stomp a newer selection). The inline
+	// error itself renders directly from `launchFailures[row.id]` in the template.
+	$effect(() => {
+		for (const id of Object.keys(launchFailures)) {
+			if (conductorState.activeId === id) setActiveConductor(BUILTIN_ID);
+		}
+	});
 
 	async function openAddPanel(): Promise<void> {
 		showAdd = true;
@@ -177,35 +241,110 @@
 				</button>
 			{/each}
 
-			<!-- Discovered + configured externals -->
-			{#each externals as c (c.id)}
+			<!-- Discovered (running) + launchable-stopped + configured-only externals -->
+			{#each externalRows as row (row.id)}
 				<div class="cond-row">
-					<button
-						type="button"
-						class="cond-item"
-						class:active={activeId === c.id}
-						role="menuitemradio"
-						aria-checked={activeId === c.id}
-						title={c.url}
-						onclick={() => select(c.id)}
-					>
-						<span class="cond-check">
-							{#if activeId === c.id}<Icon name="check" size={13} />{/if}
-						</span>
-						<span class="cond-item-label">{c.label}</span>
-					</button>
-					{#if configuredIds.has(c.id)}
+					{#if row.kind === "running"}
+						<button
+							type="button"
+							class="cond-item"
+							class:active={activeId === row.id}
+							role="menuitemradio"
+							aria-checked={activeId === row.id}
+							title={row.url}
+							onclick={() => select(row.id)}
+						>
+							<span class="cond-check">
+								{#if activeId === row.id}<Icon name="check" size={13} />{/if}
+							</span>
+							<span class="cond-item-label">{row.label}</span>
+						</button>
+						{#if isTauriEnv && row.canLaunch}
+							<button
+								type="button"
+								class="cond-action-btn"
+								title="Stop this conductor"
+								aria-label="Stop conductor"
+								onclick={(e) => handleStop(row.id, e)}
+							>
+								<Icon name="square" size={10} />
+							</button>
+						{:else if row.canForget}
+							<button
+								type="button"
+								class="cond-forget"
+								title="Forget this conductor"
+								aria-label="Forget conductor"
+								onclick={(e) => forget(row.id, e)}
+							>
+								<Icon name="x" size={11} />
+							</button>
+						{/if}
+					{:else if row.kind === "stopped"}
+						<button
+							type="button"
+							class="cond-item cond-item-stopped"
+							class:active={activeId === row.id}
+							role="menuitemradio"
+							aria-checked={activeId === row.id}
+							onclick={(e) => { e.preventDefault(); void handleLaunch(row.id, e as MouseEvent); }}
+						>
+							<span class="cond-check">
+								{#if activeId === row.id && isLaunching(row.id)}
+									<span class="cond-spinner" aria-hidden="true"></span>
+								{:else if activeId === row.id}
+									<Icon name="check" size={13} />
+								{/if}
+							</span>
+							<span class="cond-item-label">{row.label}</span>
+							<span class="cond-stopped-badge">
+								{#if isLaunching(row.id)}Launching…{:else}stopped{/if}
+							</span>
+						</button>
+						{#if isTauriEnv && !isLaunching(row.id)}
+							<button
+								type="button"
+								class="cond-action-btn cond-launch-btn"
+								title="Launch this conductor"
+								aria-label="Launch conductor"
+								onclick={(e) => void handleLaunch(row.id, e)}
+							>
+								<Icon name="play" size={10} />
+							</button>
+						{/if}
+					{:else}
+						<!-- configured-only (hand-entered URL) -->
+						<button
+							type="button"
+							class="cond-item"
+							class:active={activeId === row.id}
+							role="menuitemradio"
+							aria-checked={activeId === row.id}
+							title={row.url}
+							onclick={() => select(row.id)}
+						>
+							<span class="cond-check">
+								{#if activeId === row.id}<Icon name="check" size={13} />{/if}
+							</span>
+							<span class="cond-item-label">{row.label}</span>
+						</button>
 						<button
 							type="button"
 							class="cond-forget"
 							title="Forget this conductor"
 							aria-label="Forget conductor"
-							onclick={(e) => forget(c.id, e)}
+							onclick={(e) => forget(row.id, e)}
 						>
 							<Icon name="x" size={11} />
 						</button>
 					{/if}
 				</div>
+				<!-- One error line per row: a direct launch reject (launchErrors) OR a silent
+				     watchdog timeout (launchFailures). The reject path is shown first if both ever
+				     coexist; in practice only one is set for a given attempt. -->
+				{#if launchErrors[row.id] ?? launchFailures[row.id]}
+					<p class="cond-launch-error">{launchErrors[row.id] ?? launchFailures[row.id]}</p>
+				{/if}
 			{/each}
 
 			<!-- Raw (no conductor) — de-emphasized -->
@@ -503,5 +642,81 @@
 		margin: 0;
 		font-size: var(--fs-2xs);
 		color: var(--k-tool_result, #f0a35e);
+	}
+
+	/* ── Launch / Stop action buttons ── */
+	/* Shares shape with .cond-forget; distinct accent for each action. */
+	.cond-action-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex: 0 0 auto;
+		width: 24px;
+		height: 24px;
+		padding: 0;
+		background: transparent;
+		border: none;
+		border-radius: var(--radius-sm);
+		color: var(--faint);
+		cursor: pointer;
+		transition:
+			background var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out);
+	}
+	.cond-action-btn:hover {
+		background: var(--panel-4);
+		color: var(--text);
+	}
+	.cond-action-btn:focus-visible {
+		outline: none;
+		box-shadow: var(--focus-ring);
+	}
+	/* Launch button gets a subtle accent on hover */
+	.cond-launch-btn:hover {
+		color: var(--accent);
+	}
+
+	/* Stopped-state badge shown inline in the row label area */
+	.cond-stopped-badge {
+		flex: 0 0 auto;
+		font-size: var(--fs-2xs);
+		font-weight: 500;
+		color: var(--faint);
+		opacity: 0.75;
+		margin-left: 4px;
+	}
+
+	/* De-emphasise a stopped (not-running) row */
+	.cond-item-stopped {
+		color: var(--muted);
+		opacity: 0.75;
+	}
+	.cond-item-stopped.active {
+		opacity: 1;
+		color: var(--accent);
+	}
+
+	/* Inline launch error */
+	.cond-launch-error {
+		margin: 2px 8px 3px;
+		font-size: var(--fs-2xs);
+		color: var(--k-tool_result, #f0a35e);
+		line-height: 1.4;
+		word-break: break-word;
+	}
+
+	/* Tiny spinner for the "launching" state */
+	@keyframes cond-spin {
+		to { transform: rotate(360deg); }
+	}
+	.cond-spinner {
+		display: inline-block;
+		width: 9px;
+		height: 9px;
+		border: 1.5px solid color-mix(in srgb, var(--accent) 35%, transparent);
+		border-top-color: var(--accent);
+		border-radius: 50%;
+		animation: cond-spin 0.7s linear infinite;
+		flex: 0 0 auto;
 	}
 </style>
