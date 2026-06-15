@@ -99,9 +99,10 @@ export function decideFolds(view, scores, appliedFoldSet, respectLive, cfg = DEF
 	const blocks = view.blocks;
 	const byId = new Map(blocks.map((b) => [b.id, b]));
 
-	// The band is a fraction of the model's full context window. If the host can't report
-	// it, fall back to `budget` so we still do something sane (fold toward budget).
-	const cap = view.contextWindow ?? view.budget;
+	// The band is a fraction of the user's budget — not the model's full context window.
+	// If the host hasn't reported a context window, budget alone drives the band; if both
+	// are known, the tighter of the two wins so we never exceed either ceiling.
+	const cap = Math.min(view.budget, view.contextWindow ?? Infinity);
 	const highTok = cfg.highWater * cap;
 	const lowTok = cfg.lowWater * cap;
 
