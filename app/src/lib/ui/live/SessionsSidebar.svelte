@@ -1,6 +1,7 @@
 <script lang="ts">
 	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
+	import { folding } from "$lib/live/folding.svelte";
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import SegControl from "$lib/ui/SegControl.svelte";
@@ -119,7 +120,7 @@
 						aria-label={label(s)}
 						onclick={() => onselect(s)}
 					>
-						<span class="status-dot" class:on={isSel && connected}></span>
+						<span class="status-dot" class:on={isSel && connected} class:steering={isSel && connected && folding.enabled}></span>
 					</button>
 				{/each}
 			</div>
@@ -220,7 +221,7 @@
 							{@const isSel = s.sessionId === selected}
 							<li>
 								<button class="row" class:sel={isSel} onclick={() => onselect(s)} title={s.cwd}>
-									<span class="status-dot" class:on={isSel && connected}></span>
+									<span class="status-dot" class:on={isSel && connected} class:steering={isSel && connected && folding.enabled}></span>
 									<span class="body">
 										<span class="t1">{label(s)}</span>
 										<span class="t2 mono">{shortModel(s.model)}</span>
@@ -576,14 +577,18 @@
 		transition: background var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), opacity var(--dur-fast) var(--ease-out);
 	}
 	@keyframes halo-pulse {
-		0%, 100% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 28%, transparent); }
-		50%       { box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 10%, transparent); }
+		0%, 100% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--dot-color) 28%, transparent); }
+		50%       { box-shadow: 0 0 0 4px color-mix(in srgb, var(--dot-color) 10%, transparent); }
 	}
 	.status-dot.on {
-		background: var(--ok);
+		--dot-color: var(--accent);
+		background: var(--dot-color);
 		opacity: 1;
-		box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 28%, transparent);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--dot-color) 28%, transparent);
 		animation: halo-pulse var(--dur-slow) ease-in-out infinite;
+	}
+	.status-dot.on.steering {
+		--dot-color: var(--ok);
 	}
 	.demo-dot {
 		background: transparent;

@@ -76,13 +76,15 @@
 		!inProcessConductor(activeId) && activeId !== NONE_ID && externals.some((c) => c.id === activeId),
 	);
 	// Resolve the SELECTED id to a label. An in-process id (built-in or a sibling) resolves to its
-	// registry label; Raw is Raw; otherwise a discovered remote's label, falling back to "Built-in"
-	// for a remote not yet discovered.
+	// registry label; Raw is Raw; otherwise a discovered remote's label, falling back to the
+	// external-row label (launchable/configured) or the raw id for an unknown selection.
 	const activeLabel = $derived(
 		inProcessConductor(activeId)?.label ??
 			(activeId === NONE_ID
 				? "Raw"
-				: (externals.find((c) => c.id === activeId)?.label ?? "Built-in")),
+				: (externals.find((c) => c.id === activeId)?.label ??
+					externalRows.find((r) => r.id === activeId)?.label ??
+					activeId)),
 	);
 
 	function toggle(): void {

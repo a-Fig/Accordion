@@ -422,34 +422,37 @@ describe("RemoteRunner — conductor/status telemetry (display-only)", () => {
 	});
 });
 
-describe("attachConductor — absent remote attaches the built-in stand-in ONCE (Bug 5: re-attach loop)", () => {
-	it("does NOT re-attach a fresh built-in on every call while the selected remote stays undiscovered", () => {
+describe("attachConductor — absent remote detaches to raw ONCE (Bug 5: re-attach loop)", () => {
+	it("does NOT re-detach/refold on every call while the selected remote stays undiscovered", () => {
 		const store = makeStore(2);
 		// Establish a clean module baseline for this store first (in-proc attach, lastFallback=false).
 		attachConductor(store, "builtin", []);
 
-		// Spy on store.attach to count REAL (re-)attaches from here on.
-		let attachCount = 0;
-		const origAttach = store.attach.bind(store);
-		(store as any).attach = (c: any) => {
-			attachCount++;
-			return origAttach(c);
+		// Spy on store.detach to count REAL (re-)detaches from here on. Per main #35 an absent
+		// remote runs RAW (detach), not a built-in stand-in.
+		let detachCount = 0;
+		const origDetach = store.detach.bind(store);
+		(store as any).detach = () => {
+			detachCount++;
+			return origDetach();
 		};
 
-		// Select a remote id that is NOT in `available` → the built-in stand-in attaches once.
+		// Select a remote id that is NOT in `available` → detach to raw once.
 		attachConductor(store, "ghost-remote", []);
-		expect(attachCount).toBe(1);
+		expect(detachCount).toBe(1);
 
 		// Repeat calls with the SAME id while the remote is still absent must be no-ops. The old
-		// bug re-attached a fresh BuiltinConductor on every discovery poll → refold churn →
+		// bug re-ran the fallback (and refold) on every discovery poll → churn →
 		// effect_update_depth_exceeded (the frozen window). The lastFallback guard makes it stable.
 		attachConductor(store, "ghost-remote", []);
 		attachConductor(store, "ghost-remote", []);
-		expect(attachCount).toBe(1);
+		expect(detachCount).toBe(1);
 
-		// When the remote finally appears, we DO swap the stand-in for the real runner.
+		// When the remote finally appears, we dial the real runner (a fresh socket) — no re-detach.
+		FakeWebSocket.last = null;
 		attachConductor(store, "ghost-remote", [{ ...ENTRY, id: "ghost-remote" }]);
-		expect(attachCount).toBe(2);
+		expect(detachCount).toBe(1);
+		expect(FakeWebSocket.last).not.toBeNull();
 		FakeWebSocket.last!.open();
 
 		// Clean up so the remote runner can't leak into later tests.

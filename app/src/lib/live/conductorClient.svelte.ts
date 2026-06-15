@@ -18,7 +18,7 @@
  * `applyCommands`, which clamps every command to provider-validity).
  */
 import type { AccordionStore } from "../engine/store.svelte";
-import { BuiltinConductor, inProcessConductor } from "$conductors";
+import { inProcessConductor } from "$conductors";
 import { digest } from "../engine/digest";
 import { estTokens, firstLine } from "../engine/tokens";
 import type { ConductorEntry } from "./registry";
@@ -338,10 +338,11 @@ let activeRemote: RemoteRunner | null = null;
 // discovery poll refreshing the list must never tear down and reconnect a healthy remote).
 let lastStore: AccordionStore | null = null;
 let lastId: string | null = null;
-// True when the last attach was the built-in STAND-IN for a selected remote that wasn't
-// discovered yet. Without this, the guard below never matches that case, so every discovery
-// poll re-attaches a fresh built-in → refold → unbounded churn that can pin the reactive
-// scheduler (effect_update_depth_exceeded). Cleared whenever we attach anything real.
+// True when the last attach DETACHED to raw as a fallback for a selected remote that wasn't
+// discovered yet (main #35: we run raw, not the built-in, so the user's chosen strategy is the
+// only thing that ever folds). Without this, the guard below never matches that case, so every
+// discovery poll re-detaches → refold → unbounded churn that can pin the reactive scheduler
+// (effect_update_depth_exceeded). Cleared whenever we attach/detach for a genuinely new reason.
 let lastFallback = false;
 
 /** The remote runner currently attached, if any (so callers can route host events to it). */
@@ -353,8 +354,8 @@ export function activeRemoteRunner(): RemoteRunner | null {
  * Attach the conductor identified by `id` to `store`. `null`/`"none"` ⇒ detach (raw);
  * any id in the in-process registry (`IN_PROCESS_CONDUCTORS` — `"builtin"` and any future
  * sibling) ⇒ a fresh in-process instance; anything else ⇒ a remote runner dialed at the
- * matching discovered/configured `ConductorEntry` (falling back to the built-in if the
- * entry isn't available *yet*, so the view is never stranded). Safe to call from an effect
+ * matching discovered/configured `ConductorEntry` (detaching to raw context if the entry
+ * isn't available *yet*, so nothing folds with the wrong strategy). Safe to call from an effect
  * that tracks the available list: it is IDEMPOTENT — if we are already correctly attached to
  * `id` on `store` it returns untouched (no reconnect on list churn / heartbeat refresh), and
  * a vanished-but-still-connected remote is left alone; only a genuine change swaps.
@@ -365,16 +366,16 @@ export function attachConductor(store: AccordionStore, id: string | null, availa
 	const isRemoteId = norm !== NONE_ID && !inProc;
 	// Already correctly attached? For a remote that means the live runner's id matches AND the
 	// runner is still alive (not dead from an unexpected drop); for in-process/none, just the
-	// id+store. (A remote id that fell back to built-in last time has activeRemote === null, so
-	// this is false → we retry now that it may have appeared. A dead runner is also false →
-	// we tear it down and re-dial so the conductor process can reconnect after a socket drop.)
+	// id+store. (A remote id that fell back to raw last time has activeRemote === null, so this
+	// is false → we retry now that it may have appeared. A dead runner is also false → we tear it
+	// down and re-dial so the conductor process can reconnect after a socket drop.)
 	// Is the selected remote actually discoverable right now? (Only meaningful for a remote id.)
 	const entry = isRemoteId ? available.find((e) => e.id === norm) : undefined;
 	const alreadyCorrect =
 		store === lastStore &&
 		norm === lastId &&
 		(isRemoteId
-			? // a live runner for this id, OR a STABLE built-in stand-in while the remote is still absent
+			? // a live runner for this id, OR a STABLE detached-to-raw state while the remote is still absent
 			  (activeRemote?.id === norm && !activeRemote.isDead) || (lastFallback && !entry)
 			: true);
 	if (alreadyCorrect) return;
@@ -397,8 +398,8 @@ export function attachConductor(store: AccordionStore, id: string | null, availa
 		return;
 	}
 	if (!entry) {
-		store.attach(new BuiltinConductor()); // selected remote not available yet — fall back
-		lastFallback = true; // stand-in attached once; don't re-attach until the remote appears
+		store.detach(); // selected remote not available — run raw until it connects (main #35)
+		lastFallback = true; // detached as fallback; don't re-detach/refold every poll until the remote appears
 		return;
 	}
 	const runner = new RemoteRunner(entry, store);

@@ -7,6 +7,7 @@
 	import { conductorState } from "$lib/live/conductor.svelte";
 	import { startConductorDiscovery, stopConductorDiscovery, allConductors, isLaunching } from "$lib/live/conductorDiscovery.svelte";
 	import { attachConductor, conductorRetry } from "$lib/live/conductorClient.svelte";
+	import { folding } from "$lib/live/folding.svelte";
 	import { DEFAULT_PORT } from "$lib/live/protocol";
 	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
@@ -168,7 +169,7 @@
 								{session.filePath ? baseName(session.filePath) : s.meta.title}
 							</span>
 							{#if isLive}
-								<span class="live-chip">
+								<span class="live-chip" class:steering={folding.enabled}>
 									<span class="live-dot" title="Live — connected to pi; folds steer the agent"></span>
 									<span class="live-label">LIVE</span>
 								</span>
@@ -352,16 +353,17 @@
 		max-width: 38vw;
 	}
 
-	/* Live / Watching chip — colour driven by --chip so both states share one rule */
+	/* Live / Watching chip — colour driven by --chip so both states share one rule.
+	   Preview (default) and Watching = blue; Steering (folding armed) = green. */
 	.live-chip {
-		--chip: var(--ok);
+		--chip: var(--accent);
 		display: inline-flex;
 		align-items: center;
 		gap: 4px;
 		flex: 0 0 auto;
 	}
-	.live-chip.watching {
-		--chip: var(--accent);
+	.live-chip.steering {
+		--chip: var(--ok);
 	}
 	/* compositor-only pulse (transform + opacity) — no per-frame repaint */
 	@keyframes livepulse {
