@@ -254,6 +254,24 @@ test("contextWindow null falls back to budget for band calculation", () => {
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
+// 14. Budget below contextWindow: band uses budget, not contextWindow
+// ──────────────────────────────────────────────────────────────────────────────
+test("user budget below contextWindow: band is computed from budget", () => {
+	// contextWindow = 200_000 but user set budget = 100_000.
+	// 10 blocks × 9_500 = 95_000 rendered — over 90% of budget (90k) → epoch.
+	// If cap were contextWindow (200k), 95k would be 47.5% → hold (wrong).
+	const blocks = Array.from({ length: 10 }, (_, i) =>
+		blk({ id: `b${i}`, tokens: 9_500, foldedTokens: 50, order: i })
+	);
+	const v = view(blocks, { contextWindow: 200_000, budget: 100_000 });
+	const result = decideFolds(v, new Map(), new Set(), new Set(), DEFAULT_CFG);
+
+	assert.equal(result.cap, 100_000, "cap should be budget (the tighter ceiling)");
+	assert.equal(result.action, "epoch", "should epoch against budget, not contextWindow");
+	assert.ok(result.rendered <= 0.7 * 100_000, "rendered should fold down to ≤ lowWater of budget");
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
 // 11. Epoch grows monotonically (superset of appliedFoldSet)
 // ──────────────────────────────────────────────────────────────────────────────
 test("epoch grows monotonically: returned foldSet is superset of appliedFoldSet", () => {

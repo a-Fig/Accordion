@@ -181,6 +181,14 @@ not protection against the conductor).
   WS lifecycle + message shapes as the escape-hatch half). External (WS) implementations live
   in `conductors/<name>/`, any language; `conductors/recency-folder/` is the runnable wire
   starter.
+- **All conductors live in `conductors/`** — always check that directory for the full set;
+  this doc may not name every one. Current conductors:
+  - `builtin/` — the default, in-process. Deterministic oldest-first, lowest-value-first fold.
+  - `cold-score/` — in-process. ACT-R power-law scoring + lexical pre-unfold + hysteresis.
+  - `attention-folder/` — external (WS). A small LM (Qwen2.5-0.5B probe) scores attention
+    relevance; periodic hysteresis-band epochs fold the least-attended blocks. See
+    [ADR 0010](docs/adr/0010-attention-conductor.md).
+  - `recency-folder/` — external (WS). Minimal wire-protocol starter example.
 
 ## Visual grammar (consistent across ALL views)
 
