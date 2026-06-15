@@ -181,13 +181,14 @@
   <h1>Sliver-fold — folded blocks shrink to slivers, digests become real blocks</h1>
   <p class="sub">
     Same block data rendered both ways. <b>Left:</b> today's treatment (folded = dimmed,
-    hatched, full-size square). <b>Right:</b> the proposal — a folded block squeezes to a thin
-    vertical <b>sliver</b> inside its cell slot (column grid never reflows); its digest/summary
-    appears as a real <b>summary block</b> right before them; the whole run packs into ONE
-    compact <b>cluster</b> — summary cell + tightly butted slivers — held by a soft calm
-    <b>bubble</b> (no dead space; it wraps and holds, it never points). Slivers carry token
-    weight as horizontal lines (count = die face); summary blocks carry a die face for their
-    own size.
+    hatched, full-size square). <b>Right:</b> the corrected model — when a block is folded it is
+    replaced by a real synthetic <b>cocoa block</b> (its digest, an actual block now in the
+    context with its own dice face), and the original is shown as a thin <b>sliver</b> (weight
+    lines = the original's size), the two held by a calm <b>bubble</b>. <b>One cocoa block per
+    summary.</b> An <b>ungrouped</b> folded block is its own unit — 1 cocoa + 1 sliver — and is
+    <b>never merged with its neighbours</b> (see the four adjacent folds early on: four separate
+    cocoa+sliver pairs, not one lump). Only an <b>explicit group</b> shares one cocoa summary
+    across its N member slivers (the 3-block group near the middle).
   </p>
 
   <div class="panels">
@@ -211,12 +212,15 @@
   </div>
 
   <p class="note">
-    <b>The tradeoff now:</b> packing the slivers kills the dead space, so a folded run is
-    <i>smaller</i> than the live squares it replaces — a 4-block fold ≈ one summary cell + a
-    thin 4-bar strip, vs four full squares. What you give up is strict per-block grid alignment:
-    a folded run no longer sits on integer cell columns, it becomes its own compact unit in the
-    flow. That's the cost of "no dead space." The existing collapse-to-one-brown-tile
-    <code>group</code> still exists for when you want the run gone entirely, not just compacted.
+    <b>The model:</b> folding a block substitutes its content for a digest — that digest is the
+    <b>cocoa block</b>, a real (synthetic) block that genuinely occupies the context window, so it
+    gets a dice face for its own (small) size. The sliver beside it is the <i>original</i>,
+    kept visible thin so you still read its weight. <b>Grouping is the only thing that makes
+    blocks share one cocoa summary</b> — adjacency alone never does. So an ungrouped fold is a
+    1-cocoa + 1-sliver pair; an explicit group is 1-cocoa + N-slivers. Tradeoff to weigh: each
+    ungrouped fold is two tiles (cocoa + sliver) rather than one, so a folded region isn't more
+    compact than today — the win is legibility (you read the digest, and the original's weight,
+    at a glance), not density.
   </p>
 
 <script type="module">
@@ -247,29 +251,35 @@
   }
 
   // ---- a realistic conversation slice (older/foldable box) -----------------
-  // kind, tokens, and whether it's folded. Two folded RUNS become summaries.
+  // kind, tokens, folded?, and an optional GROUP id. A folded block with NO group is
+  // its OWN unit (1 sliver + its own cocoa block). Only an explicit group of folded
+  // blocks shares ONE cocoa summary (N member slivers → 1 cocoa). Adjacency does NOT
+  // mean grouped — neighbouring ungrouped folds are never merged.
   const KINDS = ["user","text","thinking","tool_call","tool_result"];
-  const B = (kind, tokens, folded=false, run=null) => ({ kind, tokens, folded, run });
+  const B = (kind, tokens, folded=false, group=null) => ({ kind, tokens, folded, group });
 
   const blocks = [
-    B("user", 240), B("thinking", 1200, true, "r1"), B("text", 80, true, "r1"),
-    B("tool_call", 60, true, "r1"), B("tool_result", 3200, true, "r1"),
+    B("user", 240),
+    // four ADJACENT but UNGROUPED folds — each becomes its OWN cocoa+sliver, NOT merged:
+    B("thinking", 1200, true), B("text", 80, true),
+    B("tool_call", 60, true), B("tool_result", 3200, true),
     B("text", 420),
     B("user", 90),
-    B("thinking", 5400, true, "r2"), B("text", 150, true, "r2"),
+    B("thinking", 5400, true), B("text", 150, true),   // two more ungrouped folds
     B("tool_call", 40), B("tool_result", 900),
-    B("text", 70, true, "r3"),                 // a lone fold (1 sliver → 1 summary)
+    B("text", 70, true),                                // a lone ungrouped fold
     B("user", 130), B("text", 260),
-    B("thinking", 460, true, "r4"), B("tool_call", 50, true, "r4"),
-    B("tool_result", 18000, true, "r4"),       // face 6
+    // an EXPLICIT group of 3 folded blocks → ONE cocoa + 3 slivers in one bubble:
+    B("thinking", 460, true, "g1"), B("tool_call", 50, true, "g1"),
+    B("tool_result", 18000, true, "g1"),
     B("text", 110), B("user", 200), B("text", 640),
     B("thinking", 320), B("tool_call", 45), B("tool_result", 1100),
   ];
 
-  // synthesize a digest/summary token size for a run (smaller than the run total)
-  function summaryTokens(runBlocks) {
-    const full = runBlocks.reduce((s,b)=>s+b.tokens,0);
-    return Math.max(60, Math.round(full * 0.12));  // ~12% — a real summary is compact
+  // The cocoa block holds the digest — small relative to the original(s) it replaces.
+  function cocoaTokens(members) {
+    const full = members.reduce((s,b)=>s+b.tokens,0);
+    return Math.max(40, Math.round(full * 0.1));
   }
 
   // ---------- render: TODAY ----------
@@ -322,20 +332,27 @@
         i++;
         continue;
       }
-      // folded run → ONE compact cluster: summary cell + packed slivers, in a bubble.
+      // folded block → a bubble holding its cocoa block (the real synthetic replacement)
+      // then its sliver(s). UNGROUPED = exactly this one block (1 cocoa + 1 sliver).
+      // EXPLICIT GROUP = its contiguous members (1 cocoa + N slivers). Ungrouped folds
+      // are NEVER merged with their neighbours.
+      const grp = b.group ?? null;
       const members = [];
-      const run = b.run;
-      while (i < blocks.length && blocks[i].folded &&
-             (blocks[i].run ?? null) === (run ?? null) &&
-             (run !== null || members.length === 0)) {
-        members.push(blocks[i]); i++;
+      if (grp === null) {
+        members.push(b); i++;                       // ungrouped → just this block
+      } else {
+        while (i < blocks.length && blocks[i].folded && (blocks[i].group ?? null) === grp) {
+          members.push(blocks[i]); i++;             // explicit group → all its members
+        }
       }
       const cluster = document.createElement("div");
       cluster.className = "fold-cluster";
-      const sum = document.createElement("div");
-      sum.className = "cell summary";
-      sum.appendChild(pipsEl(faceFor(summaryTokens(members))));
-      cluster.appendChild(sum);
+      // cocoa block = the synthetic block now in context; its dice face = the digest size.
+      const cocoa = document.createElement("div");
+      cocoa.className = "cell summary";
+      cocoa.appendChild(pipsEl(faceFor(cocoaTokens(members))));
+      cluster.appendChild(cocoa);
+      // the original folded block(s) as thin slivers (weight lines = the ORIGINAL size).
       for (const m of members) cluster.appendChild(sliverEl(m));
       lane.appendChild(cluster);
     }

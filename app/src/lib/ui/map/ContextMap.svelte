@@ -338,22 +338,11 @@
 
 	// ---- sliver mode helpers ------------------------------------------------
 
-	/** Title for a fold-cluster summary tile. */
-	function clusterTip(clusterBlocks: Block[]): string {
-		const sumFull = clusterBlocks.reduce((s, b) => s + b.tokens, 0);
-		const sumEff = clusterBlocks.reduce((s, b) => s + store.effTokens(b), 0);
-		return `folded run · ${clusterBlocks.length} blocks · ${k(sumFull)}→${k(sumEff)} tok · click inspect · dbl-click unfold all`;
-	}
-
-	/** Effective token sum of a cluster (for the summary tile's dice face). */
-	function clusterEffTokens(clusterBlocks: Block[]): number {
-		return clusterBlocks.reduce((s, b) => s + store.effTokens(b), 0);
-	}
-
-	/** Full (unfolded) token sum of a cluster — used for the summary tile dice face
-	 *  so a heavy hidden run shows a high face even when all blocks are digest-tiny. */
-	function clusterFullTokens(clusterBlocks: Block[]): number {
-		return clusterBlocks.reduce((s, b) => s + b.tokens, 0);
+	/** Title for an ungrouped fold's cocoa block — the digest now standing in for the block.
+	 *  The dice face on the cocoa shows ITS size (the digest); the sliver beside it carries the
+	 *  original block's weight. */
+	function foldTip(b: Block): string {
+		return `folded · ${k(b.tokens)}→${k(store.effTokens(b))} tok · click to inspect · double-click to unfold`;
 	}
 
 	// ---- range selection state (local — for creating groups) ----------------
@@ -688,11 +677,12 @@
 		// specifically, NOT plain `[data-group]`, so we don't grab the outer `.group-band`
 		// wrapper (its rect is the whole band, not the parent tile). getBoundingClientRect()
 		// returns client coords, the same space allTileCenters() uses (canvasRect.left + x).
-		// Also include sliver-mode lane items: `.lane [data-id]` (live tiles + slivers) and
-		// `.lane [data-summary]` (summary tiles, anchored on their first member id).
+		// Also include sliver-mode lane items: `.lane [data-id]` (live tiles + slivers),
+		// `.lane [data-summary]` (a fold's cocoa, anchored on its block id), and
+		// `.lane [data-group]` (a group's cocoa, anchored on the group id).
 		if (stage) {
 			for (const el of stage.querySelectorAll<HTMLElement>(
-				".group-band [data-id], .group-tile-open[data-group], .lane [data-id], .lane [data-summary]",
+				".group-band [data-id], .group-tile-open[data-group], .lane [data-id], .lane [data-summary], .lane [data-group]",
 			)) {
 				let id: string | undefined;
 				if (el.dataset.summary !== undefined) {
@@ -903,6 +893,26 @@
 					title={tip(t.b, prot)}
 				></div>
 			{/snippet}
+			{#snippet sliverTile(b: Block, interactive: boolean)}
+				<!-- The ORIGINAL folded block as a thin sliver; white lines = its weight (die face).
+				     `interactive` slivers carry data-id (click=inspect / dbl=unfold); group-member
+				     slivers are display-only (the group's cocoa owns the interaction). -->
+				{@const face = faceFor(b.tokens)}
+				{@const usable = cell - 4}
+				{@const gap = face > 1 ? Math.min(4, usable / (face - 1)) : 0}
+				{@const barStart = cell / 2 - (gap * (face - 1)) / 2}
+				<div
+					class="sliver k-{b.kind}"
+					class:sel={interactive && b.id === selectedId}
+					style:height="{cell}px"
+					data-id={interactive ? b.id : undefined}
+					title={tip(b)}
+				>
+					{#each { length: face } as _, n}
+						<div class="bar" style:top="{barStart + n * gap}px"></div>
+					{/each}
+				</div>
+			{/snippet}
 			<div class="boxes" style:--cell="{cell}px" style:--cols={cols}>
 				{#if olderTiles.length}
 					<section class="box older">
@@ -914,11 +924,11 @@
 								{#if seg.kind === "tiles"}
 									{#if settings.foldDisplayMode === "sliver"}
 										{@const laneItems = buildLane(seg.rows, (b) => store.isFolded(b))}
-										<!-- Sliver mode: DOM flex-wrap lane. Live blocks = full squares; folded
-										     contiguous runs = one fold-cluster (summary tile + slivers). Open
+										<!-- Sliver mode: DOM flex-wrap lane. Live block = a full square; each ungrouped
+										     folded block = its own cocoa + 1 sliver (never merged); a group = 1 cocoa + N slivers. Open
 										     group bands are still rendered below unchanged. -->
 										<div class="lane">
-											{#each laneItems as item (item.kind === "tile" ? item.block.id : item.kind === "group" ? item.group.id : "cluster-" + item.blocks[0].id)}
+											{#each laneItems as item (item.kind === "tile" ? "t-" + item.block.id : item.kind === "fold" ? "f-" + item.block.id : "g-" + item.group.id)}
 												{#if item.kind === "tile"}
 													{@const b = item.block}
 													<div
@@ -931,51 +941,40 @@
 														data-id={b.id}
 														title={tip(b)}
 													></div>
-												{:else if item.kind === "group"}
-													{@const g = item.group}
-													<div
-														class="cell face f{faceFor(store.groupLiveTokens(g))} group-tile"
-														class:sel={selectedId === g.id}
-														style:width="{cell}px"
-														style:height="{cell}px"
-														data-group={g.id}
-														title={groupTip(g)}
-													></div>
-												{:else}
-													{@const clusterBlocks = item.blocks}
-													{@const memberIds = clusterBlocks.map((b) => b.id).join(",")}
-													{@const clusterFace = faceFor(clusterFullTokens(clusterBlocks))}
-													<!-- data-cluster-ids on the bubble for a future cluster inspector. -->
-													<!-- v1: summary inspect shows first block only; see clusterTip + onClick/onDbl "summary" case. -->
-													<div class="fold-cluster" data-cluster-ids={memberIds}>
-														<div
-															class="cell face f{clusterFace} summary-tile"
-															class:sel={selectedId === clusterBlocks[0].id}
-															style:width="{cell}px"
-															style:height="{cell}px"
-															data-summary={memberIds}
-															title={clusterTip(clusterBlocks)}
-														></div>
-														{#each clusterBlocks as b (b.id)}
-															{@const face = faceFor(b.tokens)}
-															{@const pad = 2}
-															{@const usable = cell - pad * 2}
-															{@const gap = face > 1 ? Math.min(4, usable / (face - 1)) : 0}
-															{@const barStart = cell / 2 - (gap * (face - 1)) / 2}
-															<div
-																class="sliver k-{b.kind}"
-																class:sel={b.id === selectedId}
-																style:height="{cell}px"
-																data-id={b.id}
-																title={tip(b)}
-															>
-																{#each { length: face } as _, n}
-																	<div class="bar" style:top="{barStart + n * gap}px"></div>
-																{/each}
-															</div>
-														{/each}
-													</div>
-												{/if}
+												{:else if item.kind === "fold"}
+											{@const b = item.block}
+											<!-- ungrouped fold: the cocoa block (digest = a real block now in context; its dice
+											     face = its OWN size) + the original block as a thin sliver. Each ungrouped fold
+											     is its own unit — never merged with neighbours. -->
+											<div class="fold-cluster" data-cluster-ids={b.id}>
+												<div
+													class="cell face f{faceFor(store.effTokens(b))} summary-tile"
+													class:sel={b.id === selectedId}
+													style:width="{cell}px"
+													style:height="{cell}px"
+													data-summary={b.id}
+													title={foldTip(b)}
+												></div>
+												{@render sliverTile(b, true)}
+											</div>
+										{:else}
+											{@const g = item.group}
+											<!-- explicit group: ONE shared cocoa summary + its member slivers (display-only;
+											     the cocoa owns peek/collapse via data-group, like the old group tile). -->
+											<div class="fold-cluster" data-cluster-ids={item.members.map((m) => m.id).join(",")}>
+												<div
+													class="cell face f{faceFor(store.groupLiveTokens(g))} summary-tile"
+													class:sel={selectedId === g.id}
+													style:width="{cell}px"
+													style:height="{cell}px"
+													data-group={g.id}
+													title={groupTip(g)}
+												></div>
+												{#each item.members as m (m.id)}
+													{@render sliverTile(m, false)}
+												{/each}
+											</div>
+										{/if}
 											{/each}
 										</div>
 									{:else}
