@@ -18,7 +18,7 @@
  * `applyCommands`, which clamps every command to provider-validity).
  */
 import type { AccordionStore } from "../engine/store.svelte";
-import { BuiltinConductor, inProcessConductor } from "$conductors";
+import { inProcessConductor } from "$conductors";
 import { digest } from "../engine/digest";
 import { estTokens, firstLine } from "../engine/tokens";
 import type { ConductorEntry } from "./registry";
@@ -385,7 +385,7 @@ export function attachConductor(store: AccordionStore, id: string | null, availa
 	}
 	const entry = available.find((e) => e.id === norm);
 	if (!entry) {
-		store.attach(new BuiltinConductor()); // selected remote not available yet — fall back
+		store.detach(); // selected remote not available — run raw until it connects
 		return;
 	}
 	const runner = new RemoteRunner(entry, store);
