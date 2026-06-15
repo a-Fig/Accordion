@@ -338,10 +338,15 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 */
 	function readSessionMessages(c: ExtensionContext | null): PiMessage[] {
 		if (!c) return [];
-		const sm = c.sessionManager as unknown as {
+		let sm: {
 			buildSessionContext?: () => { messages?: unknown };
 			getBranch?: (fromId?: string) => Array<{ type: string; message?: unknown }>;
 		} | undefined;
+		try {
+			sm = c.sessionManager as unknown as typeof sm;
+		} catch {
+			return [];
+		}
 		if (!sm) return [];
 		try {
 			const sc = sm.buildSessionContext?.();
@@ -771,6 +776,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 		wss = null;
 		client = null;
+		latestCtx = null;
 	});
 
 	// ── /accordion : focus the app on this session + show status ────────────────
