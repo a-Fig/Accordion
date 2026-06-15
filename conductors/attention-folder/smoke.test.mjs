@@ -341,3 +341,37 @@ test("status: host/commandResult refreshes the folded count after an epoch", asy
 	assert.equal(status.metrics.folded, foldedN, "folded count must match the confirmed fold set");
 	assert.match(status.text, new RegExp(`\\b${foldedN} folded`), "text must report the confirmed fold count");
 });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 7: degenerate cap (no contextWindow + budget 0) must never serialize
+// NaN/Infinity — fullness is guarded to a finite 0.
+// ──────────────────────────────────────────────────────────────────────────────
+test("status: degenerate cap (contextWindow null, budget 0) emits finite fullness, never NaN", async () => {
+	// tokens 0 → rendered 0; cap 0 → fullness 0/0 = NaN. The guard must coerce it to 0.
+	const blocks = Array.from({ length: 2 }, (_, i) =>
+		blk({ id: `nan_blk_${i}`, kind: "text", tokens: 0, foldedTokens: 0, order: i, text: `n ${i}` })
+	);
+
+	ws.send(
+		JSON.stringify({
+			type: "context/update",
+			rev: 12,
+			contextWindow: null,
+			budget: 0,
+			liveTokens: 0,
+			protectedFromIndex: 0,
+			protectTokens: 0,
+			blocks,
+		})
+	);
+
+	const msg = await waitForMessage(
+		ws,
+		(m) => m.type === "conductor/status" && m.metrics?.action === "hold" && /0% full/.test(m.text ?? ""),
+		2_000
+	);
+
+	assert.doesNotMatch(msg.text, /NaN|Infinity/, "text must not contain NaN/Infinity");
+	assert.equal(Number.isFinite(msg.metrics.fullness), true, "metrics.fullness must be finite");
+	assert.equal(msg.metrics.fullness, 0, "degenerate cap → 0% fullness");
+});

@@ -101,7 +101,12 @@ function freshState() {
  * touches nothing. The host renders `text` and may use `metrics`; it never acts on either.
  */
 function buildStatus(state) {
-	const fullnessPct = Math.round((state.lastFullness ?? 0) * 100);
+	// Guard a degenerate fullness: when the host reports no contextWindow AND budget 0, the
+	// policy's cap is 0 → fullness is Infinity/NaN. Coerce to a finite 0 so `metrics.fullness`
+	// stays a number (the wire schema is number|string|boolean) and the text never reads
+	// "NaN% full". Display-only — the fold policy is unaffected.
+	const rawFull = Number.isFinite(state.lastFullness) ? state.lastFullness : 0;
+	const fullnessPct = Math.round(rawFull * 100);
 	const low = Math.round(CFG.lowWater * 100);
 	const high = Math.round(CFG.highWater * 100);
 	const folded = state.confirmedApplied.size;
