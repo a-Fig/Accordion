@@ -89,7 +89,6 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				}
 			live.status = "connected";
 			session.error = "";
-			session.live = true;
 			session.filePath = null;
 			// A live pi session is steerable, never a read-only recording. Reset here —
 			// alongside the authoritative store rebuild — so the READ-ONLY badge can never
@@ -222,7 +221,6 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 	};
 
 	ws.onclose = () => {
-		session.live = false;
 		// Guaranteed teardown (invariant #2): on disconnect, all ghosts vanish with the
 		// GUI state. A ghost cannot outlive the WS connection that spawned it.
 		ghostClearAll();
@@ -243,7 +241,6 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 export function disconnectLive(): void {
 	manualClose = true;
 	budgetLive = false;
-	session.live = false;
 	// Guaranteed teardown (invariant #2): explicit disconnect clears all ghosts
 	// immediately, before the socket close fires.
 	ghostClearAll();
