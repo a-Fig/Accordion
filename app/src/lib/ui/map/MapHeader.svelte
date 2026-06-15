@@ -6,6 +6,7 @@
 	import ConductorMenu from "./ConductorMenu.svelte";
 	import { folding, setFolding } from "$lib/live/folding.svelte";
 	import { live } from "$lib/live/liveClient.svelte";
+	import { conductorStatus } from "$lib/live/conductorClient.svelte";
 
 	let { store, readOnly = false }: { store: AccordionStore; readOnly?: boolean } = $props();
 
@@ -209,6 +210,15 @@
 			</button>
 		</div>
 	</div>
+
+	<!-- ── Conductor telemetry (display-only): one-line status from the active conductor.
+	     Empty unless a remote conductor pushed a conductor/status; in-process/Raw show nothing. -->
+	{#if conductorStatus.text}
+		<div class="cond-telemetry" role="status" title={conductorStatus.text}>
+			<Icon name="activity" size={11} />
+			<span class="cond-telemetry-text mono">{conductorStatus.text}</span>
+		</div>
+	{/if}
 
 	<!-- ── Composition bar + on-bar protected control ── -->
 	<div class="bar-area">
@@ -533,6 +543,27 @@
 	/* Protect readout (the slider moved onto the bar) */
 	.protect-read {
 		cursor: default;
+	}
+
+	/* ── Conductor telemetry line: one muted, mono status from the active conductor ──
+	   Right-aligned so it sits under the conductor switcher in the controls cluster. */
+	.cond-telemetry {
+		display: flex;
+		align-items: center;
+		justify-content: flex-end;
+		gap: 5px;
+		margin-top: -2px;
+		min-width: 0;
+		color: var(--faint);
+	}
+	.cond-telemetry-text {
+		font-size: var(--fs-2xs);
+		letter-spacing: 0.01em;
+		color: var(--muted);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
 	}
 
 	/* ── Composition bar area: bar + on-bar protected control + underline ── */

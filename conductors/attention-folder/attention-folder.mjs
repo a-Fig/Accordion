@@ -91,7 +91,61 @@ function freshState() {
 		scoringInFlight: false,
 		rescoreNeeded: true, // score on the first warm approach, and after every epoch
 		abort: new AbortController(), // fired on disconnect → kills any in-flight probe child
+		// ── display-only telemetry (conductor/status) — NEVER affects folds/commands ──
+		lastFullness: 0, // most recent rendered fullness (0..1)
+		lastAction: "hold", // "hold" | "epoch" from the most recent decision
+		lastEpoch: null, // { added, fullnessAfter } stamped when we emit a fold
+		lastStatusText: "", // dedup: the last human summary we put on the wire
 	};
+}
+
+/**
+ * Build the display-only status payload from current connection state. Pure: reads state,
+ * touches nothing. The host renders `text` and may use `metrics`; it never acts on either.
+ */
+function buildStatus(state) {
+	// Guard a degenerate fullness: when the host reports no contextWindow AND budget 0, the
+	// policy's cap is 0 → fullness is Infinity/NaN. Coerce to a finite 0 so `metrics.fullness`
+	// stays a number (the wire schema is number|string|boolean) and the text never reads
+	// "NaN% full". Display-only — the fold policy is unaffected.
+	const rawFull = Number.isFinite(state.lastFullness) ? state.lastFullness : 0;
+	const fullnessPct = Math.round(rawFull * 100);
+	const low = Math.round(CFG.lowWater * 100);
+	const high = Math.round(CFG.highWater * 100);
+	const folded = state.confirmedApplied.size;
+	const action = state.lastAction === "epoch" ? "epoch" : "holding";
+	let text = `${fullnessPct}% full · ${action} · band ${low}–${high}% · ${folded} folded`;
+	if (state.lastEpoch) {
+		text += ` · last epoch: folded ${state.lastEpoch.added} → ${Math.round(state.lastEpoch.fullnessAfter * 100)}%`;
+	}
+	if (state.scoringInFlight) text += " · scoring…";
+	const metrics = {
+		fullness: fullnessPct,
+		action: state.lastAction ?? "hold",
+		lowWater: low,
+		highWater: high,
+		folded,
+		scoring: state.scoringInFlight,
+	};
+	if (state.lastEpoch) {
+		metrics.lastEpochFolded = state.lastEpoch.added;
+		metrics.lastEpochFullness = Math.round(state.lastEpoch.fullnessAfter * 100);
+	}
+	return { text, metrics };
+}
+
+/**
+ * Emit a `conductor/status` IFF the human summary changed since the last send (the text
+ * encodes everything meaningful — fullness, action, fold count, last epoch, scoring), so an
+ * unchanged hold doesn't re-spam the wire. Strictly a `ws.send`: no fold/command/model-call
+ * side effect — this is the display-only invariant.
+ */
+function sendStatus(ws, state) {
+	if (ws.readyState !== 1 /* WebSocket.OPEN */) return; // socket gone (e.g. disconnect mid-scoring)
+	const { text, metrics } = buildStatus(state);
+	if (text === state.lastStatusText) return;
+	state.lastStatusText = text;
+	ws.send(JSON.stringify({ type: "conductor/status", text, metrics }));
 }
 
 /**
@@ -115,6 +169,7 @@ function maybeScore(ws, state, view, fullness) {
 	const candidates = cands.map((b) => ({ id: b.id, text: b.text || "" }));
 	const ids = candidates.map((c) => c.id);
 	log(`scoring ${candidates.length} candidates (fullness ${(fullness * 100).toFixed(0)}%)…`);
+	sendStatus(ws, state); // surface the "scoring…" transition
 
 	scoreCandidates({ tailText, candidates, signal: state.abort.signal, log })
 		.then((scores) => {
@@ -123,10 +178,12 @@ function maybeScore(ws, state, view, fullness) {
 			state.rescoreNeeded = false;
 			state.scoringInFlight = false;
 			log(`scores ready: ${state.scores.size} cached`);
+			sendStatus(ws, state); // scoring finished → drop the "scoring…" suffix
 		})
 		.catch((err) => {
 			state.scoringInFlight = false;
 			log(`scoring failed: ${err.message}`);
+			sendStatus(ws, state);
 		});
 }
 
@@ -172,7 +229,13 @@ wss.on("connection", (ws) => {
 			// is structurally unclampable and `reports` is always empty here. If this conductor ever
 			// emits `replace`/`group`, or folds outside that guard, revisit: a silently-clamped id
 			// recorded here as applied would never be retried.
-			if (msg.rev === state.pendingRev) state.confirmedApplied = state.pendingSet;
+			if (msg.rev === state.pendingRev) {
+				state.confirmedApplied = state.pendingSet;
+				// Refresh the readout now the epoch is CONFIRMED: until this point the status still
+				// reported the pre-epoch fold count (the host suppresses the post-fold context/update,
+				// so without this the line is stuck showing e.g. "0 folded · last epoch: folded 4").
+				sendStatus(ws, state);
+			}
 			return;
 		}
 
@@ -190,6 +253,8 @@ wss.on("connection", (ws) => {
 		// Decide against the CONFIRMED applied set (what the host actually holds), so a dropped
 		// reply doesn't make us believe a fold landed when it didn't.
 		const decision = decideFolds(view, state.scores, state.confirmedApplied, state.respectLive, CFG);
+		state.lastFullness = decision.fullness;
+		state.lastAction = decision.action;
 
 		// Emit ONLY when the desired set adds folds the host has not confirmed. This (a) keeps the
 		// prompt prefix — and the inference cache — stable between epochs (a 'hold' adds nothing),
@@ -209,10 +274,15 @@ wss.on("connection", (ws) => {
 			state.pendingRev = msg.rev;
 			state.pendingSet = new Set(decision.foldSet);
 			state.rescoreNeeded = true; // the tail moved; refresh scores before the next epoch
+			// Telemetry only: remember this epoch's size for the status line (blocks newly folded
+			// vs. what the host had confirmed, and the resulting fullness).
+			const added = [...decision.foldSet].filter((id) => !state.confirmedApplied.has(id)).length;
+			state.lastEpoch = { added, fullnessAfter: decision.fullness };
 			log(`EPOCH: folding ${decision.foldSet.size} blocks → ~${(decision.fullness * 100).toFixed(0)}% full`);
 		}
 
 		maybeScore(ws, state, view, decision.fullness);
+		sendStatus(ws, state); // display-only: reflect this decision to the human (deduped)
 	});
 
 	ws.on("close", () => {

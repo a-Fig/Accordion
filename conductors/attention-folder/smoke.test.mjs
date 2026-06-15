@@ -259,3 +259,119 @@ test("epoch: context/update over 90% contextWindow → conductor/commands with f
 	assert.ok(Array.isArray(msg.commands[0].ids), "fold command must have ids array");
 	assert.ok(msg.commands[0].ids.length > 0, "fold ids must be non-empty");
 });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 5: telemetry — a context/update yields a display-only conductor/status
+// ──────────────────────────────────────────────────────────────────────────────
+test("status: context/update → conductor/status with one-line text + metrics", async () => {
+	// 4 blocks × 12k = 48k / 100k → 48% (a hold; under the 80% warm mark so no scoring).
+	// A fullness not used by prior tests, so the deduped status is guaranteed to emit.
+	const blocks = Array.from({ length: 4 }, (_, i) =>
+		blk({ id: `status_blk_${i}`, tokens: 12_000, foldedTokens: 50, order: i })
+	);
+
+	ws.send(
+		JSON.stringify({
+			type: "context/update",
+			rev: 3,
+			contextWindow: 100_000,
+			budget: 100_000,
+			liveTokens: 48_000,
+			protectedFromIndex: 0,
+			protectTokens: 0,
+			blocks,
+		})
+	);
+
+	// Match OUR update specifically (48% full) — a prior test's epoch may have left an
+	// unconsumed conductor/status in the buffer; waitForMessage discards non-matching ones.
+	const msg = await waitForMessage(
+		ws,
+		(m) => m.type === "conductor/status" && /48% full/.test(m.text ?? ""),
+		2_000
+	);
+
+	assert.equal(msg.type, "conductor/status");
+	assert.equal(typeof msg.text, "string", "status text must be a string");
+	assert.match(msg.text, /48% full/, "status text should report this update's fullness");
+	assert.match(msg.text, /holding/, "a sub-band update should read as holding");
+	assert.ok(msg.metrics && typeof msg.metrics === "object", "metrics must be an object");
+	assert.equal(msg.metrics.action, "hold", "metrics.action should be 'hold' under the band");
+	assert.equal(msg.metrics.fullness, 48, "metrics.fullness must reflect the update");
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 6: status refresh on confirmation — host/commandResult updates the folded
+// count so the readout never sticks at the pre-epoch count (regression for the
+// "0 folded · last epoch: folded N" self-contradiction).
+// ──────────────────────────────────────────────────────────────────────────────
+test("status: host/commandResult refreshes the folded count after an epoch", async () => {
+	// Force an epoch (10 × 10k = 100k > 90k). Probe disabled → unscored fallback folds.
+	const blocks = Array.from({ length: 10 }, (_, i) =>
+		blk({ id: `confirm_blk_${i}`, kind: "tool_result", tokens: 10_000, foldedTokens: 50, order: i, text: `c ${i}` })
+	);
+
+	ws.send(
+		JSON.stringify({
+			type: "context/update",
+			rev: 11,
+			contextWindow: 100_000,
+			budget: 100_000,
+			liveTokens: 100_000,
+			protectedFromIndex: 0,
+			protectTokens: 0,
+			blocks,
+		})
+	);
+
+	// Capture how many blocks the epoch actually folded.
+	const cmd = await waitForMessage(ws, (m) => m.type === "conductor/commands" && m.rev === 11, 2_000);
+	const foldedN = cmd.commands[0].ids.length;
+	assert.ok(foldedN > 0, "epoch should fold at least one block");
+
+	// Confirm the batch. The conductor must now emit a status reporting the REAL count —
+	// before this it reported 0 folded (the host suppresses the post-fold context/update).
+	ws.send(JSON.stringify({ type: "host/commandResult", rev: 11, reports: [] }));
+
+	const status = await waitForMessage(
+		ws,
+		(m) => m.type === "conductor/status" && m.metrics?.folded === foldedN,
+		2_000
+	);
+	assert.equal(status.metrics.folded, foldedN, "folded count must match the confirmed fold set");
+	assert.match(status.text, new RegExp(`\\b${foldedN} folded`), "text must report the confirmed fold count");
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 7: degenerate cap (no contextWindow + budget 0) must never serialize
+// NaN/Infinity — fullness is guarded to a finite 0.
+// ──────────────────────────────────────────────────────────────────────────────
+test("status: degenerate cap (contextWindow null, budget 0) emits finite fullness, never NaN", async () => {
+	// tokens 0 → rendered 0; cap 0 → fullness 0/0 = NaN. The guard must coerce it to 0.
+	const blocks = Array.from({ length: 2 }, (_, i) =>
+		blk({ id: `nan_blk_${i}`, kind: "text", tokens: 0, foldedTokens: 0, order: i, text: `n ${i}` })
+	);
+
+	ws.send(
+		JSON.stringify({
+			type: "context/update",
+			rev: 12,
+			contextWindow: null,
+			budget: 0,
+			liveTokens: 0,
+			protectedFromIndex: 0,
+			protectTokens: 0,
+			blocks,
+		})
+	);
+
+	const msg = await waitForMessage(
+		ws,
+		(m) => m.type === "conductor/status" && m.metrics?.action === "hold" && /0% full/.test(m.text ?? ""),
+		2_000
+	);
+
+	assert.doesNotMatch(msg.text, /NaN|Infinity/, "text must not contain NaN/Infinity");
+	assert.equal(Number.isFinite(msg.metrics.fullness), true, "metrics.fullness must be finite");
+	assert.equal(msg.metrics.fullness, 0, "degenerate cap → 0% fullness");
+});
