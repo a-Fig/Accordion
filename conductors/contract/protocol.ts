@@ -146,17 +146,41 @@ export interface CapRequestMessage {
 	text?: string;
 }
 
+/**
+ * Display-only telemetry the conductor wants the host to surface to a human. PURELY
+ * informational: the host renders `text` (and may use `metrics`) somewhere unobtrusive and
+ * does NOTHING else — it never folds, alters commands, or triggers a model call on this.
+ *
+ * Generic by design (no privileged surface): any conductor may emit it, the host treats the
+ * payload opaquely, and a conductor that never sends one simply shows no readout. Additive
+ * and non-breaking — it carries no `rev` and expects no reply, so an older host that doesn't
+ * recognise the type just ignores it.
+ *  - "text"    — a one-line human summary (e.g. "82% full · holding · band 70–90% · 14 folded").
+ *  - "metrics" — optional structured key/values, for a host that wants to render them itself.
+ */
+export interface ConductorStatusMessage {
+	type: "conductor/status";
+	text?: string;
+	metrics?: Record<string, number | string | boolean>;
+}
+
 export type ConductorMessage =
 	| ConductorHelloMessage
 	| ConductorCommandsMessage
-	| CapRequestMessage;
+	| CapRequestMessage
+	| ConductorStatusMessage;
 
 // ─── guards ───────────────────────────────────────────────────────────────────
 
 export function isConductorMessage(m: unknown): m is ConductorMessage {
 	if (!m || typeof m !== "object") return false;
 	const t = (m as { type?: unknown }).type;
-	return t === "conductor/hello" || t === "conductor/commands" || t === "cap/request";
+	return (
+		t === "conductor/hello" ||
+		t === "conductor/commands" ||
+		t === "cap/request" ||
+		t === "conductor/status"
+	);
 }
 
 export function isHostMessage(m: unknown): m is HostMessage {

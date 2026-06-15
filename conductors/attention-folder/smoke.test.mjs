@@ -259,3 +259,43 @@ test("epoch: context/update over 90% contextWindow → conductor/commands with f
 	assert.ok(Array.isArray(msg.commands[0].ids), "fold command must have ids array");
 	assert.ok(msg.commands[0].ids.length > 0, "fold ids must be non-empty");
 });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Test 5: telemetry — a context/update yields a display-only conductor/status
+// ──────────────────────────────────────────────────────────────────────────────
+test("status: context/update → conductor/status with one-line text + metrics", async () => {
+	// 4 blocks × 12k = 48k / 100k → 48% (a hold; under the 80% warm mark so no scoring).
+	// A fullness not used by prior tests, so the deduped status is guaranteed to emit.
+	const blocks = Array.from({ length: 4 }, (_, i) =>
+		blk({ id: `status_blk_${i}`, tokens: 12_000, foldedTokens: 50, order: i })
+	);
+
+	ws.send(
+		JSON.stringify({
+			type: "context/update",
+			rev: 3,
+			contextWindow: 100_000,
+			budget: 100_000,
+			liveTokens: 48_000,
+			protectedFromIndex: 0,
+			protectTokens: 0,
+			blocks,
+		})
+	);
+
+	// Match OUR update specifically (48% full) — a prior test's epoch may have left an
+	// unconsumed conductor/status in the buffer; waitForMessage discards non-matching ones.
+	const msg = await waitForMessage(
+		ws,
+		(m) => m.type === "conductor/status" && /48% full/.test(m.text ?? ""),
+		2_000
+	);
+
+	assert.equal(msg.type, "conductor/status");
+	assert.equal(typeof msg.text, "string", "status text must be a string");
+	assert.match(msg.text, /48% full/, "status text should report this update's fullness");
+	assert.match(msg.text, /holding/, "a sub-band update should read as holding");
+	assert.ok(msg.metrics && typeof msg.metrics === "object", "metrics must be an object");
+	assert.equal(msg.metrics.action, "hold", "metrics.action should be 'hold' under the band");
+	assert.equal(msg.metrics.fullness, 48, "metrics.fullness must reflect the update");
+});

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { RemoteRunner, attachConductor, conductorLink, conductorRetry } from "./conductorClient.svelte";
+import { RemoteRunner, attachConductor, conductorLink, conductorRetry, conductorStatus } from "./conductorClient.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import type { Block, ParsedSession } from "../engine/types";
 import type { ConductorEntry } from "./registry";
@@ -369,6 +369,52 @@ describe("RemoteRunner — stale desired cleared on unexpected disconnect (Bug 3
 
 		// The store must be raw NOW, without any manual conduct() call from the test.
 		expect(store.isFolded(store.get("m0:p0")!)).toBe(false);
+	});
+});
+
+describe("RemoteRunner — conductor/status telemetry (display-only)", () => {
+	it("stashes text + metrics from a conductor/status without touching folds or replying", () => {
+		const store = makeStore(3);
+		store.setProtect(0);
+		const { ws } = connectRunner(store);
+		sendHello(ws, "full");
+
+		const resultsBefore = ws.framesOfType("host/commandResult").length;
+		ws.emit({
+			type: "conductor/status",
+			text: "82% full · holding · band 70–90% · 14 folded",
+			metrics: { fullness: 82, action: "hold", folded: 14, scoring: false },
+		});
+
+		expect(conductorStatus.text).toBe("82% full · holding · band 70–90% · 14 folded");
+		expect(conductorStatus.metrics.fullness).toBe(82);
+		// Display-only: it must NOT fold anything or emit a commandResult.
+		expect(store.isFolded(store.get("m0:p0")!)).toBe(false);
+		expect(ws.framesOfType("host/commandResult").length).toBe(resultsBefore);
+	});
+
+	it("clears the status line on an unexpected disconnect", () => {
+		const store = makeStore(2);
+		const { ws } = connectRunner(store);
+		sendHello(ws, "full");
+		ws.emit({ type: "conductor/status", text: "50% full · holding", metrics: {} });
+		expect(conductorStatus.text).toBe("50% full · holding");
+
+		ws.onclose?.(); // unexpected drop → stale telemetry must be hidden
+		expect(conductorStatus.text).toBe("");
+	});
+
+	it("clears the status line when the remote is swapped for the built-in", () => {
+		const store = makeStore(2);
+		attachConductor(store, ENTRY.id, [ENTRY]);
+		const ws = FakeWebSocket.last!;
+		ws.open();
+		sendHello(ws, "full");
+		ws.emit({ type: "conductor/status", text: "70% full · holding", metrics: {} });
+		expect(conductorStatus.text).toBe("70% full · holding");
+
+		attachConductor(store, "builtin", []); // swap to in-process → close() clears the line
+		expect(conductorStatus.text).toBe("");
 	});
 });
 

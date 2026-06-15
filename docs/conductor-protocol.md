@@ -352,6 +352,19 @@ tokenizer). The host answers with a `cap/result` carrying the same `reqId`.
 | `getContent`   | `ids[0]`         | full text of that block (for `wants:"onDemand"`)                 |
 | `getDigest`    | `ids[0]`         | the engine's per-kind folded digest (incl. the `{#code FOLDED}` tag) |
 
+**`conductor/status`** — *display-only* telemetry: a one-line summary of what you are
+calculating, for the host to surface to a human near the conductor switcher.
+
+```json
+{ "type": "conductor/status", "text": "82% full · holding · band 70–90% · 14 folded", "metrics": { "fullness": 82, "scoring": false } }
+```
+
+Purely informational. The host renders `text` (and may use the optional structured
+`metrics`) and does **nothing else** — it never folds, alters commands, or triggers a model
+call on this. Additive and non-breaking: it carries no `rev` and expects no reply, so it is
+safe to emit (or never emit) independently of `conductor/commands`. A conductor that never
+sends one simply shows no readout. See `conductors/attention-folder/` for a worked emitter.
+
 ## A reference conductor (Node.js, on the wire)
 
 A minimal, copy-paste-runnable conductor (`npm i ws`). It hosts a WS server, declares it

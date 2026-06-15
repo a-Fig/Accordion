@@ -48,6 +48,24 @@ export const conductorLink = $state<{ status: "idle" | "connecting" | "connected
 	detail: "",
 });
 
+/**
+ * Display-only telemetry from the active remote conductor (`conductor/status`, ADR 0007). A
+ * conductor may push a one-line `text` (+ optional structured `metrics`) describing what it is
+ * calculating; the UI renders it near the switcher and does NOTHING else with it — it never
+ * folds or steers on this. Empty `text` ⇒ no readout (the in-process built-in never emits one,
+ * and we clear this whenever the remote drops or is swapped out). One active remote at a time,
+ * mirroring `conductorLink`. */
+export const conductorStatus = $state<{ text: string; metrics: Record<string, number | string | boolean> }>({
+	text: "",
+	metrics: {},
+});
+
+/** Clear the status readout — on disconnect, swap, or detach, so no stale line lingers. */
+function clearConductorStatus(): void {
+	conductorStatus.text = "";
+	conductorStatus.metrics = {};
+}
+
 /** Bumped when a remote conductor that HAD connected drops unexpectedly. The attach effect
  *  in +page.svelte reads this, so a same-list socket drop (which changes no discovered-list
  *  reference) still re-fires the effect → attachConductor tears down the dead runner and
@@ -149,6 +167,8 @@ export class RemoteRunner implements Conductor {
 				// than perpetuating the last known desired state against a dead conductor.
 				this.desired = [];
 				this._dead = true;
+				clearConductorStatus(); // the telemetry line is stale now → hide it
+
 				// Immediately re-run the conductor pass so the store renders raw NOW rather than
 				// waiting for the next unrelated refold. conduct() reads this.desired (now [])
 				// and returns [], which clears all conductor folds in the same tick.
@@ -171,6 +191,7 @@ export class RemoteRunner implements Conductor {
 		this.manualClose = true;
 		const ws = this.ws;
 		this.ws = null;
+		clearConductorStatus(); // swapped/detached → drop any telemetry line
 		conductorLink.status = finalStatus ?? "idle";
 		conductorLink.detail = finalDetail ?? "";
 		try {
@@ -218,6 +239,12 @@ export class RemoteRunner implements Conductor {
 			}
 			case "cap/request":
 				this.serveCapability(m);
+				break;
+			case "conductor/status":
+				// Display-only: stash the latest text/metrics for the UI. Deliberately does NOT
+				// refold or touch any command/fold path — this channel never steers context.
+				conductorStatus.text = m.text ?? "";
+				conductorStatus.metrics = m.metrics ?? {};
 				break;
 		}
 	}
