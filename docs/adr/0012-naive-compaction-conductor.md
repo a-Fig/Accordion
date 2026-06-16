@@ -142,29 +142,37 @@ after the conductor is detached.
 ### 7. Degradation when `can("complete")` is false
 
 When there is no live model link (`host.can("complete")` returns false), the conductor
-falls back to a deterministic `group` command spanning the first-to-last aged block:
+behaviour depends on whether a prior LLM summary exists:
 
-```typescript
-return [{ kind: "group", ids: [firstId, lastId] }];
-```
+- **If `this.summary !== null`:** the existing summary commands are re-emitted unchanged.
+  Clobbering a successful LLM summary with a host-generated group digest on a transient
+  model-link drop would replace richer prose with a lower-quality fallback and leave
+  internal state inconsistent. Instead the conductor preserves the summary and waits for
+  the link to recover; newly-aged blocks stay live in the meantime.
+- **If `this.summary === null` (no prior summary):** the conductor falls back to a
+  deterministic `group` command spanning the first-to-last aged block:
 
-This collapses the aged region into a host-generated group digest (the carrier block's
-content plus a fold summary) without any LLM call. The degrade path keeps the conductor
-useful in read-only contexts, browser dev mode, and Claude Code transcript sessions — it
-shows the intent (compact the aged region) with the tools available.
+  ```typescript
+  return [{ kind: "group", ids: [firstId, lastId] }];
+  ```
 
-**Edge case.** The degrade path emits `group` only when `agedBlocks.length >= 2` (groups
-require at least two members). With fewer than two aged blocks and no `complete` capability,
-the conductor returns `currentCommands()` — which may widen the group's apparent range if
-previously grouped blocks re-entered agedBlocks. This is documented in the code and is not
-considered a defect for the baseline degrade path.
+  This collapses the aged region into a host-generated group digest without any LLM call,
+  keeping the conductor useful in read-only contexts, browser dev mode, and Claude Code
+  transcript sessions.
+
+**Edge case.** The group fallback emits a command only when `agedBlocks.length >= 2`
+(groups require at least two members) and no interleaved grouped block sits between the
+first and last aged block (which would cause an `invalid-group` clamp). With fewer than
+two aged blocks, or with interleaved grouped blocks, the conductor returns `[]`.
 
 ### 8. System prompt for the compaction call
 
 The model is given a structured `COMPACTION_SYSTEM` prompt asking for output in exactly
 five sections: Goal, Progress, Key decisions, Next steps, Critical context. This mirrors
-the summary format that Cursor and similar tools have converged on. The output is capped at
-`MAX_SUMMARY_TOKENS = 1500` output tokens (the host may clamp further).
+the summary format that Cursor and similar tools have converged on. The output is capped at `MAX_SUMMARY_TOKENS = 1500` tokens. The extension clamps the
+requested max to the model's own max-output ceiling before sending; the model enforces it
+as a hard generation cap. If the summary would exceed that ceiling, the output is truncated
+(finish-reason "length") and used as-is — acceptable for a lossy baseline.
 
 ## Consequences
 

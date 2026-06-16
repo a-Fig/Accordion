@@ -36,7 +36,14 @@ import type {
 	Command,
 } from "../contract";
 
-/** Soft cap on summary output tokens. The host may clamp further. */
+/**
+ * Soft cap on summary output tokens.
+ *
+ * The extension clamps the requested max to the model's own max-output ceiling before
+ * sending the API call, and the model enforces it as a hard generation cap. If the
+ * summary would exceed the ceiling, the output is TRUNCATED (finish-reason "length")
+ * and used as-is — acceptable for a lossy baseline.
+ */
 const MAX_SUMMARY_TOKENS = 8000;
 
 /**

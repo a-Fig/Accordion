@@ -1398,3 +1398,150 @@ describe("NaiveCompactionConductor — attemptKey keyed on newlyAged (FIX 3)", (
 		expect(host.completeCalls).toHaveLength(3);
 	});
 });
+
+// ── 15. DEGRADE PATH MUST NOT CLOBBER AN EXISTING LLM SUMMARY ────────────────
+//
+// Regression guard for FIX #1: when the model link drops (can("complete") returns false)
+// AFTER a successful LLM compaction has already been committed, the degrade path must
+// preserve the existing summary and return buildCommands(view) — not replace it with a
+// host-generated group command, which would clobber the richer LLM prose and leave
+// this.summary out of sync with what the host actually sees.
+
+describe("NaiveCompactionConductor — degrade must not clobber an existing LLM summary (FIX #1)", () => {
+	/**
+	 * Set up a conductor that has successfully compacted [a0, a1] with a real LLM summary.
+	 * Returns the conductor, host, and blocks for further manipulation.
+	 */
+	async function setupWithSummary(): Promise<{
+		conductor: NaiveCompactionConductor;
+		host: MockHost;
+		a0: ViewBlock;
+		a1: ViewBlock;
+		summaryText: string;
+	}> {
+		const conductor = new NaiveCompactionConductor();
+		const host = new MockHost({ canComplete: true });
+		conductor.attach(host);
+
+		const a0 = vb("a0", { order: 0, tokens: 50_000 });
+		const a1 = vb("a1", { order: 1, tokens: 46_000 });
+		const tail0 = vb("tail0", { tokens: 4_000 });
+
+		const view = makeView([a0, a1], [tail0], 100_000, 96_000);
+
+		// First conduct: triggers compaction (96 000 >= 0.95 * 100 000)
+		conductor.conduct(view);
+		expect(host.completeCalls).toHaveLength(1);
+
+		// Resolve with a recognisable summary string
+		const summaryText = "LLM GENERATED SUMMARY — DO NOT CLOBBER";
+		host.resolveNext(summaryText);
+		await Promise.resolve(); // flush microtask (resolve handler + requestRerun)
+
+		// One post-completion conduct to commit the summary into the host
+		const committed = conductor.conduct(view);
+		expect(committed).not.toBeNull();
+		const headCmd = (committed as Array<{ kind: string; id: string; content: string }>).find(
+			(c) => c.kind === "replace" && c.content !== "",
+		);
+		expect(headCmd).toBeDefined();
+		expect(headCmd!.content).toContain(summaryText);
+
+		return { conductor, host, a0, a1, summaryText };
+	}
+
+	it("when model link drops and a newly-aged block pushes liveTokens over threshold, returns existing summary replace-set — NO group", async () => {
+		const { conductor, host, a0, a1, summaryText } = await setupWithSummary();
+
+		// Simulate model-link drop
+		host.canComplete = false;
+
+		// Add a newly-aged block and push liveTokens back over threshold
+		const newBlock = vb("new1", { order: 2, tokens: 2_000 });
+		const viewOverThreshold = makeView(
+			[a0, a1, newBlock],
+			[vb("tail0", { tokens: 4_000 })],
+			100_000,
+			98_000,
+		);
+
+		const result = conductor.conduct(viewOverThreshold);
+
+		// Must return an array (not null, not a group fallback)
+		expect(result).not.toBeNull();
+		expect(Array.isArray(result)).toBe(true);
+		const cmds = result!;
+
+		// CRITICAL: no group command must be emitted
+		const groupCmds = cmds.filter((cmd) => cmd.kind === "group");
+		expect(groupCmds).toHaveLength(0);
+
+		// CRITICAL: the existing LLM summary text must still be present on the head block
+		const replaceCmds = cmds.filter((cmd) => cmd.kind === "replace") as Array<{
+			id: string;
+			content: string;
+		}>;
+		const headReplace = replaceCmds.find((r) => r.content !== "");
+		expect(headReplace).toBeDefined();
+		expect(headReplace!.content).toContain(summaryText);
+
+		// No additional complete calls were made (model link was down)
+		expect(host.completeCalls).toHaveLength(1);
+	});
+
+	it("the summary text is preserved verbatim in the replace-set when degrade fires", async () => {
+		const { conductor, host, a0, a1, summaryText } = await setupWithSummary();
+
+		host.canComplete = false;
+
+		const newBlock = vb("new2", { order: 2, tokens: 5_000 });
+		const view = makeView([a0, a1, newBlock], [vb("tail0")], 100_000, 97_000);
+
+		const result = conductor.conduct(view);
+		expect(Array.isArray(result)).toBe(true);
+
+		const replaceCmds = (result! as Array<{ kind: string; id: string; content: string }>).filter(
+			(c) => c.kind === "replace",
+		);
+		const headReplace = replaceCmds.find((r) => r.content !== "");
+		expect(headReplace).toBeDefined();
+		expect(headReplace!.content).toContain(summaryText);
+	});
+
+	it("after model link recovers, the next conduct relaunches to pick up newly-aged blocks", async () => {
+		const { conductor, host, a0, a1 } = await setupWithSummary();
+
+		// Drop the link and exercise the degrade path
+		host.canComplete = false;
+		const newBlock = vb("new3", { order: 2, tokens: 2_000 });
+		const viewDegraded = makeView([a0, a1, newBlock], [vb("tail0")], 100_000, 96_000);
+		conductor.conduct(viewDegraded);
+		expect(host.completeCalls).toHaveLength(1); // no new launch while link is down
+
+		// Restore the link — next conduct should see newly-aged newBlock and relaunch
+		host.canComplete = true;
+		conductor.conduct(viewDegraded);
+		expect(host.completeCalls).toHaveLength(2); // second launch fired
+	});
+
+	it("when model link drops but liveTokens is below threshold, returns existing summary — no group", async () => {
+		const { conductor, host, a0, a1, summaryText } = await setupWithSummary();
+
+		host.canComplete = false;
+
+		// Under threshold — needSummary is false; conductor re-emits existing summary via buildCommands
+		const viewUnder = makeView([a0, a1], [vb("tail0")], 100_000, 50_000);
+		const result = conductor.conduct(viewUnder);
+
+		expect(Array.isArray(result)).toBe(true);
+		const cmds = result! as Array<{ kind: string; id: string; content: string }>;
+
+		// No group command
+		expect(cmds.filter((c) => c.kind === "group")).toHaveLength(0);
+
+		// Summary still on the head block
+		const headReplace = cmds.filter((c) => c.kind === "replace").find((r) => r.content !== "");
+		expect(headReplace).toBeDefined();
+		expect(headReplace!.content).toContain(summaryText);
+	});
+});
