@@ -2,6 +2,25 @@
 
 Parked ideas with enough context to pick up cold. Newest first.
 
+## View ↔ wire unification — stricter "single source" finish (deferred 2026-06-16)
+
+**Pointer, not the work.** Full design in
+[docs/view-wire-unification.md](view-wire-unification.md).
+
+The UI could lie: "what is folded" was computed twice (the store/view vs. the wire), with
+different rules, so the screen could show a fold the agent never received (e.g. folding a
+`tool_call`). The **near-term fix (Option A — one shared foldability predicate) and the
+alarm** are being done now. **Deferred here is Option C — the single-source projection**:
+make the wire projection the only place folded-state exists, so the store becomes a thin
+view over it and divergence is *unrepresentable* rather than merely prevented.
+
+**Do C only on a trigger:** the alarm actually fires in real use (proving the shared
+predicate alone wasn't enough), OR the render layer is being reworked for another reason and
+C can be folded in cheaply. Wide blast radius (every `isFolded`/`effTokens`/`digestOf` reader
+across `ContextMap`/`MapHeader`/`Inspector`/transcript). A is the first half of C, so C lands
+as a mechanical render-layer migration on top of an already-unified predicate. See the design
+doc for specifics.
+
 ## Public launch: official website, installer flow, and pi extension distribution (pinned 2026-06-09)
 
 **Goal:** bring Accordion from a local/dev tool to a polished public product that other pi
