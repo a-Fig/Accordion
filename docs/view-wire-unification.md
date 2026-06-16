@@ -88,13 +88,17 @@ steering** — preview must match the would-be wire output.
    fold/pin/group/protect-tail states across every kind and id type; assert the view
    projection and the wire projection are identical per block. Fails red on any mismatch.
    This is the primary guarantee.
-2. **Dev runtime (loud, non-halting).** On real sessions during dogfooding, the check runs
-   after each plan computation. On mismatch it logs a **loud console error** naming the
-   diverging block (id, kind, what the screen says vs. what the wire does) — but **keeps
-   running**. (Owner decision: loud error, keep running — not a hard throw.)
-3. **Production (UI alarm only).** If it ever happens to a real user, the app **only alerts**
-   — it takes no corrective action. No self-heal, no auto-correct, no halt. It is an alarm,
-   nothing else. (Owner decision.)
+2. **Runtime alarm (identical in dev and production).** On real sessions the check runs
+   after each plan computation. On mismatch the UI shows the **slow-flashing red indicator**
+   and takes no corrective action — no self-heal, no auto-correct, no halt. This is the same
+   in every build: the user-facing alarm does not differ between dev and production. It is an
+   alarm, nothing else. (Owner decision.)
+3. **Dev-only diagnostic (extra channel, invisible to users).** In a dev build the *same*
+   mismatch ALSO emits a **loud console error** naming the diverging block (id, kind, screen
+   value vs. wire value), because only a developer can act on that detail and a production
+   user has no console open. This is not a different alarm — it is the same alarm plus a debug
+   payload that production simply has no use for. The app keeps running either way. (Owner
+   decision: loud error, keep running — not a hard throw.)
 
 **What it looks like (production + dev).** A **slow-flashing red indicator** in the UI,
 placed either next to the **"Accordion"** wordmark or **above the context bar** (the
