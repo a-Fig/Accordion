@@ -80,16 +80,16 @@ export class SlidingWindowConductor implements Conductor {
 
 	/** Remove commands whose block ids no longer exist in the view. */
 	private _pruneStale(view: ConductorView): void {
+		const blocked = new Set<string>();
+		for (const b of view.blocks) {
+			if (b.held || b.protected) blocked.add(b.id);
+		}
 		const existing = new Set(view.blocks.map((b) => b.id));
-		const before = this._commands.length;
 		this._commands = this._commands.filter((cmd) => {
-			if (cmd.kind === "group") return cmd.ids.every((id) => existing.has(id));
-			if (cmd.kind === "replace") return existing.has(cmd.id);
+			if (cmd.kind === "group") return cmd.ids.every((id) => existing.has(id) && !blocked.has(id));
+			if (cmd.kind === "replace") return existing.has(cmd.id) && !blocked.has(cmd.id);
 			return true;
 		});
-		// If we pruned anything, the savings estimate will naturally adjust on the
-		// next _estimateSavings call (it reads from _commands + view).
-		void before;
 	}
 
 	/**
