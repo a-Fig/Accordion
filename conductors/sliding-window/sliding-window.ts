@@ -78,16 +78,18 @@ export class SlidingWindowConductor implements Conductor {
 		return savings;
 	}
 
-	/** Remove commands whose block ids no longer exist in the view. */
+	/** Remove commands whose block ids no longer exist or are no longer actionable. */
 	private _pruneStale(view: ConductorView): void {
 		const blocked = new Set<string>();
+		const grouped = new Set<string>();
 		for (const b of view.blocks) {
 			if (b.held || b.protected) blocked.add(b.id);
+			if (b.grouped) grouped.add(b.id);
 		}
 		const existing = new Set(view.blocks.map((b) => b.id));
 		this._commands = this._commands.filter((cmd) => {
 			if (cmd.kind === "group") return cmd.ids.every((id) => existing.has(id) && !blocked.has(id));
-			if (cmd.kind === "replace") return existing.has(cmd.id) && !blocked.has(cmd.id);
+			if (cmd.kind === "replace") return existing.has(cmd.id) && !blocked.has(cmd.id) && !grouped.has(cmd.id);
 			return true;
 		});
 	}
@@ -102,11 +104,16 @@ export class SlidingWindowConductor implements Conductor {
 		const alreadyDropped = this._droppedIds();
 		let recovered = 0;
 
-		// Build a lookup of held block ids by message key, so we can detect when
-		// message-boundary snapping would pull a held block into a group range.
+		// Build lookups by message key for blocks that would make group snapping unsafe:
+		// (a) held blocks — the host would reject a group that snaps over a held block,
+		// (b) SKIP_KINDS blocks (user, tool_call) — snapping would pull them into the
+		//     group even though we never targeted them, causing an invalid-group clamp.
+		// For (b), fall back to individual `replace` commands instead of grouping.
 		const heldMessageKeys = new Set<string>();
+		const skipKindsMessageKeys = new Set<string>();
 		for (const b of view.blocks) {
 			if (b.held) heldMessageKeys.add(messageKey(b.id));
+			if (SKIP_KINDS.has(b.kind)) skipKindsMessageKeys.add(messageKey(b.id));
 		}
 
 		const eligible = view.blocks.slice(0, view.protectedFromIndex);
@@ -145,11 +152,19 @@ export class SlidingWindowConductor implements Conductor {
 				continue;
 			}
 
-			// Before adding to the run, check: would message-boundary snapping pull
-			// in a held block? If so, skip this block (break the run) rather than
-			// emit a group the host will reject.
+			// Would message-boundary snapping pull in a held block? Skip the whole block.
 			if (heldMessageKeys.has(messageKey(b.id))) {
 				flushRun();
+				continue;
+			}
+
+			// Would snapping pull in a SKIP_KINDS block from the same message? The group
+			// would be clamped as invalid-group. Fall back to an individual replace so
+			// the block is still dropped without triggering the snap.
+			if (skipKindsMessageKeys.has(messageKey(b.id))) {
+				flushRun();
+				this._commands.push({ kind: "replace", id: b.id, content: "" });
+				recovered += b.tokens;
 				continue;
 			}
 
