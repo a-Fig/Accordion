@@ -86,7 +86,9 @@ time to return to reversible folding and recover the full visible history in Acc
 
 The compaction system prompt asks for a structured briefing in five sections: **Goal**,
 **Progress**, **Key decisions**, **Next steps**, and **Critical context**. Output is capped
-at 1 500 tokens (`MAX_SUMMARY_TOKENS`). The host may clamp this further to its own ceiling.
+at 8 000 tokens (`MAX_SUMMARY_TOKENS`) — sized for the 20k–200k-token spans this conductor
+compacts. The extension clamps the request to the model's own max-output ceiling, and the
+model enforces it as a hard cap (over-long output is truncated, not rejected).
 
 ## Limitations (by design)
 

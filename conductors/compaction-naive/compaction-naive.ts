@@ -39,10 +39,16 @@ import type {
 /**
  * Soft cap on summary output tokens.
  *
+ * Sized for the job: this conductor compacts roughly 20k–200k tokens of aged history at a
+ * time, so the briefing needs room to retain the important signals — 1.5k was far too tight.
+ * 8k still represents a large reduction (~2.5x at 20k of input, ~25x at 200k) while leaving
+ * a useful structured summary.
+ *
  * The extension clamps the requested max to the model's own max-output ceiling before
- * sending the API call, and the model enforces it as a hard generation cap. If the
- * summary would exceed the ceiling, the output is TRUNCATED (finish-reason "length")
- * and used as-is — acceptable for a lossy baseline.
+ * sending the API call, and the model enforces it as a hard generation cap — so requesting
+ * more than a given model allows is safe (it is clamped, not rejected). If the summary would
+ * exceed the (clamped) ceiling, the output is TRUNCATED (finish-reason "length") and used
+ * as-is — acceptable for a lossy baseline.
  */
 const MAX_SUMMARY_TOKENS = 8000;
 
