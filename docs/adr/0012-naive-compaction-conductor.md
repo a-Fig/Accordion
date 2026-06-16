@@ -169,10 +169,12 @@ two aged blocks, or with interleaved grouped blocks, the conductor returns `[]`.
 
 The model is given a structured `COMPACTION_SYSTEM` prompt asking for output in exactly
 five sections: Goal, Progress, Key decisions, Next steps, Critical context. This mirrors
-the summary format that Cursor and similar tools have converged on. The output is capped at `MAX_SUMMARY_TOKENS = 1500` tokens. The extension clamps the
-requested max to the model's own max-output ceiling before sending; the model enforces it
-as a hard generation cap. If the summary would exceed that ceiling, the output is truncated
-(finish-reason "length") and used as-is — acceptable for a lossy baseline.
+the summary format that Cursor and similar tools have converged on. The output is capped at
+`MAX_SUMMARY_TOKENS = 8000` tokens — sized for the ~20k–200k-token spans this conductor
+compacts (1.5k was far too tight). The extension clamps the requested max to the model's own
+max-output ceiling before sending; the model enforces it as a hard generation cap. If the
+summary would exceed that ceiling, the output is truncated (finish-reason "length") and used
+as-is — acceptable for a lossy baseline.
 
 ## Consequences
 
