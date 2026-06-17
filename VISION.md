@@ -81,7 +81,7 @@ That is the whole shift. The old promise was *you can always overrule it*. The n
 |---|:---:|:---:|
 | Your steering (fold / unfold / pin) | yours | can be locked |
 | The agent's unfold | agent's | can be locked |
-| The tail size + tail floor | yours | can be locked |
+| The tail size + tail floor | yours / host | can be locked |
 | Peek · live map · activity log | always yours | always yours |
 | The agent's recall | always the agent's | always the agent's |
 | The budget | always yours | always yours |
@@ -91,7 +91,7 @@ That is the whole shift. The old promise was *you can always overrule it*. The n
 
 One slice of context is special: the most recent stretch of the conversation. The agent's latest reasoning, the tool results it just saw, the turn it's mid-way through — this is its working memory, and silently summarizing any of it would undercut the work in progress and the trust the whole tool depends on.
 
-So Accordion reserves a **protected working tail**: the newest ~20k tokens of context (configurable) are never folded. The automatic folder, the Conductor, manual folds, and groups are all held back from this window — they only ever operate on context older than it. The guarantee is token-based, not turn-based: it always covers a real, recent slice of the conversation regardless of how the turns happen to divide.
+So Accordion reserves a **protected working tail**: by default, the newest ~20k tokens of context (configurable) are never folded. The automatic folder, the Conductor, manual folds, and groups are all held back from this window — they only ever operate on context older than it. The guarantee is token-based, not turn-based: it always covers a real, recent slice of the conversation regardless of how the turns happen to divide.
 
 Under a collaborative Conductor — the default — this protection is absolute. Recent reasoning stays intact, always. The tail is one control an exclusive Conductor can ask to take over: if you approve a Conductor that claims the tail size, you've delegated this assumption to it — it sizes the tail, and may manage or even shrink it to nothing, because deciding what must stay verbatim is exactly the judgment you handed over. Most Conductors keep a tail anyway, for the same reason it exists; but it's now the strategy's working assumption rather than a host rule, absolute only while you keep it yours.
 

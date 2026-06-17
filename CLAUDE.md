@@ -121,8 +121,8 @@ every mode. "There's no agent on the other end, so anything goes" is a forbidden
 reasoning: the app is a source of truth, and a source of truth does not relax its rules
 when no one is watching. The foldability gate lives in ONE place (the engine) and is the
 single predicate shared by `fold()`/`isFolded`/`computeFoldOps` — never a stricter rule on
-the wire than in the view. Involvement locks ([ADR 0011](docs/adr/0011-conductor-involvement-locks.md))
-obey the same rule: a locked control is locked in every mode — preview and read-only are not
+the wire than in the view. Involvement locks ([ADR 0011](docs/adr/0011-conductor-involvement-locks.md), planned)
+will obey the same rule: a locked control is locked in every mode — preview and read-only are not
 exemptions.
 
 **Invariants (don't break):** discovery I/O is best-effort and **never blocks or alters
@@ -152,7 +152,7 @@ tool `recall`** — an unblockable read that returns a folded block's full conte
 result (like `read_file`) without mutating the standing view: no override is created, the
 block stays folded in context (vs `unfold`, which forces the block standing-open and is
 lockable under `agent-unfold`). Symmetry: **Peek : Human :: Recall : Agent.** The conductor
-then manages the resulting tool-result block like any other. `recall` sits beside `unfold` in
+then manages the resulting tool-result block like any other. `recall` would sit beside `unfold` in
 `extension/accordion.ts` and is **never lockable**. Both tools are kept for now; `unfold` is
 potentially transitional. **`recall` is specced, not yet implemented.**
 
@@ -176,7 +176,8 @@ re-exported by `conductors/contract/index.ts`, imported via the `$conductors` al
 (the WebSocket messages, `CONDUCTOR_PROTOCOL_VERSION = 2`, which *import* the `Command` /
 `ViewBlock` types so there is one definition). The host enforces one unconditional floor —
 **provider-validity** (the message stays sendable); **human overrides win for every control
-the conductor did NOT lock** (see involvement locks below); an unsafe command is clamped to
+the conductor did NOT lock** (see involvement locks below — until that ships, no conductor locks
+anything, so human overrides always win); an unsafe command is clamped to
 nearest-safe and **reported**, never silently dropped (bug/UX rails, not protection against
 the conductor).
 

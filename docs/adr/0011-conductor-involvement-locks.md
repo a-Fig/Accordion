@@ -159,12 +159,17 @@ the tail — including driving it to zero.** Concretely the lock does two things
 **Absent the `tail-size` lock, the protected tail stays host-absolute exactly as today** —
 the auto-folder, manual folds, and groups all stop before it, and a fold the tail grows over
 heals back to live. So the tail's absoluteness is now a property of the *collaborative*
-default, not of the host unconditionally.
+default, not of the host unconditionally. (This is also where ADR 0007's intent finally
+lands: 0007 framed the tail as conductor *policy*, not a host floor, but the engine never
+implemented that — today `substOne` rejects any fold of a protected block for **every**
+conductor, emitting a `protected` clamp. That absolute enforcement is exactly what the
+`tail-size` lock makes conditional.)
 
 The host keeps **no hard floor** on the tail (the owner overruled a proposed two-layer
 host-floor; not reopened). The host's **only** remaining unconditional floor is
 **provider-validity** — the outgoing message must stay sendable. The only things **never**
-lockable are **budget** and **observation**.
+lockable are the four sacred items (§2): **observation**, **budget**, the agent's **`recall`**,
+and **detach**.
 
 ### 8. Host enforcement — the load-bearing change
 
@@ -199,7 +204,8 @@ change.
 
 ## The capability picture
 
-Default (collaborative) world — unchanged from ADR 0007/0008, plus `recall`:
+The collaborative (default) capability picture — VISION's "Who controls it" matrix plus the
+new `recall` row (as in VISION, agent `pin` is a north-star entry, not yet built):
 
 | Action | You | The agent | The Conductor |
 |---|:---:|:---:|:---:|
@@ -235,15 +241,34 @@ This ADR is the **spec**; the code is the next step. Confirmed scope:
   gate `setProtect` on `tail-size`. All in `app/src/lib/engine/store.svelte.ts` (+ the wire
   mirror in `mapping.ts`/`plan.ts`). The `ConductorView` read surface needs little/no change —
   conductors already see `held` / `protected` / `grouped` / `protectedFromIndex`; the change
-  is in how the host *responds*, not what the conductor is *shown*.
+  is in how the host *responds*, not what the conductor is *shown*. Three precisions the build
+  must honor: (a) `human-steering` gates **every** human entry point —
+  `fold`/`unfold`/`pin`/`unpin`/`auto`/`createGroup`/`deleteGroup`/`foldGroup`/`unfoldGroup`/`resetAll`
+  — not just fold/unfold/pin, or the lock leaks; (b) the protection/foldability check is today
+  **duplicated** across `substOne`, `fold()`, `createGroup`, and `plan.ts`, so threading the
+  lock-set means updating each (or unifying them first — the "one place" in §8 is the target
+  state, not today's code); (c) gate strictly on the conductor's **actively declared** lock-set,
+  so with no lock declared every path stays byte-for-byte today's — **including** the
+  `protected`/`human-override` clamp emission the golden test pins (this is what keeps it additive).
 - **Command vocabulary** (`fold/replace/group/restore/pin`) — **unchanged.**
 - **`recall` agent tool** — register beside `unfold` in `extension/accordion.ts`; resolve
   codes to folded content GUI-side and return it in the tool result (engine support, like
-  `unfold`). Outside the conductor contract.
+  `unfold`). It must return the block's **original** full content (`Block.text`), never the
+  conductor's substitution or the digest — returning the lossy replacement would defeat the
+  unblockable-read guarantee. Caveat: under a `tail-size`-locked conductor the recall result is
+  itself an ordinary tail block the conductor may fold on its next pass, so the guarantee is the
+  agent's **same-turn read**, not lasting availability. Outside the conductor contract.
 - **Kill-switch freeze-on-detach** — change `detach()` to freeze the current folded view +
-  unlock, instead of reset-to-raw (`store.svelte.ts`).
+  unlock, instead of reset-to-raw (`store.svelte.ts`). Mechanism: today `detach()` →
+  `attach(null)` → `clearConductorState()` returns every non-human-held block to raw, so the
+  freeze must first **convert each currently-folded block into a sticky, human-owned fold**
+  (`override:"folded"`, `by:"you"`) so the subsequent raw pass leaves it folded and individually
+  reversible.
 - **Consent gate + lock-table UI** — the one-time confirm on exclusive attach, and the
-  checks-and-x's lock table in the conductor switcher.
+  checks-and-x's lock table in the conductor switcher. On consent, *releasing existing human
+  holds* (§6) clears the human override kinds (`pinned`/`folded`/`unfolded`, `by:"you"`) in the
+  **locked** domain only; the agent's sticky `unfolded` overrides belong to the separate
+  `agent-unfold` axis, not `human-steering`.
 
 ## Consequences
 
