@@ -357,3 +357,15 @@ This ADR was the **spec**; the implementation shipped in PR #46. Delivered scope
 - **Making observation lockable for a "clean room" autopilot.** Rejected outright:
   observation is the sacred tier. A source of truth you can't watch is not one you can trust
   to revoke; seeing is what makes the kill switch meaningful.
+
+## Deferred
+
+- **Granular `human-steering` sub-locks.** The current `human-steering` lock is all-or-nothing:
+  a conductor either owns fold/unfold/pin/unpin/group/reset as a unit, or none of it. There is
+  no way to express "lock grouping but leave pinning free" or "lock fold/unfold but leave the
+  reset button to the human." A future split could decompose `human-steering` into separate
+  named locks (e.g. `human-fold`, `human-pin`, `human-group`) giving conductors finer-grained
+  control — an autopilot that wants to own grouping but still lets the human pin blocks for
+  emphasis is currently forced to take the whole steering wheel or none of it. Deferred because
+  the current three-lock vocabulary covers every shipped conductor's needs; add sub-locks only
+  when a real conductor author needs them.
