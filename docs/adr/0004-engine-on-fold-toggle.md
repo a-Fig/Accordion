@@ -79,8 +79,10 @@ folded). (Rejected: trust positional ids and self-heal — a mis-fold is exactly
 
 1. No GUI / reply timeout / disarmed ⇒ messages pass through unmodified.
 2. `tool_call` and `user` blocks are never folded (kind-checked on both sides).
-3. The protected working tail is never auto-folded (engine), with the extension's
-   `PROTECT_RECENT_MSGS` backstop as defense in depth.
+3. The protected working tail is never auto-folded (engine). *(The extension's
+   `PROTECT_RECENT_MSGS` message-count backstop that once added defense-in-depth here was
+   removed in ADR 0011 — it was stricter than the view under the `tail-size` lock; the engine
+   is now the single foldability gate.)*
 4. Folding is content substitution, never removal — provider-safe and reversible.
 
 **Load-bearing external dependency (review Q1):** reversibility rests on pi treating

@@ -200,17 +200,21 @@ host-floor; not reopened). The host's **only** remaining unconditional floor is
 lockable are the four sacred items (§2): **observation**, **budget**, the agent's **`recall`**,
 and **detach**.
 
-**Caveat — coarse live-wire backstop.** The above describes the engine (the view). On the
-live-WS path (`app/src/lib/live/mapping.ts`) the extension keeps an independent
-`PROTECT_RECENT_MSGS = 2` constant: `applyPlan` never removes the newest ~2 messages from the
-outgoing wire, regardless of the plan it receives, as a defence-in-depth guard against a buggy
-plan touching the very tip of the conversation. This is a coarser, message-level backstop — it
-does not align exactly with the engine's token-based tail boundary — and so the view and wire
-are not fully unified on the protected region yet. Reconciling these two floors into a single
-token-based source of truth is deferred to Slice 2 (see
-[docs/view-wire-unification.md](../view-wire-unification.md)). Until then, the claim that
-"provider-validity is the **only** remaining unconditional floor" is fully true for the engine;
-on the live wire there is also this coarse message backstop.
+**Live-wire position backstop — removed (this change).** Earlier drafts kept an independent
+`PROTECT_RECENT_MSGS = 2` constant on the live-WS path (`app/src/lib/live/mapping.ts`):
+`applyPlan` refused to fold the newest ~2 messages regardless of the plan, as a coarse
+defence-in-depth guard. The `tail-size` lock turned that into a real **view↔wire divergence**:
+a `tailTokens = 0` conductor (e.g. the shipped Autopilot) folds recent content in the engine
+and `computeFoldOps`/`computeGroupOps` emit those ops, but the position backstop silently kept
+the newest two messages whole on the wire — so the GUI counted a saving the agent never
+received. That is "a stricter rule on the wire than in the view", which this repo forbids, and
+the `foldAlarm` could not catch it (the discard happened downstream of the emitted plan). The
+backstop was therefore **removed**: the engine is the single foldability gate (it never folds a
+`protected` block, so its plan already excludes protected content), and `applyPlan`'s
+durable-id + kind + balanced-tool-pair **structural** guards remain the safety floor.
+**Provider-validity is now the only unconditional floor on both the engine and the live wire.**
+A conductor that wants to spare the newest turn declares `tailTokens > 0` — the floor belongs
+in the conductor's tail policy, not a position hack on the wire the GUI cannot see or audit.
 
 ### 8. Host enforcement — the load-bearing change
 
