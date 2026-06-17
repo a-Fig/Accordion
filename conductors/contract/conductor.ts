@@ -173,6 +173,13 @@ export type ClampReason =
 	| "invalid-group"
 	/** The block is inside the protected working tail; protection is absolute, the host won't fold it. */
 	| "protected"
+	/**
+	 * The block's KIND is not foldable on the wire — only `text` / `thinking` / `tool_result`
+	 * fold; `user` (intent) and `tool_call` (folding it would orphan its result) never do. A
+	 * `fold`/`replace` targeting such a block is refused and reported, never silently applied
+	 * (which would let the view show a fold the agent never actually receives).
+	 */
+	| "not-foldable"
 	/** The op was a no-op (e.g. restoring an already-live block). */
 	| "noop";
 

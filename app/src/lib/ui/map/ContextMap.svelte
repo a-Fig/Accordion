@@ -509,6 +509,8 @@
 		if (e.kind === "group") {
 			collapseGroup(e.id);
 		} else {
+			const b = store.get(e.id);
+			if (b && !store.isFolded(b) && !store.canFold(b)) return;
 			store.toggle(e.id);
 		}
 	}
@@ -566,6 +568,8 @@
 		if (hit.kind === "group") {
 			collapseGroup(hit.gid);
 		} else if (hit.kind === "block") {
+			const b = store.get(hit.id);
+			if (b && !store.isFolded(b) && !store.canFold(b)) return;
 			store.toggle(hit.id);
 		} else if (hit.kind === "summary") {
 			// Double-click summary → unfold the whole run.
@@ -1053,6 +1057,7 @@
 				{#each store.blocks as b (b.id)}
 					{@const folded = store.isFolded(b)}
 					{@const prot = store.isProtected(b)}
+					{@const canFold = store.canFold(b)}
 					<article
 						class="tr-msg k-{b.kind}"
 						class:folded
@@ -1074,7 +1079,7 @@
 								<span class="tr-flag" title="pinned — held full"><Icon name="pin" size={10} /></span>
 							{/if}
 							<span class="grow"></span>
-							{#if !prot}
+							{#if folded || canFold}
 								<button
 									class="tr-btn"
 									onclick={(e) => { e.stopPropagation(); store.toggle(b.id); }}

@@ -8,6 +8,7 @@
 	import { startConductorDiscovery, stopConductorDiscovery, allConductors, isLaunching } from "$lib/live/conductorDiscovery.svelte";
 	import { attachConductor, conductorRetry } from "$lib/live/conductorClient.svelte";
 	import { folding } from "$lib/live/folding.svelte";
+	import { foldAlarm, runFoldCheck } from "$lib/live/foldAlarm.svelte";
 	import { DEFAULT_PORT } from "$lib/live/protocol";
 	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
@@ -129,6 +130,20 @@
 
 	const isLive = $derived(live.status === "connected");
 	const isWatching = $derived(session.readOnly && !isLive);
+
+	// View↔wire fold alarm (indicator-only): re-run the divergence check on every settled
+	// store change. `st.version` is the settled-change signal (manual fold, conductor pass,
+	// budget/protect change, append — all route through refold()→runConductor()→version++).
+	$effect(() => {
+		const st = session.store;
+		if (!st) {
+			foldAlarm.active = false;
+			foldAlarm.detail = "";
+			return;
+		}
+		st.version; // track the settled-change signal
+		runFoldCheck(st, live.status === "connected");
+	});
 </script>
 
 <svelte:head><title>Accordion</title></svelte:head>
@@ -160,6 +175,9 @@
 							<Icon name="accordion" size={20} stroke={1.75} />
 						</span>
 						<span class="wordmark">Accordion</span>
+						{#if foldAlarm.active}
+							<span class="alarm-dot" title={foldAlarm.detail || "View ↔ wire fold mismatch — the screen disagrees with what the agent would receive"}></span>
+						{/if}
 						<div class="divider"></div>
 						<div class="session-meta">
 							<span class="meta-title tnum">
@@ -391,6 +409,32 @@
 		color: var(--chip);
 		letter-spacing: 0.06em;
 		line-height: 1;
+	}
+
+	/* View↔wire fold-mismatch alarm — a single header dot, exempt from the grid
+	   perf rule (that's about the 982-tile grid, not a lone indicator). Kept
+	   compositor-only (transform + opacity) like .live-dot; slower 3s pulse. */
+	@keyframes alarmpulse {
+		0% { transform: scale(1); opacity: 0.5; }
+		70%, 100% { transform: scale(2.6); opacity: 0; }
+	}
+	.alarm-dot {
+		position: relative;
+		display: inline-block;
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--danger);
+		flex: 0 0 auto;
+	}
+	.alarm-dot::after {
+		content: "";
+		position: absolute;
+		inset: 0;
+		border-radius: 50%;
+		background: var(--danger);
+		animation: alarmpulse 3s ease-in-out infinite;
+		pointer-events: none;
 	}
 
 	/* Meta chips row (model · cwd · blocks) */

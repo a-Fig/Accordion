@@ -1,10 +1,31 @@
 # View ↔ Wire unification — make the UI structurally unable to lie
 
-**Status:** near-term fix decided (Option A + alarm); stricter finish deferred (Option C).
+**Status:** **Slice 1 LANDED** (the shared kind predicate that kills the `tool_call` lie via
+both fold doors, plus the alarm). Slice 2 (group-balance unification, protect-tail unit
+reconciliation, id-format reconciliation) is a defined fast-follow, not yet built. Stricter
+finish (Option C) remains deferred.
 **Date:** 2026-06-16
 **Owner decision:** yes to Option A now, with the alarm as the standing guardrail; Option C
 is a deferred finish, taken only if the alarm ever fires in real use or the render layer is
 being reworked for another reason.
+
+## What Slice 1 actually shipped
+
+One shared **kind** predicate `wireFoldable(b)` in `engine/digest.ts` (KIND-only — durable-id
+stays a live-wire emit concern in `computeFoldOps`, because on-disk/demo parse ids legitimately
+differ and the view must fold by kind in every mode). Both fold doors route through it:
+`store.fold()` refuses a non-foldable kind; `store.substOne()` (the conductor chokepoint for
+`fold` **and** `replace`) clamps with a new `"not-foldable"` `ClampReason` instead of silently
+applying. `store.canFold()` drives the UI affordance (`ContextMap` no longer offers Fold on a
+live `user`/`tool_call`). The **alarm** (`live/foldAlarm.svelte.ts`) re-checks view-vs-wire on
+every settled change: a universal kind backstop (all modes, excludes collapsed group members),
+a live-only set-equality check (`isFolded` set == `computeFoldOps` set — catches the rare
+positional-id divergence), an indicator-only slow-flashing red dot by the wordmark, and a
+dev-only `console.error`. The alarm deliberately does **not** verify folded-group straggler
+balance — that's the extension's structural guard + Slice 2. Golden (`conductor.builtin`) stayed
+byte-identical; the gate is a no-op on foldable-kind candidates.
+
+The sections below are the original design; they remain the reference for the Slice 2 items.
 
 ## The problem
 

@@ -12,7 +12,7 @@
  * intent. Deterministic and explainable; the smarts come later.
  */
 import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
-import { digest, digestTokens, groupDigest, groupDigestTokens, substTokens } from "./digest";
+import { digest, digestTokens, groupDigest, groupDigestTokens, substTokens, wireFoldable } from "./digest";
 import { messageKey } from "./ids";
 import type { Conductor, ConductorView, Command, ClampReport, ClampReason } from "$conductors/contract";
 import { BuiltinConductor } from "$conductors";
@@ -528,6 +528,13 @@ export class AccordionStore {
 		// Protection is ABSOLUTE: a block in the working tail is never folded, by a conductor
 		// OR the user. Refuse and report rather than violate the safety pillar.
 		if (this.isProtected(b)) return void reports.push(clamp(kind, [id], "protected", `${label(b)} is in the protected working tail`));
+		// One foldability gate, shared with the wire (`wireFoldable`). A kind the wire would
+		// never fold — `user` (intent) or `tool_call` (folding it orphans its result) — is
+		// refused here and REPORTED, never silently applied. Without this a conductor's
+		// fold/replace on such a block sets `subst` (so the view recesses the tile and counts
+		// the saving) while `computeFoldOps` drops it on the wire — the agent gets the block
+		// whole. That is the exact divergence the host must make unrepresentable.
+		if (!wireFoldable(b)) return void reports.push(clamp(kind, [id], "not-foldable", `${label(b)} is a ${b.kind}; only text/thinking/tool_result fold on the wire`));
 		b.autoFolded = true;
 		b.subst = content;
 		b.by = by;
@@ -623,12 +630,27 @@ export class AccordionStore {
 		return this.groupAt.get(id)?.folded ?? false;
 	}
 
+	/**
+	 * Can the human fold this block right now? The single predicate the UI consults to decide
+	 * whether to OFFER a Fold affordance — it mirrors EXACTLY the conditions under which
+	 * `fold()` will act, so the view never shows a dead/ineffective Fold control: the kind must
+	 * be wire-foldable, and the block must not be protected, already inside a folded group, or
+	 * human-pinned.
+	 */
+	canFold(b: Block): boolean {
+		return wireFoldable(b) && !this.isProtected(b) && !this.inFoldedGroup(b.id) && b.override !== "pinned";
+	}
+
 	fold(id: string, by: Actor = "you"): void {
 		const b = this.get(id);
 		if (!b || b.override === "pinned" || this.inFoldedGroup(id)) return;
 		// Protected working tail is never folded — not even by an explicit user action.
 		// (Pin it or widen the budget instead; protection is the safety pillar.)
 		if (this.isProtected(b)) return;
+		// Shared foldability gate (`wireFoldable`, same predicate the wire enforces): a manual
+		// fold on a non-foldable kind (user / tool_call) is refused, so the view can never show
+		// a per-block fold the agent would still receive whole. Group collapse is a separate path.
+		if (!wireFoldable(b)) return;
 		b.override = "folded";
 		b.by = by;
 		// The human is taking control: drop any conductor substitution so this folds to the

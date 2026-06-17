@@ -34,6 +34,28 @@ import { estTokens, clip, firstLine, BLOCK_OVERHEAD } from "./tokens";
 export const FOLDABLE_KINDS: ReadonlySet<BlockKind> = new Set<BlockKind>(["text", "thinking", "tool_result"]);
 
 /**
+ * The ONE foldability predicate, shared by the view and the wire. A block may be folded —
+ * its content substituted by a digest on the agent's wire — iff its KIND is foldable. This
+ * is the single gate `store.fold()` / `store.substOne()` / `store.canFold()` and
+ * `computeFoldOps` all consult, so the screen can NEVER show a per-block fold the wire would
+ * refuse. That refusal is the "UI lie" this predicate exists to make impossible: a folded
+ * `tool_call` whose tile recesses and whose tokens are counted as saved, while the agent
+ * still receives the block whole.
+ *
+ * KIND ONLY — deliberately content- and id-independent. The durable-id guard (`isDurableId`)
+ * is a LIVE-WIRE EMIT concern, NOT part of foldability: the on-disk / demo / Claude Code parse
+ * assigns non-durable ids (`<eventId>:p<j>`), and those read-only sessions must still fold by
+ * kind in every mode (preview === steering — see CLAUDE.md). So durable-id stays where it
+ * belongs, inside `computeFoldOps`, and is intentionally not mirrored here. Group collapse
+ * (ADR 0006) is a SEPARATE mechanism — structural whole-message removal with its own rules —
+ * and may legitimately include `tool_call`/`user`; this predicate governs only per-block
+ * content folding, never group collapse.
+ */
+export function wireFoldable(b: Block): boolean {
+	return FOLDABLE_KINDS.has(b.kind);
+}
+
+/**
  * Short, stable handle for a block, derived purely from its durable id (FNV-1a → base36,
  * 6 chars). Stateless and deterministic so the engine, the live link, and the
  * `accordion-context-folding` skill never drift. Not collision-free by construction, but

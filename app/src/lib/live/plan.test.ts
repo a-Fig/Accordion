@@ -86,8 +86,10 @@ describe("computeFoldOps", () => {
 		];
 		const s = makeStore(blocks);
 		s.setProtect(40);
-		// force-fold the non-protected tool_call by hand
-		s.fold("a:resp1:p0");
+		// The store's fold() now refuses non-foldable kinds at the door (the shared
+		// `wireFoldable` gate), so inject the folded view-state DIRECTLY to exercise
+		// computeFoldOps's OWN defense-in-depth kind filter independently of the store gate.
+		s.get("a:resp1:p0")!.override = "folded";
 		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(true);
 
 		const ops = computeFoldOps(s);
@@ -103,7 +105,9 @@ describe("computeFoldOps", () => {
 		];
 		const s = makeStore(blocks);
 		s.setProtect(40);
-		s.fold("u:500"); // force-fold the old user block
+		// fold() now refuses a user block at the door (shared `wireFoldable` gate); inject the
+		// folded view-state DIRECTLY to test computeFoldOps's own defense-in-depth kind filter.
+		s.get("u:500")!.override = "folded";
 		expect(s.isFolded(s.get("u:500")!)).toBe(true);
 
 		const ops = computeFoldOps(s);
