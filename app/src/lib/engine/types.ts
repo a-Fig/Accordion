@@ -107,10 +107,13 @@ export interface Group {
 	 * into the newly-protected tail, which would normally trigger pruning. But the tail only
 	 * re-protected BECAUSE the lock was released; pruning it would re-blow the very budget the
 	 * freeze exists to prevent. `pruneProtectedGroups` keeps any group with `frozen===true`.
-	 * `resetAll` drops it via `frozen.clear()` + the full `blocks` pass (correct — clean slate).
-	 * A fresh `attach()` after detach finds the frozen group already `by:"you"`, so
-	 * `clearConductorState` keeps it (correct — it is a human-owned frozen view); the
-	 * `frozen` field is harmless there (it only affects `pruneProtectedGroups`, not attach).
+	 *
+	 * Lifecycle — the exemption must be dropped the moment the group is no longer the untouched
+	 * detach-frozen view, exactly mirroring the block-level `frozen` Set, or it would leak a
+	 * permanent prune-immunity (a group folded inside a later conductor's protected tail). It is
+	 * cleared by: `attach()` (a new strategy owns the view), `foldGroup`/`unfoldGroup` (a human
+	 * re-manages it — so a re-fold can't collapse protected content), and `resetAll` (clean
+	 * slate). `deleteGroup` removes the group outright. Set ONLY by `freezeForDetach`.
 	 */
 	frozen?: boolean;
 }

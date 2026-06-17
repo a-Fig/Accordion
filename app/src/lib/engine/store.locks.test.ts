@@ -652,13 +652,16 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 
 		// Invariant: for every block, if it reads folded AND is NOT a member of a surviving
 		// folded group, then it must be wire-foldable (no illegal per-block fold on user/tool_call).
+		// NOTE: under THIS fix the group survives, so every folded block is a group member and this
+		// loop body is vacuously satisfied — it remains as a guard against the prior 7e946c5
+		// behavior (pruned group → m36 individually folded → body runs with wireFoldable===false).
+		// The live guard for this fix is the wire assertion below.
 		const foldedGroupMemberIds = new Set<string>();
 		for (const g of s.groups) {
 			if (g.folded) for (const id of g.memberIds) foldedGroupMemberIds.add(id);
 		}
 		for (const b of s.blocks) {
 			if (s.isFolded(b) && !foldedGroupMemberIds.has(b.id)) {
-				// This block is individually folded — it MUST be wire-foldable.
 				expect(wireFoldable(b), `block ${b.id} (kind=${b.kind}) is individually folded but not wire-foldable`).toBe(true);
 			}
 		}
@@ -671,6 +674,15 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 		// It reads folded because the group still exists.
 		expect(s.isFolded(m36)).toBe(true);
 		expect(s.groups.length).toBe(1);
+
+		// Anti-divergence guard at the exact state the wire reads. `computeFoldOps` skips a folded
+		// GROUP member (so it emits no per-block op for m36) and gates everything else on
+		// `wireFoldable`. So these two facts together are what guarantee the wire folds m36 the SAME
+		// way the GUI does — via the group, never as an illegal individual fold:
+		expect(wireFoldable(m36)).toBe(false); // a tool_call is never individually wire-foldable
+		expect(s.groupOf(m36)?.folded).toBe(true); // it is folded ONLY as a member of the surviving group
+		// (Wire-OP emission needs durable ids — covered in plan.test.ts; these synthetic m-ids are
+		// non-durable by construction, so computeFoldOps/computeGroupOps don't apply here.)
 
 		// Budget is still preserved.
 		expect(s.liveTokens).toBeLessThan(s.fullTokens - 2000);
@@ -729,12 +741,56 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 		// resetAll must drop the frozen exemption and return to a clean slate.
 		s.resetAll();
 
-		// No frozen groups remain.
+		// No frozen groups remain, and the tail-spanning group is actually GONE (pruned once the
+		// exemption was stripped) — not merely un-flagged.
 		expect(s.groups.every((g) => !g.frozen)).toBe(true);
-		// The group that was spanning the re-protected tail should be pruned now (no exemption).
-		// After resetAll → refold → pruneProtectedGroups, it reaches the tail and gets dropped.
-		const survivingFrozenGroups = s.groups.filter((g) => g.frozen);
-		expect(survivingFrozenGroups.length).toBe(0);
+		expect(s.groups.length).toBe(0);
+		expect(s.liveTokens).toBe(s.fullTokens); // clean slate — nothing folded
+	});
+
+	it("D: re-attaching a conductor drops the detach-freeze group exemption (no leak into the new strategy)", () => {
+		const s = makeStore(Array.from({ length: 40 }, (_, i) => blk(i)));
+		const c = new LockingConductor(["tail-size"]);
+		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
+		s.attach(c);
+		s.detach();
+		expect(s.groups[0]?.frozen).toBe(true); // frozen-exempt after detach
+
+		// A brand-new COLLABORATIVE conductor takes over. Its protected tail (default 20k) covers
+		// m36..m39, which the frozen group spans. The exemption must NOT leak across attach — the
+		// group is ordinary again and `pruneProtectedGroups` drops it (absolute protection).
+		s.attach(new LockingConductor([])); // no locks, folds nothing
+		expect(s.groups.length).toBe(0); // dropped — exemption did not leak
+		for (const id of ["m36:p0", "m37:p0", "m38:p0", "m39:p0"]) {
+			const b = s.get(id)!;
+			expect(s.isProtected(b), `${id} is in the new conductor's protected tail`).toBe(true);
+			expect(s.isFolded(b), `${id} must not be folded under the new conductor`).toBe(false);
+		}
+	});
+
+	it("E: unfold then re-fold a detach-frozen group cannot collapse protected content", () => {
+		const s = makeStore(Array.from({ length: 40 }, (_, i) => blk(i)));
+		const c = new LockingConductor(["tail-size"]);
+		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
+		s.attach(c);
+		s.detach();
+		const gid = s.groups[0].id;
+		expect(s.groups[0].frozen).toBe(true);
+
+		// Human re-manages the group while detached (no lock now). unfolding ENDS the freeze
+		// exemption, so the now-ordinary group reaching into the protected tail is pruned.
+		s.unfoldGroup(gid);
+		expect(s.groupById(gid)?.frozen).toBeFalsy();
+		// Attempt to re-fold it — it must NOT be able to collapse protected content.
+		s.foldGroup(gid);
+
+		// Absolute protection holds: the protected blocks stay live; no folded group spans the tail.
+		for (const id of ["m36:p0", "m37:p0", "m38:p0", "m39:p0"]) {
+			const b = s.get(id)!;
+			expect(s.isProtected(b)).toBe(true);
+			expect(s.isFolded(b), `${id} protected block must not be folded by a re-folded zombie group`).toBe(false);
+		}
+		expect(s.groups.some((g) => g.folded && g.memberIds.includes("m38:p0"))).toBe(false);
 	});
 });
 

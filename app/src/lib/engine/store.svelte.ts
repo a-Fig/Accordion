@@ -194,6 +194,10 @@ export class AccordionStore {
 		// A fresh strategy owns the view now — drop any detach-freeze exemptions (those blocks
 		// are ordinary human folds again, subject to the new conductor's tail/healing rules).
 		this.frozen.clear();
+		// Same for the GROUP-level exemption: a detach-frozen group must NOT keep its
+		// `pruneProtectedGroups` immunity under the new conductor, or it would sit folded inside
+		// that conductor's protected tail (which it never asked for and the human can't create).
+		if (this.groups.some((g) => g.frozen)) this.groups = this.groups.map((g) => (g.frozen ? { ...g, frozen: undefined } : g));
 		// Release human/agent holds in the domains the NEW conductor locks. Pass `c?.locks`
 		// explicitly; the `activeLocks` snapshot was just synced above so `isLocked` already agrees.
 		this.releaseLockedDomains(c?.locks ?? []);
@@ -1090,6 +1094,10 @@ export class AccordionStore {
 		const g = this.groupById(id);
 		if (!g || g.folded) return;
 		g.folded = true;
+		// A human group action ends the detach-freeze exemption — this is no longer the
+		// untouched frozen view, so normal protected-tail pruning applies again (a re-fold must
+		// not be able to collapse protected content the kill switch never froze).
+		g.frozen = undefined;
 		this.groups = [...this.groups];
 		this.emit(by, "group folded", `${g.memberIds.length} blocks`);
 		this.refold();
@@ -1104,6 +1112,10 @@ export class AccordionStore {
 		const g = this.groupById(id);
 		if (!g || !g.folded) return;
 		g.folded = false;
+		// End the detach-freeze exemption (see foldGroup): once the human unfolds it, the group
+		// is ordinary again — if it still reaches into the protected tail, the next refold's
+		// `pruneProtectedGroups` drops it instead of leaving a prune-immune zombie.
+		g.frozen = undefined;
 		this.groups = [...this.groups];
 		this.emit(by, "group unfolded", `${g.memberIds.length} blocks`);
 		this.refold();
