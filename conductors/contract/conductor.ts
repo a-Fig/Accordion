@@ -38,7 +38,7 @@ export interface ViewBlock {
 	turn: number;
 	order: number;
 	tokens: number; // full token cost
-	foldedTokens: number; // token cost if folded (the digest size) — so a conductor needn't compute it
+	foldedTokens: number; // token cost if folded — the digest size for a foldable kind, or full tokens for a non-foldable kind (which can't shrink) — so a conductor needn't compute it
 	toolName?: string;
 	callId?: string;
 	isError?: boolean;

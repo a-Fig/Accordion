@@ -68,7 +68,7 @@ wire:
 | `turn`         | number   | 1-based user turn                                                                 |
 | `order`        | number   | global 0-based position in the conversation                                      |
 | `tokens`       | number   | full token cost at full fidelity                                                 |
-| `foldedTokens` | number   | token cost **if folded** (the digest size) — precomputed so you needn't estimate |
+| `foldedTokens` | number   | token cost **if folded** — the digest size for a foldable kind, or full `tokens` for a non-foldable kind (which can't shrink) — precomputed so you needn't estimate |
 | `toolName`     | string?  | for `tool_call` / `tool_result`                                                  |
 | `callId`       | string?  | pairing key (a call and its result share it)                                     |
 | `isError`      | boolean? | tool-result error flag                                                            |
