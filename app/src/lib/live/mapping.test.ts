@@ -227,9 +227,12 @@ describe("applyPlan", () => {
 		expect((out[2] as any).toolName).toBe("read");
 	});
 
-	it("folds correctly using durable ids — all targeted blocks fold including recent ones", () => {
-		// Simulate a more complex session to exercise the durable path end-to-end.
-		// The wire trusts the engine's plan: all durable-id ops are applied regardless of position.
+	it("folds correctly using durable ids — all targeted blocks fold including the NEWEST message", () => {
+		// Exercise the durable path end-to-end AND prove the wire folds a RECENT block: the newest
+		// assistant message (index 4 of 5 — inside the old PROTECT_RECENT_MSGS=2 backstop region,
+		// protectFrom would have been 3) is targeted and must now fold, because the wire trusts the
+		// engine's plan regardless of position. This is the test's teeth: re-adding the position
+		// backstop keeps out[4] whole and fails the newest-message assertion below.
 		const sessionMsgs: PiMessage[] = [
 			{ role: "user", content: "hello", timestamp: 100 },
 			{
@@ -246,23 +249,23 @@ describe("applyPlan", () => {
 			{ role: "assistant", content: [{ type: "text", text: "newest reply" }], responseId: "resp_2", timestamp: 201 },
 		];
 
-		// Fold the thinking and text parts of the first assistant turn plus the tool result.
+		// Fold the first assistant turn, the tool result, AND the newest assistant message.
 		const ops: FoldOp[] = [
 			{ id: "a:resp_1:p0", digestText: "compressed thought" },
 			{ id: "a:resp_1:p1", digestText: "compressed text" },
-			{ id: "r:call_99", digestText: "compressed result" }, // all durable ops fold
+			{ id: "r:call_99", digestText: "compressed result" },
+			{ id: "a:resp_2:p0", digestText: "compressed newest" }, // index 4 — the old backstop suppressed this
 		];
 		const out = applyPlan(sessionMsgs, ops);
 
 		const assistantParts = out[1].content as any[];
 		expect(assistantParts[0].thinking).toBe("compressed thought");
 		expect(assistantParts[1].text).toBe("compressed text");
-
 		expect(out[2].content).toEqual([{ type: "text", text: "compressed result" }]);
-
-		// Untargeted messages pass through unchanged regardless of position
+		// The NEWEST message folds too — the teeth: a position backstop would keep it whole.
+		expect((out[4].content as any[])[0].text).toBe("compressed newest");
+		// The untargeted user message passes through (user kind is never folded anyway).
 		expect((out[3].content as string)).toBe("continue");
-		expect((out[4].content as any[])[0].text).toBe("newest reply");
 	});
 });
 
