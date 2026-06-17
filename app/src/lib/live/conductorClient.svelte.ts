@@ -228,7 +228,13 @@ export class RemoteRunner implements Conductor {
 					this.locks = validLocks.length > 0 ? Object.freeze(validLocks) : undefined;
 				}
 				this.greeted = true;
-				this.store.refold(); // first context push, now honouring the declared `wants`
+				// ADR 0011 consent → baseline (FIX 4): a remote conductor attaches BEFORE its
+				// locks are known, so `attach()`'s locked-domain release never ran. Now that the
+				// declared locks are set on THIS runner (= `store.conductor.locks`), reconcile:
+				// release standing human/agent holds in the newly-known locked domains, then
+				// refold. `reconcileLocks` refolds, so this also serves as the first context push
+				// honouring the declared `wants`.
+				this.store.reconcileLocks();
 				break;
 			case "conductor/commands": {
 				// Drop replies to stale snapshots. If the conductor echoed a rev that is
