@@ -97,6 +97,15 @@ export class AccordionStore {
 	/** Re-entrancy latch: a command that itself re-folds (e.g. `group`) must not recurse. */
 	private conducting = false;
 	/**
+	 * ADR 0011 kill-switch (FIX 1): block ids frozen by `detach()`. These are human-owned
+	 * folds the kill switch created from the just-detached conductor's view — they must
+	 * SURVIVE the protected tail re-protecting after detach (the `tail-size` lock is gone,
+	 * so `protectedFromIndex` reverts and `healProtected` would otherwise force them back to
+	 * full, re-blowing the budget the freeze exists to prevent). `healProtected` skips ids in
+	 * this set; it is cleared on `attach()` (new strategy) and `resetAll()` (clean slate).
+	 */
+	private frozen = new Set<string>();
+	/**
 	 * ClampReports from the most recent conductor pass — what the host had to clamp to the
 	 * validity floor. A remote runner reads this after triggering a pass to feed
 	 * `host/commandResult` back to its conductor. Empty after a clean pass (the built-in
@@ -154,6 +163,9 @@ export class AccordionStore {
 	attach(c: Conductor | null): void {
 		this.conductor = c;
 		this.lastCmds = [];
+		// A fresh strategy owns the view now — drop any detach-freeze exemptions (those blocks
+		// are ordinary human folds again, subject to the new conductor's tail/healing rules).
+		this.frozen.clear();
 		// Release human/agent holds in the domains the NEW conductor locks (read off `c`, not
 		// the soon-to-change `activeLocks`). Order: set conductor first so `isLocked` reflects it.
 		this.releaseLockedDomains(c?.locks ?? []);
@@ -200,6 +212,20 @@ export class AccordionStore {
 	}
 
 	/**
+	 * ADR 0011 consent → baseline for a REMOTE conductor (FIX 4). `attach()` runs the
+	 * locked-domain release synchronously, but a remote conductor's `locks` are not known at
+	 * attach time — they arrive later in `conductor/hello`. The live layer calls this once the
+	 * hello lands so standing human/agent holds in the now-known locked domains are released to
+	 * the same clean baseline an in-process exclusive conductor authors from, then re-folds. The
+	 * release also bumps `version` (via `refold`), so reactive UI gating re-evaluates when a
+	 * remote greets. No-op for a collaborative (locks-nothing) conductor — same as attach.
+	 */
+	reconcileLocks(): void {
+		this.releaseLockedDomains(this.conductor?.locks ?? []);
+		this.refold();
+	}
+
+	/**
 	 * ADR 0011 kill-switch mechanics: convert the CURRENT conductor-folded view into sticky,
 	 * human-owned folds so the subsequent conductor-less refold leaves it folded (not raw).
 	 * Runs BEFORE `conductor` is nulled, so `isFolded`/`groupWire` still reflect the live view.
@@ -209,6 +235,7 @@ export class AccordionStore {
 	 * conductor-owned folded group is reassigned `by:"you"` so `clearConductorState` keeps it.
 	 */
 	private freezeForDetach(): void {
+		this.frozen.clear();
 		for (const b of this.blocks) {
 			if (b.override !== null) continue; // human already owns it — leave as-is
 			if (!this.isFolded(b)) continue; // live; nothing to freeze
@@ -216,6 +243,13 @@ export class AccordionStore {
 			b.override = "folded";
 			b.by = "you";
 			b.subst = undefined;
+			// State hygiene (FIX 5): the fold is now a human override, not a conductor auto-fold —
+			// clear the stale `autoFolded` left over from the conductor pass.
+			b.autoFolded = false;
+			// Exempt from `healProtected` (FIX 1): once detached the `tail-size` lock is gone and
+			// the tail re-protects; without this exemption the freeze would heal straight back to
+			// full at the next refold, re-blowing the budget.
+			this.frozen.add(b.id);
 		}
 		// Reassign any folded conductor/auto group to the human so the raw pass preserves it.
 		let touched = false;
@@ -523,6 +557,11 @@ export class AccordionStore {
 	private healProtected(protectedFrom: number): void {
 		this.blocks.forEach((b, i) => {
 			if (i >= protectedFrom && b.override === "folded") {
+				// A detach-frozen fold (FIX 1) is exempt: the kill switch deliberately froze the
+				// folded view, and the tail only re-protected BECAUSE the conductor's `tail-size`
+				// lock was released on detach. Healing it would re-blow the budget the freeze
+				// exists to prevent (ADR 0011 §6). It stays folded, human-owned, reversible by hand.
+				if (this.frozen.has(b.id)) return;
 				// Protection is absolute, but do not silently erase the user intent — log the
 				// forced unfold so the activity feed shows what happened.
 				this.emit(b.by ?? "auto", "unfolded (protected)", label(b));
@@ -757,7 +796,9 @@ export class AccordionStore {
 		// ADR 0011: two separate lock axes flow through this one method.
 		//  • human-steering gates the human's hand-unfold (`by === "you"`).
 		//  • agent-unfold gates the agent's `unfold` tool (`by === "agent"`, via resolveUnfold).
-		// Refused agent unfolds bubble up as "missing" in resolveUnfold — the desired report.
+		// A refused agent unfold is a silent no-op here; `resolveUnfold` VERIFIES the block is
+		// still folded after calling and records the refusal as "missing" (FIX 3) — this method
+		// does not signal the refusal itself.
 		if (this.humanLocked(by)) return;
 		if (by === "agent" && this.isLocked("agent-unfold")) return;
 		const b = this.get(id);
@@ -816,6 +857,9 @@ export class AccordionStore {
 		// ADR 0011 `human-steering`: reset is a sweeping human steering action — refused
 		// wholesale under the lock (no overrides cleared, no log, no notify).
 		if (this.isLocked("human-steering")) return;
+		// A clean slate clears every override — including detach-frozen folds — so drop their
+		// `healProtected` exemptions too (FIX 1); a stale id here is harmless but pointless.
+		this.frozen.clear();
 		for (const b of this.blocks) {
 			b.override = null;
 			b.by = null;
@@ -947,6 +991,11 @@ export class AccordionStore {
 	}
 	unfoldGroup(id: string, by: Actor = "you"): void {
 		if (this.humanLocked(by)) return; // ADR 0011 `human-steering`
+		// ADR 0011 `agent-unfold` (FIX 2): mirror the per-block `unfold` gate. `resolveUnfold`
+		// routes a folded GROUP code here with by="agent", so without this the agent could
+		// unfold a group straight through the lock. Refused agent group-unfolds become "missing"
+		// in `resolveUnfold` (it verifies the group is still folded after this call).
+		if (by === "agent" && this.isLocked("agent-unfold")) return;
 		const g = this.groupById(id);
 		if (!g || !g.folded) return;
 		g.folded = false;

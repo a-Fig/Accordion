@@ -1,9 +1,24 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "../engine/store.svelte";
 import type { Block, BlockKind, ParsedSession } from "../engine/types";
+import type { Conductor, ConductorView, Command, LockName } from "$conductors/contract";
 import { computeFoldOps, resolveUnfold, resolveRecall } from "./plan";
 import { isDurableId } from "./mapping";
 import { foldCode } from "../engine/digest";
+
+/** A test conductor that folds a configurable command batch and declares a lock-set. */
+class LockingConductor implements Conductor {
+	readonly id = "locking";
+	readonly label = "Locking";
+	readonly locks: readonly LockName[];
+	cmds: Command[] | null = [];
+	constructor(locks: readonly LockName[] = []) {
+		this.locks = locks;
+	}
+	conduct(_view: ConductorView): Command[] | null {
+		return this.cmds;
+	}
+}
 
 // computeFoldOps mirrors the engine's LOCAL fold decisions into provider-safe wire
 // ops. These tests lock the kind filter, the durable-id guard, and the empty-digest
@@ -303,6 +318,57 @@ describe("resolveUnfold", () => {
 		resolveUnfold(s, [foldCode("a:resp1:p0")]);
 		// next plan omits it → the extension sends it full → agent's past context changes
 		expect(computeFoldOps(s).map((o) => o.id)).not.toContain("a:resp1:p0");
+	});
+
+	// ── ADR 0011 — agent-unfold lock: a refused unfold reports "missing", not "restored" (FIX 3)
+	it("under the agent-unfold lock a folded block resolves to MISSING and stays folded", () => {
+		order = 0;
+		const blocks = [
+			blk({ id: "a:resp1:p0", kind: "text", tokens: 8000 }),
+			blk({ id: "r:call1", kind: "tool_result", tokens: 8000, toolName: "grep", callId: "call1" }),
+			blk({ id: "u:1000", kind: "user", tokens: 50, text: "hi" }),
+		];
+		const s = makeStore(blocks);
+		s.setProtect(40);
+		// A conductor folds the durable block AND locks agent-unfold.
+		const c = new LockingConductor(["agent-unfold"]);
+		c.cmds = [{ kind: "fold", ids: ["a:resp1:p0"] }];
+		s.attach(c);
+		const b = s.get("a:resp1:p0")!;
+		expect(s.isFolded(b)).toBe(true);
+
+		const code = foldCode("a:resp1:p0");
+		const { restored, missing } = resolveUnfold(s, [code]);
+
+		// the refused agent unfold is reported missing, NOT a false "restored"
+		expect(restored).toEqual([]);
+		expect(missing).toEqual([code]);
+		// and the block really did stay folded — the agent was not lied to
+		expect(s.isFolded(b)).toBe(true);
+		expect(b.override).toBe(null);
+	});
+
+	it("under the agent-unfold lock a folded GROUP code resolves to MISSING and stays folded (FIX 2/3)", () => {
+		order = 0;
+		const blocks = [
+			blk({ id: "a:resp1:p0", kind: "text", tokens: 8000 }),
+			blk({ id: "a:resp2:p0", kind: "text", tokens: 8000 }),
+			blk({ id: "u:1000", kind: "user", tokens: 50, text: "hi" }),
+		];
+		const s = makeStore(blocks);
+		s.setProtect(40);
+		const c = new LockingConductor(["agent-unfold"]);
+		c.cmds = [{ kind: "group", ids: ["a:resp1:p0", "a:resp2:p0"] }];
+		s.attach(c);
+		const g = s.groups[0];
+		expect(g.folded).toBe(true);
+
+		const code = foldCode(g.id);
+		const { restored, missing } = resolveUnfold(s, [code]);
+
+		expect(restored).toEqual([]);
+		expect(missing).toEqual([code]);
+		expect(s.groupById(g.id)!.folded).toBe(true); // group never unfolded through the lock
 	});
 });
 

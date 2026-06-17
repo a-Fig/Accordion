@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "./store.svelte";
+import { AutopilotConductor } from "$conductors/autopilot/autopilot";
 import type { Conductor, ConductorView, Command, LockName } from "$conductors/contract";
 import type { Block, ParsedSession } from "./types";
 
@@ -190,6 +191,33 @@ describe("ADR 0011 — agent-unfold lock gates the agent's unfold ONLY", () => {
 		expect(s.isFolded(s.get("m0:p0")!)).toBe(true); // both refused
 		expect(s.get("m0:p0")!.override).toBe(null);
 	});
+
+	it("locked: unfoldGroup(id,'agent') is refused — the agent can't unfold a GROUP through the lock (FIX 2)", () => {
+		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		// Build a folded conductor group over m0..m1, with the agent-unfold lock held.
+		const c = new LockingConductor(["agent-unfold"]);
+		c.cmds = [{ kind: "group", ids: ["m0:p0", "m1:p0"] }];
+		s.attach(c);
+		const groupId = s.groups[0].id;
+		expect(s.groups[0].folded).toBe(true);
+
+		s.unfoldGroup(groupId, "agent"); // agent tries to force the group open
+		expect(s.groupById(groupId)!.folded).toBe(true); // refused — group stays folded
+	});
+
+	it("collaborative: unfoldGroup(id,'agent') IS allowed (the lock is what refuses it)", () => {
+		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		// A HUMAN group (so the human unfold-via-agent isn't re-asserted by a conductor each pass).
+		s.attach(new LockingConductor([])); // collaborative
+		const g = s.createGroup("m0:p0", "m1:p0");
+		expect(g).not.toBeNull();
+		expect(g!.folded).toBe(true);
+
+		s.unfoldGroup(g!.id, "agent"); // no lock → the agent unfold takes effect
+		expect(s.groupById(g!.id)!.folded).toBe(false);
+	});
 });
 
 // ── tail-size ─────────────────────────────────────────────────────────────
@@ -331,6 +359,129 @@ describe("ADR 0011 — detach freezes the folded view and unlocks", () => {
 		s.detach();
 		expect(s.liveTokens).toBe(liveFolded); // unchanged — the view is frozen, not raw
 		expect(s.liveTokens).toBeLessThan(s.fullTokens);
+	});
+});
+
+// ── detach a tail-size-locked conductor: the freeze must survive the tail re-protecting (FIX 1)
+describe("ADR 0011 — detach freeze survives the re-protected tail (FIX 1, BLOCKER)", () => {
+	it("Autopilot folds recent blocks; after detach they STAY folded (no heal back to full)", () => {
+		// An over-budget session so Autopilot (tail-size lock) folds recent blocks INTO the
+		// tail the host would normally protect. The whole small session is "the tail" at 20k.
+		const s = makeStore(Array.from({ length: 6 }, (_, i) => blk(i, "text", 5000)));
+		s.setProtect(20_000); // collaboratively the whole session would be protected
+		s.setBudget(8_000); // far below the 30k live → Autopilot must fold several blocks
+
+		s.attach(new AutopilotConductor());
+		// Under tail-size the host lifts its floor; Autopilot folds enough to fit budget.
+		const frozen = s.blocks.filter((b) => s.isFolded(b)).map((b) => b.id);
+		expect(frozen.length).toBeGreaterThan(0);
+		expect(s.liveTokens).toBeLessThanOrEqual(s.budget);
+		const liveFolded = s.liveTokens;
+
+		s.detach();
+
+		// (a) the frozen blocks are STILL folded, now human-owned.
+		for (const id of frozen) {
+			const b = s.get(id)!;
+			expect(s.isFolded(b)).toBe(true);
+			expect(b.override).toBe("folded");
+			expect(b.by).toBe("you");
+			expect(b.subst).toBeUndefined();
+			// (FIX 5) no stale autoFolded alongside the override.
+			expect(b.autoFolded).toBe(false);
+		}
+		// (b) liveTokens stays at the folded level — NOT healed back to fullTokens.
+		expect(s.liveTokens).toBe(liveFolded);
+		expect(s.liveTokens).toBeLessThan(s.fullTokens);
+		// The tail HAS re-protected now the tail-size lock is gone (proves the bug's setup).
+		expect(s.protectedFromIndex).toBeLessThan(s.blocks.length);
+		expect(frozen.some((id) => s.isProtected(s.get(id)!))).toBe(true);
+
+		// (c) all locks released and a frozen block is individually human-reversible.
+		expect(s.isLocked("human-steering")).toBe(false);
+		expect(s.isLocked("agent-unfold")).toBe(false);
+		expect(s.isLocked("tail-size")).toBe(false);
+		s.unfold(frozen[0]);
+		expect(s.isFolded(s.get(frozen[0])!)).toBe(false);
+	});
+
+	it("works with a plain test conductor declaring tail-size too (not Autopilot-specific)", () => {
+		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i, "text", 5000)));
+		s.setProtect(20_000);
+		const c = new LockingConductor(["tail-size"]);
+		// Fold the two most recent blocks — exactly the tail the host would re-protect.
+		c.cmds = [{ kind: "fold", ids: ["m3:p0", "m4:p0"] }];
+		s.attach(c);
+		expect(s.isFolded(s.get("m4:p0")!)).toBe(true);
+		const liveFolded = s.liveTokens;
+
+		s.detach();
+
+		expect(s.isFolded(s.get("m4:p0")!)).toBe(true); // frozen, not healed
+		expect(s.get("m4:p0")!.override).toBe("folded");
+		expect(s.get("m4:p0")!.by).toBe("you");
+		expect(s.liveTokens).toBe(liveFolded);
+		// The newest block IS in the re-protected tail, proving the heal exemption fired.
+		expect(s.isProtected(s.get("m4:p0")!)).toBe(true);
+	});
+
+	it("a later resetAll clears the freeze exemption (frozen folds return to auto)", () => {
+		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i, "text", 5000)));
+		s.setProtect(0); // no tail so resetAll's refold doesn't immediately re-protect
+		const c = new LockingConductor(["tail-size"]);
+		c.cmds = [{ kind: "fold", ids: ["m4:p0"] }];
+		s.attach(c);
+		s.detach();
+		expect(s.get("m4:p0")!.override).toBe("folded");
+
+		s.resetAll(); // clears overrides AND the frozen set
+		expect(s.get("m4:p0")!.override).toBe(null);
+	});
+});
+
+// ── reconcileLocks: the remote-conductor consent→baseline release (FIX 4) ─────────
+describe("ADR 0011 — reconcileLocks releases standing holds for a just-known lock-set (FIX 4)", () => {
+	it("human-steering: a human pin set before locks were known is released", () => {
+		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		s.pin("m0:p0");
+		s.fold("m1:p0");
+		expect(s.get("m0:p0")!.override).toBe("pinned");
+		expect(s.get("m1:p0")!.override).toBe("folded");
+
+		// Simulate a remote runner that attached collaboratively, then learned its locks late:
+		// set the store's conductor to a stub declaring human-steering, THEN reconcile.
+		s.conductor = new LockingConductor(["human-steering"]);
+		s.reconcileLocks();
+
+		expect(s.get("m0:p0")!.override).toBe(null); // pin released to baseline
+		expect(s.get("m0:p0")!.by).toBe(null);
+		expect(s.get("m1:p0")!.override).toBe(null); // manual fold released too
+	});
+
+	it("collaborative locks (none) ⇒ reconcileLocks releases nothing", () => {
+		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		s.pin("m0:p0");
+		s.conductor = new LockingConductor([]); // collaborative
+		s.reconcileLocks();
+		expect(s.get("m0:p0")!.override).toBe("pinned"); // untouched
+	});
+
+	it("agent-unfold: reconcile releases an agent unfold but leaves a human pin", () => {
+		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const c0 = new LockingConductor([]);
+		c0.cmds = [{ kind: "fold", ids: ["m0:p0"] }];
+		s.attach(c0);
+		s.unfold("m0:p0", "agent");
+		s.pin("m1:p0");
+		expect(s.get("m0:p0")!.by).toBe("agent");
+
+		s.conductor = new LockingConductor(["agent-unfold"]);
+		s.reconcileLocks();
+		expect(s.get("m0:p0")!.override).toBe(null); // agent unfold released
+		expect(s.get("m1:p0")!.override).toBe("pinned"); // human pin survives (different axis)
 	});
 });
 
