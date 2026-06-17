@@ -53,7 +53,9 @@ computes per-block ops + digest text, and replies. The extension applies by id
    must keep its own self-protection. (The old POC suppressed unconditionally — a
    bug to avoid here.)
 3. **Protected working tail** (the recent ~N tokens) is never auto-folded; the
-   engine enforces it, and the extension keeps a coarse backstop (defense in depth).
+   engine enforces it. *(The extension once kept a coarse message-count backstop as
+   defense in depth; it was removed in ADR 0011 — under the `tail-size` lock it was
+   stricter than the view, so the engine is now the single foldability gate.)*
 
 ## Milestone 1 (this change)
 

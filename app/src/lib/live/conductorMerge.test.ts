@@ -5,7 +5,7 @@ import type { ConductorEntry } from "./registry";
 function entry(id: string, label = id, url = `ws://localhost/${id}`): ConductorEntry {
 	return {
 		registryProtocol: 1,
-		conductorProtocol: 2,
+		conductorProtocol: 3,
 		id,
 		label,
 		url,

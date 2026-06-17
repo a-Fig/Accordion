@@ -35,7 +35,7 @@ function advertise() {
 	mkdirSync(REG_DIR, { recursive: true });
 	const entry = {
 		registryProtocol: 1,
-		conductorProtocol: 2,
+		conductorProtocol: 3,
 		id: ID,
 		label: LABEL,
 		url: URL,
@@ -71,7 +71,7 @@ wss.on("connection", (ws) => {
 	ws.send(
 		JSON.stringify({
 			type: "conductor/hello",
-			conductorProtocol: 2,
+			conductorProtocol: 3,
 			id: ID,
 			label: LABEL,
 			wants: { content: "full" },

@@ -35,7 +35,7 @@ import {
 function liveEntry(id: string): ConductorEntry {
 	return {
 		registryProtocol: 1,
-		conductorProtocol: 2,
+		conductorProtocol: 3,
 		id,
 		label: id,
 		url: `ws://127.0.0.1:7700`,

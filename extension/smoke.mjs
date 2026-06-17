@@ -49,6 +49,7 @@ function readOnlyEntry() {
 const handlers = {};
 let accordionCmd = null;
 let unfoldTool = null; // captured registerTool def for the `unfold` tool (M3)
+let recallTool = null; // captured registerTool def for the `recall` tool (ADR 0011)
 const flags = new Map();
 const notifications = [];
 const pi = {
@@ -60,6 +61,7 @@ const pi = {
 	},
 	registerTool: (def) => {
 		if (def && def.name === "unfold") unfoldTool = def;
+		if (def && def.name === "recall") recallTool = def;
 	},
 	appendEntry: () => {},
 };
@@ -154,8 +156,8 @@ await new Promise((resolve, reject) => {
 			seen.contextSync = true;
 			seen.contextBlocks = m.blocks.length;
 			// Use durable id (a:<responseId>:p0) — exercises the Phase-1 id path
-			// Also send a GROUP op (ADR 0006) collapsing m0 (user, durable u:<T0>, outside the
-			// 2-message backstop) into one summary entry — exercises range-collapse end to end.
+			// Also send a GROUP op (ADR 0006) collapsing m0 (user, durable u:<T0>) into one
+			// summary entry — exercises range-collapse end to end.
 			ws.send(
 				JSON.stringify({
 					type: "plan",
@@ -706,8 +708,9 @@ else {
 //
 // Determinism: positional ids are pure functions of array index, and we drive the
 // `context` hook directly with a fixed array, so the ids below are exact. The
-// anchor-less assistant sits at index 0 (→ m0:p0), well outside the protected tail
-// (PROTECT_RECENT_MSGS=2, padded by two trailing anchored messages).
+// anchor-less assistant sits at index 0 (→ m0:p0). The durable-id guard refuses
+// any fold op for it regardless of its position (no responseId/timestamp → no
+// durable anchor → positional id → guard drops the op).
 const posTarget = { role: "assistant", content: [{ type: "text", text: "ANCHORLESS ORIGINAL" }] }; // NO responseId / timestamp
 const posMsgs = [
 	posTarget, // index 0 → positional id m0:p0
@@ -842,6 +845,63 @@ if (!unfoldTool) {
 	await new Promise((resolve) => { wsu.on("close", resolve); wsu.close(); });
 }
 
+// ── ADR 0011: recall tool ────────────────────────────────────────────────────
+// recall is the agent's UNBLOCKABLE READ: it returns a folded block's ORIGINAL full
+// content AS the tool result THIS turn (the defining difference from unfold, which only
+// confirms a scheduled state change). The tool round-trips: it sends `recallRequest`, the
+// GUI replies `recallResult` with the full content + any missing codes, and the tool echoes
+// that content back. Assert the no-codes / not-attached guards plus the attached round-trip.
+if (!recallTool) {
+	fails.push("recall tool was not registered");
+} else {
+	// no codes → guidance, no round-trip
+	const c0 = await recallTool.execute("rc0", { codes: [] }, undefined, undefined, ctx);
+	if (!c0?.content?.[0]?.text?.includes("No fold codes")) fails.push("recall([]) did not return the no-codes guidance");
+
+	// not attached (no GUI connected here) → safe message, no hang
+	const c1 = await recallTool.execute("rc1", { codes: ["3f9a2c"] }, undefined, undefined, ctx);
+	if (!c1?.content?.[0]?.text?.includes("isn't attached")) fails.push("recall while detached did not return the not-attached message");
+
+	// attached round-trip: connect a GUI that answers recallRequest with full content + a miss
+	const RECALLED_TEXT = "THE ORIGINAL FULL TOOL RESULT CONTENT THAT WAS FOLDED";
+	let sawRecallReq = null;
+	const wsr = new WebSocket(`ws://127.0.0.1:${PORT}`);
+	await new Promise((resolve, reject) => {
+		const t = setTimeout(() => reject(new Error("recall attach timed out")), 2000);
+		wsr.on("error", reject);
+		wsr.on("message", (data) => {
+			const m = JSON.parse(data.toString());
+			if (m.type === "hello") { clearTimeout(t); resolve(); }
+		});
+	});
+	wsr.removeAllListeners("message");
+	wsr.on("message", (data) => {
+		const m = JSON.parse(data.toString());
+		if (m.type === "recallRequest") {
+			sawRecallReq = m;
+			// return full content for the first code; report the rest missing
+			wsr.send(JSON.stringify({
+				type: "recallResult",
+				reqId: m.reqId,
+				restored: m.codes.slice(0, 1).map((code) => ({ code, label: "tool_result grep · turn 3", text: RECALLED_TEXT, ids: ["r:call1"] })),
+				missing: m.codes.slice(1),
+			}));
+		} else if (m.type === "sync") {
+			// attach-flush / view syncs: answer with an empty plan so nothing hangs
+			wsr.send(JSON.stringify({ type: "plan", reqId: m.reqId, ops: [] }));
+		}
+	});
+	const c2 = await recallTool.execute("rc2", { codes: ["3f9a2c", "00abcd"] }, undefined, undefined, ctx);
+	const allText = (c2?.content ?? []).map((p) => p?.text ?? "").join("\n");
+	if (!sawRecallReq) fails.push("recall (attached) did not send a recallRequest to the GUI");
+	else if (!sawRecallReq.codes.includes("3f9a2c")) fails.push("recallRequest missing the requested code");
+	else if (!sawRecallReq.codes.includes("00abcd")) fails.push("recallRequest dropped a leading-zero code");
+	if (!allText.includes(RECALLED_TEXT)) fails.push("recall tool result did not echo the returned full content THIS turn");
+	if (!allText.includes("#3f9a2c")) fails.push("recall tool result did not label the recalled code");
+	if (!allText.includes("#00abcd")) fails.push("recall tool result did not report the missing code");
+	await new Promise((resolve) => { wsr.on("close", resolve); wsr.close(); });
+}
+
 // ── assertions ───────────────────────────────────────────────────────────────
 if (!seen.hello) fails.push("never received hello");
 if (!seen.flushOnAttach) fails.push("GUI received no history flush on attach (would stay empty until first message — the bug)");
@@ -853,8 +913,8 @@ if (!contextReturn || !contextReturn.messages) fails.push("context hook did not 
 else {
 	const foldedText = contextReturn.messages[1]?.content?.[0]?.text;
 	if (foldedText !== "FOLDED") fails.push(`a:resp-abc:p0 not folded — got ${JSON.stringify(foldedText)}`);
-	const protectedText = contextReturn.messages[3]?.content?.[0]?.text;
-	if (protectedText !== "second reply") fails.push("recent message was unexpectedly altered");
+	const untargetedText = contextReturn.messages[3]?.content?.[0]?.text;
+	if (untargetedText !== "second reply") fails.push("untargeted message (resp-def, no op in plan) was unexpectedly altered — structural passthrough broken");
 	// Group collapse (ADR 0006): m0 (user "do the thing") was replaced by the one summary
 	// entry; the array stays length 4 (one removed, one inserted) so the indices above hold.
 	const groupText = contextReturn.messages[0]?.content?.[0]?.text;
@@ -882,13 +942,14 @@ if (fails.length) {
 }
 console.log(
 	`SMOKE PASS — registry(port ${PORT}, model ✓, tokens ✓) ✓  no-GUI passthrough ✓  focus request ✓  ` +
-		`hello ✓  attach-flush(${seen.flushBlocks} blocks on connect) ✓  plan applied per-block ✓  group collapse ✓  backstop ✓  ` +
+		`hello ✓  attach-flush(${seen.flushBlocks} blocks on connect) ✓  plan applied per-block ✓  group collapse ✓  structural-passthrough ✓  ` +
 		`message_end committed-streaming ✓  model-swap window-push ✓  tool-loop (2 msgs/turn) ✓  no-dup after context ✓  ` +
 		`empty-leading-part dedup ✓  agent_end live-view ✓  shutdown cleanup ✓  ` +
 		`stream(start/end/abort) ✓  no-content-on-frame ✓  delta-dropped ✓  ` +
 		`message_end ghost-sweep ✓  agent_end ghost-sweep ✓  ` +
 			`resumed-session attach-flush ✓  getBranch fallback ✓  ` +
 				`anchor-less positional-id round-trip ✓  applyPlan guard (positional + empty-digest refused) ✓  ` +
-					`unfold tool (no-ids / detached guards, attached round-trip) ✓  skill discovery ✓`,
+					`unfold tool (no-ids / detached guards, attached round-trip) ✓  ` +
+					`recall tool (no-ids / detached guards, content-echo round-trip) ✓  skill discovery ✓`,
 );
 process.exit(0);

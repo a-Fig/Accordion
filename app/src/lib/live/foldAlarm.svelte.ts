@@ -37,12 +37,12 @@
  *
  *   3. NOT VERIFIED (documented, deliberately) — folded-GROUP member balance (stragglers).
  *      The extension's `applyPlan` re-derives which group members are actually removed
- *      (balanced tool-pairs, recent-message backstop) against pi's live message array —
- *      which the APP does not have. So this alarm does NOT compare `computeGroupOps` member
- *      sets against the view; doing so naively would false-positive on every legitimate
- *      straggler. That divergence (a known ADR-0006 accounting gap) stays covered by the
- *      extension's last-resort structural guard and a deferred Slice 2. DO NOT "fix" this
- *      alarm by adding a group member comparison.
+ *      (balanced tool-pairs) against pi's live message array — which the APP does not have.
+ *      So this alarm does NOT compare `computeGroupOps` member sets against the view; doing
+ *      so naively would false-positive on every legitimate straggler. That divergence (a
+ *      known ADR-0006 accounting gap) stays covered by the extension's last-resort structural
+ *      guard and a deferred Slice 2. DO NOT "fix" this alarm by adding a group member
+ *      comparison.
  *
  * O(n) over `store.blocks`. The writer takes `isLive` as an argument (not a `live`/`session`
  * import) to stay free of import cycles with the modules that drive it.

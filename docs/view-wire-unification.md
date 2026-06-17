@@ -91,7 +91,7 @@ says folded; agent got it whole.
 | Kind gate (`FOLDABLE_KINDS` = text/thinking/tool_result only) | yes | no | **yes** | **CLOSED** — both fold doors gate on `wireFoldable`; alarm Layer 1 backstops |
 | Durable-id only (`isDurableId`) | yes | no | **yes** | **alarmed** (live Layer 2 fires on the rare non-durable-live fold); view-side gating deferred to Slice 2 (id-format reconcile) |
 | Empty-digest skip | yes | no | yes (rare) | **CLOSED (1.1)** — empty `replace` folds to the engine digest in `substOne`, so view==wire; the wire-side skip stays as belt-and-suspenders |
-| Recent-message backstop (`PROTECT_RECENT_MSGS` = 2, by message count) | extension, by msgs | engine, by tokens | yes (rare; unit mismatch) | **deferred** to Slice 2 |
+| Recent-message backstop (`PROTECT_RECENT_MSGS` = 2, by message count) | ~~extension, by msgs~~ removed | engine, by tokens | no longer | **CLOSED** — the position backstop was removed (it was stricter than the view; a `tail-size`/`tailTokens=0` conductor folded recent content the wire then kept whole). The engine is the single foldability gate; `applyPlan` keeps only its durable-id/kind/tool-pair structural guards |
 | Group straggler balance | `applyPlan` re-derives | `classifyGroup` | **yes — already documented** ([ADR 0006](adr/0006-multiblock-folds.md) watch items: cross-group split tool-pair makes `savedTokens` understate) | **deferred** to Slice 2; alarm deliberately does NOT verify it |
 
 All the same root cause: the UI trusts its own state instead of rendering what actually goes
@@ -109,8 +109,10 @@ alarmed-or-deferred, not silently dropped.**
 > all demo/read-only folding and break the golden. So Slice 1 split it: `wireFoldable(b)` is
 > **kind-only** and universal (view + wire), while **durable-id stays a live-wire emit guard**
 > inside `computeFoldOps` (unchanged). The kind half is what actually kills the `tool_call`
-> lie. Points 2–3 below (group-balance unification, backstop reconciliation) are **Slice 2**,
-> not yet built. See the "What Slice 1 actually shipped" section above for the real surface.
+> lie. Point 2 below (group-balance unification) is still **Slice 2**, not yet built; point 3
+> (backstop reconciliation) is **done** — the wire position backstop was removed (ADR 0011), so
+> the engine is the single foldability gate. See the "What Slice 1 actually shipped" section
+> above for the real surface.
 
 Extract the wire's rules into single pure functions and route the store **through** them, so
 the view can no longer form a folded-state the wire would refuse.
@@ -124,9 +126,12 @@ the view can no longer form a folded-state the wire would refuse.
 2. **Group balance becomes one shared function.** The straggler/tool-pair-balance logic in
    `classifyGroup` (store) and `applyPlan` (mapping) collapses to one pure function consumed
    by both. Fixes the documented cross-group `savedTokens` divergence.
-3. **Reconcile the backstop unit mismatch.** Guarantee the engine's token-based protected
-   tail always covers at least the extension's `PROTECT_RECENT_MSGS` newest messages, so the
-   two backstops can't disagree.
+3. **Reconcile the backstop unit mismatch — DONE (removed, not reconciled).** Rather than make
+   the engine's token-based tail always cover the extension's message-count backstop, the
+   position backstop was **removed** outright: it was the only wire rule stricter than the view,
+   and the `tail-size` lock made that mismatch reachable (a `tailTokens=0` conductor folds recent
+   content the wire then kept whole). The engine is now the single foldability gate; `applyPlan`
+   trusts its plan and keeps only the durable-id/kind/balanced-tool-pair structural guards.
 4. **Mode-aware, not mode-permissive.** Preview/read-only has no extension and no
    round-trip, so the projection simulates the wire rules locally. Preview === steering
    except that no plan is sent. (Per the CLAUDE.md rule.)
@@ -209,7 +214,8 @@ C can be folded in cheaply. Until then, A + the alarm is durable in practice.
 ## Sequence
 
 1. Option A: shared `wireFoldable` predicate → route `store.fold`/`isFolded`/`computeFoldOps`
-   through it; collapse group-balance to one function; reconcile the backstop unit.
+   through it; collapse group-balance to one function; ~~reconcile the backstop unit~~ (done —
+   the wire position backstop was removed in ADR 0011; the engine is the single gate).
 2. The alarm: property test (always) + dev loud-error check + production slow-flashing red
    indicator near the "Accordion" wordmark / above the context bar.
 3. Option C: deferred — only on the trigger above.

@@ -13,7 +13,10 @@
 	 */
 	import { tick } from "svelte";
 	import Icon from "$lib/ui/Icon.svelte";
+	import ConsentDialog from "./ConsentDialog.svelte";
+	import type { AccordionStore } from "$lib/engine/store.svelte";
 	import { IN_PROCESS_CONDUCTORS, inProcessConductor } from "$conductors";
+	import { LOCK_NAMES, hasLock, isExclusive, type LockName } from "$conductors/contract";
 	import { conductorState, setActiveConductor } from "$lib/live/conductor.svelte";
 	import { conductorLink, BUILTIN_ID, NONE_ID } from "$lib/live/conductorClient.svelte";
 	import {
@@ -30,12 +33,93 @@
 	import { mergeExternalConductors, type ExternalRow } from "$lib/live/conductorMerge";
 	import { isTauriEnv } from "$lib/session.svelte";
 
+	// The active session's store — read for the live lock-set (`store.isLocked` /
+	// `store.conductor?.locks`) and the kill switch (`store.detach()` via the Raw row /
+	// attach path). Optional so the menu still renders if a store isn't mounted yet.
+	let { store }: { store?: AccordionStore } = $props();
+
 	let open = $state(false);
 	let showAdd = $state(false);
 	let urlDraft = $state("");
 	let urlError = $state("");
 	/** Per-id inline launch error text (cleared when the menu closes). */
 	let launchErrors = $state<Record<string, string>>({});
+
+	// ── Consent gate (ADR 0011 §6) ───────────────────────────────────────────────
+	// Selecting an EXCLUSIVE conductor (one that declares a non-empty lock-set) is a
+	// deliberate handover, so we hold the selection and show the lock table first. The
+	// pending pick lives here until the user confirms (→ commit the selection) or cancels
+	// (→ drop it, stay on the current conductor). Collaborative picks skip the gate.
+	let pendingConsent = $state<{ id: string; label: string; locks: readonly LockName[]; isRemote?: boolean } | null>(null);
+
+	function confirmConsent(): void {
+		if (pendingConsent) {
+			if (pendingConsent.isRemote) {
+				// Remote post-handshake path: already attached — record consent so the effect
+				// doesn't re-prompt. Reassign (new Set) so the $effect dependency re-runs.
+				remoteConsentedIds = new Set([...remoteConsentedIds, pendingConsent.id]);
+			} else {
+				// In-process pre-attach path: commit the selection now.
+				setActiveConductor(pendingConsent.id);
+			}
+		}
+		pendingConsent = null;
+		closeMenu();
+	}
+	function cancelConsent(): void {
+		if (pendingConsent?.isRemote) {
+			// Remote post-handshake cancel: detach (kill switch — freezes + unlocks) for an
+			// immediate, synchronous revert of the locked view.
+			store?.detach();
+			// Bug #2: detach() alone is NOT durable. The selection still points at the declined
+			// remote id, and the live RemoteRunner is still attached — so the auto-recovery path
+			// (a socket drop bumps conductorRetry.tick → the attach effect re-dials the SAME
+			// activeId) would silently re-attach and re-lock the conductor the user just declined.
+			// Reset the selection to Raw so the attach effect tears the runner down (attachConductor
+			// closes activeRemote on a NONE_ID switch) and never re-dials it. Mirrors handleStop /
+			// forget, which fall the active selection back when their conductor goes away.
+			setActiveConductor(NONE_ID);
+		}
+		pendingConsent = null; // revert: never attached (in-process) or detached (remote)
+	}
+
+	// ── Post-handshake consent for REMOTE exclusive conductors (ADR 0011 §6) ────
+	// Remote conductors only reveal their lock-set in `conductor/hello` (after the WS
+	// handshake), so the in-process pre-attach gate above never sees them. We watch
+	// `store.conductor` reactively; when a remote conductor's locks arrive exclusive we
+	// show the SAME ConsentDialog. On CANCEL we call `store.detach()` (the kill switch —
+	// freezes the current folded view and unlocks every control). On CONFIRM we just
+	// record the id so we don't re-prompt on the same session.
+	//
+	// RESIDUAL: this prompt fires after the handshake, so the remote may apply its first
+	// plan before the user responds. Cancel → detach cleanly freezes/reverts that state.
+	// The engine separately releases held overrides when the remote locks arrive.
+	//
+	// NOTE: launchable external conductors also flow through this path — launching selects
+	// the id, the WS handshake delivers locks, and this effect prompts if exclusive. The
+	// handleLaunch() path deliberately does NOT suppress this gate.
+	// Reassignment-based (not .add()) so the $effect re-runs when new ids are recorded.
+	let remoteConsentedIds = $state(new Set<string>());
+
+	$effect(() => {
+		const cond = store?.conductor;
+		// Read the lock-set off the store's REACTIVE snapshot, NOT `cond.locks` (Bug #1): a remote
+		// runner mutates its `locks` field in place when `conductor/hello` lands, so `store.conductor`
+		// keeps the same object reference and `cond.locks` would never re-track. `store.locks` is the
+		// `$state` snapshot the store reassigns in reconcileLocks(), so this effect re-runs when a
+		// remote's locks finally arrive — which is the whole point of the post-handshake gate.
+		const locks = store?.locks ?? [];
+		// Guard: no conductor, dialog already open, or conductor is in-process → skip.
+		if (!cond || pendingConsent) return;
+		if (inProcessConductor(cond.id)) return;
+		if (!isExclusive(locks)) return;
+		if (remoteConsentedIds.has(cond.id)) return;
+
+		// Remote exclusive conductor not yet consented — show the post-handshake gate.
+		// `isRemote: true` tells confirmConsent/cancelConsent to use the remote path:
+		// confirm → record as consented (already attached); cancel → store.detach().
+		pendingConsent = { id: cond.id, label: cond.label, locks, isRemote: true };
+	});
 
 	let rootEl = $state<HTMLDivElement>();
 	let triggerEl = $state<HTMLButtonElement>();
@@ -87,6 +171,14 @@
 					activeId)),
 	);
 
+	// The ACTIVE conductor's live lock-set (source of truth once attached — covers remote
+	// conductors whose locks only arrive in the handshake). Drives the trigger's "locked"
+	// chrome and the "detach to regain control" hint. Reads the store's REACTIVE snapshot
+	// (`store.locks`), not `store.conductor.locks`: a remote runner mutates its locks in place,
+	// so only the snapshot reassignment re-tracks (Bug #1).
+	const activeLocks = $derived<readonly LockName[]>(store?.locks ?? []);
+	const activeExclusive = $derived(isExclusive(activeLocks));
+
 	function toggle(): void {
 		open = !open;
 		if (!open) closeAddPanel();
@@ -104,7 +196,28 @@
 		urlError = "";
 	}
 
+	// The lock-set an in-process conductor DECLARES (known without instantiating it, via the
+	// registry entry). Remote conductors only reveal their locks after the `conductor/hello`
+	// handshake, so they're treated as collaborative until attached — the live `store.conductor`
+	// is the source of truth once that happens.
+	function declaredLocks(id: string): readonly LockName[] {
+		return inProcessConductor(id)?.locks ?? [];
+	}
+
 	function select(id: string): void {
+		// Re-selecting the active conductor is a no-op (no re-handover prompt).
+		if (id === activeId) {
+			closeMenu();
+			return;
+		}
+		const locks = declaredLocks(id);
+		if (isExclusive(locks)) {
+			// Exclusive → hold the pick behind the consent gate (ADR 0011 §6). The menu stays
+			// closed visually behind the modal; the pick only commits on confirm.
+			pendingConsent = { id, label: inProcessConductor(id)?.label ?? id, locks };
+			open = false;
+			return;
+		}
 		setActiveConductor(id);
 		closeMenu();
 	}
@@ -203,15 +316,20 @@
 		type="button"
 		class="cond-trigger"
 		class:remote={isRemote}
+		class:locked={activeExclusive}
 		class:open
 		bind:this={triggerEl}
 		aria-haspopup="menu"
 		aria-expanded={open}
 		aria-label="Switch conductor"
-		title={"Conductor: " + activeLabel + (isRemote ? " · " + conductorLink.status : "") + " — click to switch"}
+		title={"Conductor: " +
+			activeLabel +
+			(isRemote ? " · " + conductorLink.status : "") +
+			(activeExclusive ? " · exclusive (locked) — detach to take back control" : "") +
+			" — click to switch"}
 		onclick={toggle}
 	>
-		<Icon name="sliders-horizontal" size={11} />
+		<Icon name={activeExclusive ? "lock" : "sliders-horizontal"} size={11} />
 		<span class="cond-trigger-label">{activeLabel}</span>
 		{#if isRemote}
 			<span
@@ -240,6 +358,15 @@
 						{#if activeId === c.id}<Icon name="check" size={13} />{/if}
 					</span>
 					<span class="cond-item-label">{c.label}</span>
+					{#if isExclusive(c.locks)}
+						<!-- Compact lock table: one mark per lockable control (✗ = taken, ✓ = yours). -->
+						<span class="lock-mini" title="Exclusive — {c.locks!.length} of 3 controls taken over (you can always detach)">
+							<Icon name="lock" size={10} />
+							{#each LOCK_NAMES as name (name)}
+								<span class="lock-pip" class:taken={hasLock(c.locks, name)} aria-hidden="true"></span>
+							{/each}
+						</span>
+					{/if}
 				</button>
 			{/each}
 
@@ -349,19 +476,35 @@
 				{/if}
 			{/each}
 
-			<!-- Raw (no conductor) — de-emphasized -->
+			<!-- The kill switch (ADR 0011 §6): selecting Raw detaches, which FREEZES the current
+			     folded view as human-owned and unlocks every control. Always available — no lock
+			     can disable it. When an exclusive conductor is active we surface it as the way back. -->
+			{#if activeExclusive}
+				<p class="cond-locked-hint">
+					<Icon name="lock" size={10} />
+					Locked by <b>{activeLabel}</b> — detach to take back control.
+				</p>
+			{/if}
 			<button
 				type="button"
 				class="cond-item raw"
 				class:active={activeId === NONE_ID}
+				class:detach={activeExclusive}
 				role="menuitemradio"
 				aria-checked={activeId === NONE_ID}
+				title={activeExclusive
+					? "Detach: freeze the current folded view as yours and unlock every control"
+					: "Raw — no conductor managing this context"}
 				onclick={() => select(NONE_ID)}
 			>
 				<span class="cond-check">
-					{#if activeId === NONE_ID}<Icon name="check" size={13} />{/if}
+					{#if activeExclusive}
+						<Icon name="square" size={11} />
+					{:else if activeId === NONE_ID}
+						<Icon name="check" size={13} />
+					{/if}
 				</span>
-				<span class="cond-item-label">Raw</span>
+				<span class="cond-item-label">{activeExclusive ? "Detach (freeze & take back control)" : "Raw"}</span>
 			</button>
 
 			<div class="cond-sep" role="separator"></div>
@@ -394,6 +537,15 @@
 				</div>
 			{/if}
 		</div>
+	{/if}
+
+	{#if pendingConsent}
+		<ConsentDialog
+			label={pendingConsent.label}
+			locks={pendingConsent.locks}
+			onconfirm={confirmConsent}
+			oncancel={cancelConsent}
+		/>
 	{/if}
 </div>
 
@@ -468,6 +620,20 @@
 		background: var(--k-tool_result, #f0a35e);
 	}
 
+	/* Exclusive (locked) conductor — the trigger wears a warning accent so the handover is
+	   never invisible. Takes precedence over the remote accent (both can be true at once). */
+	.cond-trigger.locked {
+		color: var(--warn);
+		background: color-mix(in srgb, var(--warn) 12%, var(--panel-2));
+		border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+	}
+	.cond-trigger.locked:hover,
+	.cond-trigger.locked.open {
+		background: color-mix(in srgb, var(--warn) 18%, var(--panel));
+		border-color: var(--warn);
+		color: var(--warn);
+	}
+
 	/* ── Popover ── */
 	.cond-pop {
 		position: absolute;
@@ -517,6 +683,50 @@
 	}
 	.cond-item.raw.active {
 		color: var(--accent);
+	}
+	/* When an exclusive conductor is active, the Raw row IS the kill switch — give it weight. */
+	.cond-item.raw.detach {
+		color: var(--warn);
+		font-weight: 600;
+	}
+	.cond-item.raw.detach .cond-check {
+		color: var(--warn);
+	}
+
+	/* Compact lock table on an exclusive conductor's menu row: a lock glyph + 3 pips
+	   (filled = taken over). Reads at a glance without instantiating the conductor. */
+	.lock-mini {
+		display: inline-flex;
+		align-items: center;
+		gap: 3px;
+		flex: 0 0 auto;
+		color: var(--warn);
+		margin-left: 2px;
+	}
+	.lock-pip {
+		width: 5px;
+		height: 5px;
+		border-radius: 50%;
+		border: 1px solid color-mix(in srgb, var(--warn) 55%, transparent);
+		background: transparent;
+	}
+	.lock-pip.taken {
+		background: var(--warn);
+		border-color: var(--warn);
+	}
+
+	/* "Locked by X — detach to take back control" hint above the kill switch. */
+	.cond-locked-hint {
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		margin: 4px 6px 2px;
+		font-size: var(--fs-2xs);
+		line-height: 1.4;
+		color: var(--warn);
+	}
+	.cond-locked-hint b {
+		font-weight: 600;
 	}
 
 	/* Fixed-width leading slot so the check (or +) never shifts the label. */

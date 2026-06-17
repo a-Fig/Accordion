@@ -102,9 +102,11 @@ interface GroupOp { id: string; memberIds: string[]; summaryText: string }
    demoted to stay-live (the owner's "leave straggler live" choice). `applyPlan`
    **re-derives** this independently of the GUI (defense in depth, ADR 0004 style): it
    never emits an array with an orphaned tool call/result.
-3. **Recent backstop.** The newest `PROTECT_RECENT_MSGS` messages are never removed (this
-   is on top of the engine's token-based protected tail, which already bars protected
-   blocks from groups at all).
+3. ~~**Recent backstop.** The newest `PROTECT_RECENT_MSGS` messages are never removed.~~
+   *Superseded (ADR 0011): the message-count position backstop was removed — under the
+   `tail-size` lock it was stricter than the view and folded-in-GUI content stayed whole on
+   the wire. The engine's token-based protected tail is now the sole protection (it already
+   bars protected blocks from groups); `applyPlan` keeps only the structural guards above.*
 
 Each maximal run of removable messages collapses to one message: **role = the role of the
 first message in the run**, content = a single text part = `summaryText` (which carries the

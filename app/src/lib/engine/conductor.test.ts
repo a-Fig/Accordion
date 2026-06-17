@@ -50,25 +50,40 @@ class StubConductor implements Conductor {
 }
 
 describe("conductor seam — attach / detach", () => {
-	it("detach() makes the context raw (nothing folded)", () => {
+	// ADR 0011 §6: detach is the KILL SWITCH — it FREEZES the current folded view (so leaving
+	// can't blow the budget) and unlocks, rather than resetting to raw. The frozen folds become
+	// sticky human-owned folds, individually reversible with no conductor running.
+	it("detach() freezes the current folded view (sticky, human-owned) instead of going raw", () => {
 		const s = makeStore(Array.from({ length: 6 }, (_, i) => blk(i)));
 		s.setProtect(2000);
 		s.setBudget(2500); // 6000 live > budget → built-in must fold
-		expect(s.foldedCount).toBeGreaterThan(0);
+		const foldedBefore = s.foldedCount;
+		expect(foldedBefore).toBeGreaterThan(0);
+		const frozenIds = s.blocks.filter((b) => s.isFolded(b)).map((b) => b.id);
 
 		s.detach();
-		expect(s.foldedCount).toBe(0);
-		expect(s.blocks.every((b) => !s.isFolded(b))).toBe(true);
-		expect(s.blocks.every((b) => b.subst === undefined)).toBe(true);
-		expect(s.liveTokens).toBe(s.fullTokens);
+		// The exact folded view persists — same blocks, now human-owned.
+		expect(s.foldedCount).toBe(foldedBefore);
+		for (const id of frozenIds) {
+			const b = s.get(id)!;
+			expect(s.isFolded(b)).toBe(true);
+			expect(b.override).toBe("folded");
+			expect(b.by).toBe("you");
+			expect(b.subst).toBeUndefined(); // folds to the engine digest, individually reversible
+		}
+		// No conductor is running and the frozen folds are reversible by hand.
+		expect(s.conductor).toBe(null);
+		s.unfold(frozenIds[0]);
+		expect(s.isFolded(s.get(frozenIds[0])!)).toBe(false);
 	});
 
-	it("re-attaching a fresh built-in restores folding", () => {
+	it("re-attaching a fresh built-in re-folds (frozen human folds persist + builtin authors on top)", () => {
 		const s = makeStore(Array.from({ length: 6 }, (_, i) => blk(i)));
 		s.setProtect(2000);
 		s.setBudget(2500);
 		s.detach();
-		expect(s.foldedCount).toBe(0);
+		// Frozen, not raw: the prior fold set is preserved as human folds.
+		expect(s.foldedCount).toBeGreaterThan(0);
 
 		s.attach(new BuiltinConductor());
 		expect(s.foldedCount).toBeGreaterThan(0);
@@ -264,7 +279,10 @@ describe("conductor seam — group command", () => {
 		expect(s.isFolded(s.get("m1:p0")!)).toBe(false);
 	});
 
-	it("clears a conductor group on detach()", () => {
+	// ADR 0011 §6: detach FREEZES — a folded conductor group is reassigned to the human
+	// (by:"you") so the frozen view persists; it is NOT cleared to raw. (Programmatic raw via
+	// `attach(null)` still clears it — covered by the "clear to raw" group tests above.)
+	it("freezes a folded conductor group on detach() (reassigned to the human, not cleared)", () => {
 		const s = makeStore(Array.from({ length: 4 }, (_, i) => blk(i)));
 		s.setProtect(0);
 		const stub = new StubConductor();
@@ -273,7 +291,26 @@ describe("conductor seam — group command", () => {
 		expect(s.groups.length).toBe(1);
 
 		s.detach();
-		expect(s.groups.length).toBe(0); // detaching the conductor removes its group
+		expect(s.groups.length).toBe(1); // group preserved (frozen), now human-owned
+		expect(s.groups[0].by).toBe("you");
+		expect(s.groups[0].folded).toBe(true);
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(true); // still collapsed
+		expect(s.conductor).toBe(null);
+		// The human can now reverse it (delete the frozen group).
+		s.deleteGroup(s.groups[0].id);
+		expect(s.groups.length).toBe(0);
+	});
+
+	it("attach(null) — the programmatic go-raw — still clears a conductor group", () => {
+		const s = makeStore(Array.from({ length: 4 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const stub = new StubConductor();
+		stub.cmds = [{ kind: "group", ids: ["m0:p0", "m1:p0"] }];
+		s.attach(stub);
+		expect(s.groups.length).toBe(1);
+
+		s.attach(null); // programmatic raw (NOT the kill switch) → conductor group dropped
+		expect(s.groups.length).toBe(0);
 		expect(s.blocks.every((b) => !s.isFolded(b))).toBe(true);
 	});
 

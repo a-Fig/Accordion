@@ -24,6 +24,7 @@ import { estTokens, firstLine } from "../engine/tokens";
 import type { ConductorEntry } from "./registry";
 import {
 	CONDUCTOR_PROTOCOL_VERSION,
+	LOCK_NAMES,
 	isHostMessage, // (re-exported for symmetry/tests; host parses conductor msgs)
 	isConductorMessage,
 	type Conductor,
@@ -33,6 +34,7 @@ import {
 	type ConductorMessage,
 	type HostHelloMessage,
 	type ContextUpdateMessage,
+	type LockName,
 } from "$conductors/contract";
 
 void isHostMessage; // referenced to keep the import meaningful for downstream consumers
@@ -82,6 +84,10 @@ export const conductorRetry = $state({ tick: 0 });
 export class RemoteRunner implements Conductor {
 	readonly id: string;
 	readonly label: string;
+	/** Involvement locks declared by the remote conductor in its `conductor/hello`. Undefined
+	 *  until the hello arrives; set to a frozen array (possibly empty) once greeted.
+	 *  Undefined / empty ⇒ collaborative. Non-empty ⇒ exclusive. */
+	locks: readonly LockName[] | undefined = undefined;
 
 	private ws: WebSocket | null = null;
 	private manualClose = false;
@@ -213,10 +219,30 @@ export class RemoteRunner implements Conductor {
 					return;
 				}
 				if (m.wants?.content) this.wants = m.wants.content;
+				// Capture involvement locks (ADR 0011). Validate defensively: only accept
+				// entries that are known LockName values (wire input may carry garbage).
+				// Normalize: absent/empty → undefined (collaborative); valid entries → frozen array.
+				{
+					const rawLocks = Array.isArray(m.locks) ? m.locks : [];
+					const validLocks = rawLocks.filter((l): l is LockName => LOCK_NAMES.includes(l as LockName));
+					this.locks = validLocks.length > 0 ? Object.freeze(validLocks) : undefined;
+				}
 				this.greeted = true;
-				this.store.refold(); // first context push, now honouring the declared `wants`
+				// ADR 0011 consent → baseline (FIX 4): a remote conductor attaches BEFORE its
+				// locks are known, so `attach()`'s locked-domain release never ran. Now that the
+				// declared locks are set on THIS runner (= `store.conductor.locks`), reconcile:
+				// release standing human/agent holds in the newly-known locked domains, then
+				// refold. `reconcileLocks` refolds, so this also serves as the first context push
+				// honouring the declared `wants`.
+				this.store.reconcileLocks();
 				break;
 			case "conductor/commands": {
+				// Bug #3: a conductor MUST complete the handshake before it can steer. Protocol-
+				// version validation (and the lock declaration) live ONLY in the `conductor/hello`
+				// case, so commands arriving before/without a hello would bypass that gate entirely —
+				// a version-mismatched or never-greeted conductor could fold the live context. Ignore
+				// any commands until greeted; a well-behaved conductor always sends hello first.
+				if (!this.greeted) break;
 				// Drop replies to stale snapshots. If the conductor echoed a rev that is
 				// older than the latest context/update we have sent, this reply was computed
 				// against a state we already superseded — applying it would rewind decisions.
@@ -351,10 +377,11 @@ export function activeRemoteRunner(): RemoteRunner | null {
 }
 
 /**
- * Attach the conductor identified by `id` to `store`. `null`/`"none"` ⇒ detach (raw);
+ * Attach the conductor identified by `id` to `store`. `null`/`"none"` ⇒ detach (the ADR 0011
+ * kill switch: freezes the current folded view as human-owned, then unlocks all controls);
  * any id in the in-process registry (`IN_PROCESS_CONDUCTORS` — `"builtin"` and any future
  * sibling) ⇒ a fresh in-process instance; anything else ⇒ a remote runner dialed at the
- * matching discovered/configured `ConductorEntry` (detaching to raw context if the entry
+ * matching discovered/configured `ConductorEntry` (running RAW via `attach(null)` if the entry
  * isn't available *yet*, so nothing folds with the wrong strategy). Safe to call from an effect
  * that tracks the available list: it is IDEMPOTENT — if we are already correctly attached to
  * `id` on `store` it returns untouched (no reconnect on list churn / heartbeat refresh), and
@@ -398,8 +425,11 @@ export function attachConductor(store: AccordionStore, id: string | null, availa
 		return;
 	}
 	if (!entry) {
-		store.detach(); // selected remote not available — run raw until it connects (main #35)
-		lastFallback = true; // detached as fallback; don't re-detach/refold every poll until the remote appears
+		// attach(null), NOT detach(): detach() now FREEZES the current view (ADR 0011 kill
+		// switch). A transient waiting-for-remote state must go raw so the remote authors from a
+		// clean baseline when it connects, rather than inheriting frozen human folds.
+		store.attach(null); // selected remote not available — run raw until it connects (main #35)
+		lastFallback = true; // fell back to raw; don't re-refold every poll until the remote appears
 		return;
 	}
 	const runner = new RemoteRunner(entry, store);

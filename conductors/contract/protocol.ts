@@ -20,10 +20,14 @@
  * conductor author copies these shapes; they should not have to vendor the whole engine.
  * See `docs/conductor-protocol.md` for a copy-paste reference conductor.
  */
-import type { Command, ClampReport, ViewBlock } from "./conductor";
+import type { Command, ClampReport, ViewBlock, LockName } from "./conductor";
 
-/** Bumped on any breaking change to the messages below. Independent of the pi wire's PROTOCOL_VERSION. */
-export const CONDUCTOR_PROTOCOL_VERSION = 2;
+/**
+ * Bumped on any breaking change to the messages below. Independent of the pi wire's
+ * PROTOCOL_VERSION. v3 adds the conductor's `locks` declaration to the `conductor/hello`
+ * handshake (ADR 0011).
+ */
+export const CONDUCTOR_PROTOCOL_VERSION = 3;
 
 /**
  * How much of each block's content a conductor wants to receive (declared in
@@ -117,6 +121,8 @@ export interface ConductorHelloMessage {
 	id: string;
 	label: string;
 	wants?: { content: ContentMode };
+	/** Involvement locks this conductor declares (ADR 0011). Omitted/empty ⇒ collaborative. */
+	locks?: LockName[];
 }
 
 /**

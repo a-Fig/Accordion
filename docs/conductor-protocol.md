@@ -8,7 +8,8 @@ budget folder); this document is for writing your own.
 Conductors are **first-party** — every one lives in this repo (or a fork). There is no
 sandbox or trust boundary; the contract exists to make a conductor cheap to write, with the
 built-in as the worked example. The host enforces one floor (provider-validity) plus two
-guardrails (human overrides win; unsafe commands are clamped and reported) — these stop a
+guardrails (human overrides win unless the conductor holds an ADR 0011 involvement lock; unsafe
+commands are clamped and reported) — these stop a
 *bug* from corrupting the session or fighting the human, not an adversary.
 
 The design and rationale are in [ADR 0007](adr/0007-conductor-protocol.md), refined by
@@ -56,7 +57,11 @@ Treat everything in it as immutable.
 folds** — the host clears the previous conductor pass before building the view, so it is a
 clean baseline. `protectedFromIndex` / `protectTokens` surface the host's protected working
 tail as *policy*: you may honour it (the built-in treats it as a hard "don't fold past here"
-line) or ignore it, but folding into the tail may be reverted by host healing.
+line) or ignore it. Without the `tail-size` lock (ADR 0011), folding into the tail is reverted
+by host healing. With the lock, the tail is the conductor's own declared `tailTokens`:
+`tailTokens = 0` means no protected tail (you may fold any block), but folds inside a
+`tailTokens > 0` tail are still refused with `protected` — you own the tail's *size*, not a
+licence to fold into it.
 
 A **`ViewBlock`** is one block as every conductor sees it — identical in-process and on the
 wire:
@@ -114,9 +119,10 @@ stays sendable** — and reports anything it couldn't apply verbatim. Nothing is
 dropped; nothing throws.
 
 - **Content substitution only.** There is no remove. `replace(id, "")` "deletes" by folding the block to its `{#code FOLDED}` digest (an empty content part can't be sent), so it still costs the digest, not zero.
-- **Human-held blocks are refused.** A `fold` / `replace` / `restore` / `pin` touching a
+- **Human-held blocks are refused** (in the `human-steering`-unlocked domains). A `fold` / `replace` / `restore` / `pin` touching a
   block the human pinned, manually folded, or manually unfolded (`held: true`) comes back as
-  a `human-override` `ClampReport` and is not applied. The human always wins.
+  a `human-override` `ClampReport` and is not applied. Under the `human-steering` lock, no
+  human overrides exist to refuse — the UI blocks the action at the source (ADR 0011).
 - **A `group` over a human-held block is refused wholesale** — the entire group, not just
   the held member. Re-issue the group around the held block, or leave it.
 - **`group` validity.** The ids must be a contiguous, currently-ungrouped, ≥2-member run,
@@ -133,7 +139,7 @@ A **`ClampReport`** is `{ command, ids, reason, detail }`. `reason` is one of:
 | `human-override` | a human pin / manual fold / manual unfold owns the block — the human wins      |
 | `grouped`        | the block is inside a folded group; the group overlay owns it                  |
 | `invalid-group`  | a `group`'s ids were not a valid contiguous, ungrouped, ≥2-member run          |
-| `protected`      | the block is inside the protected working tail; protection is absolute — the host won't fold it |
+| `protected`      | the block is inside the active protected working tail; the host refuses to fold it. Without `tail-size` this is the human's `protectTokens` tail; with `tail-size` it is the conductor's declared `tailTokens` tail (`tailTokens = 0` ⇒ no tail, no `protected` clamps). See ADR 0011 |
 | `noop`           | the command was a no-op (e.g. restoring an already-live block)                 |
 
 In-process, `conduct()` returns and the host applies synchronously; the clamp reports are
@@ -169,7 +175,7 @@ conductor list — the descriptor file is not deleted), and delete it on shutdow
 | field              | type     | meaning                                                     |
 |--------------------|----------|-------------------------------------------------------------|
 | `registryProtocol` | number   | must equal `1` (the `REGISTRY_PROTOCOL` constant)           |
-| `conductorProtocol`| number   | the conductor wire version you speak (`2` today)            |
+| `conductorProtocol`| number   | the conductor wire version you speak (`3` today)            |
 | `id`               | string   | stable conductor id (also the file's basename)              |
 | `label`            | string   | human-facing name shown in the switcher                     |
 | `url`              | string   | the `ws://` endpoint Accordion dials                        |
@@ -182,7 +188,7 @@ Sample `~/.accordion/conductors/recency-folder.json`:
 ```json
 {
   "registryProtocol": 1,
-  "conductorProtocol": 2,
+  "conductorProtocol": 3,
   "id": "recency-folder",
   "label": "Recency folder",
   "url": "ws://127.0.0.1:7700",
@@ -233,7 +239,7 @@ re-applies the whole batch each time. To change one block, re-send your whole in
 ## Message reference
 
 All shapes are exact (from `conductors/contract/protocol.ts`). `CONDUCTOR_PROTOCOL_VERSION`
-is `2`.
+is `3` (bumped from 2 by ADR 0011 to carry the lock declaration in `conductor/hello`).
 
 ### host → conductor
 
@@ -242,7 +248,7 @@ is `2`.
 ```json
 {
   "type": "host/hello",
-  "conductorProtocol": 2,
+  "conductorProtocol": 3,
   "session": { "title": "fix the parser", "model": "google/gemini-2.5-flash-lite", "cwd": "/home/me/proj" },
   "budget": 70000,
   "contextWindow": 1000000
@@ -314,7 +320,7 @@ about the current state to fold into your next batch.
 **`conductor/hello`** — your opening frame.
 
 ```json
-{ "type": "conductor/hello", "conductorProtocol": 2, "id": "recency-folder", "label": "Recency folder", "wants": { "content": "full" } }
+{ "type": "conductor/hello", "conductorProtocol": 3, "id": "recency-folder", "label": "Recency folder", "wants": { "content": "full" } }
 ```
 
 `wants.content`: `"full"` (every block's text — the default), `"shape"` (structure +
@@ -382,7 +388,7 @@ wants full content, and on each `context/update` folds the oldest non-`protected
 // recency-folder.js — run: node recency-folder.js   (npm i ws)
 // Advertise it for auto-discovery by writing this JSON to
 // ~/.accordion/conductors/recency-folder.json (refresh heartbeatAt every few seconds):
-//   { "registryProtocol":1, "conductorProtocol":2, "id":"recency-folder",
+//   { "registryProtocol":1, "conductorProtocol":3, "id":"recency-folder",
 //     "label":"Recency folder", "url":"ws://127.0.0.1:7700",
 //     "pid":<pid>, "startedAt":<ms>, "heartbeatAt":<ms> }
 import { WebSocketServer } from "ws";
@@ -391,7 +397,7 @@ const wss = new WebSocketServer({ host: "127.0.0.1", port: 7700 });
 
 wss.on("connection", (ws) => {
   ws.send(JSON.stringify({
-    type: "conductor/hello", conductorProtocol: 2,
+    type: "conductor/hello", conductorProtocol: 3,
     id: "recency-folder", label: "Recency folder", wants: { content: "full" },
   }));
 

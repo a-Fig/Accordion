@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { RemoteRunner, attachConductor, conductorLink, conductorRetry, conductorStatus } from "./conductorClient.svelte";
+import { CONDUCTOR_PROTOCOL_VERSION } from "$conductors/contract";
 import { AccordionStore } from "../engine/store.svelte";
 import type { Block, ParsedSession } from "../engine/types";
 import type { ConductorEntry } from "./registry";
@@ -78,7 +79,7 @@ function makeStore(n: number): AccordionStore {
 
 const ENTRY: ConductorEntry = {
 	registryProtocol: 1,
-	conductorProtocol: 2,
+	conductorProtocol: CONDUCTOR_PROTOCOL_VERSION,
 	id: "remote-test",
 	label: "Remote Test",
 	url: "ws://127.0.0.1:9999",
@@ -110,8 +111,10 @@ function connectRunner(store: AccordionStore): { runner: RemoteRunner; ws: FakeW
 	return { runner, ws };
 }
 
-function sendHello(ws: FakeWebSocket, content: "full" | "shape" | "onDemand" = "full"): void {
-	ws.emit({ type: "conductor/hello", conductorProtocol: 2, id: "remote-test", label: "Remote Test", wants: { content } });
+function sendHello(ws: FakeWebSocket, content: "full" | "shape" | "onDemand" = "full", locks?: string[]): void {
+	const msg: Record<string, unknown> = { type: "conductor/hello", conductorProtocol: CONDUCTOR_PROTOCOL_VERSION, id: "remote-test", label: "Remote Test", wants: { content } };
+	if (locks !== undefined) msg.locks = locks;
+	ws.emit(msg);
 }
 
 describe("RemoteRunner — handshake & context push", () => {
@@ -119,7 +122,7 @@ describe("RemoteRunner — handshake & context push", () => {
 		const { ws } = connectRunner(makeStore(3));
 		const hello = ws.framesOfType("host/hello");
 		expect(hello).toHaveLength(1);
-		expect(hello[0].conductorProtocol).toBe(2);
+		expect(hello[0].conductorProtocol).toBe(CONDUCTOR_PROTOCOL_VERSION);
 		// No context pushed yet — we wait to learn `wants` so we never leak full text.
 		expect(ws.framesOfType("context/update")).toHaveLength(0);
 
@@ -143,6 +146,7 @@ describe("RemoteRunner — commands drive the store", () => {
 		const store = makeStore(3);
 		store.setProtect(0); // small fixture (3×1000 tok) is entirely inside the 20k tail — disable protection so a fold is allowed
 		const { ws } = connectRunner(store);
+		sendHello(ws, "full"); // complete the handshake — commands are ignored until greeted (Bug #3)
 		ws.emit({ type: "conductor/commands", rev: 1, commands: [{ kind: "fold", ids: ["m0:p0"] }] });
 
 		expect(store.isFolded(store.get("m0:p0")!)).toBe(true);
@@ -157,6 +161,7 @@ describe("RemoteRunner — commands drive the store", () => {
 		const store = makeStore(3);
 		store.setProtect(0); // see above — disable protection so the tiny fixture's blocks are foldable
 		const { ws } = connectRunner(store);
+		sendHello(ws, "full"); // complete the handshake — commands are ignored until greeted (Bug #3)
 		ws.emit({
 			type: "conductor/commands",
 			rev: 2,
@@ -171,10 +176,30 @@ describe("RemoteRunner — commands drive the store", () => {
 		expect(result.reports.some((r: any) => r.reason === "unknown-id")).toBe(true);
 	});
 
+	it("IGNORES conductor/commands that arrive before conductor/hello (greeted gate, Bug #3)", () => {
+		const store = makeStore(3);
+		store.setProtect(0);
+		const { ws } = connectRunner(store); // socket open, host/hello sent — but NO conductor/hello yet
+		const resultsBefore = ws.framesOfType("host/commandResult").length;
+
+		// A conductor that skips the handshake and sends commands straight away bypasses the
+		// protocol-version check (which lives only in the hello case). The runner must drop these.
+		ws.emit({ type: "conductor/commands", rev: 1, commands: [{ kind: "fold", ids: ["m0:p0"] }] });
+
+		expect(store.isFolded(store.get("m0:p0")!)).toBe(false); // command ignored — nothing folded
+		expect(ws.framesOfType("host/commandResult").length).toBe(resultsBefore); // no result echoed
+
+		// After the handshake completes, the same command applies normally.
+		sendHello(ws, "full");
+		ws.emit({ type: "conductor/commands", rev: 1, commands: [{ kind: "fold", ids: ["m0:p0"] }] });
+		expect(store.isFolded(store.get("m0:p0")!)).toBe(true);
+	});
+
 	it("holds the last command set when the conductor goes silent", () => {
 		const store = makeStore(3);
 		store.setProtect(0); // see above — disable protection so the tiny fixture's blocks are foldable
 		const { ws } = connectRunner(store);
+		sendHello(ws, "full"); // complete the handshake — commands are ignored until greeted (Bug #3)
 		ws.emit({ type: "conductor/commands", commands: [{ kind: "fold", ids: ["m0:p0"] }] });
 		expect(store.isFolded(store.get("m0:p0")!)).toBe(true);
 
@@ -422,36 +447,37 @@ describe("RemoteRunner — conductor/status telemetry (display-only)", () => {
 	});
 });
 
-describe("attachConductor — absent remote detaches to raw ONCE (Bug 5: re-attach loop)", () => {
+describe("attachConductor — absent remote runs raw ONCE (Bug 5: re-attach loop)", () => {
 	it("does NOT re-detach/refold on every call while the selected remote stays undiscovered", () => {
 		const store = makeStore(2);
 		// Establish a clean module baseline for this store first (in-proc attach, lastFallback=false).
 		attachConductor(store, "builtin", []);
 
-		// Spy on store.detach to count REAL (re-)detaches from here on. Per main #35 an absent
-		// remote runs RAW (detach), not a built-in stand-in.
-		let detachCount = 0;
-		const origDetach = store.detach.bind(store);
-		(store as any).detach = () => {
-			detachCount++;
-			return origDetach();
+		// Spy on store.attach to count REAL raw-fallbacks from here on. Per main #35 an absent
+		// remote runs RAW — now via attach(null), NOT detach() (which since ADR 0011 FREEZES the
+		// view as the kill switch; a transient waiting-for-remote must go raw, not freeze).
+		let rawCount = 0;
+		const origAttach = store.attach.bind(store);
+		(store as any).attach = (c: any) => {
+			if (c === null) rawCount++;
+			return origAttach(c);
 		};
 
-		// Select a remote id that is NOT in `available` → detach to raw once.
+		// Select a remote id that is NOT in `available` → raw once.
 		attachConductor(store, "ghost-remote", []);
-		expect(detachCount).toBe(1);
+		expect(rawCount).toBe(1);
 
 		// Repeat calls with the SAME id while the remote is still absent must be no-ops. The old
 		// bug re-ran the fallback (and refold) on every discovery poll → churn →
 		// effect_update_depth_exceeded (the frozen window). The lastFallback guard makes it stable.
 		attachConductor(store, "ghost-remote", []);
 		attachConductor(store, "ghost-remote", []);
-		expect(detachCount).toBe(1);
+		expect(rawCount).toBe(1);
 
-		// When the remote finally appears, we dial the real runner (a fresh socket) — no re-detach.
+		// When the remote finally appears, we dial the real runner (a fresh socket) — no re-raw.
 		FakeWebSocket.last = null;
 		attachConductor(store, "ghost-remote", [{ ...ENTRY, id: "ghost-remote" }]);
-		expect(detachCount).toBe(1);
+		expect(rawCount).toBe(1);
 		expect(FakeWebSocket.last).not.toBeNull();
 		FakeWebSocket.last!.open();
 
@@ -488,5 +514,77 @@ describe("RemoteRunner — conductorRetry tick (bounded auto-recovery)", () => {
 
 		// Tick must remain unchanged — no thrash retry for a never-greeted runner.
 		expect(conductorRetry.tick).toBe(tickBefore);
+	});
+});
+
+describe("RemoteRunner — involvement locks from conductor/hello (ADR 0011)", () => {
+	it("exposes declared locks on the runner after conductor/hello with locks present", () => {
+		const store = makeStore(2);
+		const { runner, ws } = connectRunner(store);
+
+		// Before hello: locks must be undefined (not yet greeted).
+		expect(runner.locks).toBeUndefined();
+
+		// Send hello with two locks.
+		sendHello(ws, "full", ["human-steering", "tail-size"]);
+
+		// The runner must expose exactly those locks, frozen.
+		expect(runner.locks).toBeDefined();
+		expect(Array.from(runner.locks!)).toEqual(["human-steering", "tail-size"]);
+		// Must be frozen (immutable).
+		expect(Object.isFrozen(runner.locks)).toBe(true);
+
+		runner.close();
+	});
+
+	it("leaves locks undefined when conductor/hello omits the locks field (collaborative)", () => {
+		const store = makeStore(2);
+		const { runner, ws } = connectRunner(store);
+
+		// sendHello with no locks argument → locks field absent from the wire message.
+		sendHello(ws, "full");
+
+		// Collaborative: locks must be undefined, not an empty array.
+		expect(runner.locks).toBeUndefined();
+
+		runner.close();
+	});
+
+	it("leaves locks undefined when conductor/hello sends an empty locks array (collaborative)", () => {
+		const store = makeStore(2);
+		const { runner, ws } = connectRunner(store);
+
+		sendHello(ws, "full", []);
+
+		// Empty array is also collaborative — normalized to undefined.
+		expect(runner.locks).toBeUndefined();
+
+		runner.close();
+	});
+
+	it("filters out unknown/invalid lock names from the wire (defensive validation)", () => {
+		const store = makeStore(2);
+		const { runner, ws } = connectRunner(store);
+
+		// Send a mix of valid and invalid lock names.
+		sendHello(ws, "full", ["human-steering", "not-a-lock", "tail-size", 42 as any]);
+
+		// Only the two valid LockName values should survive.
+		expect(runner.locks).toBeDefined();
+		expect(Array.from(runner.locks!)).toEqual(["human-steering", "tail-size"]);
+
+		runner.close();
+	});
+
+	it("leaves locks undefined when all declared lock names are invalid (no valid entry survives)", () => {
+		const store = makeStore(2);
+		const { runner, ws } = connectRunner(store);
+
+		// All entries are garbage — should be normalized to undefined (collaborative).
+		sendHello(ws, "full", ["bogus-lock", "another-fake"]);
+
+		expect(runner.locks).toBeUndefined();
+
+		runner.close();
 	});
 });

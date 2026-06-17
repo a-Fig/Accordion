@@ -13,10 +13,10 @@
 import { session, cancelPendingLoad } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import { wireToBlock } from "./mapping";
-import { computeFoldOps, computeGroupOps, resolveUnfold } from "./plan";
+import { computeFoldOps, computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
 import { folding } from "./folding.svelte";
 import { activeRemoteRunner } from "./conductorClient.svelte";
-import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage } from "./protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage, type RecallResultMessage } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 
 let socket: WebSocket | null = null;
@@ -187,6 +187,22 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				ws.send(JSON.stringify(reply));
 			} catch {
 				/* socket gone — the tool will time out and tell the agent to retry */
+			}
+		} else if (msg.type === "recallRequest") {
+			// The live agent asked (via the `recall` tool, ADR 0011) for the ORIGINAL full
+			// content of folded blocks it saw tagged `{#<code> FOLDED}`. recall is an
+			// UNBLOCKABLE READ - the counterpart to the human's peek: it returns the content
+			// THIS turn and does NOT change fold state (no override, the block stays folded).
+			// Because it is a pure read, it is NOT gated by the armed/disarmed steering toggle:
+			// we resolve against the current store either way (resolveRecall never mutates, so
+			// disarmed there is simply nothing folded to recall, all codes report missing).
+			const codes = Array.isArray(msg.codes) ? msg.codes : [];
+			const { restored, missing } = session.store ? resolveRecall(session.store, codes) : { restored: [], missing: codes };
+			const reply: RecallResultMessage = { type: "recallResult", reqId: msg.reqId, restored, missing };
+			try {
+				ws.send(JSON.stringify(reply));
+			} catch {
+				/* socket gone - the tool will time out and tell the agent to retry */
 			}
 		} else if (msg.type === "stream") {
 			// Ghost lifecycle — presentation only; ghosts NEVER enter session.store.blocks.

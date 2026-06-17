@@ -31,6 +31,22 @@
 /** The block kinds, mirrored from the engine so this contract has zero engine dependency. */
 export type ConductorBlockKind = "user" | "text" | "thinking" | "tool_call" | "tool_result";
 
+/** The three steering controls a conductor may take exclusive control of (ADR 0011). */
+export type LockName = "human-steering" | "agent-unfold" | "tail-size";
+
+/** All lockable controls, in canonical order (for UIs that render the lock table). */
+export const LOCK_NAMES: readonly LockName[] = ["human-steering", "agent-unfold", "tail-size"];
+
+/** True if `locks` claims `name`. The single predicate the host/UI use to test a lock. */
+export function hasLock(locks: readonly LockName[] | undefined, name: LockName): boolean {
+	return !!locks && locks.includes(name);
+}
+
+/** True if `locks` declares any lock at all (exclusive vs collaborative). */
+export function isExclusive(locks: readonly LockName[] | undefined): boolean {
+	return !!locks && locks.length > 0;
+}
+
 /** One block as every conductor sees it — pure serializable data, identical in-process and on the wire. */
 export interface ViewBlock {
 	id: string;
@@ -207,5 +223,32 @@ export interface Conductor {
 	readonly id: string;
 	/** Human-facing label for the switcher UI. */
 	readonly label: string;
+	/**
+	 * Involvement locks (ADR 0011): the steering controls this conductor takes EXCLUSIVE
+	 * control of. Undefined / empty ⇒ **collaborative** (the default — human and agent
+	 * overrides always win, today's behavior). A non-empty subset ⇒ **exclusive**: the host
+	 * gates the named controls from the human/agent, the human's only recourse is detach
+	 * (the kill switch), and `tail-size` hands the conductor ownership of the protected tail —
+	 * it declares the tail size via `tailTokens` (`0` ⇒ no tail, may fold any block; `> 0` ⇒
+	 * folds inside its own declared tail are still refused `protected`).
+	 * Never includes observation, budget, the agent's `recall`, or detach — those are sacred.
+	 */
+	readonly locks?: readonly LockName[];
+	/**
+	 * How much tail the conductor wants while holding the `tail-size` lock (ADR 0011).
+	 * Semantics parallel the human's `protectTokens`: a token target driving the same
+	 * walk-back algorithm. **0 (or omitted) = "own the whole context, no protected tail"**
+	 * — every block arrives with `protected: false`, and the conductor may fold freely into
+	 * recent reasoning (today's tail-size behavior). **N > 0 = "protect the newest ~N tokens
+	 * of tail"** — the host's walk-back algorithm protects the newest blocks summing to N
+	 * tokens (same 25% overflow cap as the human's tail), so those blocks arrive with
+	 * `protected: true` and the conductor folds only older content. Ignored entirely if the
+	 * conductor does not hold the `tail-size` lock. Remote conductors (WebSocket) always read
+	 * as 0 (whole-context ownership); remote-wire `tailTokens` support is a follow-up.
+	 *
+	 * Example: `tailTokens = 8000` keeps the newest ~8 k tokens protected while the conductor
+	 * manages everything older. `tailTokens` omitted (or 0) owns everything — no protected tail.
+	 */
+	readonly tailTokens?: number;
 	conduct(view: ConductorView): Command[] | null;
 }

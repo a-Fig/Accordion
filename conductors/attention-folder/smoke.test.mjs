@@ -172,7 +172,7 @@ test("server sends conductor/hello with wants.content==='full'", async () => {
 	const msg = await nextMessage(ws, 2_000);
 	assert.equal(msg.type, "conductor/hello");
 	assert.equal(msg.wants?.content, "full");
-	assert.equal(msg.conductorProtocol, 2);
+	assert.equal(msg.conductorProtocol, 3);
 });
 
 // ──────────────────────────────────────────────────────────────────────────────

@@ -385,13 +385,29 @@ describe("ColdScoreConductor — built-in unaffected by conductor swap", () => {
 		expect(s.liveTokens).toBeLessThanOrEqual(s.budget);
 	});
 
-	it("detach() returns to raw even when cold-score was active", () => {
+	// ADR 0011 §6: detach is the kill switch — it FREEZES the current folded view (so leaving
+	// can't blow the budget) and unlocks, rather than resetting to raw. The frozen folds become
+	// sticky human-owned folds. (Programmatic raw is `attach(null)`, asserted below.)
+	it("detach() freezes the cold-score view as human-owned folds (not raw)", () => {
+		const blocks = Array.from({ length: 15 }, (_, i) => blk(i, "text", 1000));
+		const s = makeStore(blocks, 8_000, 0);
+		s.attach(new ColdScoreConductor());
+		const foldedBefore = s.foldedCount;
+		expect(foldedBefore).toBeGreaterThan(0);
+
+		s.detach();
+		expect(s.foldedCount).toBe(foldedBefore); // frozen, not cleared
+		expect(s.conductor).toBe(null);
+		expect(s.blocks.filter((b) => s.isFolded(b)).every((b) => b.override === "folded" && b.by === "you")).toBe(true);
+	});
+
+	it("attach(null) returns to raw even when cold-score was active", () => {
 		const blocks = Array.from({ length: 15 }, (_, i) => blk(i, "text", 1000));
 		const s = makeStore(blocks, 8_000, 0);
 		s.attach(new ColdScoreConductor());
 		expect(s.foldedCount).toBeGreaterThan(0);
 
-		s.detach();
+		s.attach(null); // programmatic raw (NOT the kill switch)
 		expect(s.foldedCount).toBe(0);
 		expect(s.liveTokens).toBe(s.fullTokens);
 	});

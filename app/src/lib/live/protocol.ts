@@ -88,10 +88,11 @@ export interface FoldOp {
  *
  * Provider safety lives on BOTH sides (defense in depth, like `FoldOp`): the extension's
  * `applyPlan` re-derives tool-pair balance independently and only removes WHOLE, balanced,
- * durable, non-backstop messages — on ANY doubt the affected messages pass through
- * untouched. Safe because `applyPlan`'s output feeds the model only; the GUI's block sync
- * and `sentCount` cursor run off the un-collapsed `linearize`, so a removal can never desync
- * the view.
+ * durable messages — on ANY doubt the affected messages pass through untouched. The wire
+ * trusts the engine's plan (the engine is the single foldability gate and never folds a
+ * protected block), so no separate wire-side position backstop is applied. Safe because
+ * `applyPlan`'s output feeds the model only; the GUI's block sync and `sentCount` cursor
+ * run off the un-collapsed `linearize`, so a removal can never desync the view.
  */
 export interface GroupOp {
 	id: string;
@@ -163,7 +164,26 @@ export interface UnfoldRequestMessage {
 	codes: string[];
 }
 
-export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage;
+/**
+ * Sent by the extension when the live AGENT calls the `recall` tool (protocol v4 —
+ * ADR 0011). `recall` is the agent's counterpart to the human's "peek": an UNBLOCKABLE
+ * read that returns a folded block's ORIGINAL full content AS a tool result THIS turn,
+ * WITHOUT mutating the standing view (no override created, the block stays folded). It
+ * is the safety net that makes locking the agent's `unfold` non-blinding, so it is never
+ * gated by any lock.
+ *
+ * `codes` are the short fold codes the agent read from the `{#<code> FOLDED}` tags. The
+ * GUI resolves each code to every folded block carrying it and returns the full content
+ * (NOT the lossy digest) in the `recallResult` reply — the defining difference from
+ * `unfoldRequest`, which schedules a state change and echoes nothing.
+ */
+export interface RecallRequestMessage {
+	type: "recallRequest";
+	reqId: number;
+	codes: string[];
+}
+
+export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage;
 
 // ── Client → server (GUI → extension) ────────────────────────────────────────
 
@@ -207,18 +227,44 @@ export interface UnfoldResultMessage {
 	missing: string[];
 }
 
-export type ClientMessage = PlanMessage | AttachMessage | UnfoldResultMessage;
+/** One block's original full content returned by a `recallResult` (ADR 0011). */
+export interface RecallContent {
+	/** The fold code the agent referenced (the block stays folded — recall is read-only). */
+	code: string;
+	/** Short human label, e.g. "tool_result read_file · turn 12" or "group · 4 blocks". */
+	label: string;
+	/** The block's ORIGINAL full text (NOT the folded digest) — for a group, its members joined. */
+	text: string;
+	/** The block ids this content covers (≥1; >1 on a hash collision or a group recall). */
+	ids: string[];
+}
+
+/**
+ * The GUI's reply to a `recallRequest` (protocol v4, ADR 0011). `restored` carries the
+ * ORIGINAL full content of each matched folded block (the agent gets it back THIS turn,
+ * like a `read_file` result); `missing` lists codes the GUI could not resolve to any
+ * folded block (unknown, or already full). This is a PURE READ — recall NEVER changes
+ * fold state, so the standing view is untouched (the block stays folded in context).
+ */
+export interface RecallResultMessage {
+	type: "recallResult";
+	reqId: number;
+	restored: RecallContent[];
+	missing: string[];
+}
+
+export type ClientMessage = PlanMessage | AttachMessage | UnfoldResultMessage | RecallResultMessage;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 export function isServerMessage(v: unknown): v is ServerMessage {
 	if (!v || typeof v !== "object" || !("type" in v)) return false;
 	const t = (v as any).type;
-	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest";
+	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest";
 }
 
 export function isClientMessage(v: unknown): v is ClientMessage {
 	if (!v || typeof v !== "object" || !("type" in v)) return false;
 	const t = (v as any).type;
-	return t === "plan" || t === "attach" || t === "unfoldResult";
+	return t === "plan" || t === "attach" || t === "unfoldResult" || t === "recallResult";
 }
