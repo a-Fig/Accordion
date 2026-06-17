@@ -319,8 +319,20 @@
 	const k = (n: number) => { n = Math.round(n); return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`; };
 	function tip(b: Block, prot = false): string {
 		const tool = b.toolName ? ` ${b.toolName}` : "";
-		const f = store.isFolded(b) ? ` · folded ${b.tokens}→${store.effTokens(b)}` : "";
-		const action = prot ? "click to inspect · protected — never folds" : "click to inspect · double-click to fold";
+		const folded = store.isFolded(b);
+		const f = folded ? ` · folded ${b.tokens}→${store.effTokens(b)}` : "";
+		// The hint mirrors what a double-click actually DOES (store.toggle), so the tile never
+		// advertises a fold the canFold gate would refuse — a live user/tool_call, a pin, or the
+		// protected tail. Unfold stays offered for an already-folded block.
+		const action = folded
+			? "click to inspect · double-click to unfold"
+			: store.canFold(b)
+				? "click to inspect · double-click to fold"
+				: prot
+					? "click to inspect · protected — never folds"
+					: b.override === "pinned"
+						? "click to inspect · pinned — held live"
+						: "click to inspect · this kind never folds";
 		return `${b.kind}${tool} · ${b.tokens.toLocaleString()} tok${f}\n${action}`;
 	}
 	function groupTip(g: Group): string {
