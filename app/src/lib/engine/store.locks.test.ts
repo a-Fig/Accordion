@@ -3,6 +3,7 @@ import { AccordionStore } from "./store.svelte";
 import { AutopilotConductor } from "$conductors/autopilot/autopilot";
 import type { Conductor, ConductorView, Command, LockName } from "$conductors/contract";
 import type { Block, ParsedSession } from "./types";
+import { wireFoldable } from "./digest";
 
 /*
  * ADR 0011 — conductor involvement locks (HOST ENFORCEMENT).
@@ -615,16 +616,125 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 		s.detach();
 
 		// After detach, liveTokens must stay close to the folded level — NOT spring back to
-		// fullTokens when the group is pruned because the tail re-protects.
-		// Allow up to ~150 tok slack: when the group is pruned the members fall back to
-		// individual digests (instead of one combined group digest), which can differ slightly.
-		expect(Math.abs(s.liveTokens - foldedLive)).toBeLessThan(150);
+		// fullTokens. The group is preserved via the frozen exemption (NOT pruned), so savings
+		// are exact (same group digest before and after). Allow a tiny epsilon for rounding.
+		expect(Math.abs(s.liveTokens - foldedLive)).toBeLessThan(10);
 		// Belt-and-suspenders: still meaningfully below full (group saved at least 3 digests).
 		expect(s.liveTokens).toBeLessThan(s.fullTokens - 2000);
 
-		// The group members should read as individually frozen folds (group was pruned by the
-		// re-protected tail, but member overrides now hold the freeze).
+		// The group itself survives (frozen exempt from pruning), so members read folded via
+		// groupWire — NOT as individually frozen per-block folds.
+		expect(s.groups.length).toBe(1);
+		expect(s.groups[0].folded).toBe(true);
+		expect(s.groups[0].frozen).toBe(true);
+		expect(s.groups[0].by).toBe("you");
 		expect(s.isFolded(s.get("m38:p0")!)).toBe(true);
+		// Members keep override===null — no individual `override:"folded"` was stamped on them.
+		expect(s.get("m38:p0")!.override).toBeNull();
+	});
+
+	it("A: no view↔wire divergence — a non-foldable group member is never individually folded after detach", () => {
+		// 40 blocks × 1000 tok. m36 = tool_call (non-foldable), m37 = its tool_result, m38+m39 = text.
+		const blocks = Array.from({ length: 40 }, (_, i) => blk(i));
+		blocks[36] = blk(36, "tool_call", 1000, { callId: "c1", toolName: "x" });
+		blocks[37] = blk(37, "tool_result", 1000, { callId: "c1" });
+		const s = makeStore(blocks);
+		// Do NOT call setProtect — keep default 20 000 token tail.
+
+		const c = new LockingConductor(["tail-size"]);
+		// Group m36..m39: includes a tool_call (non-foldable kind) and a tool_result + two text.
+		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
+		s.attach(c);
+		expect(s.groups.length).toBe(1);
+		expect(s.groups[0].folded).toBe(true);
+
+		s.detach();
+
+		// Invariant: for every block, if it reads folded AND is NOT a member of a surviving
+		// folded group, then it must be wire-foldable (no illegal per-block fold on user/tool_call).
+		const foldedGroupMemberIds = new Set<string>();
+		for (const g of s.groups) {
+			if (g.folded) for (const id of g.memberIds) foldedGroupMemberIds.add(id);
+		}
+		for (const b of s.blocks) {
+			if (s.isFolded(b) && !foldedGroupMemberIds.has(b.id)) {
+				// This block is individually folded — it MUST be wire-foldable.
+				expect(wireFoldable(b), `block ${b.id} (kind=${b.kind}) is individually folded but not wire-foldable`).toBe(true);
+			}
+		}
+
+		// Specifically: m36 (tool_call) must NOT be individually folded. Its folded appearance
+		// comes only from being inside the surviving frozen group.
+		const m36 = s.get("m36:p0")!;
+		expect(m36.override).toBeNull(); // no per-block fold
+		expect(m36.autoFolded).toBe(false);
+		// It reads folded because the group still exists.
+		expect(s.isFolded(m36)).toBe(true);
+		expect(s.groups.length).toBe(1);
+
+		// Budget is still preserved.
+		expect(s.liveTokens).toBeLessThan(s.fullTokens - 2000);
+	});
+
+	it("B: surviving frozen group + human dissolve returns members to live (no stale fold leak)", () => {
+		// 40 blocks. Group over m2..m5 — older than the tail, includes mixed kinds.
+		const blocks = Array.from({ length: 40 }, (_, i) => blk(i));
+		// Put a user block at m2 and a tool_call+tool_result pair at m3..m4.
+		blocks[2] = blk(2, "user", 1000);
+		blocks[3] = blk(3, "tool_call", 1000, { callId: "c2", toolName: "y" });
+		blocks[4] = blk(4, "tool_result", 1000, { callId: "c2" });
+		const s = makeStore(blocks);
+		// Keep default 20k tail — m2..m5 are old blocks well outside it.
+
+		const c = new LockingConductor(["tail-size"]);
+		c.cmds = [{ kind: "group", ids: ["m2:p0", "m3:p0", "m4:p0", "m5:p0"] }];
+		s.attach(c);
+		expect(s.groups.length).toBe(1);
+		expect(s.groups[0].folded).toBe(true);
+
+		s.detach();
+
+		// The group is older than the tail so it survives pruning even without the frozen
+		// exemption, but it should still be marked frozen (it was a conductor group, now
+		// frozen-reassigned to human).
+		expect(s.groups.length).toBe(1);
+		expect(s.groups[0].by).toBe("you");
+
+		// Now the human dissolves it.
+		s.deleteGroup(s.groups[0].id);
+
+		// Every former member must be NOT folded. Under 7e946c5 they were individually stamped
+		// with override:"folded" and would stay folded after deleteGroup — the leak.
+		for (const id of ["m2:p0", "m3:p0", "m4:p0", "m5:p0"]) {
+			const b = s.get(id)!;
+			expect(b.override, `${id} should have override===null after group dissolved`).toBeNull();
+			expect(s.isFolded(b), `${id} should not be folded after group dissolved`).toBe(false);
+		}
+	});
+
+	it("C: resetAll drops a detach-frozen group (no surviving frozen group after clean slate)", () => {
+		const s = makeStore(Array.from({ length: 40 }, (_, i) => blk(i)));
+		// Do NOT call setProtect — keep default 20 000 token tail.
+
+		const c = new LockingConductor(["tail-size"]);
+		// Group m36..m39 spans the soon-re-protected tail.
+		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
+		s.attach(c);
+		expect(s.groups.length).toBe(1);
+
+		s.detach();
+		expect(s.groups.length).toBe(1);
+		expect(s.groups[0].frozen).toBe(true);
+
+		// resetAll must drop the frozen exemption and return to a clean slate.
+		s.resetAll();
+
+		// No frozen groups remain.
+		expect(s.groups.every((g) => !g.frozen)).toBe(true);
+		// The group that was spanning the re-protected tail should be pruned now (no exemption).
+		// After resetAll → refold → pruneProtectedGroups, it reaches the tail and gets dropped.
+		const survivingFrozenGroups = s.groups.filter((g) => g.frozen);
+		expect(survivingFrozenGroups.length).toBe(0);
 	});
 });
 

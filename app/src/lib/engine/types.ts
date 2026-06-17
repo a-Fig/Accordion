@@ -98,6 +98,21 @@ export interface Group {
 	 * always sets it (default `"you"`).
 	 */
 	by?: Actor;
+	/**
+	 * Set true only by `freezeForDetach` (ADR 0011 §6 kill switch) to exempt a
+	 * detach-frozen group from `pruneProtectedGroups`. This is the group analogue of the
+	 * block-level `frozen` Set used by `healProtected`: when the kill switch fires it
+	 * reassigns a folded conductor group to `by:"you"` AND sets `frozen:true`. After detach
+	 * the `tail-size` lock is released and the host tail re-protects — the group now reaches
+	 * into the newly-protected tail, which would normally trigger pruning. But the tail only
+	 * re-protected BECAUSE the lock was released; pruning it would re-blow the very budget the
+	 * freeze exists to prevent. `pruneProtectedGroups` keeps any group with `frozen===true`.
+	 * `resetAll` drops it via `frozen.clear()` + the full `blocks` pass (correct — clean slate).
+	 * A fresh `attach()` after detach finds the frozen group already `by:"you"`, so
+	 * `clearConductorState` keeps it (correct — it is a human-owned frozen view); the
+	 * `frozen` field is harmless there (it only affects `pruneProtectedGroups`, not attach).
+	 */
+	frozen?: boolean;
 }
 
 export interface SessionMeta {
