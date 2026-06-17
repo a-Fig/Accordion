@@ -44,6 +44,13 @@
 	});
 	const partnerProtected = $derived(partner ? store.isProtected(partner) : false);
 
+	// Can the human fold this block / its partner right now? The single engine predicate the
+	// fold controls consult, so the Inspector never offers a fold the wire would refuse (a live
+	// user/tool_call) — matching ContextMap. Unfold of an already-folded block always stays.
+	const canFoldBlock = $derived(block ? store.canFold(block) : false);
+	const canFoldPartner = $derived(partner ? store.canFold(partner) : false);
+	const partnerFolded = $derived(partner ? store.isFolded(partner) : false);
+
 	function body(b: Block): { text: string; clipped: number } {
 		const t = b.text ?? "";
 		return t.length > CAP ? { text: t.slice(0, CAP) + "…", clipped: t.length } : { text: t, clipped: 0 };
@@ -220,9 +227,9 @@
 			<div class="meta-actions">
 				<button
 					class="action-btn"
-					class:action-disabled={protect}
-					disabled={protect}
-					title={protect ? "Protected working tail — never folded" : folded ? "Unfold block" : "Fold block"}
+					class:action-disabled={!folded && !canFoldBlock}
+					disabled={!folded && !canFoldBlock}
+					title={folded ? "Unfold block" : canFoldBlock ? "Fold block" : protect ? "Protected working tail — never folded" : pinned ? "Pinned — unpin to fold" : "Only text, thinking & tool results can fold"}
 					onclick={() => store.toggle(block!.id)}
 				>
 					<Icon name={folded ? "chevrons-up-down" : "chevrons-down-up"} size={14} />
@@ -275,19 +282,19 @@
 						{partner.kind === "tool_result" ? "Result it produced" : "Call that produced this"}
 					</span>
 					<span class="partner-meta tnum">
-						{store.isFolded(partner) ? "folded" : "live"} · {fmt(store.effTokens(partner))} tok
+						{partnerFolded ? "folded" : "live"} · {fmt(store.effTokens(partner))} tok
 					</span>
 				</div>
 
 				<button
 					class="action-btn partner-toggle"
-					class:action-disabled={partnerProtected}
-					disabled={partnerProtected}
-					title={partnerProtected ? "Protected — never folded" : store.isFolded(partner) ? "Unfold partner" : "Fold partner"}
+					class:action-disabled={!partnerFolded && !canFoldPartner}
+					disabled={!partnerFolded && !canFoldPartner}
+					title={partnerFolded ? "Unfold partner" : canFoldPartner ? "Fold partner" : partnerProtected ? "Protected — never folded" : partner?.override === "pinned" ? "Pinned — unpin to fold" : "Only text, thinking & tool results can fold"}
 					onclick={() => store.toggle(partner!.id)}
 				>
 					<Icon name="corner-down-right" size={14} />
-					{partnerProtected ? "Protected" : store.isFolded(partner) ? "Unfold" : "Fold"} partner
+					{partnerFolded ? "Unfold" : canFoldPartner ? "Fold" : partnerProtected ? "Protected" : "Fold"} partner
 				</button>
 
 				<pre class="partner-preview mono">{body(partner).text}</pre>

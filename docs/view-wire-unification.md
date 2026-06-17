@@ -1,10 +1,68 @@
 # View ↔ Wire unification — make the UI structurally unable to lie
 
-**Status:** near-term fix decided (Option A + alarm); stricter finish deferred (Option C).
+**Status:** **Slice 1 + 1.1 LANDED** (the shared kind predicate that kills the `tool_call` lie
+via both fold doors, the alarm, and the code-review follow-ups: Inspector `canFold`, honest
+`foldedTokens`, empty-`replace`→digest, and the wire path routed through `wireFoldable`).
+Slice 2 (group-balance unification, protect-tail unit reconciliation, id-format reconciliation)
+is a defined fast-follow, not yet built. Stricter finish (Option C) remains deferred.
 **Date:** 2026-06-16
 **Owner decision:** yes to Option A now, with the alarm as the standing guardrail; Option C
 is a deferred finish, taken only if the alarm ever fires in real use or the render layer is
 being reworked for another reason.
+
+## What Slice 1 actually shipped
+
+One shared **kind** predicate `wireFoldable(b)` in `engine/digest.ts` (KIND-only — durable-id
+stays a live-wire emit concern in `computeFoldOps`, because on-disk/demo parse ids legitimately
+differ and the view must fold by kind in every mode). Both fold doors route through it:
+`store.fold()` refuses a non-foldable kind; `store.substOne()` (the conductor chokepoint for
+`fold` **and** `replace`) clamps with a new `"not-foldable"` `ClampReason` instead of silently
+applying. `store.canFold()` drives the UI affordance (`ContextMap` no longer offers Fold on a
+live `user`/`tool_call`). The **alarm** (`live/foldAlarm.svelte.ts`) re-checks view-vs-wire on
+every settled change: a universal kind backstop (all modes, excludes collapsed group members),
+a live-only set-equality check (`isFolded` set == `computeFoldOps` set — catches the rare
+positional-id divergence), an indicator-only slow-flashing red dot by the wordmark, and a
+dev-only `console.error`. The alarm deliberately does **not** verify folded-group straggler
+balance — that's the extension's structural guard + Slice 2. Golden (`conductor.builtin`) stayed
+byte-identical; the gate is a no-op on foldable-kind candidates.
+
+## Slice 1.1 — code-review fixes (2026-06-17)
+
+A max-effort review of the Slice 1 PR (#45) surfaced four issues where the kind gate had
+landed but its rollout was incomplete or a second divergence vector remained. PM call: fix the
+four that complete the thesis ("structurally unable to lie") or close a reachable regression;
+defer the low-severity cleanup to Slice 2 (see [BACKLOG.md](BACKLOG.md)).
+
+- **Inspector fold buttons now gate on `canFold`.** Slice 1 wired `canFold` into `ContextMap`
+  (Map grid + transcript) but missed `Inspector.svelte` — its "Fold block" / "Fold partner"
+  buttons gated only on protection, so a live `user`/`tool_call` showed an enabled Fold button
+  that silently no-op'd. Both now consult `store.canFold` (unfold of an already-folded block
+  always stays). The lie was already closed by the store gate; this closes the dead-control gap.
+- **`ConductorView.foldedTokens` is honest for non-foldable kinds** (`= tokens`, since they
+  can't shrink). The default **builtin** conductor's candidate filter (`foldedTokens < tokens`)
+  has no kind guard, so when over-budget *beyond* what foldable kinds can save it proposed
+  folding `tool_call`/`user`; the Slice 1 `substOne` gate then clamped each `"not-foldable"` and
+  `runConductor` logged it **every refold pass** (activity-log spam). Fixing `foldedTokens` at
+  the view — the one surface every conductor consumes — makes that proposal impossible for
+  builtin, cold-score, cold-epoch, and any future conductor at once, with no per-conductor kind
+  knowledge. Golden stayed byte-identical (its fixture never descends that far).
+- **Empty `replace` folds to the engine digest, not `""`.** `wireFoldable` is kind-only and
+  `substOne` had no empty-content guard, so a conductor `replace(id, "")` (the documented
+  "delete" form) on a foldable durable block read folded (~0 tokens) while `computeFoldOps`
+  dropped the empty digest → the agent received it whole: the residual per-block lie the kind
+  gate didn't cover. `substOne` now normalizes `""` to a plain fold (the `{#code FOLDED}` digest,
+  the smallest wire-safe form), so view == wire; the contract doc is updated to match.
+- **The wire path now actually consults `wireFoldable`.** `computeFoldOps` and `resolveUnfold`
+  called `FOLDABLE_KINDS.has(b.kind)` directly while the `wireFoldable` docblock claimed they
+  "consult" it — a single-source drift vector and a false docblock (CLAUDE.md "one gate"). Both
+  now call `wireFoldable(b)`, so the gate is genuinely single-sourced across view and wire.
+
+Tests: `store.foldgate.test.ts` gains `foldedTokens`-honesty + builtin-never-proposes +
+empty-`replace` round-trip cases; `conductor.test.ts`'s empty-`replace` test moves from the old
+"emptied" assertion to the digest fallback. svelte-check 0/0, vitest 326/326, golden
+byte-identical, extension smoke PASS.
+
+The sections below are the original design; they remain the reference for the Slice 2 items.
 
 ## The problem
 
@@ -28,30 +86,41 @@ says folded; agent got it whole.
 
 ### Confirmed divergence points (not just tool_call)
 
-| Rule | Wire enforces | View enforces | Diverges? |
-|---|---|---|---|
-| Kind gate (`FOLDABLE_KINDS` = text/thinking/tool_result only) | yes | no | **yes** |
-| Durable-id only (`isDurableId`) | yes | no | **yes** |
-| Empty-digest skip | yes | no | yes (rare) |
-| Recent-message backstop (`PROTECT_RECENT_MSGS` = 2, by message count) | extension, by msgs | engine, by tokens | yes (rare; unit mismatch) |
-| Group straggler balance | `applyPlan` re-derives | `classifyGroup` | **yes — already documented** ([ADR 0006](adr/0006-multiblock-folds.md) watch items: cross-group split tool-pair makes `savedTokens` understate) |
+| Rule | Wire enforces | View enforces | Diverged? | Slice 1 |
+|---|---|---|---|---|
+| Kind gate (`FOLDABLE_KINDS` = text/thinking/tool_result only) | yes | no | **yes** | **CLOSED** — both fold doors gate on `wireFoldable`; alarm Layer 1 backstops |
+| Durable-id only (`isDurableId`) | yes | no | **yes** | **alarmed** (live Layer 2 fires on the rare non-durable-live fold); view-side gating deferred to Slice 2 (id-format reconcile) |
+| Empty-digest skip | yes | no | yes (rare) | **CLOSED (1.1)** — empty `replace` folds to the engine digest in `substOne`, so view==wire; the wire-side skip stays as belt-and-suspenders |
+| Recent-message backstop (`PROTECT_RECENT_MSGS` = 2, by message count) | extension, by msgs | engine, by tokens | yes (rare; unit mismatch) | **deferred** to Slice 2 |
+| Group straggler balance | `applyPlan` re-derives | `classifyGroup` | **yes — already documented** ([ADR 0006](adr/0006-multiblock-folds.md) watch items: cross-group split tool-pair makes `savedTokens` understate) | **deferred** to Slice 2; alarm deliberately does NOT verify it |
 
 All the same root cause: the UI trusts its own state instead of rendering what actually goes
 out. This is governed by the CLAUDE.md rule "preview/read-only is NOT a more permissive
-mode" — preview must match the *would-be* wire output too.
+mode" — preview must match the *would-be* wire output too. **Slice 1 closes the per-block
+KIND lie (the one a user can actually trigger) and installs the alarm; the rarer rows are
+alarmed-or-deferred, not silently dropped.**
 
 ## Near-term fix — Option A: one shared predicate (DOING THIS)
+
+> **As-shipped (Slice 1) note — read this first.** The design below originally pictured a
+> single predicate combining *kind + durable-id + non-empty-digest*. Implementation found
+> that the durable-id half **cannot** gate the view: the on-disk / demo / Claude-Code parse
+> assigns non-durable ids (`<eventId>:p<j>`), so demanding durable-id in the view would forbid
+> all demo/read-only folding and break the golden. So Slice 1 split it: `wireFoldable(b)` is
+> **kind-only** and universal (view + wire), while **durable-id stays a live-wire emit guard**
+> inside `computeFoldOps` (unchanged). The kind half is what actually kills the `tool_call`
+> lie. Points 2–3 below (group-balance unification, backstop reconciliation) are **Slice 2**,
+> not yet built. See the "What Slice 1 actually shipped" section above for the real surface.
 
 Extract the wire's rules into single pure functions and route the store **through** them, so
 the view can no longer form a folded-state the wire would refuse.
 
-1. **One foldability predicate.** A single `wireFoldable(block)` (kind + durable-id +
-   non-empty-digest) lives in the engine ([`digest.ts`](../app/src/lib/engine/digest.ts)
-   already owns `FOLDABLE_KINDS`; `isDurableId` currently lives in `mapping.ts` and must be
-   reachable from the engine). `store.fold()`, `store.isFolded`, and `computeFoldOps` all
-   gate on this one function. `applyPlan` (extension) imports the same function — it keeps
-   re-deriving as defense-in-depth, but from identical code, so it can only ever **agree**,
-   never silently disagree.
+1. **One foldability predicate.** A single `wireFoldable(block)` lives in the engine
+   ([`digest.ts`](../app/src/lib/engine/digest.ts), next to `FOLDABLE_KINDS`). `store.fold()`,
+   `store.substOne()`, `store.canFold()`, `store.isFolded` accounting, and `computeFoldOps`
+   all gate on it. (As shipped it is **kind-only** — see the note above; the durable-id guard
+   remains wire-side in `computeFoldOps`, and the extension's `applyPlan` keeps re-deriving as
+   defense-in-depth from identical code, so it can only ever **agree**.)
 2. **Group balance becomes one shared function.** The straggler/tool-pair-balance logic in
    `classifyGroup` (store) and `applyPlan` (mapping) collapses to one pure function consumed
    by both. Fixes the documented cross-group `savedTokens` divergence.

@@ -68,7 +68,7 @@ wire:
 | `turn`         | number   | 1-based user turn                                                                 |
 | `order`        | number   | global 0-based position in the conversation                                      |
 | `tokens`       | number   | full token cost at full fidelity                                                 |
-| `foldedTokens` | number   | token cost **if folded** (the digest size) — precomputed so you needn't estimate |
+| `foldedTokens` | number   | token cost **if folded** — the digest size for a foldable kind, or full `tokens` for a non-foldable kind (which can't shrink) — precomputed so you needn't estimate |
 | `toolName`     | string?  | for `tool_call` / `tool_result`                                                  |
 | `callId`       | string?  | pairing key (a call and its result share it)                                     |
 | `isError`      | boolean? | tool-result error flag                                                            |
@@ -102,7 +102,7 @@ pair can never orphan.
 | command   | shape                                | effect                                                                 |
 |-----------|--------------------------------------|------------------------------------------------------------------------|
 | `fold`    | `{ kind:"fold", ids, digest? }`      | Collapse blocks to a digest. No `digest` → the host's per-kind digest + the `{#code FOLDED}` agent-recovery tag. A `digest` string → exactly that text is shown and the agent receives it. |
-| `replace` | `{ kind:"replace", id, content }`    | Substitute a block's content with arbitrary text. `content: ""` is the safe form of **delete** — the block stays in place (pairing intact) but contributes almost nothing. |
+| `replace` | `{ kind:"replace", id, content }`    | Substitute a block's content with arbitrary text. The block stays in place (pairing intact). `content: ""` means "shrink to nothing": an empty content part can't be sent on the wire, so the host folds the block to its `{#code FOLDED}` digest (the smallest wire-safe form), so the view matches what the agent receives. Only `text`/`thinking`/`tool_result` fold. |
 | `group`   | `{ kind:"group", ids }`              | Collapse a **contiguous** run into one summary entry (summary-on-head, the rest emptied — never removed). The group covers the run from the **first to the last** named id, snapped outward to whole messages — blocks *between* the first and last are swept in even if unnamed. For a non-contiguous set, issue one `group` per run, or empty/replace blocks individually. |
 | `restore` | `{ kind:"restore", ids }`            | Return blocks to full, live content (undo a fold/replace). No-op on a human-held block. |
 | `pin`     | `{ kind:"pin", ids }`                | Assert blocks stay live and open — e.g. force live a block an earlier command in the same batch folded. Never overrides a *human* pin. |
@@ -113,7 +113,7 @@ The host clamps each command to the one floor it keeps — **provider-validity, 
 stays sendable** — and reports anything it couldn't apply verbatim. Nothing is silently
 dropped; nothing throws.
 
-- **Content substitution only.** There is no remove. `replace(id, "")` is how you "delete".
+- **Content substitution only.** There is no remove. `replace(id, "")` "deletes" by folding the block to its `{#code FOLDED}` digest (an empty content part can't be sent), so it still costs the digest, not zero.
 - **Human-held blocks are refused.** A `fold` / `replace` / `restore` / `pin` touching a
   block the human pinned, manually folded, or manually unfolded (`held: true`) comes back as
   a `human-override` `ClampReport` and is not applied. The human always wins.

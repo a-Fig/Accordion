@@ -26,7 +26,7 @@ import type { AccordionStore } from "../engine/store.svelte";
 import type { Block } from "../engine/types";
 import type { FoldOp, GroupOp, UnfoldRestored } from "./protocol";
 import { isDurableId } from "./mapping";
-import { foldCode, FOLDABLE_KINDS } from "../engine/digest";
+import { foldCode, wireFoldable } from "../engine/digest";
 
 /**
  * Compute the fold plan for the current store state: one `FoldOp` per block that
@@ -42,7 +42,7 @@ export function computeFoldOps(store: AccordionStore): FoldOp[] {
 		// wire (applyPlan removes the message before any in-place fold runs) AND a trap — the op
 		// would carry the block's own digest, divergent from the group summary. Skip them.
 		if (store.groupOf(b)?.folded) continue;
-		if (!FOLDABLE_KINDS.has(b.kind)) continue; // never user / tool_call
+		if (!wireFoldable(b)) continue; // never user / tool_call — the ONE shared foldability gate
 		if (!isDurableId(b.id)) continue; // durable-id safety guard
 		const digestText = store.digestOf(b);
 		if (!digestText) continue; // never empty a content part
@@ -118,7 +118,7 @@ export function resolveUnfold(store: AccordionStore, codes: string[]): { restore
 		// durable id. So the agent can only ever restore something it was actually shown a
 		// `{#code FOLDED}` tag for — never a human pin, a locally-folded user/tool_call, or
 		// a positional-id block that was never on the wire.
-		const matches = store.blocks.filter((b) => store.isFolded(b) && FOLDABLE_KINDS.has(b.kind) && isDurableId(b.id) && foldCode(b.id) === code);
+		const matches = store.blocks.filter((b) => store.isFolded(b) && wireFoldable(b) && isDurableId(b.id) && foldCode(b.id) === code);
 		for (const b of matches) {
 			// A member of a FOLDED group is controlled by the group, not per-block overrides —
 			// `store.unfold` would no-op there (ADR 0006 §2). Route it through `unfoldGroup` so

@@ -38,7 +38,7 @@ export interface ViewBlock {
 	turn: number;
 	order: number;
 	tokens: number; // full token cost
-	foldedTokens: number; // token cost if folded (the digest size) — so a conductor needn't compute it
+	foldedTokens: number; // token cost if folded — the digest size for a foldable kind, or full tokens for a non-foldable kind (which can't shrink) — so a conductor needn't compute it
 	toolName?: string;
 	callId?: string;
 	isError?: boolean;
@@ -106,9 +106,12 @@ export interface FoldCommand {
 }
 
 /**
- * Substitute a block's content with arbitrary text the conductor chose. `content: ""`
- * is the safe form of "delete" — the block stays in place (so its callId/pairing is
- * intact) but contributes (almost) nothing.
+ * Substitute a block's content with arbitrary text the conductor chose. The block stays in
+ * place (so its callId/pairing is intact). `content: ""` means "shrink to nothing": an empty
+ * content part can't be sent to the provider, so the host folds the block to its standard
+ * `{#code FOLDED}` digest (the smallest wire-safe form) — guaranteeing the view always matches
+ * what the agent receives. Only `text`/`thinking`/`tool_result` fold; a `replace` on a
+ * `user`/`tool_call` is clamped `not-foldable`.
  */
 export interface ReplaceCommand {
 	kind: "replace";
@@ -173,6 +176,13 @@ export type ClampReason =
 	| "invalid-group"
 	/** The block is inside the protected working tail; protection is absolute, the host won't fold it. */
 	| "protected"
+	/**
+	 * The block's KIND is not foldable on the wire — only `text` / `thinking` / `tool_result`
+	 * fold; `user` (intent) and `tool_call` (folding it would orphan its result) never do. A
+	 * `fold`/`replace` targeting such a block is refused and reported, never silently applied
+	 * (which would let the view show a fold the agent never actually receives).
+	 */
+	| "not-foldable"
 	/** The op was a no-op (e.g. restoring an already-live block). */
 	| "noop";
 

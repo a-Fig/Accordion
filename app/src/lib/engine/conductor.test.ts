@@ -3,7 +3,7 @@ import { AccordionStore } from "./store.svelte";
 import { BuiltinConductor } from "$conductors";
 import type { Conductor, ConductorView, Command } from "$conductors/contract";
 import type { Block, ParsedSession } from "./types";
-import { BLOCK_OVERHEAD } from "./tokens";
+import { digest, digestTokens } from "./digest";
 
 /*
  * The conductor SEAM (ADR 0007): the store runs whatever strategy is attached, clamps
@@ -128,7 +128,7 @@ describe("conductor seam — substitution", () => {
 		expect(b.subst).toBeUndefined();
 	});
 
-	it("replace substitutes arbitrary content; '' is the safe 'delete'", () => {
+	it("replace substitutes arbitrary content; '' folds to the engine digest (smallest wire-safe form)", () => {
 		const s = makeStore(Array.from({ length: 3 }, (_, i) => blk(i)));
 		s.setProtect(0);
 		const stub = new StubConductor();
@@ -144,8 +144,12 @@ describe("conductor seam — substitution", () => {
 
 		const e = s.get("m1:p0")!;
 		expect(s.isFolded(e)).toBe(true);
-		expect(s.digestOf(e)).toBe(""); // emptied
-		expect(s.effTokens(e)).toBe(BLOCK_OVERHEAD); // costs only structural overhead, never removed
+		// An empty replacement can't be sent on the wire (an empty content part is invalid), so
+		// the host folds it to the engine digest — the smallest wire-safe form — never literal "".
+		// The view then matches exactly what the agent receives (no empty-digest divergence).
+		expect(s.digestOf(e)).toBe(digest(e));
+		expect(s.digestOf(e)).not.toBe("");
+		expect(s.effTokens(e)).toBe(digestTokens(e));
 	});
 
 	it("restore returns a conductor-folded block to live", () => {

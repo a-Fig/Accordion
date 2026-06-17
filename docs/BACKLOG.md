@@ -2,6 +2,45 @@
 
 Parked ideas with enough context to pick up cold. Newest first.
 
+## Slice 1.1 review — deferred low-severity cleanup (deferred 2026-06-17)
+
+The PR #45 max-effort review fixed the four substantive items (Inspector `canFold`, honest
+`foldedTokens`, empty-`replace`→digest, wire routed through `wireFoldable` — see
+[view-wire-unification.md](view-wire-unification.md) "Slice 1.1"). These remaining findings are
+low-severity (no lie, no reachable regression) and were deliberately deferred:
+
+- **Alarm Layer 2's "on the wire but NOT in view" loop is dead code.** `wireSet` is always a
+  subset of `viewSet` (`computeFoldOps` adds kind/durable/non-empty filters on top of the view's
+  folded set), so that branch can never fire (`live/foldAlarm.svelte.ts`). Either drop it or
+  fold it into a one-directional check + comment.
+- **Alarm `$effect` over-subscribes + repeats O(n) passes.** It tracks every block reactive
+  field (not just `store.version`) and, when live, walks the blocks for Layer 1, again for
+  `viewSet`, and a third time inside `computeFoldOps` (which also allocates digest strings the
+  alarm doesn't need). Merge Layer 1 + `viewSet` into one pass, build an id-only wire set, and
+  short-circuit when `foldedCount === 0` (`+page.svelte` effect + `foldAlarm.svelte.ts`).
+- **`inFoldedGroup` is defined twice.** `foldAlarm.svelte.ts`'s private helper re-derives
+  `store.groupOf(b)?.folded`; the store owns the same predicate (used by `canFold`). Expose/reuse
+  one.
+- **Extract `store.canToggle(id)` (= `isFolded(b) || canFold(b)`).** The double-click guard is
+  copy-pasted into both `ContextMap.svelte` handlers and spelled differently from the transcript
+  button's `{#if folded || canFold}`.
+- **CSS dedupe.** `@keyframes alarmpulse` is byte-identical to `livepulse`, and `.alarm-dot` ≈
+  `.live-dot` (only color + duration differ) in `+page.svelte`. Share one `@keyframes pulse` and
+  a `.status-dot` base with `--dot-color`/`--dot-duration`.
+- **Dead "Unfold" for a collapsed folded-group member** (`ContextMap.svelte` transcript ~1082
+  AND `Inspector.svelte` block + partner fold buttons): `folded`/`isFolded` is true so the
+  control shows enabled, but `toggle`→`unfold` no-ops inside a folded group. Pre-existing in all
+  three (also true under the old `{#if !prot}` / `disabled={protect}` gates); gate on
+  `(folded && !inFoldedGroup) || canFold`, or route grouped members to `unfoldGroup`.
+- **Hoist the conductor-visible foldable-kind set into the contract.** `cold-score.ts` and
+  `cold-epoch.ts` each declare a private `FOLDABLE_KINDS`; with the honest-`foldedTokens` fix
+  they no longer *need* it for the shrink decision, but a single `conductors/contract` export
+  (consumed by the engine and every conductor) would make foldability truly single-sourced
+  across the conductor boundary too. Touches the public conductor surface → its own small PR.
+- **Property-test id fidelity.** `foldconsistency.property.test.ts`'s `durableId()` gives every
+  assistant part a `:p0` suffix, so same-message-prefix logic (group/partner pairing) isn't
+  exercised on realistic ids. Tighten the generator to emit per-message part indices.
+
 ## View ↔ wire unification — stricter "single source" finish (deferred 2026-06-16)
 
 **Pointer, not the work.** Full design in
