@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "./store.svelte";
+import { computeFoldOps } from "../live/plan";
 import type { Conductor, ConductorView, Command } from "$conductors/contract";
 import type { Block, ParsedSession } from "./types";
 
@@ -203,5 +204,45 @@ describe("canFold — truth table", () => {
 		const text = s.get("a:r1:p1")!; // index 2, older than the tail
 		expect(s.isProtected(text)).toBe(false);
 		expect(s.canFold(text)).toBe(true);
+	});
+
+	it("a foldable-kind block inside a FOLDED group → false (the group owns it, not the kind)", () => {
+		const s = makeStore(session());
+		s.setBudget(1_000_000); // isolate: no auto-fold, the group is the only fold
+		s.setProtect(0);
+		// Group the whole assistant message + its result; folded by default (ADR 0006).
+		const g = s.createGroup("a:r1:p0", "r:c1")!;
+		expect(g.folded).toBe(true);
+		const text = s.get("a:r1:p1")!; // a FOLDABLE kind, now a collapsed group member
+		expect(s.isFolded(text)).toBe(true);
+		// canFold is false despite the foldable kind — the folded group controls the member,
+		// so offering a per-block Fold would be a dead/duplicate affordance.
+		expect(s.canFold(text)).toBe(false);
+		// Hand it back: once the group unfolds, a foldable member is individually offerable again.
+		s.unfoldGroup(g.id);
+		expect(s.canFold(text)).toBe(true);
+	});
+});
+
+describe("end-to-end — the gate kills the lie on BOTH the view and the wire", () => {
+	it("a conductor folding a tool_call is clamped AND the wire still emits the block whole", () => {
+		const s = makeStore(session());
+		s.setProtect(0);
+		const reports = s.applyCommands([{ kind: "fold", ids: ["a:r1:p2"] }], "auto");
+		// View side: refused with a named clamp, the tile never recesses.
+		expect(reports[0].reason).toBe("not-foldable");
+		expect(s.isFolded(s.get("a:r1:p2")!)).toBe(false);
+		// Wire side: computeFoldOps never emits the tool_call → the agent receives it whole.
+		// View and wire AGREE (both: not folded) — the divergence is gone, not merely hidden.
+		expect(computeFoldOps(s).map((o) => o.id)).not.toContain("a:r1:p2");
+	});
+
+	it("positive control: folding the paired tool_result DOES round-trip to the wire", () => {
+		const s = makeStore(session());
+		s.setProtect(0);
+		const reports = s.applyCommands([{ kind: "fold", ids: ["r:c1"] }], "auto");
+		expect(reports).toHaveLength(0); // foldable kind → no clamp
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true); // folded in the view
+		expect(computeFoldOps(s).map((o) => o.id)).toContain("r:c1"); // AND emitted to the wire
 	});
 });

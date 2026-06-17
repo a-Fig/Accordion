@@ -163,3 +163,43 @@ describe("runFoldCheck — live-only view↔wire symmetric difference", () => {
 		expect(foldAlarm.detail).toContain("m9:p0");
 	});
 });
+
+describe("runFoldCheck — folded groups are exempt (group collapse is not a per-block lie)", () => {
+	// A GROUP collapse (ADR 0006) is structural whole-message removal, NOT per-block content
+	// folding — so it may legitimately collapse a tool_call / user member. Such a member reads
+	// `isFolded === true` but its KIND is non-foldable; the universal check MUST skip it (via the
+	// `!groupOf(b)?.folded` exclusion) or it would false-fire on every legitimate group collapse.
+	// This pins that exclusion: remove it and this test goes red. (Group straggler BALANCE is a
+	// separate, deliberately-unverified concern — extension structural guard + Slice 2.)
+	it("stays inactive when a folded group contains a tool_call member (off-wire AND live)", () => {
+		order = 0;
+		const blocks = [
+			blk({ id: "u:1", kind: "user", tokens: 500, text: "do it" }),
+			blk({ id: "a:r1:p0", kind: "thinking", tokens: 800 }),
+			blk({ id: "a:r1:p1", kind: "text", tokens: 600 }),
+			blk({ id: "a:r1:p2", kind: "tool_call", tokens: 100, toolName: "read", callId: "c1" }),
+			blk({ id: "r:c1", kind: "tool_result", tokens: 3000, toolName: "read", callId: "c1" }),
+			blk({ id: "u:2", kind: "user", tokens: 400, text: "thanks" }),
+		];
+		const s = makeStore(blocks);
+		s.setBudget(1_000_000); // isolate: no auto-fold, the group is the only fold
+		s.setProtect(1); // protect only the newest block (u:2)
+
+		const g = s.createGroup("a:r1:p0", "r:c1")!;
+		expect(g.folded).toBe(true);
+		expect(g.memberIds).toContain("a:r1:p2"); // the tool_call is swept into the group
+
+		// Precondition that makes this a REAL test of the exclusion: the tool_call member reads
+		// folded (collapsed) AND has a non-foldable kind — exactly the shape Layer 1 would flag
+		// if it didn't exempt folded-group members.
+		const tc = s.get("a:r1:p2")!;
+		expect(s.isFolded(tc)).toBe(true);
+		expect(s.groupOf(tc)?.folded).toBe(true);
+
+		runFoldCheck(s, false);
+		expect(foldAlarm.active).toBe(false);
+		runFoldCheck(s, true);
+		expect(foldAlarm.active).toBe(false);
+		expect(foldAlarm.detail).toBe("");
+	});
+});

@@ -49,30 +49,41 @@ says folded; agent got it whole.
 
 ### Confirmed divergence points (not just tool_call)
 
-| Rule | Wire enforces | View enforces | Diverges? |
-|---|---|---|---|
-| Kind gate (`FOLDABLE_KINDS` = text/thinking/tool_result only) | yes | no | **yes** |
-| Durable-id only (`isDurableId`) | yes | no | **yes** |
-| Empty-digest skip | yes | no | yes (rare) |
-| Recent-message backstop (`PROTECT_RECENT_MSGS` = 2, by message count) | extension, by msgs | engine, by tokens | yes (rare; unit mismatch) |
-| Group straggler balance | `applyPlan` re-derives | `classifyGroup` | **yes — already documented** ([ADR 0006](adr/0006-multiblock-folds.md) watch items: cross-group split tool-pair makes `savedTokens` understate) |
+| Rule | Wire enforces | View enforces | Diverged? | Slice 1 |
+|---|---|---|---|---|
+| Kind gate (`FOLDABLE_KINDS` = text/thinking/tool_result only) | yes | no | **yes** | **CLOSED** — both fold doors gate on `wireFoldable`; alarm Layer 1 backstops |
+| Durable-id only (`isDurableId`) | yes | no | **yes** | **alarmed** (live Layer 2 fires on the rare non-durable-live fold); view-side gating deferred to Slice 2 (id-format reconcile) |
+| Empty-digest skip | yes | no | yes (rare) | unchanged (wire-side in `computeFoldOps`) |
+| Recent-message backstop (`PROTECT_RECENT_MSGS` = 2, by message count) | extension, by msgs | engine, by tokens | yes (rare; unit mismatch) | **deferred** to Slice 2 |
+| Group straggler balance | `applyPlan` re-derives | `classifyGroup` | **yes — already documented** ([ADR 0006](adr/0006-multiblock-folds.md) watch items: cross-group split tool-pair makes `savedTokens` understate) | **deferred** to Slice 2; alarm deliberately does NOT verify it |
 
 All the same root cause: the UI trusts its own state instead of rendering what actually goes
 out. This is governed by the CLAUDE.md rule "preview/read-only is NOT a more permissive
-mode" — preview must match the *would-be* wire output too.
+mode" — preview must match the *would-be* wire output too. **Slice 1 closes the per-block
+KIND lie (the one a user can actually trigger) and installs the alarm; the rarer rows are
+alarmed-or-deferred, not silently dropped.**
 
 ## Near-term fix — Option A: one shared predicate (DOING THIS)
+
+> **As-shipped (Slice 1) note — read this first.** The design below originally pictured a
+> single predicate combining *kind + durable-id + non-empty-digest*. Implementation found
+> that the durable-id half **cannot** gate the view: the on-disk / demo / Claude-Code parse
+> assigns non-durable ids (`<eventId>:p<j>`), so demanding durable-id in the view would forbid
+> all demo/read-only folding and break the golden. So Slice 1 split it: `wireFoldable(b)` is
+> **kind-only** and universal (view + wire), while **durable-id stays a live-wire emit guard**
+> inside `computeFoldOps` (unchanged). The kind half is what actually kills the `tool_call`
+> lie. Points 2–3 below (group-balance unification, backstop reconciliation) are **Slice 2**,
+> not yet built. See the "What Slice 1 actually shipped" section above for the real surface.
 
 Extract the wire's rules into single pure functions and route the store **through** them, so
 the view can no longer form a folded-state the wire would refuse.
 
-1. **One foldability predicate.** A single `wireFoldable(block)` (kind + durable-id +
-   non-empty-digest) lives in the engine ([`digest.ts`](../app/src/lib/engine/digest.ts)
-   already owns `FOLDABLE_KINDS`; `isDurableId` currently lives in `mapping.ts` and must be
-   reachable from the engine). `store.fold()`, `store.isFolded`, and `computeFoldOps` all
-   gate on this one function. `applyPlan` (extension) imports the same function — it keeps
-   re-deriving as defense-in-depth, but from identical code, so it can only ever **agree**,
-   never silently disagree.
+1. **One foldability predicate.** A single `wireFoldable(block)` lives in the engine
+   ([`digest.ts`](../app/src/lib/engine/digest.ts), next to `FOLDABLE_KINDS`). `store.fold()`,
+   `store.substOne()`, `store.canFold()`, `store.isFolded` accounting, and `computeFoldOps`
+   all gate on it. (As shipped it is **kind-only** — see the note above; the durable-id guard
+   remains wire-side in `computeFoldOps`, and the extension's `applyPlan` keeps re-deriving as
+   defense-in-depth from identical code, so it can only ever **agree**.)
 2. **Group balance becomes one shared function.** The straggler/tool-pair-balance logic in
    `classifyGroup` (store) and `applyPlan` (mapping) collapses to one pure function consumed
    by both. Fixes the documented cross-group `savedTokens` divergence.

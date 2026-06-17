@@ -21,13 +21,19 @@
  *      (ADR 0006) is a SEPARATE structural mechanism that legitimately removes whole
  *      `tool_call`/`user` messages — a collapsed tool_call member is not a lie.
  *
- *   2. LIVE-ONLY — `viewSet` (per-block folds the view shows) vs `wireSet` (per-block folds
- *      `computeFoldOps` actually emits) must be IDENTICAL. The interesting residual case
- *      this catches: a foldable-kind block that is folded in the view but dropped by
- *      `computeFoldOps` because its id is non-durable (`isDurableId` false) — INTENDED to
- *      fire, since the view then shows a fold the wire silently won't perform. Gated to
- *      live because off-wire/demo/Claude-Code sessions use non-durable on-disk ids, so
- *      `computeFoldOps` is empty there and this check would false-positive on every fold.
+ *   2. LIVE-ONLY — `viewSet` (per-block folds the view shows) vs `wireSet` (the per-block
+ *      folds `computeFoldOps` produces) must be IDENTICAL. Note `computeFoldOps` is the
+ *      WOULD-BE ARMED plan: when `folding.enabled` is off the agent's actual wire is empty,
+ *      but the correct comparison is still the would-be plan, NOT the empty disarmed wire —
+ *      per the CLAUDE.md rule, preview/listening must match what steering WOULD send, so a
+ *      fold the armed plan would refuse is a lie even while disarmed. (That is why this layer
+ *      gates on connection, not on `folding.enabled`.) The interesting residual case it
+ *      catches: a foldable-kind block folded in the view but dropped by `computeFoldOps`
+ *      because its id is non-durable (`isDurableId` false) — INTENDED to fire, since the view
+ *      shows a fold steering would silently not perform. Gated to live because off-wire / demo
+ *      / Claude-Code sessions use non-durable on-disk ids, so `computeFoldOps` is empty there
+ *      and this check would false-positive on every fold (the id-format reconciliation that
+ *      would let it run off-wire is deferred to Slice 2).
  *
  *   3. NOT VERIFIED (documented, deliberately) — folded-GROUP member balance (stragglers).
  *      The extension's `applyPlan` re-derives which group members are actually removed
@@ -84,7 +90,9 @@ export function runFoldCheck(store: AccordionStore, isLive: boolean): void {
 		for (const b of store.blocks) {
 			if (store.isFolded(b) && !inFoldedGroup(store, b)) viewSet.add(b.id);
 		}
-		// wireSet — per-block folds computeFoldOps actually emits to the agent.
+		// wireSet — the would-be ARMED wire plan (what computeFoldOps emits if steering is on).
+		// Comparing against this, not the possibly-empty disarmed wire, is intentional: preview
+		// must match what steering WOULD send (CLAUDE.md). See the Layer 2 note in the file doc.
 		const wireSet = new Set<string>(computeFoldOps(store).map((op) => op.id));
 
 		// In view but NOT on the wire — the screen shows a fold the agent never receives
