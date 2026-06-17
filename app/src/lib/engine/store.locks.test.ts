@@ -262,6 +262,26 @@ describe("ADR 0011 — tail-size lock: the conductor owns the tail", () => {
 		expect(s3.lastReports.some((r) => r.reason === "protected")).toBe(true);
 	});
 
+	it("locked with non-finite tailTokens (NaN): clamps to 0 (own everything), never poisons the boundary or protectTokens", () => {
+		// A buggy first-party conductor hands NaN. It must read as 0 (no tail), NOT fall through
+		// protectedFromIndex to `return 0` (whole context protected — the inverse of intent), and
+		// must NOT leak NaN into the human's protectTokens via detach inheritance.
+		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i, "text", 1000)));
+		s.setProtect(20_000);
+		const c = new LockingConductor(["tail-size"], Number.NaN);
+		const newest = s.blocks[s.blocks.length - 1].id;
+		c.cmds = [{ kind: "fold", ids: [newest] }];
+		s.attach(c);
+
+		expect(s.protectedFromIndex).toBe(s.blocks.length); // NaN → 0 → no tail (own everything)
+		expect(s.blocks.every((b) => !s.isProtected(b))).toBe(true);
+		expect(s.isFolded(s.get(newest)!)).toBe(true); // recent fold applies — NOT clamped "protected"
+
+		s.detach();
+		expect(Number.isFinite(s.protectTokens)).toBe(true); // not NaN-poisoned
+		expect(s.protectTokens).toBe(0); // inherited the clamped 0, not NaN
+	});
+
 	it("locked: setProtect is a no-op (the human can't resize the tail)", () => {
 		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i)));
 		s.attach(new LockingConductor(["tail-size"]));
@@ -484,7 +504,7 @@ describe("ADR 0011 — detach inherits the conductor's tail — no snap-back, vi
 		expect(s.isProtected(s.get("m4:p0")!)).toBe(false);
 	});
 
-	it("a later resetAll clears the frozen folds (override back to null)", () => {
+	it("a later resetAll returns frozen folds to a clean slate (override null AND liveTokens===fullTokens)", () => {
 		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i, "text", 5000)));
 		s.setProtect(0); // no tail
 		const c = new LockingConductor(["tail-size"]);
@@ -492,9 +512,31 @@ describe("ADR 0011 — detach inherits the conductor's tail — no snap-back, vi
 		s.attach(c);
 		s.detach();
 		expect(s.get("m4:p0")!.override).toBe("folded");
+		expect(s.liveTokens).toBeLessThan(s.fullTokens); // something is genuinely folded
 
-		s.resetAll(); // clears all overrides
+		s.resetAll(); // clears all overrides → pure budget view
 		expect(s.get("m4:p0")!.override).toBe(null);
+		expect(s.liveTokens).toBe(s.fullTokens); // truly raw — not merely override-null
+	});
+
+	it("resetAll dissolves a surviving detach-frozen GROUP (inherited 0-tail can't prune it, so reset must)", () => {
+		// Regression for the inherited-0-tail gap: a tail-size conductor groups recent blocks;
+		// detach inherits protectTokens=0 (no tail), so the group survives as a human-owned fold.
+		// resetAll must still return a clean slate — without dissolving groups it leaves the group
+		// folded, silently contradicting its own "all blocks to auto".
+		const s = makeStore(Array.from({ length: 40 }, (_, i) => blk(i)));
+		const c = new LockingConductor(["tail-size"]); // tailTokens omitted → 0
+		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
+		s.attach(c);
+		s.detach();
+		expect(s.groups.length).toBe(1); // group survived detach (no tail to prune it)
+		expect(s.protectTokens).toBe(0);
+		expect(s.liveTokens).toBeLessThan(s.fullTokens);
+
+		s.resetAll();
+		expect(s.groups.length).toBe(0); // group dissolved — true clean slate
+		expect(s.liveTokens).toBe(s.fullTokens);
+		expect(s.blocks.every((b) => b.override === null)).toBe(true);
 	});
 
 	it("tailTokens=3000: boundary STABLE across detach — protectTokens inherits 3000, protectedFromIndex=7", () => {

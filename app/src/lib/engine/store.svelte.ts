@@ -143,7 +143,14 @@ export class AccordionStore {
 	 *  (remote props just arrived). */
 	private syncLocks(): void {
 		this.activeLocks = this.conductor?.locks ?? [];
-		this.activeTailTokens = Math.max(0, Math.round(this.conductor?.tailTokens ?? 0));
+		// Clamp defensively. A buggy first-party conductor could hand NaN / Infinity / a negative.
+		// Non-finite must collapse to 0 (own-the-whole-context), NOT poison the boundary: with
+		// `activeTailTokens === NaN`, `protectedFromIndex` falls through to `return 0` (the WHOLE
+		// context protected — the exact opposite of "own everything") and detach would inherit NaN
+		// into the human's `protectTokens`. `Math.round(NaN) === NaN` and `Math.max(0, NaN) === NaN`,
+		// so the finiteness guard must come first.
+		const tail = this.conductor?.tailTokens;
+		this.activeTailTokens = Number.isFinite(tail) ? Math.max(0, Math.round(tail as number)) : 0;
 	}
 	/** Does the active conductor hold `name`? PUBLIC — the UI gates affordances/tooltips on it. */
 	isLocked(name: LockName): boolean {
@@ -962,7 +969,7 @@ export class AccordionStore {
 		b.by = null;
 		this.refold();
 	}
-	/** Clear every manual override — pure budget view. */
+	/** Clear every manual override AND dissolve every group — pure budget view (back to auto). */
 	resetAll(): void {
 		// ADR 0011 `human-steering`: reset is a sweeping human steering action — refused
 		// wholesale under the lock (no overrides cleared, no log, no notify).
@@ -971,6 +978,12 @@ export class AccordionStore {
 			b.override = null;
 			b.by = null;
 		}
+		// "Pure budget view" means NO manual fold construct survives — groups included. Drop every
+		// group; an attached conductor rebuilds its own (`by:"auto"/"conductor"`) groups on the
+		// refold below, so in practice this clears only HUMAN groups. Without it, a human-owned
+		// group — including a detach-frozen view whose inherited 0-tail leaves no protected tail to
+		// prune it — would survive reset still folded, silently contradicting "all blocks to auto".
+		if (this.groups.length) this.groups = [];
 		this.emit("you", "reset", "all blocks to auto");
 		this.refold();
 		// Empty id list = "everything changed"; the conductor reconciles from the next update.
