@@ -43,14 +43,16 @@ function makeStore(blocks: Block[]): AccordionStore {
 	return new AccordionStore(parsed);
 }
 
-/** A test conductor with a configurable lock-set and a directly-set desired command batch. */
+/** A test conductor with a configurable lock-set, optional tailTokens, and a directly-set desired command batch. */
 class LockingConductor implements Conductor {
 	readonly id = "locking";
 	readonly label = "Locking";
 	readonly locks: readonly LockName[];
+	readonly tailTokens?: number;
 	cmds: Command[] | null = [];
-	constructor(locks: readonly LockName[] = []) {
+	constructor(locks: readonly LockName[] = [], tailTokens?: number) {
 		this.locks = locks;
+		this.tailTokens = tailTokens;
 	}
 	conduct(_view: ConductorView): Command[] | null {
 		return this.cmds;
@@ -223,14 +225,41 @@ describe("ADR 0011 — agent-unfold lock gates the agent's unfold ONLY", () => {
 
 // ── tail-size ─────────────────────────────────────────────────────────────
 describe("ADR 0011 — tail-size lock: the conductor owns the tail", () => {
-	it("locked: protectedFromIndex === blocks.length (no protected tail)", () => {
+	it("locked: protectedFromIndex === blocks.length (no protected tail) when tailTokens omitted", () => {
 		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i)));
 		s.setProtect(20_000); // would normally protect the whole small session
 		expect(s.protectedFromIndex).toBe(0); // collaborative: all protected
 
-		s.attach(new LockingConductor(["tail-size"]));
+		s.attach(new LockingConductor(["tail-size"])); // no tailTokens → 0 → blocks.length
 		expect(s.protectedFromIndex).toBe(s.blocks.length); // no host tail under the lock
 		expect(s.blocks.every((b) => !s.isProtected(b))).toBe(true);
+	});
+
+	it("locked with tailTokens=3000: walk-back protects newest ~3k tokens, conductor folds only older", () => {
+		// 10 blocks × 1000 tok each. Walk-back of 3000 should protect blocks 7,8,9.
+		const s = makeStore(Array.from({ length: 10 }, (_, i) => blk(i, "text", 1000)));
+		s.attach(new LockingConductor(["tail-size"], 3000));
+		expect(s.protectedFromIndex).toBe(7); // blocks 7,8,9 protected (3×1000 = 3000 = target)
+		// Older blocks are not protected.
+		for (let i = 0; i < 7; i++) expect(s.isProtected(s.get(`m${i}:p0`)!), `m${i} should not be protected`).toBe(false);
+		// Protected tail blocks are protected.
+		for (let i = 7; i < 10; i++) expect(s.isProtected(s.get(`m${i}:p0`)!), `m${i} should be protected`).toBe(true);
+
+		// Conductor can fold an older block (m0) — no "protected" clamp.
+		const c = new LockingConductor(["tail-size"], 3000);
+		c.cmds = [{ kind: "fold", ids: ["m0:p0"] }];
+		const s2 = makeStore(Array.from({ length: 10 }, (_, i) => blk(i, "text", 1000)));
+		s2.attach(c);
+		expect(s2.isFolded(s2.get("m0:p0")!)).toBe(true);
+		expect(s2.lastReports.some((r) => r.reason === "protected")).toBe(false);
+
+		// Conductor cannot fold a protected block (m9) — clamped "protected".
+		const c2 = new LockingConductor(["tail-size"], 3000);
+		c2.cmds = [{ kind: "fold", ids: ["m9:p0"] }];
+		const s3 = makeStore(Array.from({ length: 10 }, (_, i) => blk(i, "text", 1000)));
+		s3.attach(c2);
+		expect(s3.isFolded(s3.get("m9:p0")!)).toBe(false);
+		expect(s3.lastReports.some((r) => r.reason === "protected")).toBe(true);
 	});
 
 	it("locked: setProtect is a no-op (the human can't resize the tail)", () => {
@@ -363,54 +392,55 @@ describe("ADR 0011 — detach freezes the folded view and unlocks", () => {
 	});
 });
 
-// ── detach a tail-size-locked conductor: the freeze must survive the tail re-protecting (FIX 1)
-describe("ADR 0011 — detach freeze survives the re-protected tail (FIX 1, BLOCKER)", () => {
-	it("Autopilot folds recent blocks; after detach they STAY folded (no heal back to full)", () => {
-		// An over-budget session so Autopilot (tail-size lock) folds recent blocks INTO the
-		// tail the host would normally protect. The whole small session is "the tail" at 20k.
+// ── detach a tail-size-locked conductor: tail inheritance prevents snap-back (new mechanism)
+describe("ADR 0011 — detach inherits the conductor's tail — no snap-back, view frozen", () => {
+	it("Autopilot (tailTokens=0) folds recent blocks; after detach they STAY folded, protectTokens inherited 0", () => {
+		// An over-budget session so Autopilot (tail-size lock, tailTokens=0) folds recent blocks.
 		const s = makeStore(Array.from({ length: 6 }, (_, i) => blk(i, "text", 5000)));
-		s.setProtect(20_000); // collaboratively the whole session would be protected
+		s.setProtect(20_000); // human would protect the whole session collaboratively
 		s.setBudget(8_000); // far below the 30k live → Autopilot must fold several blocks
 
 		s.attach(new AutopilotConductor());
-		// Under tail-size the host lifts its floor; Autopilot folds enough to fit budget.
-		const frozen = s.blocks.filter((b) => s.isFolded(b)).map((b) => b.id);
-		expect(frozen.length).toBeGreaterThan(0);
+		// Under tail-size the host uses activeTailTokens=0 → no protected tail for the conductor.
+		const foldedIds = s.blocks.filter((b) => s.isFolded(b)).map((b) => b.id);
+		expect(foldedIds.length).toBeGreaterThan(0);
 		expect(s.liveTokens).toBeLessThanOrEqual(s.budget);
 		const liveFolded = s.liveTokens;
 
 		s.detach();
 
-		// (a) the frozen blocks are STILL folded, now human-owned.
-		for (const id of frozen) {
+		// (a) The folded blocks are STILL folded, now human-owned and individually reversible.
+		for (const id of foldedIds) {
 			const b = s.get(id)!;
 			expect(s.isFolded(b)).toBe(true);
 			expect(b.override).toBe("folded");
 			expect(b.by).toBe("you");
 			expect(b.subst).toBeUndefined();
-			// (FIX 5) no stale autoFolded alongside the override.
-			expect(b.autoFolded).toBe(false);
+			expect(b.autoFolded).toBe(false); // no stale autoFolded alongside the override
 		}
 		// (b) liveTokens stays at the folded level — NOT healed back to fullTokens.
 		expect(s.liveTokens).toBe(liveFolded);
 		expect(s.liveTokens).toBeLessThan(s.fullTokens);
-		// The tail HAS re-protected now the tail-size lock is gone (proves the bug's setup).
-		expect(s.protectedFromIndex).toBeLessThan(s.blocks.length);
-		expect(frozen.some((id) => s.isProtected(s.get(id)!))).toBe(true);
+		// (c) NEW MECHANISM: protectTokens inherited Autopilot's tailTokens (0);
+		// protectedFromIndex stays blocks.length (no host tail) — NO snap-back.
+		expect(s.protectTokens).toBe(0);
+		expect(s.protectedFromIndex).toBe(s.blocks.length);
+		// The frozen blocks are NOT protected (no host tail to protect them into).
+		for (const id of foldedIds) expect(s.isProtected(s.get(id)!)).toBe(false);
 
-		// (c) all locks released and a frozen block is individually human-reversible.
+		// (d) all locks released and a frozen block is individually human-reversible.
 		expect(s.isLocked("human-steering")).toBe(false);
 		expect(s.isLocked("agent-unfold")).toBe(false);
 		expect(s.isLocked("tail-size")).toBe(false);
-		s.unfold(frozen[0]);
-		expect(s.isFolded(s.get(frozen[0])!)).toBe(false);
+		s.unfold(foldedIds[0]);
+		expect(s.isFolded(s.get(foldedIds[0])!)).toBe(false);
 	});
 
-	it("works with a plain test conductor declaring tail-size too (not Autopilot-specific)", () => {
+	it("plain tail-size conductor (tailTokens=0): folds persist, protectTokens inherited 0, NO snap-back", () => {
 		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i, "text", 5000)));
 		s.setProtect(20_000);
-		const c = new LockingConductor(["tail-size"]);
-		// Fold the two most recent blocks — exactly the tail the host would re-protect.
+		const c = new LockingConductor(["tail-size"]); // tailTokens omitted → 0
+		// Fold the two most recent blocks — the ones the host would re-protect on snap-back.
 		c.cmds = [{ kind: "fold", ids: ["m3:p0", "m4:p0"] }];
 		s.attach(c);
 		expect(s.isFolded(s.get("m4:p0")!)).toBe(true);
@@ -418,15 +448,18 @@ describe("ADR 0011 — detach freeze survives the re-protected tail (FIX 1, BLOC
 
 		s.detach();
 
-		expect(s.isFolded(s.get("m4:p0")!)).toBe(true); // frozen, not healed
+		// Folds persist as human-owned.
+		expect(s.isFolded(s.get("m4:p0")!)).toBe(true);
 		expect(s.get("m4:p0")!.override).toBe("folded");
 		expect(s.get("m4:p0")!.by).toBe("you");
 		expect(s.liveTokens).toBe(liveFolded);
-		// The newest block IS in the re-protected tail, proving the heal exemption fired.
-		expect(s.isProtected(s.get("m4:p0")!)).toBe(true);
+		// NEW: protectTokens inherited 0 → no host tail → m4 is NOT protected (no snap-back).
+		expect(s.protectTokens).toBe(0);
+		expect(s.protectedFromIndex).toBe(s.blocks.length);
+		expect(s.isProtected(s.get("m4:p0")!)).toBe(false);
 	});
 
-	it("a redundant second detach() is a no-op — the freeze is NOT wiped (idempotent)", () => {
+	it("a redundant second detach() is a no-op (idempotent)", () => {
 		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i, "text", 5000)));
 		s.setProtect(20_000);
 		const c = new LockingConductor(["tail-size"]);
@@ -436,8 +469,8 @@ describe("ADR 0011 — detach freeze survives the re-protected tail (FIX 1, BLOC
 		const liveFolded = s.liveTokens;
 
 		// cancelConsent calls detach() then setActiveConductor(NONE_ID), whose attach effect
-		// detaches AGAIN. The second detach must not re-run freezeForDetach()/frozen.clear() and
-		// spring the re-protected tail back open (FIX 1 regression guarded by detach()'s idempotency).
+		// detaches AGAIN. The second detach must not re-run freezeForDetach() and re-inherit or
+		// re-stamp. The guard makes the second call a true no-op.
 		s.detach();
 		s.detach();
 
@@ -445,20 +478,39 @@ describe("ADR 0011 — detach freeze survives the re-protected tail (FIX 1, BLOC
 		expect(s.get("m4:p0")!.override).toBe("folded");
 		expect(s.get("m4:p0")!.by).toBe("you");
 		expect(s.liveTokens).toBe(liveFolded);
-		expect(s.isProtected(s.get("m4:p0")!)).toBe(true);
+		// m4 NOT protected (inherited protectTokens=0, no snap-back even after double detach).
+		expect(s.protectTokens).toBe(0);
+		expect(s.protectedFromIndex).toBe(s.blocks.length);
+		expect(s.isProtected(s.get("m4:p0")!)).toBe(false);
 	});
 
-	it("a later resetAll clears the freeze exemption (frozen folds return to auto)", () => {
+	it("a later resetAll clears the frozen folds (override back to null)", () => {
 		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i, "text", 5000)));
-		s.setProtect(0); // no tail so resetAll's refold doesn't immediately re-protect
+		s.setProtect(0); // no tail
 		const c = new LockingConductor(["tail-size"]);
 		c.cmds = [{ kind: "fold", ids: ["m4:p0"] }];
 		s.attach(c);
 		s.detach();
 		expect(s.get("m4:p0")!.override).toBe("folded");
 
-		s.resetAll(); // clears overrides AND the frozen set
+		s.resetAll(); // clears all overrides
 		expect(s.get("m4:p0")!.override).toBe(null);
+	});
+
+	it("tailTokens=3000: boundary STABLE across detach — protectTokens inherits 3000, protectedFromIndex=7", () => {
+		// 10 blocks × 1000 tok. Conductor declares tailTokens=3000 → protectedFromIndex=7 during reign.
+		const s = makeStore(Array.from({ length: 10 }, (_, i) => blk(i, "text", 1000)));
+		s.setProtect(20_000); // human's default (overwritten on detach)
+		const c = new LockingConductor(["tail-size"], 3000);
+		c.cmds = []; // no folds needed — just test boundary
+		s.attach(c);
+		expect(s.protectedFromIndex).toBe(7); // conductor's 3000-token tail
+
+		s.detach();
+
+		// Boundary stable: protectTokens inherited 3000 → same walk-back → same index.
+		expect(s.protectTokens).toBe(3000);
+		expect(s.protectedFromIndex).toBe(7);
 	});
 });
 
@@ -592,21 +644,20 @@ describe("ADR 0011 — Bug #1: in-place remote lock update propagates only via t
 	});
 });
 
-// ── detach freezes a folded group that spans the soon-re-protected tail (BUG FIX) ──────────
+// ── Bug #2: detach freezes a tail-size conductor's folded group (new mechanism) ──────────
 describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2)", () => {
-	it("detach freezes a tail-size conductor's folded group over the tail (budget not re-blown)", () => {
-		// 40 blocks × 1000 tok = 40 000 full tokens. Default protectTokens (~20 000) means
-		// roughly the newest 20 blocks are protected collaboratively. Under tail-size the lock
-		// lifts that floor, so the conductor can group across the tail boundary.
+	it("detach inherits tail (0), group survives as human-owned, budget not re-blown", () => {
+		// 40 blocks × 1000 tok = 40 000 full tokens. Default protectTokens (20 000) would
+		// normally protect ~20 newest blocks. Under tail-size (tailTokens=0) the conductor
+		// owns the whole context, so the group can span any blocks.
 		const s = makeStore(Array.from({ length: 40 }, (_, i) => blk(i)));
 		// Do NOT call setProtect — keep the default 20 000 token tail.
 
-		const c = new LockingConductor(["tail-size"]);
-		// Group m36..m39 (four recent blocks) — spans the tail the host would re-protect.
+		const c = new LockingConductor(["tail-size"]); // tailTokens=0
+		// Group m36..m39 — spans what would be the re-protected tail on snap-back.
 		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
 		s.attach(c);
 
-		// The group should exist and be folded, and have saved tokens vs. full.
 		expect(s.groups.length).toBe(1);
 		expect(s.groups[0].folded).toBe(true);
 		expect(s.liveTokens).toBeLessThan(s.fullTokens);
@@ -615,21 +666,21 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 
 		s.detach();
 
-		// After detach, liveTokens must stay close to the folded level — NOT spring back to
-		// fullTokens. The group is preserved via the frozen exemption (NOT pruned), so savings
-		// are exact (same group digest before and after). Allow a tiny epsilon for rounding.
+		// liveTokens stays close to the folded level — no snap-back (tail inherited as 0).
 		expect(Math.abs(s.liveTokens - foldedLive)).toBeLessThan(10);
-		// Belt-and-suspenders: still meaningfully below full (group saved at least 3 digests).
+		// Belt-and-suspenders: still meaningfully below full.
 		expect(s.liveTokens).toBeLessThan(s.fullTokens - 2000);
 
-		// The group itself survives (frozen exempt from pruning), so members read folded via
-		// groupWire — NOT as individually frozen per-block folds.
+		// NEW MECHANISM: inherited tail keeps protectedFromIndex at blocks.length.
+		expect(s.protectTokens).toBe(0);
+		expect(s.protectedFromIndex).toBe(s.blocks.length);
+
+		// The group survives as a human-owned fold. No frozen flag (that field is gone).
 		expect(s.groups.length).toBe(1);
 		expect(s.groups[0].folded).toBe(true);
-		expect(s.groups[0].frozen).toBe(true);
 		expect(s.groups[0].by).toBe("you");
 		expect(s.isFolded(s.get("m38:p0")!)).toBe(true);
-		// Members keep override===null — no individual `override:"folded"` was stamped on them.
+		// Members keep override===null — no individual `override:"folded"` was stamped.
 		expect(s.get("m38:p0")!.override).toBeNull();
 	});
 
@@ -641,7 +692,7 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 		const s = makeStore(blocks);
 		// Do NOT call setProtect — keep default 20 000 token tail.
 
-		const c = new LockingConductor(["tail-size"]);
+		const c = new LockingConductor(["tail-size"]); // tailTokens=0
 		// Group m36..m39: includes a tool_call (non-foldable kind) and a tool_result + two text.
 		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
 		s.attach(c);
@@ -652,10 +703,8 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 
 		// Invariant: for every block, if it reads folded AND is NOT a member of a surviving
 		// folded group, then it must be wire-foldable (no illegal per-block fold on user/tool_call).
-		// NOTE: under THIS fix the group survives, so every folded block is a group member and this
-		// loop body is vacuously satisfied — it remains as a guard against the prior 7e946c5
-		// behavior (pruned group → m36 individually folded → body runs with wireFoldable===false).
-		// The live guard for this fix is the wire assertion below.
+		// The group survives (no snap-back thanks to inherited tail), so every folded block is a
+		// group member — the loop body is vacuously satisfied, and remains as a regression guard.
 		const foldedGroupMemberIds = new Set<string>();
 		for (const g of s.groups) {
 			if (g.folded) for (const id of g.memberIds) foldedGroupMemberIds.add(id);
@@ -666,8 +715,7 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 			}
 		}
 
-		// Specifically: m36 (tool_call) must NOT be individually folded. Its folded appearance
-		// comes only from being inside the surviving frozen group.
+		// Specifically: m36 (tool_call) must NOT be individually folded.
 		const m36 = s.get("m36:p0")!;
 		expect(m36.override).toBeNull(); // no per-block fold
 		expect(m36.autoFolded).toBe(false);
@@ -675,30 +723,24 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 		expect(s.isFolded(m36)).toBe(true);
 		expect(s.groups.length).toBe(1);
 
-		// Anti-divergence guard at the exact state the wire reads. `computeFoldOps` skips a folded
-		// GROUP member (so it emits no per-block op for m36) and gates everything else on
-		// `wireFoldable`. So these two facts together are what guarantee the wire folds m36 the SAME
-		// way the GUI does — via the group, never as an illegal individual fold:
+		// Anti-divergence guard.
 		expect(wireFoldable(m36)).toBe(false); // a tool_call is never individually wire-foldable
-		expect(s.groupOf(m36)?.folded).toBe(true); // it is folded ONLY as a member of the surviving group
-		// (Wire-OP emission needs durable ids — covered in plan.test.ts; these synthetic m-ids are
-		// non-durable by construction, so computeFoldOps/computeGroupOps don't apply here.)
+		expect(s.groupOf(m36)?.folded).toBe(true); // folded ONLY as a member of the surviving group
 
 		// Budget is still preserved.
 		expect(s.liveTokens).toBeLessThan(s.fullTokens - 2000);
 	});
 
-	it("B: surviving frozen group + human dissolve returns members to live (no stale fold leak)", () => {
-		// 40 blocks. Group over m2..m5 — older than the tail, includes mixed kinds.
+	it("B: surviving human group + dissolve returns members to live (no stale fold leak)", () => {
+		// 40 blocks. Group over m2..m5 — older than what would be the re-protected tail.
 		const blocks = Array.from({ length: 40 }, (_, i) => blk(i));
 		// Put a user block at m2 and a tool_call+tool_result pair at m3..m4.
 		blocks[2] = blk(2, "user", 1000);
 		blocks[3] = blk(3, "tool_call", 1000, { callId: "c2", toolName: "y" });
 		blocks[4] = blk(4, "tool_result", 1000, { callId: "c2" });
 		const s = makeStore(blocks);
-		// Keep default 20k tail — m2..m5 are old blocks well outside it.
 
-		const c = new LockingConductor(["tail-size"]);
+		const c = new LockingConductor(["tail-size"]); // tailTokens=0
 		c.cmds = [{ kind: "group", ids: ["m2:p0", "m3:p0", "m4:p0", "m5:p0"] }];
 		s.attach(c);
 		expect(s.groups.length).toBe(1);
@@ -706,17 +748,14 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 
 		s.detach();
 
-		// The group is older than the tail so it survives pruning even without the frozen
-		// exemption, but it should still be marked frozen (it was a conductor group, now
-		// frozen-reassigned to human).
+		// Group survives as human-owned.
 		expect(s.groups.length).toBe(1);
 		expect(s.groups[0].by).toBe("you");
 
-		// Now the human dissolves it.
+		// Human dissolves it.
 		s.deleteGroup(s.groups[0].id);
 
-		// Every former member must be NOT folded. Under 7e946c5 they were individually stamped
-		// with override:"folded" and would stay folded after deleteGroup — the leak.
+		// Every former member must be NOT folded — no stale per-block fold leak.
 		for (const id of ["m2:p0", "m3:p0", "m4:p0", "m5:p0"]) {
 			const b = s.get(id)!;
 			expect(b.override, `${id} should have override===null after group dissolved`).toBeNull();
@@ -724,73 +763,92 @@ describe("ADR 0011 — detach freezes tail-size conductor's folded group (Bug #2
 		}
 	});
 
-	it("C: resetAll drops a detach-frozen group (no surviving frozen group after clean slate)", () => {
+	it("C: position-one — human grows the tail over a detach-frozen group → group is pruned", () => {
+		// 40 blocks, default tail, conductor groups m36..m39 (recent), detach inherits tail=0.
 		const s = makeStore(Array.from({ length: 40 }, (_, i) => blk(i)));
-		// Do NOT call setProtect — keep default 20 000 token tail.
-
-		const c = new LockingConductor(["tail-size"]);
-		// Group m36..m39 spans the soon-re-protected tail.
-		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
-		s.attach(c);
-		expect(s.groups.length).toBe(1);
-
-		s.detach();
-		expect(s.groups.length).toBe(1);
-		expect(s.groups[0].frozen).toBe(true);
-
-		// resetAll must drop the frozen exemption and return to a clean slate.
-		s.resetAll();
-
-		// No frozen groups remain, and the tail-spanning group is actually GONE (pruned once the
-		// exemption was stripped) — not merely un-flagged.
-		expect(s.groups.every((g) => !g.frozen)).toBe(true);
-		expect(s.groups.length).toBe(0);
-		expect(s.liveTokens).toBe(s.fullTokens); // clean slate — nothing folded
-	});
-
-	it("D: re-attaching a conductor drops the detach-freeze group exemption (no leak into the new strategy)", () => {
-		const s = makeStore(Array.from({ length: 40 }, (_, i) => blk(i)));
-		const c = new LockingConductor(["tail-size"]);
+		// Keep default 20k tail.
+		const c = new LockingConductor(["tail-size"]); // tailTokens=0
 		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
 		s.attach(c);
 		s.detach();
-		expect(s.groups[0]?.frozen).toBe(true); // frozen-exempt after detach
 
-		// A brand-new COLLABORATIVE conductor takes over. Its protected tail (default 20k) covers
-		// m36..m39, which the frozen group spans. The exemption must NOT leak across attach — the
-		// group is ordinary again and `pruneProtectedGroups` drops it (absolute protection).
-		s.attach(new LockingConductor([])); // no locks, folds nothing
-		expect(s.groups.length).toBe(0); // dropped — exemption did not leak
+		// After detach: protectTokens=0, group survives.
+		expect(s.protectTokens).toBe(0);
+		expect(s.groups.length).toBe(1);
+
+		// Human grows the tail to 20k. m36..m39 are now in the protected tail.
+		// pruneProtectedGroups fires and drops the group.
+		s.setProtect(20_000);
+
+		expect(s.groups.length).toBe(0); // group pruned (position one)
 		for (const id of ["m36:p0", "m37:p0", "m38:p0", "m39:p0"]) {
 			const b = s.get(id)!;
-			expect(s.isProtected(b), `${id} is in the new conductor's protected tail`).toBe(true);
-			expect(s.isFolded(b), `${id} must not be folded under the new conductor`).toBe(false);
+			expect(s.isProtected(b), `${id} should be protected after setProtect(20000)`).toBe(true);
+			expect(s.isFolded(b), `${id} should not be folded after group pruned`).toBe(false);
 		}
+		expect(s.liveTokens).toBe(s.fullTokens); // clean — nothing folded
 	});
 
-	it("E: unfold then re-fold a detach-frozen group cannot collapse protected content", () => {
+	it("D: inheritance consequence — subsequent collaborative conductor runs with inherited protectTokens=0", () => {
+		// After detaching the tailTokens=0 group conductor (protectTokens now 0), attach a new
+		// collaborative conductor (no locks). It defers to the inherited protectTokens (0) — so
+		// protectedFromIndex = blocks.length, and the group SURVIVES (not pruned, no tail to grow
+		// over). Then the human sets a tail and the group is pruned.
 		const s = makeStore(Array.from({ length: 40 }, (_, i) => blk(i)));
-		const c = new LockingConductor(["tail-size"]);
+		const c = new LockingConductor(["tail-size"]); // tailTokens=0
 		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
 		s.attach(c);
 		s.detach();
-		const gid = s.groups[0].id;
-		expect(s.groups[0].frozen).toBe(true);
 
-		// Human re-manages the group while detached (no lock now). unfolding ENDS the freeze
-		// exemption, so the now-ordinary group reaching into the protected tail is pruned.
-		s.unfoldGroup(gid);
-		expect(s.groupById(gid)?.frozen).toBeFalsy();
-		// Attempt to re-fold it — it must NOT be able to collapse protected content.
-		s.foldGroup(gid);
+		// Attach a new collaborative conductor (no locks, folds nothing).
+		s.attach(new LockingConductor([]));
 
-		// Absolute protection holds: the protected blocks stay live; no folded group spans the tail.
+		// protectTokens inherited 0 → no host tail → protectedFromIndex = blocks.length.
+		expect(s.protectedFromIndex).toBe(s.blocks.length);
+		// Group survives (nothing to prune it — no protected tail overlaps it).
+		expect(s.groups.length).toBe(1);
+
+		// Human grows the tail → group pruned.
+		s.setProtect(20_000);
+		expect(s.groups.length).toBe(0);
 		for (const id of ["m36:p0", "m37:p0", "m38:p0", "m39:p0"]) {
 			const b = s.get(id)!;
 			expect(s.isProtected(b)).toBe(true);
-			expect(s.isFolded(b), `${id} protected block must not be folded by a re-folded zombie group`).toBe(false);
+			expect(s.isFolded(b)).toBe(false);
 		}
-		expect(s.groups.some((g) => g.folded && g.memberIds.includes("m38:p0"))).toBe(false);
+	});
+
+	it("E: after human grows the tail, protected blocks cannot be folded/grouped", () => {
+		// After detach (protectTokens 0, group survives), human grows tail via setProtect(20000)
+		// → m36..m39 become protected, group is pruned. Then attempting to fold/group them fails.
+		const s = makeStore(Array.from({ length: 40 }, (_, i) => blk(i)));
+		const c = new LockingConductor(["tail-size"]); // tailTokens=0
+		c.cmds = [{ kind: "group", ids: ["m36:p0", "m37:p0", "m38:p0", "m39:p0"] }];
+		s.attach(c);
+		s.detach();
+		s.setProtect(20_000); // grow tail → m36..m39 protected, group pruned (Test C)
+
+		expect(s.groups.length).toBe(0);
+		for (const id of ["m36:p0", "m37:p0", "m38:p0", "m39:p0"]) {
+			expect(s.isProtected(s.get(id)!)).toBe(true);
+		}
+
+		// Attempting createGroup over protected content is refused (createGroup has a tail guard).
+		const g = s.createGroup("m36:p0", "m39:p0");
+		expect(g).toBeNull(); // refused — spans protected tail
+		expect(s.groups.length).toBe(0);
+
+		// Attempting individual fold of a protected block is also refused.
+		s.fold("m38:p0");
+		expect(s.get("m38:p0")!.override).toBeNull(); // refused — protected
+
+		// m36..m39 stay live and protected.
+		for (const id of ["m36:p0", "m37:p0", "m38:p0", "m39:p0"]) {
+			const b = s.get(id)!;
+			expect(s.isProtected(b)).toBe(true);
+			expect(s.isFolded(b)).toBe(false);
+		}
+		expect(s.groups.some((g2) => g2.folded && g2.memberIds.includes("m38:p0"))).toBe(false);
 	});
 });
 

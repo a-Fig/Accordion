@@ -137,24 +137,53 @@ conductor takes over). The exact presentation can change later; the data is the 
 - **On consent**, existing human holds in a now-locked domain are **released to the
   conductor's baseline** — the human has handed over the keys, so the conductor authors from
   a clean baseline (the same way `conduct()` already works).
-- **Detach (the kill switch)** → **freeze the current folded view in place and unlock all
-  controls.** It is **not** reset-to-raw: dumping every block back to full content could blow
-  the budget the instant you leave. The frozen folds become individually human-reversible
-  (neutral/sticky, no conductor running), and every control returns to the human. Detach is
-  **host-enforced and unconditional** — no lock can touch it and no conductor can refuse it.
+- **Detach (the kill switch)** → **inherit the conductor's tail, freeze the current folded
+  view in place, and unlock all controls.** It is **not** reset-to-raw: dumping every block
+  back to full content could blow the budget the instant you leave. Concretely:
+  1. **Tail inheritance.** If the conductor held `tail-size`, the host reads the conductor's
+     declared `tailTokens` (see §7) and writes that value into `protectTokens` before nulling
+     the conductor. Because `protectedFromIndex` uses the same walk-back algorithm for the
+     locked and the unlocked path, the protected-tail boundary is **identical before and after
+     detach** — no block newly enters the protected tail, `healProtected` never fires on the
+     post-detach refold, and the budget is not re-blown. The human's prior `protectTokens`
+     is overwritten; a subsequently attached collaborative conductor (e.g. the built-in) runs
+     with the inherited value until the human re-drags the slider. If the conductor did not
+     hold `tail-size`, `protectTokens` is left untouched.
+  2. **Fold freeze.** Each block the conductor was folding individually (not in a group) is
+     converted to a sticky human-owned fold (`override:"folded"`, `by:"you"`, `subst`
+     cleared) — individually reversible, folds to the engine digest. Members of a
+     conductor-owned folded group are NOT individually stamped (that would put illegal
+     `override:"folded"` on non-foldable kinds like `user` / `tool_call`); instead the
+     group itself is reassigned to `by:"you"` so the subsequent conductor-less refold keeps
+     it. The on-screen view therefore persists, now human-owned.
+  3. **From then on, the normal heal-and-prune invariant governs.** If the HUMAN later grows
+     the protected tail over a detach-frozen fold or group (e.g. via the slider),
+     `healProtected` / `pruneProtectedGroups` handle it as ordinary human overrides —
+     "position one." Re-folding or re-grouping protected blocks after tail growth is refused
+     by the standard tail guard in `fold()` / `createGroup()`.
+  - Every control returns to the human. Detach is **host-enforced and unconditional** — no
+    lock can touch it and no conductor can refuse it.
 - **Switching conductor → conductor** → the new conductor **authors from baseline** (already
   how `conduct()` works); its own lock-set and the §6 consent gate apply.
 
-### 7. Approved = full control; no host floor on the tail
+### 7. Approved = full control; the conductor declares its own tail
 
 If a conductor declares the `tail-size` lock and the user approves, it gets **full control of
-the tail — including driving it to zero.** Concretely the lock does two things:
+the tail — including driving it to zero.** Concretely the lock does three things:
 
 1. The human can no longer **resize** the tail (`setProtect` is locked).
 2. The host **stops treating the protected tail as an absolute no-fold floor.** The conductor
-   may fold any block, recent reasoning included. A conductor that *wants* a protected tail
-   simply doesn't fold the recent blocks; one that wants none folds freely. Accordion imposes
-   no tail of its own.
+   may fold any block, recent reasoning included.
+3. The conductor may declare how much tail **it** wants via the optional `tailTokens` property
+   on the `Conductor` interface. `tailTokens = 0` (or omitted, the default) = "own the whole
+   context, no protected tail" — every block arrives with `protected: false`, identical to the
+   previous behaviour under the lock. `tailTokens = N > 0` = "protect the newest ~N tokens of
+   tail" — the host's walk-back algorithm (same 25% overflow cap as the human's tail) marks
+   the newest blocks summing to N tokens as `protected: true`; the conductor sees them in the
+   `ConductorView` and the `substOne` guard refuses folding them. This lets a conductor
+   declare "I want full control over everything **except** the last 8 k tokens" — e.g.
+   `tailTokens = 8000`. Remote conductors (WebSocket) always read `tailTokens = 0`; remote-wire
+   tailTokens support is a scoped follow-up (not in this PR).
 
 **Absent the `tail-size` lock, the protected tail stays host-absolute exactly as today** —
 the auto-folder, manual folds, and groups all stop before it, and a fold the tail grows over

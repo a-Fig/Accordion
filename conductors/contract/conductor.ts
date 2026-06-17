@@ -232,5 +232,21 @@ export interface Conductor {
 	 * Never includes observation, budget, the agent's `recall`, or detach — those are sacred.
 	 */
 	readonly locks?: readonly LockName[];
+	/**
+	 * How much tail the conductor wants while holding the `tail-size` lock (ADR 0011).
+	 * Semantics parallel the human's `protectTokens`: a token target driving the same
+	 * walk-back algorithm. **0 (or omitted) = "own the whole context, no protected tail"**
+	 * — every block arrives with `protected: false`, and the conductor may fold freely into
+	 * recent reasoning (today's tail-size behavior). **N > 0 = "protect the newest ~N tokens
+	 * of tail"** — the host's walk-back algorithm protects the newest blocks summing to N
+	 * tokens (same 25% overflow cap as the human's tail), so those blocks arrive with
+	 * `protected: true` and the conductor folds only older content. Ignored entirely if the
+	 * conductor does not hold the `tail-size` lock. Remote conductors (WebSocket) always read
+	 * as 0 (whole-context ownership); remote-wire `tailTokens` support is a follow-up.
+	 *
+	 * Example: `tailTokens = 8000` keeps the newest ~8 k tokens protected while the conductor
+	 * manages everything older. `tailTokens` omitted (or 0) owns everything — no protected tail.
+	 */
+	readonly tailTokens?: number;
 	conduct(view: ConductorView): Command[] | null;
 }

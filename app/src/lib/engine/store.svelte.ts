@@ -97,15 +97,6 @@ export class AccordionStore {
 	/** Re-entrancy latch: a command that itself re-folds (e.g. `group`) must not recurse. */
 	private conducting = false;
 	/**
-	 * ADR 0011 kill-switch (FIX 1): block ids frozen by `detach()`. These are human-owned
-	 * folds the kill switch created from the just-detached conductor's view — they must
-	 * SURVIVE the protected tail re-protecting after detach (the `tail-size` lock is gone,
-	 * so `protectedFromIndex` reverts and `healProtected` would otherwise force them back to
-	 * full, re-blowing the budget the freeze exists to prevent). `healProtected` skips ids in
-	 * this set; it is cleared on `attach()` (new strategy) and `resetAll()` (clean slate).
-	 */
-	private frozen = new Set<string>();
-	/**
 	 * ClampReports from the most recent conductor pass — what the host had to clamp to the
 	 * validity floor. A remote runner reads this after triggering a pass to feed
 	 * `host/commandResult` back to its conductor. Empty after a clean pass (the built-in
@@ -139,10 +130,20 @@ export class AccordionStore {
 	 * because it is set synchronously before each `refold()`, enforcement stays exact.
 	 */
 	private activeLocks = $state<readonly LockName[]>([]);
-	/** Mirror the current conductor's declared locks into the reactive snapshot. Called from
-	 *  `attach()` (in-process locks known now) and `reconcileLocks()` (remote locks just arrived). */
+	/**
+	 * Reactive snapshot of the active conductor's declared `tailTokens` (ADR 0011). Mirrored
+	 * here for the same reactivity reason as `activeLocks` (Bug #1): a remote conductor's
+	 * props arrive late by in-place mutation, so reading `this.conductor.tailTokens` directly
+	 * in a `$derived` would never re-track. Read this mirror, not the conductor. Always 0 for
+	 * conductors that omit `tailTokens` (whole-context ownership, no protected tail).
+	 */
+	private activeTailTokens = $state(0);
+	/** Mirror the current conductor's declared locks (and tailTokens) into the reactive
+	 *  snapshots. Called from `attach()` (in-process props known now) and `reconcileLocks()`
+	 *  (remote props just arrived). */
 	private syncLocks(): void {
 		this.activeLocks = this.conductor?.locks ?? [];
+		this.activeTailTokens = Math.max(0, Math.round(this.conductor?.tailTokens ?? 0));
 	}
 	/** Does the active conductor hold `name`? PUBLIC — the UI gates affordances/tooltips on it. */
 	isLocked(name: LockName): boolean {
@@ -185,19 +186,13 @@ export class AccordionStore {
 	 */
 	attach(c: Conductor | null): void {
 		this.conductor = c;
-		// Mirror the new conductor's locks into the reactive snapshot BEFORE any gate reads them
-		// (releaseLockedDomains → isLocked, the refold's protectedFromIndex → isLocked("tail-size")).
-		// For an in-process conductor these are the final locks; a remote runner attaches with locks
-		// undefined and updates the snapshot later via reconcileLocks().
+		// Mirror the new conductor's locks (and tailTokens) into the reactive snapshots BEFORE
+		// any gate reads them (releaseLockedDomains → isLocked, the refold's protectedFromIndex
+		// → isLocked("tail-size") / activeTailTokens). For an in-process conductor these are the
+		// final values; a remote runner attaches with locks undefined and updates the snapshots
+		// later via reconcileLocks().
 		this.syncLocks();
 		this.lastCmds = [];
-		// A fresh strategy owns the view now — drop any detach-freeze exemptions (those blocks
-		// are ordinary human folds again, subject to the new conductor's tail/healing rules).
-		this.frozen.clear();
-		// Same for the GROUP-level exemption: a detach-frozen group must NOT keep its
-		// `pruneProtectedGroups` immunity under the new conductor, or it would sit folded inside
-		// that conductor's protected tail (which it never asked for and the human can't create).
-		if (this.groups.some((g) => g.frozen)) this.groups = this.groups.map((g) => (g.frozen ? { ...g, frozen: undefined } : g));
 		// Release human/agent holds in the domains the NEW conductor locks. Pass `c?.locks`
 		// explicitly; the `activeLocks` snapshot was just synced above so `isLocked` already agrees.
 		this.releaseLockedDomains(c?.locks ?? []);
@@ -214,11 +209,11 @@ export class AccordionStore {
 	 * therefore persists, now human-owned, with all locks released.
 	 */
 	detach(): void {
-		// Idempotent: detaching an already conductor-less store is a no-op. A second pass would
-		// re-run freezeForDetach() → frozen.clear(), wiping the heal-exemptions the first detach
-		// set, springing the protected-tail folds back open (FIX 1 regression). cancelConsent
-		// deliberately calls detach() then setActiveConductor(NONE_ID), whose attach effect detaches
-		// again — this guard makes that second detach harmless.
+		// Idempotent: detaching an already conductor-less store is a no-op. Re-running
+		// freezeForDetach() on the second call would re-inherit the tail / re-stamp folds from
+		// scratch; the guard makes the second detach a true no-op. cancelConsent deliberately
+		// calls detach() then setActiveConductor(NONE_ID), whose attach effect detaches again —
+		// this guard makes that second detach harmless.
 		if (this.conductor === null) return;
 		this.freezeForDetach();
 		this.conductor = null;
@@ -276,23 +271,42 @@ export class AccordionStore {
 	}
 
 	/**
-	 * ADR 0011 kill-switch mechanics: convert the CURRENT conductor-folded view into sticky,
-	 * human-owned folds so the subsequent conductor-less refold leaves it folded (not raw).
-	 * Runs BEFORE `conductor` is nulled, so `isFolded`/`groupWire` still reflect the live view.
-	 * A block the human already holds (`override !== null`) is untouched. A block the conductor
-	 * folds individually (via `autoFolded`/`subst`, `override === null`, NOT inside a folded
-	 * group) becomes `override:"folded"`, `by:"you"`, `subst` cleared → folds to the engine
-	 * digest, individually reversible. Members of a folded group are NOT individually frozen
-	 * here — the group itself IS the frozen view; see the group reassignment loop below. This
-	 * matters because group collapse legitimately includes non-foldable kinds (`user`,
-	 * `tool_call`) whose individual `override:"folded"` would be an illegal state (the wire
-	 * refuses non-foldable per-block folds via `wireFoldable`) — exactly the view↔wire
-	 * divergence this repo forbids. A conductor-owned folded group is instead reassigned to
-	 * `by:"you"` AND marked `frozen:true` so `pruneProtectedGroups` exempts it even after the
-	 * re-protected tail grows over it (same principle as the block-level `frozen` Set).
+	 * ADR 0011 kill-switch mechanics: inherit the conductor's tail boundary into the host's
+	 * `protectTokens` so detach causes NO snap-back, then convert the CURRENT conductor-folded
+	 * view into sticky, human-owned folds so the subsequent conductor-less refold leaves it
+	 * folded (not raw). Runs BEFORE `conductor` is nulled, so `isLocked`/`isFolded`/
+	 * `groupWire` still reflect the live conductor's state.
+	 *
+	 * TAIL INHERITANCE: if the conductor held `tail-size`, its `activeTailTokens` becomes the
+	 * new `protectTokens`. Because `protectedFromIndex` uses the same walk-back algorithm for
+	 * both the locked and unlocked path, the boundary is IDENTICAL before and after detach —
+	 * no block newly enters the protected tail, so `healProtected` never fires on the detach
+	 * refold, and the budget is not re-blown. The human's prior `protectTokens` is overwritten;
+	 * a subsequently attached collaborative conductor runs with the inherited value until the
+	 * human re-drags the slider. If the conductor did not hold `tail-size`, `protectTokens` is
+	 * left untouched.
+	 *
+	 * FOLD FREEZE: a block the human already holds (`override !== null`) is untouched. A block
+	 * the conductor folds individually (via `autoFolded`/`subst`, `override === null`, NOT
+	 * inside a folded group) becomes `override:"folded"`, `by:"you"`, `subst` cleared → folds
+	 * to the engine digest, individually reversible. Members of a folded group are NOT
+	 * individually frozen here — the group itself IS the frozen view. This matters because
+	 * group collapse legitimately includes non-foldable kinds (`user`, `tool_call`) whose
+	 * individual `override:"folded"` would be an illegal state (the wire refuses non-foldable
+	 * per-block folds via `wireFoldable`) — exactly the view↔wire divergence this repo forbids.
+	 * A conductor-owned folded group is reassigned to `by:"you"` (just the provenance change —
+	 * no `frozen` flag needed, since the inherited tail prevents the snap-back that required it).
+	 * From then on the normal heal-and-prune invariant governs: if the HUMAN later grows the
+	 * protected tail over a detach-frozen fold or group, `healProtected`/`pruneProtectedGroups`
+	 * handles it as an ordinary human override — "position one."
 	 */
 	private freezeForDetach(): void {
-		this.frozen.clear();
+		// TAIL INHERITANCE: inherit the conductor's tail boundary so the post-detach
+		// `protectedFromIndex` is stable (no snap-back, no re-blow). Direct field assign —
+		// NOT setProtect (which is gated under the tail-size lock, which we still hold here).
+		if (this.isLocked("tail-size")) {
+			this.protectTokens = this.activeTailTokens;
+		}
 		for (const b of this.blocks) {
 			if (b.override !== null) continue; // human already owns it — leave as-is
 			if (!this.isFolded(b)) continue; // live (or straggler in an open group) — nothing to freeze
@@ -304,24 +318,19 @@ export class AccordionStore {
 			b.override = "folded";
 			b.by = "you";
 			b.subst = undefined;
-			// State hygiene (FIX 5): the fold is now a human override, not a conductor auto-fold —
+			// State hygiene: the fold is now a human override, not a conductor auto-fold —
 			// clear the stale `autoFolded` left over from the conductor pass.
 			b.autoFolded = false;
-			// Exempt from `healProtected` (FIX 1): once detached the `tail-size` lock is gone and
-			// the tail re-protects; without this exemption the freeze would heal straight back to
-			// full at the next refold, re-blowing the budget.
-			this.frozen.add(b.id);
 		}
-		// Reassign any folded conductor/auto group to the human AND mark it frozen so
-		// `pruneProtectedGroups` keeps it even after the host tail re-protects over it.
-		// The group is the frozen view — its members keep override===null, so `groupWire`
-		// shadows them in `isFolded`/`effTokens` exactly as before detach; no individual
-		// `override:"folded"` is ever written on a non-foldable member.
+		// Reassign any folded conductor/auto group to the human so the subsequent raw pass
+		// keeps it. The group is the frozen view — its members keep override===null, so
+		// `groupWire` shadows them in `isFolded`/`effTokens` exactly as before detach; no
+		// individual `override:"folded"` is ever written on a non-foldable member.
 		let touched = false;
 		const reassigned = this.groups.map((g) => {
 			if (g.folded && (g.by === "auto" || g.by === "conductor")) {
 				touched = true;
-				return { ...g, by: "you" as Actor, frozen: true };
+				return { ...g, by: "you" as Actor };
 			}
 			return g;
 		});
@@ -469,28 +478,31 @@ export class AccordionStore {
 	}
 
 	/**
-	 * Index of the first protected block. Walking back from the newest block, protect
-	 * whole blocks until the target `protectTokens` is reached, but refuse to pull in
-	 * the next older block if doing so would exceed a strict 25% whole-block overflow
-	 * cap. That keeps the slider honest: 20k means roughly 20k, not 40k just because a
-	 * huge boundary block happened to cross the threshold.
+	 * Index of the first protected block. The same walk-back algorithm runs in all cases:
+	 * walking back from the newest block, protect whole blocks until the token target is
+	 * reached, refusing to pull in the next older block if doing so would exceed a strict
+	 * 25% whole-block overflow cap. That keeps the slider honest: 20k means roughly 20k,
+	 * not 40k just because a huge boundary block happened to cross the threshold.
+	 *
+	 * ADR 0011 `tail-size` lock: the active conductor's `activeTailTokens` (0 if omitted)
+	 * replaces `protectTokens` as the target. With `activeTailTokens === 0` the walk-back
+	 * never runs (target 0 → blocks.length), identical to today's "conductor owns the whole
+	 * context." With `activeTailTokens > 0` the conductor declares a protected tail of its
+	 * own, protecting the newest ~N tokens — so only older blocks arrive with
+	 * `protected: false`. Absent the lock, `protectTokens` drives the walk-back exactly as
+	 * before — the collaborative/golden path is byte-identical.
 	 *
 	 * Protection remains absolute for what IS inside the tail, and we always protect at
-	 * least the newest block. Therefore a single newest block may exceed the cap by
+	 * least the newest block when target > 0. A single newest block may exceed the cap by
 	 * itself — the cap only decides whether to add another older block.
 	 */
 	protectedFromIndex = $derived.by(() => {
 		if (!this.blocks.length) return 0;
-		// ADR 0011 `tail-size` lock: the conductor owns the tail, so the HOST stops
-		// protecting it — exactly the `target === 0` "protection disabled" path. With no
-		// protected tail: `isProtected` is false everywhere (the `substOne` "protected"
-		// clamp never fires, the conductor may fold any block including recent reasoning),
-		// `healProtected` finds nothing, manual fold()/createGroup() stop refusing in the
-		// tail, and the grid collapses to one box. Absent the lock the tail is host-absolute
-		// exactly as before — so the golden/collaborative path is unchanged.
-		if (this.isLocked("tail-size")) return this.blocks.length;
-		const target = this.protectTokens;
-		// Protection disabled: every block is foldable.
+		// Under tail-size the conductor's activeTailTokens drives the walk-back; without the
+		// lock the human's protectTokens drives it. Both follow exactly the same algorithm.
+		const target = this.isLocked("tail-size") ? this.activeTailTokens : this.protectTokens;
+		// target === 0: protection disabled — every block is foldable (or the conductor
+		// owns the whole context). blocks.length ⇒ isProtected is false everywhere.
 		if (target === 0) return this.blocks.length;
 		const cap = target * PROTECT_OVERFLOW_CAP;
 		// Always absorb the newest block unconditionally — it is indivisible and the
@@ -531,19 +543,16 @@ export class AccordionStore {
 	 * collapse protected content we drop the whole group — keeping the grid (older box uses
 	 * the display list, protected box renders raw tiles) and the accounting consistent.
 	 *
-	 * ADR 0011 §6 exception: a group marked `frozen:true` by `freezeForDetach` is KEPT even
-	 * if it now reaches into the protected tail. This mirrors the block-level `frozen` Set
-	 * exemption in `healProtected`: the tail only re-protected BECAUSE the `tail-size` lock
-	 * was released on detach, so pruning the frozen group would re-blow the budget the freeze
-	 * exists to prevent. The human can still dissolve it manually post-detach (deleteGroup /
-	 * unfoldGroup), and `resetAll` clears it via the normal block + frozen.clear() sweep.
+	 * After a tail-size-conductor detach the host inherits the conductor's `tailTokens` into
+	 * `protectTokens` (ADR 0011 §6), so the boundary is stable across detach and no group is
+	 * newly swept into the protected tail by the detach itself. If the HUMAN later grows the
+	 * tail over a detach-frozen group (e.g. via `setProtect`), this prune fires as normal —
+	 * "position one" — the group is dropped and its members become live protected blocks.
 	 */
 	private pruneProtectedGroups(): void {
 		if (!this.groups.length) return;
 		const pf = this.protectedFromIndex;
 		const kept = this.groups.filter((g) => {
-			// Detach-frozen groups are exempt from pruning (ADR 0011 §6 — see comment above).
-			if (g.frozen) return true;
 			const reaches = g.memberIds.some((id) => (this.index.get(id) ?? Infinity) >= pf);
 			if (reaches) this.emit("auto", "ungrouped (protected)", `${g.memberIds.length} blocks`);
 			return !reaches;
@@ -631,11 +640,6 @@ export class AccordionStore {
 	private healProtected(protectedFrom: number): void {
 		this.blocks.forEach((b, i) => {
 			if (i >= protectedFrom && b.override === "folded") {
-				// A detach-frozen fold (FIX 1) is exempt: the kill switch deliberately froze the
-				// folded view, and the tail only re-protected BECAUSE the conductor's `tail-size`
-				// lock was released on detach. Healing it would re-blow the budget the freeze
-				// exists to prevent (ADR 0011 §6). It stays folded, human-owned, reversible by hand.
-				if (this.frozen.has(b.id)) return;
 				// Protection is absolute, but do not silently erase the user intent — log the
 				// forced unfold so the activity feed shows what happened.
 				this.emit(b.by ?? "auto", "unfolded (protected)", label(b));
@@ -704,7 +708,10 @@ export class AccordionStore {
 			contextWindow: this.contextWindow,
 			liveTokens: this.liveTokens,
 			protectedFromIndex: protectedFrom,
-			protectTokens: this.protectTokens,
+			// Under tail-size the conductor sees ITS OWN tail target — the same value that
+			// drove `protectedFromIndex`. Absent the lock, the human's `protectTokens` is passed
+			// as before (collaborative/golden path unchanged).
+			protectTokens: this.isLocked("tail-size") ? this.activeTailTokens : this.protectTokens,
 		};
 	}
 
@@ -960,19 +967,10 @@ export class AccordionStore {
 		// ADR 0011 `human-steering`: reset is a sweeping human steering action — refused
 		// wholesale under the lock (no overrides cleared, no log, no notify).
 		if (this.isLocked("human-steering")) return;
-		// A clean slate clears every override — including detach-frozen folds — so drop their
-		// `healProtected` exemptions too (FIX 1); a stale id here is harmless but pointless.
-		this.frozen.clear();
 		for (const b of this.blocks) {
 			b.override = null;
 			b.by = null;
 		}
-		// Also clear frozen flags on any detach-frozen groups so they lose their
-		// pruning exemption and are treated as ordinary human groups from here on.
-		// (The subsequent refold → pruneProtectedGroups will drop any that reach into
-		// the re-protected tail; clearConductorState then drops conductor-owned ones.)
-		const hasFrozenGroup = this.groups.some((g) => g.frozen);
-		if (hasFrozenGroup) this.groups = this.groups.map((g) => (g.frozen ? { ...g, frozen: undefined } : g));
 		this.emit("you", "reset", "all blocks to auto");
 		this.refold();
 		// Empty id list = "everything changed"; the conductor reconciles from the next update.
@@ -1094,10 +1092,6 @@ export class AccordionStore {
 		const g = this.groupById(id);
 		if (!g || g.folded) return;
 		g.folded = true;
-		// A human group action ends the detach-freeze exemption — this is no longer the
-		// untouched frozen view, so normal protected-tail pruning applies again (a re-fold must
-		// not be able to collapse protected content the kill switch never froze).
-		g.frozen = undefined;
 		this.groups = [...this.groups];
 		this.emit(by, "group folded", `${g.memberIds.length} blocks`);
 		this.refold();
@@ -1112,10 +1106,6 @@ export class AccordionStore {
 		const g = this.groupById(id);
 		if (!g || !g.folded) return;
 		g.folded = false;
-		// End the detach-freeze exemption (see foldGroup): once the human unfolds it, the group
-		// is ordinary again — if it still reaches into the protected tail, the next refold's
-		// `pruneProtectedGroups` drops it instead of leaving a prune-immune zombie.
-		g.frozen = undefined;
 		this.groups = [...this.groups];
 		this.emit(by, "group unfolded", `${g.memberIds.length} blocks`);
 		this.refold();

@@ -41,6 +41,11 @@ export class AutopilotConductor implements Conductor {
 	/**
 	 * All three steering controls are locked. The host gates the human and agent from
 	 * interfering; the human's only recourse is detach (the kill switch). See ADR 0011.
+	 *
+	 * `tailTokens` is deliberately omitted (defaults to 0 = own the whole context, no
+	 * protected tail). A conductor that wants to preserve a protected tail can declare
+	 * e.g. `tailTokens = 8000` to keep the newest ~8 k tokens protected while managing
+	 * everything older.
 	 */
 	readonly locks = ["human-steering", "agent-unfold", "tail-size"] as const;
 
