@@ -13,14 +13,14 @@
 import { BuiltinConductor } from "./builtin/builtin";
 import { ColdScoreConductor } from "./cold-score/cold-score";
 import { ColdEpochConductor } from "./cold-epoch/cold-epoch";
-import { SlidingWindowConductor } from "./sliding-window/sliding-window";
+import { DropOldestConductor } from "./drop-oldest/drop-oldest";
 import { AutopilotConductor } from "./autopilot/autopilot";
 import type { Conductor, LockName } from "./contract";
 
 export { BuiltinConductor } from "./builtin/builtin";
 export { ColdScoreConductor } from "./cold-score/cold-score";
 export { ColdEpochConductor } from "./cold-epoch/cold-epoch";
-export { SlidingWindowConductor } from "./sliding-window/sliding-window";
+export { DropOldestConductor } from "./drop-oldest/drop-oldest";
 export { AutopilotConductor } from "./autopilot/autopilot";
 
 /**
@@ -42,7 +42,7 @@ export const IN_PROCESS_CONDUCTORS: InProcessConductor[] = [
   { id: "builtin", label: "Built-in", create: () => new BuiltinConductor() },
   { id: "cold-score", label: "Cold-score", create: () => new ColdScoreConductor() },
   { id: "cold-epoch", label: "Cold epoch", create: () => new ColdEpochConductor() },
-  { id: "sliding-window", label: "Sliding window", create: () => new SlidingWindowConductor() },
+  { id: "drop-oldest", label: "Drop oldest", locks: ["human-steering", "agent-unfold"], create: () => new DropOldestConductor() },
   {
     id: "autopilot",
     label: "Autopilot",
