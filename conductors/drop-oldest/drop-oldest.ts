@@ -14,6 +14,12 @@
  *  - A run may be a single block (1-member group); the `GroupCommand` contract allows it.
  *  - tool_call/tool_result pair-balance is delegated entirely to the host's `applyPlan`
  *    Phase A, which guarantees a call and its result are deleted together or neither.
+ *    Caveat (deliberate, bounded): the conductor credits a dropped block's FULL tokens toward
+ *    the target even when the host keeps it LIVE as a straggler (a tool pair straddling the run
+ *    boundary, or the run snapping outward to a whole message). So the visible window can sit a
+ *    little above the 70% target for one episode; the next grow pass extends the run to balance
+ *    the pair and the overshoot closes. The host owns deletion granularity too: `createGroup`
+ *    snaps a run outward to whole messages, so a run ending mid-message deletes the rest of it.
  *
  *  - WHY internal state: the host clears conductor-owned folds before every pass, so
  *    `view.liveTokens` is ALWAYS the raw, fully-unfolded size — which only grows. A stateless
