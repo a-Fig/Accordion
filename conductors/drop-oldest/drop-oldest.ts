@@ -1,32 +1,39 @@
 /*
  * drop-oldest.ts — delete the oldest non-user blocks to keep the live window under budget.
  *
- * Strategy:
- *  - Trigger: liveTokens > budget * 0.90
- *  - Target:  bring live tokens back down to ~70% of budget
+ * Strategy (high-water / low-water hysteresis band):
+ *  - Trigger (high-water): the AGENT-VISIBLE live window climbs above budget * 0.90.
+ *  - Target  (low-water):  bring the visible window back down to ~70% of budget.
+ *  - Between the two it HOLDS — once dropped to 70% the agent's context is allowed to grow
+ *    back up to 90% (≈20% of fresh turns) before the next deletion. It does NOT re-act on
+ *    every pass; it waits for the window to refill to the high-water mark.
  *  - Eligible region: only blocks OLDER than the protected tail (slice(0, protectedFromIndex)).
  *  - Walk eligible oldest-first. Skip `user` blocks — they express intent and must stay
- *    visible. Every other block is accumulated into the current contiguous run. When a
- *    `user` block is hit (or the loop ends), the accumulated run is flushed as a single
- *    `group` command with `digest: null`, which signals the host to DELETE those messages
- *    from the wire entirely — the agent never sees them. Accumulation stops as soon as the
+ *    visible. Every other not-yet-dropped block is added to the committed drop-set until the
  *    running removed-token total reaches the remove target.
  *  - A run may be a single block (1-member group); the `GroupCommand` contract allows it.
- *  - Note: tool_call/tool_result pair-balance is delegated entirely to the host's `applyPlan`
- *    Phase A, which guarantees a call and its result are deleted together or neither (an
- *    unbalanced half is left as a straggler). No pairing logic is needed here.
- *  - State: none. Recomputed from the raw baseline every pass (the host clears prior
- *    conductor state before each call, so `liveTokens` is always the unfolded size). Once
- *    live tokens fall back below the trigger threshold, it clears to raw.
+ *  - tool_call/tool_result pair-balance is delegated entirely to the host's `applyPlan`
+ *    Phase A, which guarantees a call and its result are deleted together or neither.
+ *
+ *  - WHY internal state: the host clears conductor-owned folds before every pass, so
+ *    `view.liveTokens` is ALWAYS the raw, fully-unfolded size — which only grows. A stateless
+ *    conductor that compares `liveTokens` to 90% would therefore re-trigger on every pass once
+ *    the raw size first crossed 90%, pinning the agent's view at 70% forever. To implement the
+ *    band we must remember what we have already deleted: `dropped` is the committed drop-set
+ *    (block ids). The visible window = `liveTokens − Σ(tokens of dropped blocks still eligible)`,
+ *    and the trigger is evaluated against THAT, not the raw baseline. The set is MONOTONIC —
+ *    a deleted block is gone (per the "the block is gone" design); we only ever ADD to it,
+ *    never release — and it is re-emitted as `group(digest:null)` commands every pass so the
+ *    host (which rebuilds conductor groups each pass) keeps them applied.
  *
  * Locks: "human-steering" + "agent-unfold" (collaborative on tail-size — the human keeps
  * the protected-tail dial). The conductor never touches blocks inside the protected tail.
  */
-import type { Conductor, ConductorView, Command } from "../contract";
+import type { Conductor, ConductorView, ViewBlock, Command } from "../contract";
 
-/** Fraction of budget that triggers deletion. */
+/** Fraction of budget that triggers deletion (high-water mark). */
 const TRIGGER = 0.9;
-/** Fraction of budget the live window is brought back down to. */
+/** Fraction of budget the visible window is brought back down to (low-water mark). */
 const TARGET = 0.7;
 
 export class DropOldestConductor implements Conductor {
@@ -40,25 +47,67 @@ export class DropOldestConductor implements Conductor {
 	readonly locks = ["human-steering", "agent-unfold"] as const;
 
 	/**
-	 * Emit `group(digest: null)` commands over the oldest non-user runs until the live
-	 * window is projected back to ~70% of budget. `user` blocks are skipped in place and
-	 * split the run; each run is emitted as one drop command.
+	 * The committed drop-set: ids of blocks we have decided to delete from the wire. Monotonic
+	 * within a session (deleted = gone); pruned only of ids no longer present in the view.
+	 */
+	private dropped = new Set<string>();
+
+	/**
+	 * Grow the committed drop-set when the agent-visible window crosses the high-water mark,
+	 * then re-emit the whole set as `group(digest:null)` deletes every pass. Below the mark it
+	 * holds: the set is unchanged and simply re-emitted (the window refills toward 90%).
 	 */
 	conduct(view: ConductorView): Command[] {
-		if (view.budget <= 0 || view.blocks.length === 0) return [];
+		if (view.budget <= 0 || view.blocks.length === 0) {
+			// No budget / nothing to manage → forget any prior commitments and clear to raw.
+			this.dropped.clear();
+			return [];
+		}
 
-		// Under the threshold → nothing to do (clear to raw).
-		if (view.liveTokens <= view.budget * TRIGGER) return [];
+		// Forget committed ids that are no longer present (defensive — live sessions are
+		// append-only, but a reset / new session would invalidate them).
+		const present = new Set(view.blocks.map((b) => b.id));
+		for (const id of this.dropped) if (!present.has(id)) this.dropped.delete(id);
 
-		// Only the blocks older than the protected tail are eligible.
+		// Only blocks older than the protected tail are eligible for deletion.
 		const eligible = view.blocks.slice(0, view.protectedFromIndex);
-		if (eligible.length === 0) return [];
 
-		const removeTarget = view.liveTokens - view.budget * TARGET;
+		// Agent-visible live window = raw baseline minus what we are already deleting. Count
+		// only dropped blocks that are still eligible: one that slid into the protected tail
+		// (the human widened the dial) is no longer being deleted, so it counts as live again.
+		let droppedTokens = 0;
+		for (const b of eligible) if (this.dropped.has(b.id)) droppedTokens += b.tokens;
+		const visible = view.liveTokens - droppedTokens;
+
+		// HYSTERESIS: only GROW the drop-set when the visible window is above the high-water
+		// mark. Otherwise hold the current set (re-emitted below) and let the window refill.
+		if (visible > view.budget * TRIGGER) {
+			const removeTarget = visible - view.budget * TARGET;
+			let removed = 0;
+			for (const b of eligible) {
+				if (b.kind === "user") continue; // user intent stays visible
+				if (this.dropped.has(b.id)) continue; // already committed
+				this.dropped.add(b.id);
+				removed += b.tokens;
+				if (removed >= removeTarget) break;
+			}
+		}
+
+		// Re-emit the committed drop-set as contiguous group(digest:null) runs. The host clears
+		// conductor groups each pass, so re-emitting IS how the deletes are held in place.
+		return this.emitRuns(eligible);
+	}
+
+	/**
+	 * Collapse the committed drop-set into contiguous `group(digest:null)` commands over the
+	 * eligible region. Any non-dropped block (a `user` block, a not-yet-dropped block, or the
+	 * protected boundary) flushes the current run, so a run is always a contiguous span of
+	 * deleted blocks — `user` blocks split runs into separate commands.
+	 */
+	private emitRuns(eligible: ViewBlock[]): Command[] {
 		const cmds: Command[] = [];
-		let removed = 0;
-		let runStart = -1; // index of the first block in the current run
-		let runEnd = -1;   // index of the last block in the current run
+		let runStart = -1;
+		let runEnd = -1;
 
 		const flush = () => {
 			if (runStart === -1) return;
@@ -72,27 +121,13 @@ export class DropOldestConductor implements Conductor {
 		};
 
 		for (let i = 0; i < eligible.length; i++) {
-			const b = eligible[i];
-
-			if (b.kind === "user") {
-				// User blocks split runs; flush whatever we have.
+			if (this.dropped.has(eligible[i].id)) {
+				if (runStart === -1) runStart = i;
+				runEnd = i;
+			} else {
 				flush();
-				continue;
-			}
-
-			// Extend the current run to include this block.
-			if (runStart === -1) runStart = i;
-			runEnd = i;
-			removed += b.tokens;
-
-			if (removed >= removeTarget) {
-				// We've removed enough — flush and stop.
-				flush();
-				break;
 			}
 		}
-
-		// Flush any open run at end of loop (target not yet hit but we've exhausted eligible).
 		flush();
 
 		return cmds;

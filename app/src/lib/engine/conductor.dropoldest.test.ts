@@ -12,6 +12,8 @@
  *   5. A single non-user block between two user blocks → 1-member group (ids[0] === ids[1]).
  *   6. Empty block list and zero budget → returns [].
  *   7. Lock declaration is stable and matches registry entry.
+ *   8. Hysteresis band — once dropped to ~70% it HOLDS (does not re-drop every pass) until
+ *      the agent-visible window refills past 90%; the drop-set is monotonic.
  */
 import { describe, it, expect } from "vitest";
 import { DropOldestConductor } from "$conductors/drop-oldest/drop-oldest";
@@ -242,6 +244,81 @@ describe("DropOldestConductor — empty/zero-budget guards", () => {
 });
 
 // ── 7. Lock declaration ────────────────────────────────────────────────────────
+
+// ── 8. Hysteresis band (high-water 90% / low-water 70%) ──────────────────────
+
+describe("DropOldestConductor — hysteresis: holds between 70% and 90%", () => {
+	it("does NOT re-drop on a second pass once the visible window is below the trigger", () => {
+		// 10 × 1000 = 10k raw, budget 10k. First pass drops to ~70% (m0..m2).
+		const blocks = Array.from({ length: 10 }, (_, i) => vb(`m${i}:p0`, "text", i, 1_000));
+		const c = new DropOldestConductor();
+
+		// Pass 1: raw 10k > 90% → drop m0..m2.
+		const first = c.conduct(makeView(blocks, 10_000, 10_000));
+		expect(first).toHaveLength(1);
+		expect((first[0] as { ids: string[] }).ids).toEqual(["m0:p0", "m2:p0"]);
+
+		// Pass 2: the host clears conductor folds, so liveTokens is the SAME raw 10k. A stateless
+		// conductor would drop again; this one sees visible = 10k − 3k = 7k ≤ 90% → HOLDS.
+		const second = c.conduct(makeView(blocks, 10_000, 10_000));
+		// Byte-identical to pass 1 — the same delete, re-emitted to hold it. No new blocks.
+		expect(second).toEqual(first);
+	});
+
+	it("re-drops only after the visible window refills past 90% (new turns appended)", () => {
+		const c = new DropOldestConductor();
+
+		// Pass 1: 10 × 1000 = 10k, budget 10k → drop m0..m2 (visible → 7k).
+		const v1 = Array.from({ length: 10 }, (_, i) => vb(`m${i}:p0`, "text", i, 1_000));
+		c.conduct(makeView(v1, 10_000, 10_000));
+
+		// Agent adds 3 new turns (≈3k). Raw is now 13k; dropped still {m0,m1,m2} → visible = 10k
+		// > 90% → grow the drop-set by another ~3k (m3..m5) back toward 70%.
+		const v2 = Array.from({ length: 13 }, (_, i) => vb(`m${i}:p0`, "text", i, 1_000));
+		const grown = c.conduct(makeView(v2, 10_000, 13_000));
+
+		const droppedIds = grown.flatMap((cmd) => {
+			const ids = (cmd as { ids: string[] }).ids;
+			// Expand [first,last] runs over the contiguous block range.
+			const start = v2.findIndex((b) => b.id === ids[0]);
+			const end = v2.findIndex((b) => b.id === ids[1]);
+			return v2.slice(start, end + 1).map((b) => b.id);
+		});
+		// Original 3 still deleted, plus the next 3 oldest.
+		expect(droppedIds).toEqual(["m0:p0", "m1:p0", "m2:p0", "m3:p0", "m4:p0", "m5:p0"]);
+	});
+
+	it("holds at the band — visible between 70% and 90% adds nothing", () => {
+		const c = new DropOldestConductor();
+		const v1 = Array.from({ length: 10 }, (_, i) => vb(`m${i}:p0`, "text", i, 1_000));
+		c.conduct(makeView(v1, 10_000, 10_000)); // drop m0..m2 → visible 7k
+
+		// One small turn appended (+500). Raw 10.5k, dropped 3k → visible 7.5k (< 90%) → hold.
+		const v2 = [...v1, vb("m10:p0", "text", 10, 500)];
+		const held = c.conduct(makeView(v2, 10_000, 10_500));
+		expect((held[0] as { ids: string[] }).ids).toEqual(["m0:p0", "m2:p0"]); // unchanged
+		expect(held).toHaveLength(1);
+	});
+
+	it("is monotonic — never restores a deleted block, even far below budget", () => {
+		const c = new DropOldestConductor();
+		const blocks = Array.from({ length: 10 }, (_, i) => vb(`m${i}:p0`, "text", i, 1_000));
+		c.conduct(makeView(blocks, 10_000, 10_000)); // drop m0..m2
+
+		// Budget jumps so visible is now far under target — deletes still hold (gone = gone).
+		const after = c.conduct(makeView(blocks, 100_000, 10_000));
+		expect((after[0] as { ids: string[] }).ids).toEqual(["m0:p0", "m2:p0"]);
+	});
+
+	it("clears the committed drop-set when the budget drops to zero", () => {
+		const c = new DropOldestConductor();
+		const blocks = Array.from({ length: 10 }, (_, i) => vb(`m${i}:p0`, "text", i, 1_000));
+		c.conduct(makeView(blocks, 10_000, 10_000)); // drop m0..m2
+		expect(c.conduct(makeView(blocks, 0, 10_000))).toEqual([]); // zero budget → forget + raw
+		// And with budget restored but still under trigger, nothing is re-dropped.
+		expect(c.conduct(makeView(blocks, 100_000, 10_000))).toEqual([]);
+	});
+});
 
 describe("DropOldestConductor — lock declaration", () => {
 	it("locks human-steering and agent-unfold but NOT tail-size", () => {
