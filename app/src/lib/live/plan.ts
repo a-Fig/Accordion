@@ -56,9 +56,9 @@ export function computeFoldOps(store: AccordionStore): FoldOp[] {
  * FOLDED group. `memberIds` is the group's durable member ids — the GUI's *intent*; the
  * extension's `applyPlan` independently re-derives which whole, balanced messages it may
  * actually remove (a non-durable member is dropped here too, since a positional id is not
- * stable across array shifts). `summaryText` is the engine's
- * single-source-of-truth recap, carrying the one `{#code FOLDED}` tag for the whole range.
- * Pure read; the store is never mutated.
+ * stable across array shifts). `summaryText` is the engine's single-source-of-truth recap
+ * (carrying the one `{#code FOLDED}` tag for default-recap groups), or `null` for a drop
+ * group (the wire removes the run and inserts nothing). Pure read; the store is never mutated.
  */
 export function computeGroupOps(store: AccordionStore): GroupOp[] {
 	const out: GroupOp[] = [];
@@ -66,8 +66,11 @@ export function computeGroupOps(store: AccordionStore): GroupOp[] {
 		if (!g.folded) continue;
 		const memberIds = g.memberIds.filter(isDurableId);
 		if (!memberIds.length) continue; // nothing durably removable
-		const summaryText = store.groupSummary(g);
-		if (!summaryText) continue;
+		const isDropGroup = store.isDropGroup(g);
+		const summaryText: string | null = isDropGroup ? null : store.groupSummary(g);
+		// Drop group (summaryText === null) is VALID — do not skip it.
+		// Only skip a non-drop group whose summary is empty/whitespace (defensive; shouldn't happen).
+		if (summaryText !== null && !summaryText.trim()) continue;
 		out.push({ id: g.id, memberIds, summaryText });
 	}
 	return out;

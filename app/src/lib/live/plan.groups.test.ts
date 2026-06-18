@@ -33,7 +33,7 @@ describe("computeGroupOps", () => {
 		expect(ops.length).toBe(1);
 		expect(ops[0].id).toBe(g.id);
 		expect(ops[0].memberIds).toEqual(["a:r1:p0", "a:r1:p1", "a:r1:p2", "r:c1"]);
-		expect(ops[0].summaryText.startsWith(`{#${foldCode(g.id)} FOLDED} group ·`)).toBe(true);
+		expect(ops[0].summaryText!.startsWith(`{#${foldCode(g.id)} FOLDED} group ·`)).toBe(true);
 	});
 
 	it("emits nothing for an UNFOLDED group (open groups are wire-invisible)", () => {

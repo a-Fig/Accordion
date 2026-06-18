@@ -189,9 +189,14 @@ describe("createGroup — validation & message snapping", () => {
 		expect(s.groups.length).toBe(0);
 	});
 
-	it("refuses a <2-member group and an overlapping one", () => {
+	it("allows a 1-member group (≥1 rule relaxed from ≥2) and refuses an overlapping one", () => {
 		const s = makeStore();
-		expect(s.createGroup("u:1", "u:1")).toBeNull(); // single user message, 1 block
+		// A single-block group is now valid (minimum is ≥1 since the drop-group feature landed).
+		// u:1 is a user block with no tool-pair dependency, so it has a carrier and collapses.
+		const single = s.createGroup("u:1", "u:1");
+		expect(single).not.toBeNull();
+		expect(single!.memberIds).toEqual(["u:1"]);
+		s.deleteGroup(single!.id); // clean up so we can test the overlap case independently
 		s.createGroup("a:r1:p0", "r:c1");
 		expect(s.createGroup("a:r1:p1", "u:2")).toBeNull(); // overlaps the existing group
 		expect(s.groups.length).toBe(1);

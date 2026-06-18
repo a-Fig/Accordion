@@ -86,6 +86,10 @@ export interface FoldOp {
  * text, carrying the group's `{#<code> FOLDED}` tag where `code = foldCode(group.id)` — ONE
  * handle for the whole range, so the agent restores it all with one `unfold` code.
  *
+ * `summaryText === null` means DROP: the run is removed from the wire and NO replacement
+ * message is inserted. The agent never sees those blocks. Phase A (tool-pair balancing) still
+ * applies — only whole, balanced messages are removed. Phase B simply emits nothing.
+ *
  * Provider safety lives on BOTH sides (defense in depth, like `FoldOp`): the extension's
  * `applyPlan` re-derives tool-pair balance independently and only removes WHOLE, balanced,
  * durable messages — on ANY doubt the affected messages pass through untouched. The wire
@@ -97,7 +101,8 @@ export interface FoldOp {
 export interface GroupOp {
 	id: string;
 	memberIds: string[];
-	summaryText: string;
+	/** `null` = drop (remove the run, insert no message); non-null string = the summary text. */
+	summaryText: string | null;
 }
 
 // ── Server → client (extension → GUI) ────────────────────────────────────────

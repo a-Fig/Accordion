@@ -142,10 +142,22 @@ export interface ReplaceCommand {
  * first and last id are swept into the group even if you did not name them, and a partly-
  * named message is rounded up to its whole. To collapse a non-contiguous set, issue
  * separate `group` commands per run, or `replace`/empty individual blocks instead.
+ *
+ * `digest` controls the summary text the host uses for this group:
+ *   - `undefined` → the host's default recap summary (`groupDigest`). Byte-identical to
+ *     today's behavior — existing conductors are unaffected.
+ *   - `null` OR `""` → **DROP**: the run is removed from the wire, and NO replacement
+ *     message is inserted. The agent never sees those blocks. This is the second deliberate
+ *     exception to the "content substitution, never structural removal" rule stated in this
+ *     file's header (the first being the existing group→summary removal); like that exception
+ *     it is whole-message, pair-balanced, and re-derived defensively on the wire.
+ *   - A non-empty string → that exact string is used as the summary verbatim, like
+ *     `FoldCommand.digest` (no tag added).
  */
 export interface GroupCommand {
 	kind: "group";
 	ids: string[];
+	digest?: string | null;
 }
 
 /** Return blocks to full, live content (undo a fold/replace). No-op on human-held blocks. */
@@ -188,7 +200,7 @@ export type ClampReason =
 	| "human-override"
 	/** The block is inside a folded group; the group overlay owns it. */
 	| "grouped"
-	/** A group command's ids were not a valid contiguous, ungrouped, ≥2-member run. */
+	/** A group command's ids were not a valid contiguous, ungrouped, ≥1-member run. */
 	| "invalid-group"
 	/** The block is inside the protected working tail; protection is absolute, the host won't fold it. */
 	| "protected"

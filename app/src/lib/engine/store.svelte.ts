@@ -13,6 +13,7 @@
  */
 import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
 import { digest, digestTokens, groupDigest, groupDigestTokens, substTokens, wireFoldable } from "./digest";
+import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { messageKey } from "./ids";
 import type { Conductor, ConductorView, Command, ClampReport, ClampReason, LockName } from "$conductors/contract";
 import { hasLock } from "$conductors/contract";
@@ -443,7 +444,14 @@ export class AccordionStore {
 		for (const g of this.groups) {
 			if (!g.folded) continue;
 			const c = this.classifyGroup(g);
-			const summaryTok = c.carrier ? groupDigestTokens(g, c.collapsedMembers) : 0;
+			// Carrier token cost mirrors groupLiveTokens: drop → 0, custom digest → its tokens,
+			// default recap → groupDigestTokens. Non-carrier collapsed members always 0.
+			let summaryTok = 0;
+			if (c.carrier) {
+				if (this.isDropGroup(g)) summaryTok = 0; // drop group
+				else if (typeof g.digest === "string") summaryTok = estTokens(g.digest) + BLOCK_OVERHEAD; // custom literal
+				else summaryTok = groupDigestTokens(g, c.collapsedMembers); // default recap
+			}
 			for (const b of c.members) {
 				if (c.collapsed.has(b.id)) m.set(b.id, { tokens: b.id === c.carrier ? summaryTok : 0, collapsed: true });
 				else m.set(b.id, { tokens: b.tokens, collapsed: false }); // straggler: live, full
@@ -764,7 +772,7 @@ export class AccordionStore {
 					for (const id of c.ids) this.liveOne(id, by, c.kind, reports);
 					break;
 				case "group":
-					this.groupCmd(c.ids, by, reports);
+					this.groupCmd(c.ids, by, reports, c.digest);
 					break;
 			}
 		}
@@ -815,21 +823,21 @@ export class AccordionStore {
 	}
 
 	/**
-	 * Apply a `group` command by reusing the human group machinery (contiguous, ≥2,
+	 * Apply a `group` command by reusing the human group machinery (contiguous, ≥1,
 	 * ungrouped, older than the tail). Human always wins: if SNAPPING the range would sweep
 	 * a human-held block (pinned / manually folded / manually unfolded) into the collapse,
 	 * refuse the whole group and report it — never silently override the human's choice.
 	 * (Human-initiated groups go straight through `createGroup` and keep their old freedom.)
 	 */
-	private groupCmd(ids: string[], by: Actor, reports: ClampReport[]): void {
-		if (ids.length < 2) return void reports.push(clamp("group", ids, "invalid-group", "a group needs ≥2 blocks"));
+	private groupCmd(ids: string[], by: Actor, reports: ClampReport[], digest?: string | null): void {
+		if (ids.length < 1) return void reports.push(clamp("group", ids, "invalid-group", "a group needs ≥1 block"));
 		const range = this.snappedRange(ids[0], ids[ids.length - 1]);
 		if (range) {
 			const held = range.filter((id) => this.get(id)?.override != null);
 			if (held.length)
 				return void reports.push(clamp("group", ids, "human-override", `would collapse ${held.length} human-held block(s)`));
 		}
-		const g = this.createGroup(ids[0], ids[ids.length - 1], by);
+		const g = this.createGroup(ids[0], ids[ids.length - 1], by, digest);
 		if (!g) reports.push(clamp("group", ids, "invalid-group", "not a valid contiguous, ungrouped run older than the protected tail"));
 	}
 
@@ -1024,8 +1032,15 @@ export class AccordionStore {
 		}
 		return out;
 	}
+	/** True iff this group should emit NO wire message — a drop group (digest null or ""). */
+	isDropGroup(g: Group): boolean {
+		return g.digest === null || g.digest === "";
+	}
+
 	/** The one summary string the group's folded tile renders / the agent receives. */
 	groupSummary(g: Group): string {
+		if (this.isDropGroup(g)) return ""; // drop group: caller must branch on isDropGroup first
+		if (typeof g.digest === "string" && g.digest) return g.digest; // non-empty literal → verbatim
 		const c = this.classifyGroup(g);
 		return groupDigest(g, c.collapsedMembers.length ? c.collapsedMembers : c.members);
 	}
@@ -1043,7 +1058,20 @@ export class AccordionStore {
 			return n;
 		}
 		const c = this.classifyGroup(g);
-		let n = c.carrier ? groupDigestTokens(g, c.collapsedMembers) : 0;
+		// Drop group: the carrier contributes 0 (no wire message inserted).
+		// Custom-digest group: the carrier contributes the literal summary's token cost.
+		// Default recap group: carrier contributes the group digest tokens (unchanged).
+		let carrierTokens = 0;
+		if (c.carrier) {
+			if (this.isDropGroup(g)) {
+				carrierTokens = 0;
+			} else if (typeof g.digest === "string" && g.digest) {
+				carrierTokens = estTokens(g.digest) + BLOCK_OVERHEAD;
+			} else {
+				carrierTokens = groupDigestTokens(g, c.collapsedMembers);
+			}
+		}
+		let n = carrierTokens;
 		for (const id of c.stragglers) n += this.get(id)?.tokens ?? 0;
 		return n;
 	}
@@ -1080,9 +1108,12 @@ export class AccordionStore {
 	 * Create a group from a block range (the human's selection, any two member ids). The
 	 * range is SNAPPED outward to whole messages (never splits an assistant message's parts),
 	 * then validated: entirely older than the protected tail, no member already grouped
-	 * (no overlap), ≥2 members. Folds it on creation. Returns the group, or null if invalid.
+	 * (no overlap), ≥1 member. Folds it on creation. Returns the group, or null if invalid.
+	 *
+	 * `digest` is the optional conductor-supplied summary override (mirrors `GroupCommand.digest`):
+	 * `undefined` → default recap; `null`/`""` → drop (no wire message); non-empty string → verbatim.
 	 */
-	createGroup(startId: string, endId: string, by: Actor = "you"): Group | null {
+	createGroup(startId: string, endId: string, by: Actor = "you", digest?: string | null): Group | null {
 		// ADR 0011 `human-steering`: a human hand-group is refused under the lock. The
 		// conductor's own group command routes here with by="auto"/"conductor" and is NOT
 		// gated (it is the conductor steering, not the human).
@@ -1094,8 +1125,8 @@ export class AccordionStore {
 		for (const id of memberIds) {
 			if (this.groupAt.get(id)) return null; // overlap with an existing group
 		}
-		if (memberIds.length < 2) return null;
-		const g: Group = { id: `g:${memberIds[0]}`, memberIds, folded: true, by };
+		if (memberIds.length < 1) return null;
+		const g: Group = { id: `g:${memberIds[0]}`, memberIds, folded: true, by, digest };
 		// A group must actually collapse something. If EVERY member is a split tool-pair half
 		// (its partner sits outside the range), nothing folds into the summary — the tile would
 		// hide live blocks for zero benefit. That isn't a fold; refuse it (ADR 0006 §4: a folded

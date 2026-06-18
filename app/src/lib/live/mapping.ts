@@ -309,16 +309,18 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 	// member would otherwise throw inside the `context` hook (e.g. `isDurableId(null)`) and
 	// defeat the passthrough guarantee. Re-derive every guard defensively and drop anything off.
 	const safeOps = (ops ?? []).filter((o) => o && typeof o.id === "string" && isDurableId(o.id) && typeof o.digestText === "string" && o.digestText);
-	// summaryText must be a NON-EMPTY string and every member id a string (a number/object/
-	// whitespace value would emit a provider-invalid text part or throw downstream).
+	// A group is valid if:
+	//   • every member id is a string (non-string ids would throw inside isDurableId)
+	//   • summaryText is null (drop group — valid) OR a non-empty, non-whitespace string
+	//     (a whitespace-only string would emit a provider-invalid text part; empty string
+	//     is not a drop op — it is a malformed non-drop op, so we reject it).
 	const safeGroups = (groups ?? []).filter(
 		(g) =>
 			g &&
-			typeof g.summaryText === "string" &&
-			g.summaryText.trim() &&
 			Array.isArray(g.memberIds) &&
 			g.memberIds.length &&
-			g.memberIds.every((m) => typeof m === "string"),
+			g.memberIds.every((m) => typeof m === "string") &&
+			(g.summaryText === null || (typeof g.summaryText === "string" && g.summaryText.trim())),
 	);
 	if (!safeOps.length && !safeGroups.length) return messages;
 
@@ -378,13 +380,19 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 	for (let i = 0; i < messages.length; ) {
 		const g = owner[i];
 		if (g) {
-			// Consume the maximal consecutive run owned by the SAME group → one entry. A
-			// group split by an interior straggler yields one entry per run (same summary).
-			const role = messages[i].role === "assistant" ? "assistant" : "user";
+			// Consume the maximal consecutive run owned by the SAME group. A group split by
+			// an interior straggler yields one entry per run (same group object, same decision).
 			let j = i + 1;
 			while (j < messages.length && owner[j] === g) j++;
-			out.push({ role, content: [{ type: "text", text: g.summaryText }] } as PiMessage);
-			changed = true;
+			if (g.summaryText === null) {
+				// DROP: consume the run and push nothing — the agent never sees these messages.
+				changed = true;
+			} else {
+				// REPLACE: insert ONE synthetic summary message (existing behavior).
+				const role = messages[i].role === "assistant" ? "assistant" : "user";
+				out.push({ role, content: [{ type: "text", text: g.summaryText }] } as PiMessage);
+				changed = true;
+			}
 			i = j;
 			continue;
 		}
