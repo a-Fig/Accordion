@@ -39,17 +39,17 @@ defines the seam, not what makes a good conductor.
 
 ## Decision
 
-### 1. The contract is one pure idea: `conduct(snapshot) → Command[]`
+### 1. The contract is one pure idea: `conduct(view) → Command[] | null`
 
 A **conductor** is an interchangeable context-management strategy. The host hands it a
-read-only `ContextSnapshot` (every block in conversation order, the budget, the context
+read-only `ConductorView` (every block in conversation order, the budget, the context
 window, the current live token cost, and the host's protected-tail policy); the conductor
 replies with `Command[]` describing the context it wants. The host clamps those commands
 to the one floor it enforces, applies them to the session store, and — on a live session —
 mirrors the resulting store state down the unchanged pi wire via `computeFoldOps`.
 
-The in-process shape lives in `app/src/lib/engine/conductor.ts` (`ContextSnapshot`, the
-`Command` union, `ClampReport`/`ClampReason`, and `interface Conductor`). It is
+The in-process shape lives in `conductors/contract/conductor.ts` (`ConductorView`, the
+`Command` union, `ClampReport`/`ClampReason`, `ConductorHost`, and `interface Conductor`). It is
 dependency-free and runes-free so the engine, the live wire layer, and an out-of-process
 conductor can all import it.
 
@@ -58,8 +58,9 @@ The return value carries three meanings:
 - **`Command[]`** — the conductor's *complete desired state*; the host resets to the raw
   baseline and applies the batch.
 - **`[]`** — explicitly clear to raw (nothing folded).
-- **`null`** — *hold*: keep the last applied state untouched. This is how an async
-  (remote) conductor that is still thinking declines to block a model call.
+- **`null`** — *hold*: reuse the previous non-null command batch while still rebuilding from
+  baseline and enforcing host invariants. This is how an async conductor that is still
+  thinking declines to block a model call.
 
 ### 2. The async, cross-process form is a WebSocket — the **conductor hosts, Accordion connects**
 

@@ -15,7 +15,7 @@ import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
 import { digest, digestTokens, groupDigest, groupDigestTokens, substTokens, wireFoldable } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { messageKey } from "./ids";
-import type { Conductor, ConductorView, Command, ClampReport, ClampReason, LockName } from "$conductors/contract";
+import type { Conductor, ConductorView, Command, ClampReport, ClampReason, LockName, ConductorHost } from "$conductors/contract";
 import { hasLock } from "$conductors/contract";
 import { BuiltinConductor } from "$conductors";
 
@@ -97,6 +97,14 @@ export class AccordionStore {
 	private lastCmds: Command[] = [];
 	/** Re-entrancy latch: a command that itself re-folds (e.g. `group`) must not recurse. */
 	private conducting = false;
+	/**
+	 * Lifecycle generation for the attached conductor. Async conductors receive a host object
+	 * whose `requestRerun()` captures this epoch; if the conductor is later replaced, any stale
+	 * completion is ignored instead of refolding the new strategy's state.
+	 */
+	private conductorEpoch = 0;
+	/** Debounce token for in-process async conductor re-entry. */
+	private conductorRerunQueuedFor: { conductor: Conductor; epoch: number } | null = null;
 	/**
 	 * ClampReports from the most recent conductor pass — what the host had to clamp to the
 	 * validity floor. A remote runner reads this after triggering a pass to feed
@@ -180,6 +188,7 @@ export class AccordionStore {
 		this.meta = parsed.meta;
 		this.blocks = parsed.blocks;
 		this.reindex();
+		this.attachConductorHost(this.conductor);
 		this.refold();
 	}
 
@@ -193,6 +202,9 @@ export class AccordionStore {
 	 * conductor (no locks) releases nothing — byte-for-byte today's behavior.
 	 */
 	attach(c: Conductor | null): void {
+		this.detachConductorHost(this.conductor);
+		this.conductorEpoch++;
+		this.conductorRerunQueuedFor = null;
 		this.conductor = c;
 		// Mirror the new conductor's locks (and tailTokens) into the reactive snapshots BEFORE
 		// any gate reads them (releaseLockedDomains → isLocked, the refold's protectedFromIndex
@@ -201,9 +213,11 @@ export class AccordionStore {
 		// later via reconcileLocks().
 		this.syncLocks();
 		this.lastCmds = [];
+		this.lastReports = [];
 		// Release human/agent holds in the domains the NEW conductor locks. Pass `c?.locks`
 		// explicitly; the `activeLocks` snapshot was just synced above so `isLocked` already agrees.
 		this.releaseLockedDomains(c?.locks ?? []);
+		this.attachConductorHost(c);
 		this.refold();
 	}
 	/**
@@ -223,12 +237,17 @@ export class AccordionStore {
 		// calls detach() then setActiveConductor(NONE_ID), whose attach effect detaches again —
 		// this guard makes that second detach harmless.
 		if (this.conductor === null) return;
+		const oldConductor = this.conductor;
 		this.freezeForDetach();
+		this.detachConductorHost(oldConductor);
+		this.conductorEpoch++;
+		this.conductorRerunQueuedFor = null;
 		this.conductor = null;
 		// Kill switch unlocks every control — clear the reactive lock snapshot to match the now-null
 		// conductor (otherwise stale locks would keep the gates closed and the UI showing "locked").
 		this.syncLocks();
 		this.lastCmds = [];
+		this.lastReports = [];
 		this.refold();
 	}
 
@@ -366,6 +385,51 @@ export class AccordionStore {
 	private reindex(): void {
 		this.index.clear();
 		for (let i = 0; i < this.blocks.length; i++) this.index.set(this.blocks[i].id, i);
+	}
+
+	/** Give the current in-process conductor a tiny host API, if it asked for one. */
+	private attachConductorHost(c: Conductor | null): void {
+		if (!c?.attach) return;
+		const epoch = this.conductorEpoch;
+		const host: ConductorHost = {
+			requestRerun: () => this.requestConductorRerun(c, epoch),
+		};
+		try {
+			c.attach(host);
+		} catch (e) {
+			// Lifecycle failures are conductor bugs, not store bugs. Keep the model-call path live
+			// and let the upcoming refold fall back to the conductor's normal `conduct()` handling.
+			this.emit("conductor", "conductor attach error", e instanceof Error ? e.message : String(e));
+		}
+	}
+
+	/** Notify the old conductor it no longer owns this store; lifecycle bugs must not wedge us. */
+	private detachConductorHost(c: Conductor | null): void {
+		if (!c?.detach) return;
+		try {
+			c.detach();
+		} catch (e) {
+			this.emit("conductor", "conductor detach error", e instanceof Error ? e.message : String(e));
+		}
+	}
+
+	/**
+	 * Async bridge for in-process conductors. A conductor may finish work after `conduct()`
+	 * returned `null`; this schedules exactly one later pass for a burst of completions. The
+	 * captured conductor + epoch make late completions from a detached conductor harmless.
+	 */
+	private requestConductorRerun(c: Conductor, epoch: number): void {
+		if (this.conductor !== c || this.conductorEpoch !== epoch) return;
+		if (this.conductorRerunQueuedFor) return;
+		const token = { conductor: c, epoch };
+		this.conductorRerunQueuedFor = token;
+		const enqueue = typeof queueMicrotask === "function" ? queueMicrotask : (fn: () => void) => Promise.resolve().then(fn);
+		enqueue(() => {
+			if (this.conductorRerunQueuedFor !== token) return;
+			this.conductorRerunQueuedFor = null;
+			if (this.conductor !== c || this.conductorEpoch !== epoch) return;
+			this.refold();
+		});
 	}
 
 	// ---- reads -------------------------------------------------------------

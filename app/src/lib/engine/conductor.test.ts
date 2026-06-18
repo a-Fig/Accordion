@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "./store.svelte";
 import { BuiltinConductor } from "$conductors";
-import type { Conductor, ConductorView, Command } from "$conductors/contract";
+import type { Conductor, ConductorView, Command, ConductorHost } from "$conductors/contract";
 import type { Block, ParsedSession } from "./types";
 import { digest, digestTokens } from "./digest";
 
@@ -47,6 +47,44 @@ class StubConductor implements Conductor {
 		this.lastSnapshot = view;
 		return this.cmds;
 	}
+}
+
+/** Async in-process conductor test double: returns `null` while "thinking", then pokes host. */
+class AsyncStubConductor implements Conductor {
+	readonly id = "async-stub";
+	readonly label = "Async Stub";
+	cmds: Command[] | null = null;
+	host: ConductorHost | null = null;
+	conductCalls = 0;
+	attachCalls = 0;
+	detachCalls = 0;
+	attach(host: ConductorHost): void {
+		this.attachCalls++;
+		this.host = host;
+	}
+	detach(): void {
+		this.detachCalls++;
+	}
+	conduct(_view: ConductorView): Command[] | null {
+		this.conductCalls++;
+		return this.cmds;
+	}
+}
+
+class ThrowLifecycleConductor extends StubConductor {
+	throwAttach = false;
+	throwDetach = false;
+	attach(_host: ConductorHost): void {
+		if (this.throwAttach) throw new Error("attach boom");
+	}
+	detach(): void {
+		if (this.throwDetach) throw new Error("detach boom");
+	}
+}
+
+async function flushMicrotasks(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
 }
 
 describe("conductor seam — attach / detach", () => {
@@ -381,6 +419,150 @@ describe("conductor seam — hold last state (null)", () => {
 
 		expect(s.isFolded(s.get("m0:p0")!)).toBe(true); // held
 		expect(s.isFolded(s.get("m9:p0")!)).toBe(false); // new content arrives raw
+	});
+});
+
+describe("conductor seam — in-process async rerun hook", () => {
+	it("lets an in-process conductor request a fresh pass after returning null", async () => {
+		const s = makeStore(Array.from({ length: 3 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const stub = new AsyncStubConductor();
+		stub.cmds = null; // still computing: attach pass should hold raw
+		s.attach(stub);
+
+		expect(stub.attachCalls).toBe(1);
+		expect(stub.host).not.toBeNull();
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(false);
+
+		stub.cmds = [{ kind: "fold", ids: ["m0:p0"] }];
+		stub.host!.requestRerun();
+		await flushMicrotasks();
+
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(true);
+		expect(s.get("m0:p0")!.by).toBe("auto");
+	});
+
+	it("debounces a burst of async rerun requests into one conductor pass", async () => {
+		const s = makeStore(Array.from({ length: 3 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const stub = new AsyncStubConductor();
+		s.attach(stub);
+		const before = stub.conductCalls;
+
+		stub.host!.requestRerun();
+		stub.host!.requestRerun();
+		stub.host!.requestRerun();
+		await flushMicrotasks();
+
+		expect(stub.conductCalls).toBe(before + 1);
+	});
+
+	it("ignores stale rerun requests after the conductor is replaced", async () => {
+		const s = makeStore(Array.from({ length: 3 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const oldConductor = new AsyncStubConductor();
+		s.attach(oldConductor);
+		const oldHost = oldConductor.host!;
+		const oldCalls = oldConductor.conductCalls;
+
+		const replacement = new StubConductor();
+		replacement.cmds = [];
+		s.attach(replacement);
+		expect(oldConductor.detachCalls).toBe(1);
+
+		oldConductor.cmds = [{ kind: "fold", ids: ["m0:p0"] }];
+		oldHost.requestRerun();
+		await flushMicrotasks();
+
+		expect(oldConductor.conductCalls).toBe(oldCalls); // stale host poke did not re-enter it
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(false); // replacement's raw state remains
+	});
+
+	it("ignores a rerun that was queued before the conductor was replaced", async () => {
+		const s = makeStore(Array.from({ length: 3 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const oldConductor = new AsyncStubConductor();
+		s.attach(oldConductor);
+		const oldCalls = oldConductor.conductCalls;
+		oldConductor.host!.requestRerun(); // queued while oldConductor is still active
+
+		const replacement = new StubConductor();
+		replacement.cmds = [];
+		s.attach(replacement); // invalidates the queued old-host callback before it runs
+		await flushMicrotasks();
+
+		expect(oldConductor.conductCalls).toBe(oldCalls);
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(false);
+	});
+
+	it("a queued stale rerun cannot clear the next conductor's debounce latch", async () => {
+		const s = makeStore(Array.from({ length: 3 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const oldConductor = new AsyncStubConductor();
+		s.attach(oldConductor);
+		oldConductor.host!.requestRerun(); // stale callback will run before the new callback
+
+		const nextConductor = new AsyncStubConductor();
+		s.attach(nextConductor);
+		const nextCalls = nextConductor.conductCalls;
+		nextConductor.host!.requestRerun();
+		nextConductor.host!.requestRerun();
+		await flushMicrotasks();
+
+		expect(nextConductor.conductCalls).toBe(nextCalls + 1);
+	});
+
+	it("ignores stale rerun requests after plain detach", async () => {
+		const s = makeStore(Array.from({ length: 3 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const stub = new AsyncStubConductor();
+		s.attach(stub);
+		const host = stub.host!;
+		const calls = stub.conductCalls;
+
+		s.detach();
+		stub.cmds = [{ kind: "fold", ids: ["m0:p0"] }];
+		host.requestRerun();
+		await flushMicrotasks();
+
+		expect(stub.conductCalls).toBe(calls);
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(false);
+	});
+
+	it("calls detach lifecycle when a conductor is detached", () => {
+		const s = makeStore(Array.from({ length: 2 }, (_, i) => blk(i)));
+		const stub = new AsyncStubConductor();
+		s.attach(stub);
+		s.detach();
+		expect(stub.detachCalls).toBe(1);
+	});
+
+	it("logs and continues when attach lifecycle throws", () => {
+		const s = makeStore(Array.from({ length: 2 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const stub = new ThrowLifecycleConductor();
+		stub.throwAttach = true;
+		stub.cmds = [{ kind: "fold", ids: ["m0:p0"] }];
+
+		expect(() => s.attach(stub)).not.toThrow();
+		expect(s.log.some((e) => e.action === "conductor attach error" && e.detail === "attach boom")).toBe(true);
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(true); // conduct still ran after the lifecycle error
+	});
+
+	it("logs and continues when detach lifecycle throws", () => {
+		const s = makeStore(Array.from({ length: 2 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const stub = new ThrowLifecycleConductor();
+		stub.throwDetach = true;
+		stub.cmds = [{ kind: "fold", ids: ["m0:p0"] }];
+		s.attach(stub);
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(true);
+
+		expect(() => s.detach()).not.toThrow();
+		expect(s.log.some((e) => e.action === "conductor detach error" && e.detail === "detach boom")).toBe(true);
+		expect(s.conductor).toBe(null);
+		expect(s.isFolded(s.get("m0:p0")!)).toBe(true); // kill-switch detach still froze the view
+		expect(s.get("m0:p0")!.by).toBe("you");
 	});
 });
 

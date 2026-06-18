@@ -39,6 +39,23 @@ session. The built-in (`conductors/builtin/builtin.ts`) is a ~15-line example of
 this; read it to see the surface in action. (For the step-by-step + a minimal example, see
 [`conductors/README.md`](../conductors/README.md).)
 
+`conduct()` is always synchronous. If a conductor needs async work — for example an LLM
+summary call — it implements the optional lifecycle hook:
+
+```ts
+attach(host: ConductorHost): void
+detach(): void
+```
+
+`host.requestRerun()` is the in-process async bridge. Start the async work from `conduct()`,
+return `null` while it is in flight, cache the finished `Command[]` inside the conductor,
+then call `requestRerun()`. The host schedules a later `conduct()` pass, debounces bursts of
+requests, and ignores stale requests from a conductor that has since been detached or
+replaced. Async completions must never mutate the store directly. If a conductor stores the
+host object on `this` and may reuse the same instance across attachments, it should also use
+its own generation/cancellation token so an old promise cannot write stale commands into a
+new attachment.
+
 ## The view you receive — `ConductorView`
 
 `conduct()` is handed a read-only `ConductorView`: pure, serializable data the host owns.
@@ -95,10 +112,11 @@ saving a fold would buy.
 - **`Command[]`** — your *complete desired state*. The host resets to the raw baseline and
   applies the whole batch, so to change one block you re-send your whole intention.
 - **`[]`** — explicitly clear to raw (nothing folded).
-- **`null`** — *hold*: the host keeps the last applied state untouched. Used by an async
-  (remote) conductor still thinking; it must never block a model call. (An in-process
-  conductor is synchronous and normally always has a definite answer — the built-in never
-  returns `null`.)
+- **`null`** — *hold*: the host reuses the previous non-null command batch. It still rebuilds
+  from the raw baseline and re-enforces protection/provider-validity, so new content not
+  covered by the previous batch arrives raw. Remote conductors use this through
+  `RemoteRunner`; in-process conductors use `ConductorHost.requestRerun()` to ask for a fresh
+  pass when their async result is ready. The built-in never returns `null`.
 
 Most commands are **content substitution** — a block is replaced in place, not spliced out,
 which guarantees a `tool_call`/`tool_result` pair can never orphan. The deliberate exception

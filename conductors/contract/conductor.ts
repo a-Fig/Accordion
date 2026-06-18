@@ -215,6 +215,19 @@ export type ClampReason =
 	| "noop";
 
 /**
+ * Host services available to an in-process conductor. The object is deliberately tiny and
+ * dependency-free so the contract remains importable everywhere the wire contract is used.
+ *
+ * `requestRerun()` is the async bridge: a conductor can return `null` from `conduct()` while
+ * it computes off-thread, then call this when fresh commands are ready in its own cache. The
+ * host debounces the poke and re-enters `conduct()` on a later microtask; the conductor must
+ * still return synchronously from that next call.
+ */
+export interface ConductorHost {
+	requestRerun(): void;
+}
+
+/**
  * A context-management strategy. The built-in folder is one; a remote WebSocket
  * conductor is wrapped in another. The host calls `conduct()` whenever the context
  * changes (a block streamed in, the budget moved, the protect tail resized).
@@ -223,12 +236,14 @@ export type ClampReason =
  *  - `Command[]` — the conductor's complete desired state; the host resets to baseline
  *    and applies it.
  *  - `[]` — explicitly clear to raw (nothing folded).
- *  - `null` — "hold": the host keeps the last applied state untouched. Used by an
- *    async (remote) conductor that is still thinking; it must never block a model call.
+ *  - `null` — "hold": the host reuses the last non-null command batch. It still rebuilds
+ *    from baseline and re-enforces invariants, so new blocks not named in that batch arrive
+ *    raw. Used by an async conductor that is still thinking; it must never block a model call.
  *
  * `conduct()` MUST be synchronous and side-effect-free with respect to the view.
- * An out-of-process conductor does its async work off to the side and feeds the result
- * back through a synchronous runner (see `RemoteRunner` in the live layer).
+ * An in-process conductor can use `ConductorHost.requestRerun()` to re-enter after async
+ * work; an out-of-process conductor does the same through a synchronous runner (see
+ * `RemoteRunner` in the live layer).
  */
 export interface Conductor {
 	/** Stable identifier, e.g. "builtin" or a remote session id. Drives actor attribution. */
@@ -262,5 +277,13 @@ export interface Conductor {
 	 * manages everything older. `tailTokens` omitted (or 0) owns everything — no protected tail.
 	 */
 	readonly tailTokens?: number;
+	/**
+	 * Optional lifecycle hook for in-process conductors that need host services. Called when
+	 * the store attaches this conductor, before the first `conduct()` pass. Synchronous
+	 * conductors can ignore it.
+	 */
+	attach?(host: ConductorHost): void;
+	/** Optional lifecycle hook called when the store detaches or replaces this conductor. */
+	detach?(): void;
 	conduct(view: ConductorView): Command[] | null;
 }

@@ -130,27 +130,27 @@ recommended mitigation is a manual smoke test against the sample session before 
 
 ---
 
-## Host/contract extensions required (the real new work for C2 + C3)
+## Host/contract extensions for C2 + C3
 
-Neither C2 nor C3 can land without two host-side additions:
+C2/C3 depend on the async hook below plus one remaining host-side addition:
 
 ### (1) In-process async re-run hook
 
-Today, only the WS escape-hatch path (`RemoteRunner`) gets re-entry — a WS message arrives
-and `store.refold()` is called. An in-process conductor has no way to trigger a fresh
-`conduct()` pass after async work completes.
+**Status:** landed — the `Conductor` contract now has optional `attach(host)` / `detach()`
+lifecycle hooks, and `ConductorHost.requestRerun()` schedules a debounced fresh store pass
+for async in-process conductors. Stale requests from replaced conductors are ignored. The
+remaining C2/C3 work can build on this hook.
 
-**Required change:** thread a `requestRerun: () => void` callback through `attach()` (or
-a thin `ConductorHost` object) so an LLM conductor can fire it from a `.then()`. The host
-debounces the call (at most one re-run per turn to prevent runaway loops). This is contained
-to `store.svelte.ts` and `conductors/contract/conductor.ts` (`Conductor.attach?` optional
-lifecycle method, or passed via `create(host)`).
+Previously, only the WS escape-hatch path (`RemoteRunner`) got re-entry — a WS message
+arrived and `store.refold()` was called. In-process conductors can now do the same without
+becoming a separate process: fire `host.requestRerun()` from a `.then()` after caching the
+async result, and the host re-enters `conduct()` without blocking the model-call path.
 
 **Two paths for async conductors:**
 
 - **Recommended — in-process + re-run hook.** Integrated into the registry, the header
   switcher, and the conductor dropdown without extra plumbing. One TS class, same authoring
-  model. Requires the hook above (~half a day of store work).
+  model. The hook is now available.
 - **WS escape hatch.** Zero host changes; runs out-of-process; the async bridge is already
   there (the WS message → `store.refold()` path). Downside: the conductor must be a
   separate WS server process, complicating the dev loop and ruling out native Rust LLM

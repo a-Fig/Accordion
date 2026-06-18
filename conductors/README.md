@@ -26,8 +26,22 @@ policy. You return the context you *want*, as commands:
 - **`Command[]`** — your complete desired state. The host resets to the raw baseline and
   applies the whole batch, so to change one block you re-send your whole intention.
 - **`[]`** — explicitly clear to raw (nothing folded).
-- **`null`** — *hold*: keep the last applied state (used by an async/remote conductor still
-  thinking; never blocks a model call).
+- **`null`** — *hold*: reuse the previous non-null command batch (used by an async/remote
+  conductor still thinking; never blocks a model call). The host still rebuilds from the raw
+  baseline and enforces invariants, so new blocks not named in that batch arrive raw.
+
+In-process conductors may also implement optional lifecycle hooks:
+
+```ts
+attach(host: ConductorHost): void
+detach(): void
+```
+
+Use `attach()` only when you need a host service. Today that service is
+`host.requestRerun()`: start async work outside `conduct()`, return `null` while it is in
+flight, cache the finished command set, then call `requestRerun()` so Accordion schedules a
+fresh synchronous `conduct()` pass. The host debounces bursts of requests and ignores stale
+requests after the conductor is replaced.
 
 The `Command` union is `fold · replace · group · restore · pin`. Most are **content
 substitution** (a block is replaced in place, never removed), so a `tool_call`/`tool_result`
@@ -159,6 +173,59 @@ cost before it is safe to emit.
 It is the **second worked example** alongside the built-in — read it to see what instance
 state and a multi-pass pipeline look like in a real in-process conductor. The built-in's
 golden test is untouched.
+
+### Async in-process conductors
+
+`conduct()` must remain synchronous, but an in-process conductor can bridge to async work by
+using the optional host hook:
+
+```ts
+import type { Command, Conductor, ConductorHost, ConductorView } from "../contract";
+
+export class AsyncSummaryConductor implements Conductor {
+  readonly id = "async-summary";
+  readonly label = "Async summary";
+  private host: ConductorHost | null = null;
+  private desired: Command[] | null = null;
+  private inFlight = false;
+  private generation = 0;
+
+  attach(host: ConductorHost): void {
+    this.host = host;
+    this.desired = null;
+    this.generation++;
+  }
+
+  detach(): void {
+    this.host = null;
+    this.desired = null;
+    this.inFlight = false;
+    this.generation++;
+  }
+
+  conduct(view: ConductorView): Command[] | null {
+    if (this.desired) return this.desired;
+    if (!this.inFlight) {
+      this.inFlight = true;
+      const host = this.host;
+      const generation = this.generation;
+      void summarizeLater(view).then((commands) => {
+        if (this.generation !== generation || this.host !== host) return;
+        this.desired = commands;
+        this.inFlight = false;
+        host?.requestRerun();
+      });
+    }
+    return null; // hold the previous state while the async work runs
+  }
+}
+```
+
+The important rule is that async completion never mutates the store directly. It only updates
+the conductor's own cache and asks the host to re-enter `conduct()`.
+If you store the host on `this`, guard async completions with a conductor-local generation
+like the example above: Accordion ignores stale host objects, but a reused conductor instance
+must also avoid letting an old promise write into its new attachment.
 
 **Convention:** give your conductor its own subdirectory here, pick a stable `id`, and either
 register it in-process (`index.ts`) or — for the WS escape hatch — advertise a registry file
