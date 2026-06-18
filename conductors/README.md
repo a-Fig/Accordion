@@ -136,6 +136,7 @@ session is currently active.
 | [`contract/`](contract/) | The contract, dependency-free: `conductor.ts` (the in-process `ConductorView` / `Command` / `Conductor`) + `protocol.ts` (the WebSocket messages, which import `Command`/`ViewBlock` so there's one definition). |
 | [`builtin/`](builtin/)   | The default conductor (`builtin.ts`) — the minimal worked example. |
 | [`cold-score/`](cold-score/) | Relevance-aware in-process conductor — ACT-R scoring + lexical pre-unfold + hysteresis. The second worked example. |
+| [`garbage-collector/`](garbage-collector/) | Reachability-aware in-process conductor — mark-and-sweep from roots over entity/causal/message edges; folds unreachable blocks first. The third worked example. |
 | [`index.ts`](index.ts)   | The in-process registry (`IN_PROCESS_CONDUCTORS`). Add a line; it appears in the switcher. |
 | [`recency-folder/`](recency-folder/) | The runnable out-of-process (WebSocket) example. |
 
@@ -149,7 +150,38 @@ session is currently active.
 | [`cold-score/`](cold-score/) | TypeScript | in-process | **Relevance-aware folder.** ACT-R cold-score ranking + lexical pre-unfold (keep blocks live whose identifiers appear in the protected tail) + per-block hysteresis cooldowns. Emits `fold` commands only. Instance state (recalls / cooldowns) accumulates across `conduct()` calls. See [ADR 0009](../docs/adr/0009-cold-score-conductor.md). |
 | [`attention-folder/`](attention-folder/) | Node.js + Python | out-of-process (WS) | **Attention-based periodic folder.** A Qwen2.5-0.5B probe scores how much the current work tail attends to each older block; the conductor folds the least-attended blocks at deliberate "epochs" rather than every turn, keeping the inference prompt cache stable between folds. Hysteresis band: 70–90% of the context window. See [ADR 0010](../docs/adr/0010-attention-conductor.md) and its own [README](attention-folder/README.md). |
 | [`sliding-window/`](sliding-window/) | TypeScript | in-process | **Hard-delete oldest non-user blocks.** A high-water/low-water band: when the agent-visible window crosses ~90% of budget it issues `group` commands with `digest: null` (DROP) over the oldest non-`user` blocks — skipping user messages, which stay live — down to ~70%, then **holds** (re-emitting the deletes) while the window refills. Carries a monotonic drop-set as instance state. Locks `human-steering` + `agent-unfold` (NOT `tail-size`). Known limitations (bounded, self-correcting straggler/snap overshoot): see [ADR 0006](../docs/adr/0006-multiblock-folds.md#known-limitations-sliding-window). |
+| [`garbage-collector/`](garbage-collector/) | TypeScript | in-process | **Reachability-based folder.** Treats context as a managed heap: roots = protected tail + human-held + the first `user` message; a reference graph (entity identifiers shared with cold-score's extractor, `callId` causal pairs, same-message id-prefix links) seeds a mark phase, and the sweep folds UNREACHABLE candidates first, falling back to reachable ones only under budget pressure. Collaborative (no locks). See [ADR 0012](../docs/adr/0012-garbage-collector-conductor.md). |
 | [`recency-folder/`](recency-folder/) | Node.js | out-of-process (WS) | **Wire example.** Folds the oldest non-protected `tool_result` blocks until under budget, and auto-advertises for discovery. Intentionally crude — copy it and grow your own. |
+
+### Garbage-collector conductor
+
+[`garbage-collector/`](garbage-collector/) is a third in-process conductor — a
+reachability-aware peer to the built-in and cold-score. Where the built-in folds
+oldest-first and cold-score folds coldest-activation-first, the garbage collector folds
+**unreachable-first**: it treats context as a managed heap and runs mark-and-sweep.
+
+- **Roots** = the protected working tail + human-held blocks + the **first** `user`
+  message (the original task statement). Only the first user message is a root — a
+  mid-session user turn that has aged out of the tail is durable (never folded) but no
+  longer anchors reachability, so work the agent has moved on from can go unreachable.
+- **Reference graph** (`edges.ts`) — three bidirectional edge kinds, all derived from the
+  pure `ConductorView`: **entity** edges (blocks sharing a distinctive file/symbol
+  identifier, extracted via cold-score's `extractIdentifiers` so the two relevance-aware
+  conductors agree on what a "symbol" is), **causal** edges (`tool_call`/`tool_result`
+  sharing a `callId`), and **message** edges (assistant parts sharing an id prefix). Entity
+  edges are rarity-guarded and chained (not cliqued) — reachability is preserved, edge count
+  stays linear.
+- **Mark then sweep** — mark every block reachable from the roots; fold candidates are
+  ordered unreachable-first, then by the built-in's kind-rank and age within each tier, and
+  folded greedily until the live context fits the budget. If unreachable blocks don't
+  suffice, reachable ones follow — the **budget guarantee is the hard invariant**;
+  reachability is the ordering, not a veto.
+
+It is **collaborative** (no involvement locks — reachability is a relevance signal, not a
+claim of authority), carries **no instance state** (the graph is recomputed from the view
+each pass, so it is fully deterministic), and emits only `fold` commands. See
+[ADR 0012](../docs/adr/0012-garbage-collector-conductor.md). The imaginarium's
+generational refinement (nursery / old gen / tenured) is future work.
 
 ### Cold-score conductor
 
