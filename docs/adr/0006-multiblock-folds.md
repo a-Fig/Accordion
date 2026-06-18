@@ -284,10 +284,56 @@ engine, which always sends `null` for a drop.
 
 ### Introduces: `drop-oldest` conductor
 
-`conductors/drop-oldest/` replaces `conductors/sliding-window/`. When live tokens exceed ~90%
-of budget it issues `group` commands with `digest: null` to remove the oldest non-`user` blocks
-(skipping user messages, which stay live) until the estimate falls to ~70%. It locks
-`human-steering` + `agent-unfold` (NOT `tail-size`) so that, while attached, neither a human
-override nor an agent `unfold` can re-admit content it dropped — recovery is only via the
-detach kill switch (see the DROP bullet above). It leaves `tail-size` unlocked so the human
-keeps the protected-tail dial.
+`conductors/drop-oldest/` replaces `conductors/sliding-window/`. It issues `group` commands
+with `digest: null` to remove the oldest non-`user` blocks (skipping user messages, which stay
+live). It locks `human-steering` + `agent-unfold` (NOT `tail-size`) so that, while attached,
+neither a human override nor an agent `unfold` can re-admit content it dropped — recovery is
+only via the detach kill switch (see the DROP bullet above). It leaves `tail-size` unlocked so
+the human keeps the protected-tail dial.
+
+**Hysteresis band (high-water 90% / low-water 70%).** The host clears conductor-owned folds
+before every pass (`runConductor` → `clearConductorState`), so `view.liveTokens` is always the
+raw, fully-unfolded size — which only grows. A *stateless* trigger comparing that to 90% would
+therefore re-fire on every pass once the raw size first crossed 90%, pinning the agent's window
+at 70% forever. So the conductor keeps internal state: `dropped`, the committed (monotonic)
+drop-set. Each pass it computes the **agent-visible** window (`liveTokens − Σ tokens of dropped
+blocks still eligible`) and only *grows* the drop-set when *that* crosses 90%, bringing it back
+to ~70%, then **holds** — re-emitting the same `group(digest:null)` commands so the deletes
+stay applied while the window refills toward 90% again. The set is monotonic (a dropped block
+is gone), pruned only of ids no longer present.
+
+### Known limitations (`drop-oldest`)
+
+The conductor decides at **block** granularity, but the host enforces deletion at **whole-message
++ tool-pair** granularity (`createGroup` snaps a run outward to whole messages; `applyPlan`
+Phase A keeps a message live if a tool pair straddles the removal boundary). The conductor's
+token accounting models neither, so two bounded discrepancies exist. Both are **self-correcting**
+(the next grow pass closes them) and err in the **safe direction** — the agent keeps *more*
+context than the target, never less — and neither reintroduces the "pinned at 70%" behavior the
+hysteresis band fixed.
+
+- **Straggler over-credit.** When a dropped `tool_call`'s `tool_result` is *not* also in the
+  drop-set (it sits in the protected tail, or the remove loop stopped before reaching it), Phase A
+  keeps that message **live** as a straggler — but the conductor already counted its full tokens
+  as freed. So the visible window can sit a little above the 70% target. It self-corrects: the
+  next time the window refills past 90%, the grow pass extends the run to include the result, the
+  pair balances, and the overshoot closes. Worst case is a *frozen* session running slightly over
+  a soft target — moot, since a frozen session makes no model calls.
+
+- **Snap over-deletion.** If the remove loop's boundary falls mid-message (it drops an assistant
+  turn's `thinking` block but stops before that turn's `text`/`tool_call` blocks), `createGroup`
+  snaps the run outward to the whole message and deletes the rest of that same turn. This
+  over-deletes relative to the conductor's target, but only ever the *remainder of a turn it had
+  already begun deleting*, and it stays under budget.
+
+**Why not fixed.** Closing both exactly means teaching the conductor to reason in whole messages
+and pair `tool_call`/`tool_result` by `callId`. Pairing is cheap (`callId` is already in
+`ConductorView`), but whole-message reasoning needs message identity, which today lives only in
+the block-id string convention (`messageKey`, `app/src/lib/engine/ids.ts`) — the conductor would
+have to parse a format the engine owns, or `ViewBlock` would need an additive `messageKey` field.
+Not worth the coupling or the protocol bump for a bounded, self-correcting, safe-direction
+overshoot. This is the same root cause already flagged for cold-score auto-coalesce ("align runs
+to whole-message boundaries and model the host's straggler cost", `conductors/README.md`). The
+deeper reason exactness is awkward: the `ConductorView` is always the **raw baseline**, so a
+history-dependent strategy like this must *predict* its own effect open-loop rather than observe
+it — and the straggler drift lives in that prediction.
