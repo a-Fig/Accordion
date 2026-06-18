@@ -42,7 +42,7 @@ export const IN_PROCESS_CONDUCTORS: InProcessConductor[] = [
   { id: "builtin", label: "Built-in", create: () => new BuiltinConductor() },
   { id: "cold-score", label: "Cold-score", create: () => new ColdScoreConductor() },
   { id: "cold-epoch", label: "Cold epoch", create: () => new ColdEpochConductor() },
-  { id: "sliding-window", label: "Sliding window", create: () => new SlidingWindowConductor() },
+  { id: "sliding-window", label: "Sliding window", locks: ["human-steering", "agent-unfold"], create: () => new SlidingWindowConductor() },
   {
     id: "autopilot",
     label: "Autopilot",

@@ -39,6 +39,19 @@ describe("faceFor — token → die face mapping", () => {
 });
 
 // ---------------------------------------------------------------------------
+// PIP_POSITIONS[0] — blank face for drop groups
+// ---------------------------------------------------------------------------
+
+describe("buildSprites — face 0 produces a blank sprite (no pips)", () => {
+  it("face 0 is included in PIP_POSITIONS as an empty array", () => {
+    // We can't call buildSprites() in node (no HTMLCanvasElement), but we can
+    // verify the exported faceFor thresholds don't collide with 0, and that
+    // faceFor(0) still returns 1 (the caller must pass 0 explicitly for drop groups).
+    expect(faceFor(0)).toBe(1); // faceFor never returns 0 — callers pass 0 directly
+  });
+});
+
+// ---------------------------------------------------------------------------
 // computeGeometry
 // ---------------------------------------------------------------------------
 

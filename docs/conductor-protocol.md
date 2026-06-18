@@ -100,15 +100,17 @@ saving a fold would buy.
   conductor is synchronous and normally always has a definite answer — the built-in never
   returns `null`.)
 
-Every command is **content substitution, never structural removal** — a block is never
-spliced out, only its content changes. That is what guarantees a `tool_call`/`tool_result`
-pair can never orphan.
+Most commands are **content substitution** — a block is replaced in place, not spliced out,
+which guarantees a `tool_call`/`tool_result` pair can never orphan. The deliberate exception
+is `group` with `digest: null` (DROP): the run is removed from the wire entirely and no
+replacement is inserted. Phase A tool-pair balancing still applies, so no orphaned pairs
+result. See the `group` row below and ADR 0006 §drop-addendum.
 
 | command   | shape                                | effect                                                                 |
 |-----------|--------------------------------------|------------------------------------------------------------------------|
 | `fold`    | `{ kind:"fold", ids, digest? }`      | Collapse blocks to a digest. No `digest` → the host's per-kind digest + the `{#code FOLDED}` agent-recovery tag. A `digest` string → exactly that text is shown and the agent receives it. |
 | `replace` | `{ kind:"replace", id, content }`    | Substitute a block's content with arbitrary text. The block stays in place (pairing intact). `content: ""` means "shrink to nothing": an empty content part can't be sent on the wire, so the host folds the block to its `{#code FOLDED}` digest (the smallest wire-safe form), so the view matches what the agent receives. Only `text`/`thinking`/`tool_result` fold. |
-| `group`   | `{ kind:"group", ids }`              | Collapse a **contiguous** run into one summary entry (summary-on-head, the rest emptied — never removed). The group covers the run from the **first to the last** named id, snapped outward to whole messages — blocks *between* the first and last are swept in even if unnamed. For a non-contiguous set, issue one `group` per run, or empty/replace blocks individually. |
+| `group`   | `{ kind:"group", ids, digest? }`     | Collapse a **contiguous** run (≥1 member) into an entry. The group covers the run from the **first to the last** named id, snapped outward to whole messages — blocks *between* the first and last are swept in even if unnamed. For a non-contiguous set, issue one `group` per run, or empty/replace blocks individually. `digest` controls what replaces the run: **`undefined`** → the host's default deterministic recap + `{#code FOLDED}` tag (unchanged behavior); **`null` or `""`** → **DROP**: the run is removed from the wire and NO replacement is inserted — the agent never sees those blocks, `recall`/`unfold` cannot recover them (they are gone by design); **a non-empty string** → that exact text is the summary verbatim (like `FoldCommand.digest`, no tag added). DROP is the second deliberate exception to "content substitution, never structural removal" (see ADR 0006 §drop-addendum); like the existing group→summary exception it is whole-message and pair-balanced. |
 | `restore` | `{ kind:"restore", ids }`            | Return blocks to full, live content (undo a fold/replace). No-op on a human-held block. |
 | `pin`     | `{ kind:"pin", ids }`                | Assert blocks stay live and open — e.g. force live a block an earlier command in the same batch folded. Never overrides a *human* pin. |
 
@@ -118,15 +120,16 @@ The host clamps each command to the one floor it keeps — **provider-validity, 
 stays sendable** — and reports anything it couldn't apply verbatim. Nothing is silently
 dropped; nothing throws.
 
-- **Content substitution only.** There is no remove. `replace(id, "")` "deletes" by folding the block to its `{#code FOLDED}` digest (an empty content part can't be sent), so it still costs the digest, not zero.
+- **Content substitution, with one removal exception.** `replace(id, "")` "deletes" by folding the block to its `{#code FOLDED}` digest (an empty content part can't be sent), so it still costs the digest, not zero. The sole true removal is `group` with `digest: null` (DROP) — it removes the whole run from the wire and inserts nothing; see the `group` row above and ADR 0006 §drop-addendum.
 - **Human-held blocks are refused** (in the `human-steering`-unlocked domains). A `fold` / `replace` / `restore` / `pin` touching a
   block the human pinned, manually folded, or manually unfolded (`held: true`) comes back as
   a `human-override` `ClampReport` and is not applied. Under the `human-steering` lock, no
   human overrides exist to refuse — the UI blocks the action at the source (ADR 0011).
 - **A `group` over a human-held block is refused wholesale** — the entire group, not just
   the held member. Re-issue the group around the held block, or leave it.
-- **`group` validity.** The ids must be a contiguous, currently-ungrouped, ≥2-member run,
-  entirely older than the protected tail. Otherwise: `invalid-group`.
+- **`group` validity.** The ids must form a contiguous, currently-ungrouped, ≥1-member run
+  entirely older than the protected tail. Otherwise: `invalid-group`. A single-member group
+  is valid — it is the idiomatic way to drop or summarize one lone block.
 - **Grouped members are off-limits.** A block already inside a folded group (`grouped:
   true`) is owned by the group overlay; folding it individually double-counts → a `grouped`
   report. Leave grouped blocks alone.
@@ -138,7 +141,7 @@ A **`ClampReport`** is `{ command, ids, reason, detail }`. `reason` is one of:
 | `unknown-id`     | no block with that id exists (vanished in a resync, or never existed)          |
 | `human-override` | a human pin / manual fold / manual unfold owns the block — the human wins      |
 | `grouped`        | the block is inside a folded group; the group overlay owns it                  |
-| `invalid-group`  | a `group`'s ids were not a valid contiguous, ungrouped, ≥2-member run          |
+| `invalid-group`  | a `group`'s ids were not a valid contiguous, ungrouped, ≥1-member run entirely outside the protected tail |
 | `protected`      | the block is inside the active protected working tail; the host refuses to fold it. Without `tail-size` this is the human's `protectTokens` tail; with `tail-size` it is the conductor's declared `tailTokens` tail (`tailTokens = 0` ⇒ no tail, no `protected` clamps). See ADR 0011 |
 | `noop`           | the command was a no-op (e.g. restoring an already-live block)                 |
 

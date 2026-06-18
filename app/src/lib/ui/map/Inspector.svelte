@@ -79,6 +79,7 @@
 	const gLiveTok = $derived(group ? store.groupLiveTokens(group) : 0);
 	const gSavedTok = $derived(group ? store.groupSavedTokens(group) : 0);
 	const gStrag = $derived(group ? store.groupStragglerCount(group) : 0);
+	const gIsDropGroup = $derived(group ? store.isDropGroup(group) : false);
 	const gDigest = $derived(group ? groupDigest(group, store.groupMembers(group)) : "");
 	const gTurnFirst = $derived(gMembers.length > 0 ? gMembers[0].turn : 0);
 	const gTurnLast = $derived(gMembers.length > 0 ? gMembers[gMembers.length - 1].turn : 0);
@@ -185,13 +186,23 @@
 
 		<!-- ── Body: group digest ─────────────────────────────────── -->
 		<div class="body-wrap">
-			<div class="digest-callout">
-				<div class="digest-label">
-					<Icon name="chevrons-down-up" size={12} stroke={2} />
-					Group digest — shown to agent when folded
+			{#if gIsDropGroup}
+				<div class="digest-callout digest-callout-drop">
+					<div class="digest-label digest-label-drop">
+						<Icon name="chevrons-down-up" size={12} stroke={2} />
+						Drop group — removed from wire
+					</div>
+					<p class="drop-note">The agent does not see this block</p>
 				</div>
-				<pre class="digest-text mono">{gDigest}</pre>
-			</div>
+			{:else}
+				<div class="digest-callout">
+					<div class="digest-label">
+						<Icon name="chevrons-down-up" size={12} stroke={2} />
+						Group digest — shown to agent when folded
+					</div>
+					<pre class="digest-text mono">{gDigest}</pre>
+				</div>
+			{/if}
 		</div>
 	</aside>
 {:else if block}
@@ -586,6 +597,12 @@
 		gap: var(--sp-2);
 	}
 
+	/* Drop group variant: muted/faint palette — content is gone, not just summarised. */
+	.digest-callout-drop {
+		border-left-color: var(--faint);
+		opacity: 0.75;
+	}
+
 	.digest-label {
 		display: flex;
 		align-items: center;
@@ -597,12 +614,25 @@
 		letter-spacing: .05em;
 	}
 
+	.digest-label-drop {
+		color: var(--faint);
+	}
+
 	.digest-text {
 		margin: 0;
 		font-size: var(--fs-sm);
 		color: var(--muted);
 		white-space: pre-wrap;
 		word-break: break-word;
+		line-height: 1.5;
+	}
+
+	/* Muted note shown instead of a digest for drop groups. */
+	.drop-note {
+		margin: 0;
+		font-size: var(--fs-sm);
+		font-style: italic;
+		color: var(--faint);
 		line-height: 1.5;
 	}
 

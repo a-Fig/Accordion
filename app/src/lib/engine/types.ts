@@ -76,8 +76,10 @@ export interface Block {
  * member's per-block override — folding the group collapses the range; unfolding it
  * returns the members to their own fold state. The id is `g:<firstMemberDurableId>`; its
  * agent-unfold handle is `foldCode(id)`. Invariants (enforced at creation, store.createGroup):
- * contiguous · non-overlapping · flat (members are blocks, never groups) · ≥2 members ·
- * entirely older than the protected tail. `memberIds` is in conversation (block) order.
+ * contiguous · non-overlapping · flat (members are blocks, never groups) · ≥1 member
+ * (relaxed from ≥2 so a lone block can be dropped/summarized — must still collapse at least
+ * one member, i.e. not be all-stragglers) · entirely older than the protected tail.
+ * `memberIds` is in conversation (block) order.
  *
  * `by` is provenance: who created the group. A HUMAN group (`by:"you"`) is durable — it
  * survives every conductor pass untouched. A conductor/auto group (`by:"auto"`/`"conductor"`,
@@ -98,6 +100,13 @@ export interface Group {
 	 * always sets it (default `"you"`).
 	 */
 	by?: Actor;
+	/**
+	 * Conductor-supplied summary override (mirrors `GroupCommand.digest`):
+	 *   - `undefined` → default recap via `groupDigest` (unchanged behavior).
+	 *   - `null` or `""` → DROP: the run is removed from the wire, no message inserted.
+	 *   - Non-empty string → that exact string is used as the summary verbatim.
+	 */
+	digest?: string | null;
 }
 
 export interface SessionMeta {
