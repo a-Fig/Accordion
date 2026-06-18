@@ -253,7 +253,7 @@ describe("DropOldestConductor — lock declaration", () => {
 	it("id and label are stable", () => {
 		const c = new DropOldestConductor();
 		expect(c.id).toBe("drop-oldest");
-		expect(c.label).toBe("Drop oldest");
+		expect(c.label).toBe("Sliding window");
 	});
 
 	it("registry entry locks deep-equal instance locks (drift guard)", () => {

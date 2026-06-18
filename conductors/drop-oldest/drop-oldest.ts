@@ -31,7 +31,7 @@ const TARGET = 0.7;
 
 export class DropOldestConductor implements Conductor {
 	readonly id = "drop-oldest";
-	readonly label = "Drop oldest";
+	readonly label = "Sliding window";
 
 	/**
 	 * Locks human steering and agent unfold; tail-size is left to the human so the
