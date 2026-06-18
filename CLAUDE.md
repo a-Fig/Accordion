@@ -247,6 +247,7 @@ the conductor).
   - `attention-folder/` — external (WS). A small LM (Qwen2.5-0.5B probe) scores attention
     relevance; periodic hysteresis-band epochs fold the least-attended blocks. See
     [ADR 0010](docs/adr/0010-attention-conductor.md).
+  - `garbage-collector/` — in-process. Reachability-based: mark-and-sweep from roots (protected tail + held + first `user` message) over entity/causal/message edges; folds unreachable blocks first, reachable ones only as a budget fallback. Collaborative, no instance state. See [ADR 0012](docs/adr/0012-garbage-collector-conductor.md).
   - `recency-folder/` — external (WS). Minimal wire-protocol starter example.
 
 ## Visual grammar (consistent across ALL views)
