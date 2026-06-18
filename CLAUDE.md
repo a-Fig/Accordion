@@ -241,9 +241,9 @@ the conductor).
     byte-stable fold set inside a hysteresis band and changes it only at deliberate epochs
     (when projected live tokens cross the high-water mark), so the folded prefix stays
     cache-warm between epochs.
-  - `sliding-window/` — in-process. Dead-simple: when live tokens exceed ~90% of budget,
-    summarize the oldest run into one group and trim back to ~70%; the group is anchored at
-    the oldest block and extends forward as the session grows. Stateless.
+  - `drop-oldest/` — in-process. When live tokens exceed ~90% of budget, issues `group`
+    commands with `digest: null` (DROP) to hard-delete the oldest non-`user` blocks down to
+    ~70%; skips user messages. Locks `human-steering` + `agent-unfold`. Replaced `sliding-window`.
   - `attention-folder/` — external (WS). A small LM (Qwen2.5-0.5B probe) scores attention
     relevance; periodic hysteresis-band epochs fold the least-attended blocks. See
     [ADR 0010](docs/adr/0010-attention-conductor.md).

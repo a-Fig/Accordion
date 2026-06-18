@@ -243,9 +243,10 @@ did NOT lock."** Concretely:
 
 ### 9. Additivity — nothing changes until you opt in
 
-The default is **collaborative**. Every conductor that ships in `conductors/` today — the
-built-in, `cold-score`, `cold-epoch`, `sliding-window`, `attention-folder`, and
-`recency-folder` — declares **no locks** and keeps today's behavior. The
+The default is **collaborative**. Every conductor that shipped in `conductors/` before ADR
+0011 — the built-in, `cold-score`, `cold-epoch`, `attention-folder`, and `recency-folder`
+— declares **no locks** and keeps today's behavior. (`sliding-window` was removed; its
+replacement `drop-oldest` DOES declare locks — see the drop-addendum in ADR 0006.) The
 built-in's `conduct()` is **byte-identical**, so the golden test
 (`conductor.builtin.test.ts`) is **untouched**. That untouched golden is the proof this ships
 **additively**: a user who never picks a locking conductor never sees a single behavioral

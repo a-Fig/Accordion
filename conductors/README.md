@@ -29,9 +29,12 @@ policy. You return the context you *want*, as commands:
 - **`null`** — *hold*: keep the last applied state (used by an async/remote conductor still
   thinking; never blocks a model call).
 
-The `Command` union is `fold · replace · group · restore · pin` — all **content
-substitution, never structural removal**, so a `tool_call`/`tool_result` pair can never
-orphan. The host enforces exactly one floor — **provider-validity** (the outgoing message
+The `Command` union is `fold · replace · group · restore · pin`. Most are **content
+substitution** (a block is replaced in place, never removed), so a `tool_call`/`tool_result`
+pair can never orphan. The one exception: a `group` command with `digest: null` or `digest: ""`
+is a **DROP** — the run is removed from the wire entirely and no replacement is inserted. This
+is the idiomatic way to implement hard deletion (e.g. `drop-oldest`). Phase A tool-pair
+balancing still applies, so no orphaned pairs can result. The host enforces exactly one floor — **provider-validity** (the outgoing message
 stays sendable) — plus two guardrails: human overrides always win, and anything it can't
 apply verbatim is clamped to nearest-safe and **reported**, never silently dropped. These
 are bug/UX rails, not defenses against you.
@@ -131,6 +134,7 @@ session is currently active.
 | [`builtin/`](builtin/) | TypeScript | in-process | **The default + reference.** Folds purely to keep the live context under budget, oldest-first, lowest-value-kind-first (`tool_result` → `thinking` → `text` → `tool_call` → `user`). ~15-line `conduct`; golden-tested byte-identical. |
 | [`cold-score/`](cold-score/) | TypeScript | in-process | **Relevance-aware folder.** ACT-R cold-score ranking + lexical pre-unfold (keep blocks live whose identifiers appear in the protected tail) + per-block hysteresis cooldowns. Emits `fold` commands only. Instance state (recalls / cooldowns) accumulates across `conduct()` calls. See [ADR 0009](../docs/adr/0009-cold-score-conductor.md). |
 | [`attention-folder/`](attention-folder/) | Node.js + Python | out-of-process (WS) | **Attention-based periodic folder.** A Qwen2.5-0.5B probe scores how much the current work tail attends to each older block; the conductor folds the least-attended blocks at deliberate "epochs" rather than every turn, keeping the inference prompt cache stable between folds. Hysteresis band: 70–90% of the context window. See [ADR 0010](../docs/adr/0010-attention-conductor.md) and its own [README](attention-folder/README.md). |
+| [`drop-oldest/`](drop-oldest/) | TypeScript | in-process | **Hard-delete oldest non-user blocks.** When live tokens exceed ~90% of budget, issues `group` commands with `digest: null` (DROP) to remove the oldest non-`user` blocks — skipping user messages, which stay live — until the estimate falls to ~70%. Locks `human-steering` + `agent-unfold` (NOT `tail-size`). Replaced `sliding-window`. |
 | [`recency-folder/`](recency-folder/) | Node.js | out-of-process (WS) | **Wire example.** Folds the oldest non-protected `tool_result` blocks until under budget, and auto-advertises for discovery. Intentionally crude — copy it and grow your own. |
 
 ### Cold-score conductor

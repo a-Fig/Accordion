@@ -38,8 +38,9 @@ interface Group { id: string; memberIds: string[]; folded: boolean }
 
 The "new kind of block" the owner pictured is purely the **UI tile**. Invariants enforced
 at creation: members are **contiguous** in block order, **non-overlapping** (a block is in
-≤1 group), **flat** (no nesting — a member is always a block, never a group), at least two
-members, **entirely older than the protected tail** (`protectedFromIndex`), and **collapse
+≤1 group), **flat** (no nesting — a member is always a block, never a group), at least one
+member (originally two; relaxed to one — see the addendum below), **entirely older than the
+protected tail** (`protectedFromIndex`), and **collapse
 at least one member** — a group whose every member is a split tool-pair half (nothing folds
 into the summary) is refused, since a folded group must *replace* its blocks with the parent
 summary, not hide live blocks behind a zero-saving tile. The group
@@ -215,3 +216,66 @@ recent message, passes through on any guard failure, stays pure; `computeGroupOp
 and the protect-tail/group interactions; `groupDigest` shape/determinism. Extension
 `smoke.mjs`: an armed group-collapse round-trip and a group-code unfold. Full gate:
 `svelte-check` 0/0/0, `vitest` green, extension smoke.
+
+---
+
+## Addendum — `digest: null` DROP and single-member groups (2026-06-17)
+
+### New capability
+
+`GroupCommand` gains an optional `digest?: string | null` field; the wire `GroupOp.summaryText`
+is now `string | null` (was `string`). Together they introduce a **DROP** mode and relax the
+minimum-member constraint:
+
+- `digest === undefined` → default recap summary + `{#code FOLDED}` tag. **Byte-identical to
+  existing behavior**; no existing conductor is affected.
+- `digest === null` (or `""`) → **DROP**: the run is removed from the wire and NO replacement
+  is inserted. The agent never sees those blocks. `recall` and `unfold` cannot recover a
+  dropped block — it is gone from the model's message array by design. Phase A (tool-pair
+  balancing) still runs, so no orphaned tool pairs can result.
+- Non-empty string → that exact string is used as the summary verbatim (like `FoldCommand.digest`,
+  no tag added).
+
+A group may now have a **single member** (was ≥2). This enables dropping or summarizing one
+lone block without needing to fabricate a companion.
+
+### Relation to the "content substitution, never structural removal" rule
+
+This is the **second deliberate exception** to the founding rule stated in `conductors/contract/conductor.ts`
+(the first being the existing group→summary collapse that already removed messages and inserted
+one synthetic entry). DROP is a stricter extension of that same exception: same Phase A
+whole-message / pair-balanced guards; Phase B simply emits nothing instead of a summary.
+
+**Provider safety:** DROP reuses the Phase A whole-message / tool-pair-balanced removal that
+already ships in `applyPlan`, so no orphaned tool pair can result. The remaining concern is
+**same-role adjacency** — removing a non-`user` run between two user turns leaves two adjacent
+user messages. What is *verified*: the worked providers in this setup are OpenAI-compatible
+(`openrouter`, `openai-codex` per `~/.pi/agent/settings.json`), which accept consecutive
+same-role messages; and the existing group→summary path *already* emits same-role adjacency
+(a `tool_result`-led run maps to a `role:"user"` summary, `mapping.ts`), so DROP introduces no
+new adjacency class. What is *not* verified: pi's exact provider send/normalization path (the
+provider client is not in the published dist), so we do **not** rely on pi coalescing same-role
+messages. If a strictly-alternating provider (e.g. Anthropic's native Messages API) is ever
+used, the fallback is to insert a minimal placeholder message per dropped run instead of
+nothing — the same Phase A machinery, Phase B emitting a one-token entry. Not built; flagged.
+
+**How `""` resolves to a drop (no contradiction):** the engine normalizes `digest === ""` to a
+drop *before* the wire. `store.isDropGroup(g)` is true for both `null` and `""`, and
+`computeGroupOps` emits `summaryText: store.isDropGroup(g) ? null : …` — so a `""`-digest group
+reaches the wire as `summaryText: null`, exactly like an explicit `null`. The wire therefore
+never receives a literal `""` from the normal engine path.
+
+**`applyPlan` wire-side enforcement** (`app/src/lib/live/mapping.ts`): when `g.summaryText === null`
+Phase B consumes the run and pushes nothing to `out`. The `safeGroups` filter accepts
+`summaryText === null` (DROP) or a non-empty, non-whitespace string (summary), and rejects a
+literal `""`/whitespace string as a malformed op (passing those messages through untouched).
+That rejection is pure defense-in-depth for a hand-crafted op — it is unreachable through the
+engine, which always sends `null` for a drop.
+
+### Introduces: `drop-oldest` conductor
+
+`conductors/drop-oldest/` replaces `conductors/sliding-window/`. When live tokens exceed ~90%
+of budget it issues `group` commands with `digest: null` to remove the oldest non-`user` blocks
+(skipping user messages, which stay live) until the estimate falls to ~70%. It locks
+`human-steering` + `agent-unfold` (NOT `tail-size`) because it irreversibly discards content
+— human override or agent unfold cannot recover what was sent as DROP.
