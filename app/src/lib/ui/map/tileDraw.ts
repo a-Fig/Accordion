@@ -23,7 +23,7 @@ export type TileSpec = {
   id: string;
   /** Block kind, "group" for a collapsed folder tile, "vacated"/"ghost" for placeholders. */
   kind: BlockKind | "group" | "vacated" | "ghost";
-  /** Die face 1–6 (ignored for vacated). */
+  /** Die face 0–6 (0 = blank/no pips for drop groups; ignored for vacated). */
   face: number;
   folded: boolean;
   pinned: boolean;
@@ -168,7 +168,9 @@ export function desaturate(hex: string, factor = 0.5): string {
 // ---------------------------------------------------------------------------
 
 // Pip centres on a 100×100 viewBox — ported exactly from the f1–f6 SVGs in ContextMap.svelte.
+// Face 0 is a blank die (no pips) — used for drop groups whose token cost is 0.
 const PIP_POSITIONS: Record<number, [number, number][]> = {
+  0: [],
   1: [[50, 50]],
   2: [
     [28, 28],
@@ -218,7 +220,7 @@ export function buildSprites(dpr = 1): Map<number, HTMLCanvasElement> {
   _sprites = new Map();
   const sz = SPRITE_SIZE * dpr;
 
-  for (let face = 1; face <= 6; face++) {
+  for (let face = 0; face <= 6; face++) {
     const c = document.createElement("canvas");
     c.width = sz;
     c.height = sz;

@@ -134,7 +134,7 @@
 				out.push({
 					id: g.id,
 					kind: "group",
-					face: faceFor(store.groupLiveTokens(g)),
+					face: store.isDropGroup(g) ? 0 : faceFor(store.groupLiveTokens(g)),
 					folded: false,
 					pinned: false,
 					selected: selectedId === g.id,
@@ -357,6 +357,9 @@
 			: "";
 		const savedStr = saved > 0 ? ` · saves ${k(saved)} tok` : "";
 		const stragStr = strag > 0 ? ` · ${strag} kept live` : "";
+		if (store.isDropGroup(g)) {
+			return `drop group · ${members.length} blocks · ${k(full)} tok removed\n${turns}\nThe agent does not see this block\nclick to inspect`;
+		}
 		return `group · ${members.length} blocks · ${k(full)} tok full${savedStr}${stragStr}\n${turns}\nclick to peek · double-click to collapse`;
 	}
 
@@ -1022,7 +1025,8 @@
 											     the cocoa owns peek/collapse via data-group, like the old group tile). -->
 											<div class="fold-cluster" data-cluster-ids={item.members.map((m) => m.id).join(",")}>
 												<div
-													class="cell face f{faceFor(store.groupLiveTokens(g))} summary-tile"
+													class="cell face f{store.isDropGroup(g) ? 0 : faceFor(store.groupLiveTokens(g))} summary-tile"
+													class:drop-group={store.isDropGroup(g)}
 													class:sel={selectedId === g.id}
 													style:width="{cell}px"
 													style:height="{cell}px"
@@ -1057,7 +1061,8 @@
 									     Member tiles are still DOM .cell elements — resolveHit handles them. -->
 									<div class="group-band" class:live data-group={g.id}>
 										<div
-											class="cell face f{faceFor(store.groupLiveTokens(g))} group-tile group-tile-open"
+											class="cell face f{store.isDropGroup(g) ? 0 : faceFor(store.groupLiveTokens(g))} group-tile group-tile-open"
+											class:drop-group={store.isDropGroup(g)}
 											class:sel={selectedId === g.id}
 											data-group={g.id}
 											title="{live ? 'group (unfolded — live)' : 'group (peek — preview only)'} · {seg.row.members.length} blocks · double-click to collapse"
@@ -1603,6 +1608,21 @@
 	}
 	.f6::before {
 		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='26' r='11'/><circle cx='72' cy='26' r='11'/><circle cx='28' cy='50' r='11'/><circle cx='72' cy='50' r='11'/><circle cx='28' cy='74' r='11'/><circle cx='72' cy='74' r='11'/></g></svg>");
+	}
+	/* Face 0: blank die — no pips. Used for drop groups (0 tokens on the wire). */
+	.f0::before {
+		background-image: none;
+	}
+
+	/* Drop-group tile: extra visual cue that this group is deleted from the wire.
+	   A dashed border + reduced opacity signals "gone" without inventing new colors. */
+	.drop-group {
+		opacity: 0.55;
+		outline: 1.5px dashed color-mix(in srgb, var(--faint) 60%, transparent);
+		outline-offset: -2px;
+	}
+	.drop-group:hover {
+		opacity: 0.75;
 	}
 
 	/* ---- group tile styles — for .group-tile-open in the open-group band ---- */
