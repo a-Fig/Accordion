@@ -78,18 +78,20 @@ for (let i = 0; i < view.protectedFromIndex && i < view.blocks.length; i++) {
 The protected working tail passes through verbatim — its blocks receive no `replace` command.
 Compacting into the protected tail would destroy the agent's live reasoning, which the
 conductor has no business touching. Human-held blocks (`b.held`) are also skipped, honouring
-the "human overrides always win" rule (ADR 0007). `tool_call` blocks are skipped because the
-host's replacement path does not kind-check them; the conductor must not orphan tool results.
+the "human overrides always win" rule (ADR 0007). `tool_call` blocks are skipped so tool
+invocations are never summarized away from their results. `user` blocks may be prompt context,
+but they remain live and are never `replace` targets because per-block user folds are not
+wire-representable.
 
 ### 4. Commands: `replace`, not `fold`
 
 The conductor emits **`replace`** commands, not `fold`:
 
-- The oldest aged block (the "head") gets `replace(headId, summaryText)` — it carries the
-  summary prose.
-- Every other aged block gets `replace(id, "")` — it stays structurally in place (no
-  block is ever removed; `tool_call`/`tool_result` pairing is intact) but contributes
-  (almost) nothing to the token count.
+- The oldest wire-foldable aged block (the "head": `text`, `thinking`, or `tool_result`)
+  gets `replace(headId, summaryText)` — it carries the summary prose.
+- Every other wire-foldable aged block gets `replace(id, "")` — it stays structurally in
+  place (no block is ever removed; `tool_call`/`tool_result` pairing is intact) but
+  contributes (almost) nothing to the token count. `user` and `tool_call` blocks stay live.
 
 This is deliberate. A `fold` command would produce a `{#code FOLDED}` tag that the agent
 could pass to the `unfold` tool. Using `replace` instead means **the agent cannot
@@ -98,11 +100,15 @@ what it sees. The human can always detach this conductor (context returns to raw
 to the built-in to recover, but the agent cannot do it through normal means. That asymmetry
 faithfully reproduces what mainstream compaction tools do.
 
-**Provider-validity note.** The conductor excludes `tool_call` blocks from the aged region
-entirely: they are never selected as the summary head and never receive an empty
-`replace(id, "")`. The host's substitution path applies `replace` commands verbatim and
-does not kind-check `tool_call` blocks, so the conductor self-enforces this invariant rather
-than relying on a clamp. Matching `tool_result` blocks may still be compacted when safe.
+**Provider-validity note.** The host's substitution path kind-checks `replace` exactly like
+`fold`: `user` and `tool_call` targets are clamped as `not-foldable`. The conductor still
+self-enforces the same target set instead of relying on that clamp, because a clamped summary
+head plus successfully applied empty replaces would lose the summary. Matching `tool_result`
+blocks may still be compacted when safe.
+
+**Exclusive conductor note.** Naive compaction declares `locks: ["human-steering", "agent-unfold"]`.
+Selection therefore goes through the ADR 0011 consent gate, and detaching uses the normal
+freeze/kill-switch path so the compacted summary view remains in place for budget safety.
 
 ### 5. Recursive amnesia: the compaction prompt is built from the summary, not the originals
 

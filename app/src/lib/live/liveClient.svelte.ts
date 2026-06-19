@@ -368,8 +368,6 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			if (typeof msg.reqId !== "number") return;
 			// Out-of-band completion response from the extension (protocol v5). Look up the
 			// pending promise by reqId; if the entry is gone (aborted or stale), ignore silently.
-			// FIX #6: guard against a malformed frame mis-resolving a pending completion.
-			if (typeof msg.reqId !== "number") return;
 			const pending = pendingCompletions.get(msg.reqId);
 			if (pending) {
 				if (msg.ok) {

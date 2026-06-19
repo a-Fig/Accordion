@@ -426,12 +426,17 @@ export class AccordionStore {
 		const store = this;
 		return {
 			can(capability) {
-				if (capability === "complete") return store.completer != null;
+				if (capability === "complete") {
+					return store.conductor === forConductor && store.conductorEpoch === epoch && store.completer != null;
+				}
 				if (capability === "countTokens") return true;
 				if (capability === "digest") return true;
 				return false;
 			},
 			complete(req: CompletionRequest): Promise<CompletionResult> {
+				if (store.conductor !== forConductor || store.conductorEpoch !== epoch) {
+					return Promise.reject(new Error("stale conductor host"));
+				}
 				if (!store.completer) return Promise.reject(new Error("completion capability unavailable"));
 				return store.completer(req);
 			},

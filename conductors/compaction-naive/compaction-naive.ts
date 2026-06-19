@@ -19,11 +19,12 @@
  * The human can always DETACH this conductor to recover full history — that's Accordion
  * being Accordion — but the agent cannot. That asymmetry is the whole point.
  *
- * TOOL_CALL SAFETY: this conductor never emits a `replace` targeting a `tool_call` block.
- * `tool_call` blocks are excluded from the aged region entirely — they are left live and
- * untouched. This matches the engine's "tool_call is never folded" invariant and keeps the
- * outgoing message provider-valid. The host's `substOne` has NO kind-check and would apply
- * a `replace` to a `tool_call` verbatim, so the conductor must not emit one.
+ * REPLACE-TARGET SAFETY: this conductor only emits `replace` commands for block kinds the
+ * host can actually represent on the wire (`text`, `thinking`, and `tool_result`). The host
+ * is still the final safety net — it clamps non-foldable `user`/`tool_call` targets with
+ * `not-foldable` — but relying on that clamp would break this conductor's own invariant: the
+ * summary must land on a valid head before any other block is emptied. Non-foldable blocks
+ * therefore stay live and are never command targets.
  *
  * No Svelte, no $state, no engine imports. Types only from ../contract.
  */
@@ -159,6 +160,16 @@ export class NaiveCompactionConductor implements Conductor {
 	// ── lifecycle ──────────────────────────────────────────────────────────────
 
 	attach(host: ConductorHost): void {
+		// A conductor lifetime starts fresh on attach. The common UI path creates a new instance,
+		// but the contract allows re-attaching the same instance; do not let a summary or retry key
+		// from a prior session leak into the next one.
+		if (this.inflight) {
+			this.inflight.abort();
+			this.inflight = null;
+		}
+		this.summary = null;
+		this.compactedIds = new Set();
+		this.lastAttemptKey = "";
 		this.host = host;
 	}
 
@@ -182,13 +193,11 @@ export class NaiveCompactionConductor implements Conductor {
 		// The THRESHOLD at which compaction is triggered: 95 % of the token budget.
 		const threshold = 0.95 * view.budget;
 
-		// AGED REGION: blocks eligible to compact = older than the protected working tail,
-		// not human-held, not already inside a conductor group, and NOT tool_call.
-		//
-		// tool_call blocks are excluded because the host's substOne has NO kind-check and
-		// would apply a replace verbatim — emptying a tool_call would violate the engine's
-		// "tool_call is never folded → never orphans its result" invariant. The conductor
-		// itself enforces this; the host will not protect us.
+		// AGED REGION: blocks eligible to summarize = older than the protected working tail,
+		// not human-held, not already inside a conductor group, and NOT tool_call. `tool_call`
+		// stays live so a tool invocation is never summarized away from its result. `user` blocks
+		// may be included in the prompt for context, but buildCommands() will never target them
+		// with `replace` because the host cannot represent per-block folds for user intent.
 		const agedBlocks: ViewBlock[] = [];
 		for (let i = 0; i < view.protectedFromIndex && i < view.blocks.length; i++) {
 			const b = view.blocks[i];
@@ -203,10 +212,13 @@ export class NaiveCompactionConductor implements Conductor {
 
 		// Determine what is genuinely new since the last successful compaction.
 		const newlyAged: ViewBlock[] = agedBlocks.filter((b) => !this.compactedIds.has(b.id));
+		const newlyReplaceable = newlyAged.filter(isReplaceableByHost);
 
 		// Decide whether to (re)summarize:
-		// trigger only when >= 95% full AND there are newly aged blocks to fold in.
-		const needSummary = view.liveTokens >= threshold && newlyAged.length > 0;
+		// trigger only when >= 95% full AND there are newly aged blocks the host can actually
+		// replace/fold. Non-foldable `user` blocks may provide prompt context when a foldable
+		// neighbour ages with them, but they should not by themselves burn a completion call.
+		const needSummary = view.liveTokens >= threshold && newlyReplaceable.length > 0;
 
 		if (!needSummary) {
 			this.host.setStatus(null);
@@ -268,14 +280,19 @@ export class NaiveCompactionConductor implements Conductor {
 	 * This method re-derives the command set from the LIVE view on every call:
 	 *   1. Compute SURVIVING compacted blocks = ids in compactedIds that still exist in
 	 *      view.blocks AND are not held, not grouped, not protected.
-	 *   2. Choose head = surviving block with the LOWEST order (oldest surviving). If the
-	 *      original head vanished, the summary re-homes to the next oldest survivor.
-	 *   3. If NO survivor qualifies as head → return [] (clear to raw). No empties emitted,
+	 *   2. Keep only host-replaceable survivors (`text`, `thinking`, `tool_result`) as command
+	 *      targets. `user`/`tool_call` blocks stay live: the host would clamp them with
+	 *      `not-foldable`, so using one as the summary head would discard the summary while
+	 *      still allowing other empty replaces to apply.
+	 *   3. Choose head = replaceable survivor with the LOWEST order (oldest surviving). If the
+	 *      original head vanished or is non-foldable, the summary re-homes to the next oldest
+	 *      replaceable survivor.
+	 *   4. If NO replaceable survivor qualifies as head → return [] (clear to raw). No empties emitted,
 	 *      no data loss — the host resets all blocks to full live content this pass.
-	 *   4. Otherwise return [ replace(head, summary), ...replace(other, "") per other survivor ].
+	 *   5. Otherwise return [ replace(head, summary), ...replace(other, "") per other replaceable survivor ].
 	 *
 	 * INVARIANT: this method NEVER returns an array containing replace(x,"") unless it also
-	 * contains replace(head, summary) on a block present in the current view.
+	 * contains replace(head, summary) on a host-replaceable block present in the current view.
 	 *
 	 * Returns:
 	 *   - null  → no summary yet; used ONLY while a first-trip completion is in-flight
@@ -306,22 +323,28 @@ export class NaiveCompactionConductor implements Conductor {
 		// The summary text is preserved in this.summary in case a future view re-exposes blocks.
 		if (survivors.length === 0) return [];
 
-		// Choose head = block with the lowest order (oldest surviving compacted block).
-		// sort() is non-mutating-friendly since survivors is a local array.
-		survivors.sort((a, b) => a.order - b.order);
-		const head = survivors[0];
+		// Only replace kinds that the host can represent on the wire. If the oldest survivor is
+		// a `user` block, replacing it would be clamped `not-foldable`; any empty replaces for
+		// the other survivors would still apply, dropping the summary. Re-home the head to the
+		// oldest replaceable survivor instead.
+		const replaceable = survivors.filter(isReplaceableByHost);
+		if (replaceable.length === 0) return [];
+
+		// Choose head = replaceable block with the lowest order (oldest valid target).
+		// sort() is non-mutating-friendly since replaceable is a local array.
+		replaceable.sort((a, b) => a.order - b.order);
+		const head = replaceable[0];
 
 		const cmds: Command[] = [];
 
 		// The head block carries the summary text.
 		cmds.push({ kind: "replace", id: head.id, content: this.summary });
 
-		// Every other surviving compacted block is emptied — it stays structurally in
+		// Every other replaceable surviving compacted block is emptied — it stays structurally in
 		// place (tool-call/result pairing is intact) but contributes (almost) nothing
 		// to the token count.
-		// NOTE: tool_call blocks are never in compactedIds (excluded from agedBlocks at
-		// collection time), so we can never accidentally empty a tool_call here.
-		for (const b of survivors) {
+		// Non-foldable survivors (user/tool_call) are deliberately left live.
+		for (const b of replaceable) {
 			if (b.id === head.id) continue;
 			cmds.push({ kind: "replace", id: b.id, content: "" });
 		}
@@ -368,13 +391,24 @@ export class NaiveCompactionConductor implements Conductor {
 			signal: controller.signal,
 		}).then(
 			(result) => {
+				const text = result.text.trim();
+				if (!text) {
+					// Empty output would replace the aged context with only the boilerplate header.
+					// Treat it as a failed attempt: preserve the prior summary/state and wait for
+					// genuinely new aged content before retrying this same key.
+					this.inflight = null;
+					this.host?.setStatus("Naive compaction failed — model returned an empty summary", {
+						aged: count,
+					});
+					return;
+				}
 				// Success: commit the new summary and command state.
 				// NOTE: we do NOT store a headId — buildCommands() re-derives the head from
 				// the live view every call, so it is always valid even if blocks shift.
 				this.inflight = null;
 				this.summary =
 					`[Compacted summary of ${count} earlier message${count === 1 ? "" : "s"}]\n\n` +
-					result.text;
+					text;
 				this.compactedIds = launchedAgedIds;
 				// Ask the host to re-run conduct() now so the replace commands take effect
 				// immediately rather than waiting for the next natural context change.
@@ -462,4 +496,9 @@ function blockLabel(b: ViewBlock): string {
 			return String(_never);
 		}
 	}
+}
+
+/** Block kinds the host can fold/replace as individual wire content substitutions. */
+function isReplaceableByHost(b: ViewBlock): boolean {
+	return b.kind === "text" || b.kind === "thinking" || b.kind === "tool_result";
 }

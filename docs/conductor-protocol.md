@@ -624,13 +624,15 @@ path (which in turn relays over the pi wire as `completeRequest` / `completeResu
   "completion": {
     "system": "You are a compaction assistant …",
     "prompt": "… aged context blocks …",
-    "maxOutputTokens": 1500
+    "maxOutputTokens": 8000
   }
 }
 ```
 
 The `completion` object accepts `system`, `prompt`, and `maxOutputTokens`. The host uses the
-user's live session model (there is no `model` override on the wire in this version).
+user's live session model (there is no `model` override on the wire in this version). Remote
+completion requests are not cancellable over JSON/WS; if the conductor detaches or no longer
+wants the result, the in-flight model call may still finish and the stale result is ignored.
 
 **Receiving the result:**
 

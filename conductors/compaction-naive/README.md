@@ -32,9 +32,11 @@ See [ADR 0013](../../docs/adr/0013-conductor-host-capabilities.md) (host capabil
 
 **Trigger:** when `liveTokens ≥ 95 %` of the token budget.
 
-**Aged region:** all blocks older than the host's protected working tail (`protectedFromIndex`)
-that are not human-held and not already inside a conductor group. The protected tail always
-passes through verbatim — compacting live reasoning would destroy the agent's current work.
+**Aged region:** blocks older than the host's protected working tail (`protectedFromIndex`)
+that are not human-held, not already inside a conductor group, and not `tool_call`. `user`
+blocks may be included in the summary prompt for context, but remain live because they are not
+wire-foldable replace targets. The protected tail always passes through verbatim — compacting
+live reasoning would destroy the agent's current work.
 
 **Compaction pass (model available):**
 
@@ -44,14 +46,14 @@ passes through verbatim — compacting live reasoning would destroy the agent's 
 2. `conduct()` returns immediately with the last applied commands (or `null` on the very
    first call) — it never blocks.
 3. When the completion resolves, the conductor:
-   - Replaces the **oldest aged block** (the "head") with the summary text, prefixed by a
-     count tag: `[Compacted summary of N earlier messages]`.
-   - Replaces every other aged block with `""` (empty content — structurally in place, so
-     pairing is intact). `tool_call` blocks are **excluded from compaction entirely** (never
-     appear as head or empty replace targets) — the conductor enforces this itself, consistent
-     with the engine's "tool_call is never folded → never orphans its result" invariant. The
-     host's apply layer has no kind-check and would apply a replace to a tool_call verbatim,
-     so the conductor must not emit one.
+   - Replaces the **oldest wire-foldable aged block** (the "head": `text`, `thinking`, or
+     `tool_result`) with the summary text, prefixed by a count tag:
+     `[Compacted summary of N earlier messages]`.
+   - Replaces every other wire-foldable aged block with `""` (empty content — structurally in
+     place, so pairing is intact). `user` and `tool_call` blocks are never replace targets;
+     they stay live. The host also clamps such commands as `not-foldable`, but the conductor
+     avoids emitting them so the summary head cannot be clamped away while other empty
+     replaces apply.
    - Calls `host.requestRerun()` to schedule a fresh `conduct()` pass that emits those
      commands immediately.
 
@@ -96,8 +98,10 @@ model enforces it as a hard cap (over-long output is truncated, not rejected).
 - **Compounding amnesia** — each compaction only reads the prior summary + new content; errors
   introduced in an early summary persist and compound.
 - Depends on **`host.can("complete")`** — unavailable in browser dev mode and read-only sessions.
-- `tool_call` blocks are excluded from compaction by the conductor itself (never targeted by
-  a replace command). The host's apply layer has no kind-check and would apply a replace
-  verbatim, so the conductor enforces the exclusion — it does not rely on the host to clamp.
+- `user` and `tool_call` blocks are left live and are never targeted by a replace command.
+  The host's apply layer independently clamps them as `not-foldable`; the conductor avoids
+  them so a clamped summary head cannot cause data loss.
+- The conductor is **exclusive**: it declares `human-steering` and `agent-unfold` locks while
+  attached, so the normal ADR 0011 consent gate and detach freeze/kill-switch behaviour apply.
 - The conductor **does not track its own model spend** (no `inputTokens`/`outputTokens`
   accounting) — this is a baseline, not a production system.

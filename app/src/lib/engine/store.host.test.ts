@@ -567,6 +567,45 @@ describe("AccordionStore host — complete() request forwarding", () => {
 		expect(receivedReqs[0].signal).toBe(controller.signal);
 		expect(receivedReqs[0].model).toBe("test-model");
 	});
+
+	it("rejects complete() from a stale host after conductor swap without calling the completer", async () => {
+		const s = makeStore([blk(0)]);
+		const c1 = new TrackingConductor("c1");
+		const c2 = new TrackingConductor("c2");
+		s.attach(c1);
+		const oldHost = c1.capturedHost!;
+
+		let calls = 0;
+		s.completer = async () => {
+			calls++;
+			return { text: "should not run", model: "m" };
+		};
+
+		s.attach(c2);
+
+		expect(oldHost.can("complete")).toBe(false);
+		await expect(oldHost.complete({ prompt: "stale" })).rejects.toThrow("stale conductor host");
+		expect(calls).toBe(0);
+	});
+
+	it("rejects complete() from a stale host after detach without calling the completer", async () => {
+		const s = makeStore([blk(0)]);
+		const c = new TrackingConductor("c");
+		s.attach(c);
+		const oldHost = c.capturedHost!;
+
+		let calls = 0;
+		s.completer = async () => {
+			calls++;
+			return { text: "should not run", model: "m" };
+		};
+
+		s.detach();
+
+		expect(oldHost.can("complete")).toBe(false);
+		await expect(oldHost.complete({ prompt: "stale" })).rejects.toThrow("stale conductor host");
+		expect(calls).toBe(0);
+	});
 });
 
 // ── 9. setStatus() display telemetry ────────────────────────────────────────

@@ -27,6 +27,8 @@
 
 import { describe, it, expect } from "vitest";
 import { NaiveCompactionConductor } from "$conductors/compaction-naive/compaction-naive";
+import { AccordionStore } from "./store.svelte";
+import type { Block, ParsedSession } from "./types";
 import type {
 	ConductorHost,
 	ConductorView,
@@ -89,6 +91,41 @@ function makeView(
 		protectedFromIndex: agedBlocks.length,
 		protectTokens: 20_000,
 	};
+}
+
+/** Build a real engine Block for end-to-end AccordionStore regressions. */
+function blk(
+	i: number,
+	kind: Block["kind"] = "text",
+	tokens = 1000,
+	extra: Partial<Block> = {},
+): Block {
+	return {
+		id: `m${i}:p0`,
+		kind,
+		turn: i + 1,
+		order: i,
+		text: `block ${i} ` + "x".repeat(tokens * 4),
+		tokens,
+		override: null,
+		autoFolded: false,
+		by: null,
+		...extra,
+	};
+}
+
+function makeStore(blocks: Block[]): AccordionStore {
+	const parsed: ParsedSession = {
+		meta: { format: "pi", title: "t", cwd: "", model: "" },
+		blocks,
+		lineCount: 0,
+		skipped: 0,
+	};
+	return new AccordionStore(parsed);
+}
+
+async function flushMicrotasks(times = 4): Promise<void> {
+	for (let i = 0; i < times; i++) await Promise.resolve();
 }
 
 // ── Mock host ─────────────────────────────────────────────────────────────────
@@ -349,6 +386,24 @@ describe("NaiveCompactionConductor — first compaction cycle", () => {
 
 		expect(head).toBeDefined();
 		expect(head!.content).toContain("4 earlier message");
+	});
+
+	it("empty completion text is treated as failure and does not apply header-only compaction", async () => {
+		const c = new NaiveCompactionConductor();
+		const host = new MockHost();
+		c.attach(host);
+
+		const aged = [vb("a0"), vb("a1")];
+		const view = makeView(aged, [vb("tail0")], 100_000, 96_000);
+
+		expect(c.conduct(view)).toBeNull();
+		host.resolveNext("   \n\t  ");
+		await Promise.resolve();
+		expect(host.statusText).toContain("empty summary");
+
+		const result = c.conduct(view);
+		expect(result).toEqual([]);
+		expect(host.requestRerunCalls).toBe(0);
 	});
 });
 
@@ -710,7 +765,7 @@ describe("NaiveCompactionConductor — detach() lifecycle", () => {
 		expect(signal).toBeDefined();
 		expect(signal!.aborted).toBe(false);
 
-		// Disposing should abort the signal
+		// Detaching should abort the signal
 		c.detach();
 
 		expect(signal!.aborted).toBe(true);
@@ -758,6 +813,31 @@ describe("NaiveCompactionConductor — detach() lifecycle", () => {
 
 		// host is null after detach → returns null per the early guard
 		expect(result).toBeNull();
+	});
+
+	it("reattach resets prior summary, compacted ids, and retry key", async () => {
+		const c = new NaiveCompactionConductor();
+		const host1 = new MockHost();
+		c.attach(host1);
+
+		const oldView = makeView([vb("old0"), vb("old1")], [vb("tail0")], 100_000, 96_000);
+		c.conduct(oldView);
+		host1.resolveNext("old summary");
+		await Promise.resolve();
+		expect(c.conduct(oldView)).not.toEqual([]);
+
+		c.detach();
+		const host2 = new MockHost();
+		c.attach(host2);
+
+		// Same ids in a later session must not inherit the old summary/compactedIds.
+		const newView = makeView([vb("old0"), vb("old1")], [vb("tail0")], 100_000, 50_000);
+		expect(c.conduct(newView)).toEqual([]);
+
+		// A failed attempt key from the prior lifetime must not suppress a fresh launch either.
+		const overBudget = makeView([vb("old0"), vb("old1")], [vb("tail0")], 100_000, 96_000);
+		expect(c.conduct(overBudget)).toBeNull();
+		expect(host2.completeCalls).toHaveLength(1);
 	});
 });
 
@@ -915,7 +995,7 @@ describe("NaiveCompactionConductor — threshold boundary (95%)", () => {
 // ── 11. DATA-LOSS REGRESSION: vanishing head / all gone ───────────────────────
 //
 // These tests are the regression guard for the blocker described in the adversarial review:
-// the prior `currentCommands()` re-emitted stale cached ids (summary, compactedIds, headId)
+// the prior cached-command path re-emitted stale cached ids (summary, compactedIds, headId)
 // without validating against the live view. If headId vanished, the head replace was
 // clamped, but the empty replaces for other compacted ids were applied VERBATIM → data loss.
 //
@@ -1148,9 +1228,9 @@ describe("NaiveCompactionConductor — head grouped/protected re-homing (FIX 1)"
 
 // ── 13. TOOL_CALL EXCLUSION ───────────────────────────────────────────────────
 //
-// The host's `substOne` has NO kind-check — it applies a `replace` to a tool_call
-// verbatim. The conductor itself must exclude tool_call blocks from compaction to
-// match the engine invariant "tool_call is never folded → never orphans its result".
+// The host kind-checks and clamps non-foldable replace targets, including tool_call and
+// user. The conductor still avoids those targets itself: if the summary head were clamped
+// away while other empty replaces applied, the agent would lose history with no summary.
 
 describe("NaiveCompactionConductor — tool_call exclusion (FIX 2)", () => {
 	it("tool_call blocks in the aged region are never included in the compaction prompt", () => {
@@ -1248,9 +1328,97 @@ describe("NaiveCompactionConductor — tool_call exclusion (FIX 2)", () => {
 		expect(result).toEqual([]);
 		expect(host.completeCalls).toHaveLength(0);
 	});
+
+	it("when oldest compacted survivor is user, summary re-homes to oldest replaceable block", async () => {
+		const c = new NaiveCompactionConductor();
+		const host = new MockHost();
+		c.attach(host);
+
+		const user = vb("u0", { kind: "user", order: 0, text: "original user intent" });
+		const text = vb("t0", { kind: "text", order: 1, text: "assistant text" });
+		const thought = vb("th0", { kind: "thinking", order: 2, text: "assistant thought" });
+		const view = makeView([user, text, thought], [vb("tail0")], 100_000, 96_000);
+
+		c.conduct(view);
+		expect(host.completeCalls).toHaveLength(1);
+		// User content may be part of the summary prompt for context, but user blocks must stay
+		// live and must never become replace targets.
+		expect(host.completeCalls[0].prompt).toContain("original user intent");
+		host.resolveNext("summary text");
+		await Promise.resolve();
+
+		const result = c.conduct(view);
+		expect(result).not.toBeNull();
+		const replaces = result!.filter((r) => r.kind === "replace") as Array<{ id: string; content: string }>;
+		expect(replaces.map((r) => r.id)).not.toContain("u0");
+
+		const summaryReplace = replaces.find((r) => r.content !== "");
+		expect(summaryReplace).toBeDefined();
+		expect(summaryReplace!.id).toBe("t0");
+		expect(summaryReplace!.content).toContain("summary text");
+
+		const emptyReplaces = replaces.filter((r) => r.content === "");
+		expect(emptyReplaces.map((r) => r.id)).toEqual(["th0"]);
+	});
+
+	it("when aged region is only user blocks, does not launch a useless completion", () => {
+		const c = new NaiveCompactionConductor();
+		const host = new MockHost();
+		c.attach(host);
+
+		const view = makeView(
+			[vb("u0", { kind: "user", tokens: 50_000 }), vb("u1", { kind: "user", tokens: 45_000 })],
+			[vb("tail0")],
+			100_000,
+			96_000,
+		);
+
+		expect(c.conduct(view)).toEqual([]);
+		expect(host.completeCalls).toHaveLength(0);
+	});
 });
 
-// ── 14. ATTEMPTKEY ON NEWLYAGED ───────────────────────────────────────────────
+// ── 14. STORE-LEVEL REGRESSION: non-foldable oldest block ─────────────────────
+
+describe("NaiveCompactionConductor — AccordionStore integration", () => {
+	it("delivers the summary through the real store when the oldest aged block is user", async () => {
+		const blocks = [
+			blk(0, "user", 1000, { text: "opening user request" }),
+			blk(1, "text", 2000, { text: "assistant progress" }),
+			blk(2, "thinking", 1000, { text: "private reasoning" }),
+			blk(3, "tool_result", 1000, { text: "tool output" }),
+			blk(4, "text", 500, { text: "protected tail" }),
+		];
+		const s = makeStore(blocks);
+		s.setProtect(500);
+		s.setBudget(5_000);
+		s.completer = async () => ({ text: "STORE LEVEL SUMMARY", model: "test-model" });
+
+		s.attach(new NaiveCompactionConductor());
+		await flushMicrotasks();
+
+		const user = s.blocks[0];
+		const summaryHead = s.blocks[1];
+		const thinking = s.blocks[2];
+		const toolResult = s.blocks[3];
+
+		// The bug: this used to choose the user block as head. The store correctly clamped that
+		// replace as not-foldable, so the summary vanished while other aged blocks folded.
+		expect(s.lastReports.some((r) => r.reason === "not-foldable")).toBe(false);
+		expect(user.autoFolded).toBe(false);
+		expect(user.subst).toBeUndefined();
+
+		// The summary must land on the oldest foldable/rewriteable block instead.
+		expect(summaryHead.autoFolded).toBe(true);
+		expect(summaryHead.subst).toContain("STORE LEVEL SUMMARY");
+
+		// Other foldable aged blocks are compacted behind the summary head.
+		expect(thinking.autoFolded).toBe(true);
+		expect(toolResult.autoFolded).toBe(true);
+	});
+});
+
+// ── 15. ATTEMPTKEY ON NEWLYAGED ───────────────────────────────────────────────
 //
 // FIX 3: the attempt key is now based on the NEWLY AGED ids (not the full aged set).
 // A pure SHRINK of the aged set (hold/pin removes an old block, no new blocks arrive)

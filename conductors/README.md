@@ -37,11 +37,12 @@ attach(host: ConductorHost): void
 detach(): void
 ```
 
-Use `attach()` only when you need a host service. Today that service is
-`host.requestRerun()`: start async work outside `conduct()`, return `null` while it is in
-flight, cache the finished command set, then call `requestRerun()` so Accordion schedules a
-fresh synchronous `conduct()` pass. The host debounces bursts of requests and ignores stale
-requests after the conductor is replaced.
+Use `attach()` only when you need a host service. The host exposes `requestRerun()` for async
+re-entry, plus capability helpers such as `complete()`, `countTokens()`, `digestOf()`, and
+`setStatus()`. The common async pattern is: start work outside `conduct()`, return `null`
+while it is in flight, cache the finished command set, then call `requestRerun()` so Accordion
+schedules a fresh synchronous `conduct()` pass. The host debounces bursts of requests and
+ignores stale requests after the conductor is replaced.
 
 The `Command` union is `fold · replace · group · restore · pin`. Most are **content
 substitution** (a block is replaced in place, never removed), so a `tool_call`/`tool_result`

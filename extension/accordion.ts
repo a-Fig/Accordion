@@ -241,6 +241,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// session that already has turns (especially a RESUMED session, where no
 	// `context`/`agent_end` has fired yet so `lastMessages` would still be empty).
 	let latestCtx: ExtensionContext | null = null;
+	// Most recent model object, updated both from full hook contexts and the immediate
+	// `/model` event. Completion requests use this so `model: "current"` really follows a
+	// just-selected model instead of waiting for the next `context` hook to refresh latestCtx.
+	let latestModel: any = null;
 
 	// ── discovery (registry) state ──────────────────────────────────────────────
 	let port = 0; // actual ephemeral port, filled once the server is listening
@@ -380,6 +384,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	/** Adopt a model's id + context window into the live + meta state (best-effort). */
 	function applyModel(m: { id?: string; contextWindow?: number } | undefined): void {
 		if (!m) return;
+		latestModel = m;
 		if (m.id) {
 			model = m.id;
 			meta.model = m.id;
@@ -504,14 +509,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 							// Only send if this GUI is still the active client (reconnect guard).
 							if (capturedWs === client && capturedWs.readyState === 1) send(capturedWs, r);
 						};
-						// FIX #7: validate prompt before doing any async work.
+						// Validate prompt before doing any async work.
 						if (typeof req.prompt !== "string" || req.prompt.length === 0) {
 							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "missing or empty prompt" });
 							return;
 						}
 						try {
 							const ctx = latestCtx;
-							const m = ctx?.model;
+							const m = latestModel ?? ctx?.model;
 							if (!ctx || !m) {
 								reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "no model available" });
 								return;
@@ -522,12 +527,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 								return;
 							}
 							const { complete } = await import("@earendil-works/pi-ai");
-							// FIX #7: pass system only if it's a string; treat as optional.
+							// Pass system only if it's a string; treat as optional.
 							const context = {
 								...(typeof req.system === "string" ? { systemPrompt: req.system } : {}),
 								messages: [{ role: "user" as const, content: req.prompt, timestamp: Date.now() }],
 							};
-							// FIX #3: clamp requested maxOutputTokens to the model's own output ceiling
+							// Clamp requested maxOutputTokens to the model's own output ceiling
 							// so a conductor requesting more than the model allows can't trigger a provider
 							// rejection; the model still hard-caps generation (truncates at the limit).
 							let maxTokens: number | undefined;

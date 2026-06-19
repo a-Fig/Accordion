@@ -270,10 +270,10 @@ the conductor).
   - `compaction-naive/` — in-process. Naive compaction baseline: summarizes aged context into
     a prose blob via `host.complete`; lossy + recursive amnesia (each pass only reads the prior
     summary). No fold tags — the agent cannot self-unfold. The intentional foil to reversible
-    folding. `tool_call` blocks are excluded from the aged region entirely (the conductor never
-    emits a `replace` on them), consistent with the engine's "tool_call is never folded"
-    invariant; the host's `substOne` has no kind-check and would apply a replace verbatim, so
-    the conductor enforces this itself. See [ADR 0013](docs/adr/0013-conductor-host-capabilities.md) / [ADR 0014](docs/adr/0014-naive-compaction-conductor.md).
+    folding. `replace` commands are emitted only for wire-foldable block kinds (`text`,
+    `thinking`, `tool_result`). `user` and `tool_call` blocks stay live; the host would clamp
+    them as `not-foldable`, but relying on that clamp could drop the summary head while other
+    empty replaces apply. See [ADR 0013](docs/adr/0013-conductor-host-capabilities.md) / [ADR 0014](docs/adr/0014-naive-compaction-conductor.md).
 
 ## Visual grammar (consistent across ALL views)
 

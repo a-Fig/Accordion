@@ -322,7 +322,9 @@ export class RemoteRunner implements Conductor {
 	 */
 	private serveCapability(m: Extract<ConductorMessage, { type: "cap/request" }>): void {
 		// "complete" is async — handle it in a detached async path so it never blocks the
-		// synchronous dispatch of the other cases below.
+		// synchronous dispatch of the other cases below. AbortSignal is not serializable over
+		// this conductor WS protocol, so a detached remote conductor may still incur an in-flight
+		// model call; stale results are dropped by send()/host guards rather than applied.
 		if (m.capability === "complete") {
 			void (async () => {
 				if (!this.host || !this.host.can("complete")) {
