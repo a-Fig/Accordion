@@ -28,6 +28,7 @@ import {
 	isHostMessage, // (re-exported for symmetry/tests; host parses conductor msgs)
 	isConductorMessage,
 	type Conductor,
+	type ConductorHost,
 	type ConductorView,
 	type Command,
 	type ContentMode,
@@ -91,6 +92,14 @@ export class RemoteRunner implements Conductor {
 
 	private ws: WebSocket | null = null;
 	private manualClose = false;
+	/**
+	 * The host-capabilities handle injected by the store via `attach(host)` on attach.
+	 * Null until attach is called; cleared in detach. A WS conductor uses this to serve
+	 * "complete" capability requests from the remote process — the wire is just a transport:
+	 * the remote conductor calls `cap/request { capability:"complete" }`, RemoteRunner
+	 * proxies the call to the same `host.complete()` that an in-process conductor uses.
+	 */
+	private host: ConductorHost | null = null;
 	/** True after an UNEXPECTED socket drop (not a manual close). A dead runner can never
 	 * re-dial, so `attachConductor` must not treat it as "already correctly attached". */
 	private _dead = false;
@@ -119,6 +128,30 @@ export class RemoteRunner implements Conductor {
 		if (this.suppressUpdate) this.suppressUpdate = false;
 		else if (this.greeted) this.pushContext(view); // hold the first push until wants is known
 		return this.desired;
+	}
+
+	/**
+	 * OPTIONAL Conductor lifecycle — called once by the store on attach, before the first
+	 * `conduct()`. Stashes the host reference so `serveCapability` can proxy "complete"
+	 * requests from the remote process through the same host the store provides to every
+	 * in-process conductor. The WS is merely a transport for the same service.
+	 */
+	attach(host: ConductorHost): void {
+		this.host = host;
+	}
+
+	/**
+	 * OPTIONAL Conductor lifecycle — called by the store on detach / swap. Clears the
+	 * host reference so any in-flight "complete" cap/request that arrives after the remote
+	 * has been detached gets a clean "completion unavailable" error rather than trying to
+	 * call a host that is no longer ours.
+	 *
+	 * Note: we do NOT close the WebSocket here — `close()` is the explicit lifecycle call
+	 * (invoked by `attachConductor` before attaching a new one). `detach()` is a STORE
+	 * signal only; the socket teardown is the manager's responsibility.
+	 */
+	detach(): void {
+		this.host = null;
 	}
 
 	// ---- lifecycle --------------------------------------------------------
@@ -275,8 +308,62 @@ export class RemoteRunner implements Conductor {
 		}
 	}
 
-	/** Answer a capability request from the conductor (the host owns the engine + tokenizer). */
+	/**
+	 * Answer a capability request from the remote conductor (the host owns the engine + tokenizer).
+	 *
+	 * Synchronous capabilities ("countTokens", "getContent", "summarize", "getDigest") reply
+	 * inline. The async "complete" capability is handled in its own async IIFE so it never
+	 * blocks the synchronous dispatch of the other cases; the existing sync paths are unchanged.
+	 *
+	 * "complete" proxies through the SAME `host.complete()` that an in-process conductor uses —
+	 * the WS is merely a transport for the same capability. The remote process calls
+	 * `cap/request { capability:"complete", completion: { prompt, system?, maxOutputTokens? } }`
+	 * and receives `cap/result { ok, value:text, model, inputTokens, outputTokens }` asynchronously.
+	 */
 	private serveCapability(m: Extract<ConductorMessage, { type: "cap/request" }>): void {
+		// "complete" is async — handle it in a detached async path so it never blocks the
+		// synchronous dispatch of the other cases below. AbortSignal is not serializable over
+		// this conductor WS protocol, so a detached remote conductor may still incur an in-flight
+		// model call; stale results are dropped by send()/host guards rather than applied.
+		if (m.capability === "complete") {
+			void (async () => {
+				if (!this.host || !this.host.can("complete")) {
+					this.send({ type: "cap/result", reqId: m.reqId, ok: false, error: "completion unavailable" });
+					return;
+				}
+				const prompt = m.completion?.prompt;
+				if (typeof prompt !== "string" || !prompt) {
+					this.send({ type: "cap/result", reqId: m.reqId, ok: false, error: "missing completion.prompt" });
+					return;
+				}
+				try {
+					const r = await this.host.complete({
+						system: m.completion?.system,
+						prompt,
+						maxOutputTokens: m.completion?.maxOutputTokens,
+					});
+					this.send({
+						type: "cap/result",
+						reqId: m.reqId,
+						ok: true,
+						value: r.text,
+						model: r.model,
+						inputTokens: r.inputTokens,
+						outputTokens: r.outputTokens,
+					});
+				} catch (e) {
+					this.send({
+						type: "cap/result",
+						reqId: m.reqId,
+						ok: false,
+						error: String((e as Error)?.message ?? e),
+					});
+				}
+			})();
+			return; // synchronous path exits here; the async IIFE fires independently
+		}
+
+		// Synchronous capabilities — reply inline, no await.
 		const id = m.ids?.[0];
 		const b = id ? this.store.get(id) : undefined;
 		let value: string | number | undefined;

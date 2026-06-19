@@ -134,6 +134,13 @@ header toggle). Disarmed, the GUI still replies with an empty plan — M1 behavi
 model call altered. Armed, `computePlan` mirrors the engine's fold decisions into ops
 via `computeFoldOps` (`plan.ts`), guarded so only **durable-id** `text`/`thinking`/
 `tool_result` blocks are ever folded (`isDurableId`; `applyPlan` enforces the same).
+The out-of-band **completion relay** (`completeRequest` / `completeResult`, pi wire v5)
+is a separate channel: the GUI sends it when a conductor calls `host.complete()`, the
+extension runs the model call and returns the raw result, and the GUI passes it back to
+the conductor. This is **never on the `context` hook path** — it runs on a side channel
+completely outside the `sync→plan→apply` loop and must never block or alter the agent's
+own model call. The extension stays thin: it runs exactly the completion it is handed and
+decides nothing (strategy lives in the conductor, in the GUI).
 
 **M3 — agent self-unfold ([ADR 0005](docs/adr/0005-agent-unfold.md)):** the engine's
 `digest()` now prefixes every folded block's digest with `{#<code> FOLDED}`, where
@@ -172,7 +179,8 @@ exists to make them cheap to write, with the built-in as the worked example. The
 lives in the top-level **`conductors/contract/`** (both halves dependency-free / Node-safe,
 re-exported by `conductors/contract/index.ts`, imported via the `$conductors` alias):
 `conductor.ts` (the in-process shape — `ConductorView`, `ViewBlock`, the `Command` union
-`fold·replace·group·restore·pin`, `ClampReport`, the `Conductor` interface) and `protocol.ts`
+`fold·replace·group·restore·pin`, `ClampReport`, the `Conductor` interface, plus
+`ConductorHost` / `CompletionRequest` / `CompletionResult` / `HostCapabilityId`) and `protocol.ts`
 (the WebSocket messages, `CONDUCTOR_PROTOCOL_VERSION = 3`, which *import* the `Command` /
 `ViewBlock` types so there is one definition). The host enforces one unconditional floor —
 **provider-validity** (the message stays sendable); **human overrides win for every control
@@ -219,6 +227,16 @@ the conductor).
   every conductor are attributed uniformly (`by:"auto"`; no `id === "builtin"` special-case).
   Its byte-identical output is pinned by a golden test (`conductor.builtin.test.ts`) — don't
   break it.
+- **Host capabilities are first-class on the `Conductor` interface.** An optional
+  `attach(host: ConductorHost)` lifecycle hook (called once before the first `conduct()`) injects
+  a `ConductorHost` handle with six methods: `can`, `complete`, `countTokens`, `digestOf`,
+  `setStatus`, `requestRerun`. `"complete"` is the first real capability — how LLM summarisation calls come to
+  Accordion: the conductor fires `host.complete(req)` off-path, holds with `null`, stashes the
+  result in instance state, then calls `host.requestRerun()` to re-run `conduct()` and emit
+  commands. `conduct()` stays synchronous throughout. `detach()` (optional) lets the conductor
+  cancel in-flight calls. A pure conductor (the built-in) omits `attach` and is unaffected. The
+  live pi extension relays `completeRequest` / `completeResult` out-of-band, outside the
+  `sync→plan→apply` model-call path. Full reference: Part 3 of `docs/conductor-protocol.md`.
 - **WebSocket is a demoted escape hatch** for a separate process / another language. The
   conductor hosts a WS endpoint; Accordion **dials as a client** (the webview can't host a
   server). `context/update` carries the full `ConductorView`. App side:
@@ -249,6 +267,13 @@ the conductor).
     [ADR 0010](docs/adr/0010-attention-conductor.md).
   - `garbage-collector/` — in-process. Reachability-based: mark-and-sweep from roots (protected tail + held + first `user` message) over entity/causal/message edges; folds unreachable blocks first, reachable ones only as a budget fallback. Collaborative, no instance state. See [ADR 0012](docs/adr/0012-garbage-collector-conductor.md).
   - `recency-folder/` — external (WS). Minimal wire-protocol starter example.
+  - `compaction-naive/` — in-process. Naive compaction baseline: summarizes aged context into
+    a prose blob via `host.complete`; lossy + recursive amnesia (each pass only reads the prior
+    summary). No fold tags — the agent cannot self-unfold. The intentional foil to reversible
+    folding. `replace` commands are emitted only for wire-foldable block kinds (`text`,
+    `thinking`, `tool_result`). `user` and `tool_call` blocks stay live; the host would clamp
+    them as `not-foldable`, but relying on that clamp could drop the summary head while other
+    empty replaces apply. See [ADR 0013](docs/adr/0013-conductor-host-capabilities.md) / [ADR 0014](docs/adr/0014-naive-compaction-conductor.md).
 
 ## Visual grammar (consistent across ALL views)
 

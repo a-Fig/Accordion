@@ -214,16 +214,91 @@ export type ClampReason =
 	/** The op was a no-op (e.g. restoring an already-live block). */
 	| "noop";
 
+// ─── Host capabilities ────────────────────────────────────────────────────────
+
+/**
+ * The set of optional services the host MAY offer to a conductor. Not all hosts support
+ * all capabilities: a headless test harness might omit "complete"; a read-only transcript
+ * viewer has no live model link. Always call `host.can(id)` before depending on one.
+ *
+ *  - "complete"     — run an out-of-band model completion (requires a live session model).
+ *  - "countTokens"  — synchronous token estimate using the host's tokenizer.
+ *  - "digest"       — the engine's per-kind folded digest for a known block id.
+ */
+export type HostCapabilityId = "complete" | "countTokens" | "digest";
+
+/**
+ * A provider-agnostic request to the host to run a model completion off to the side.
+ * This is NEVER on the `conduct()` hot path — it is fire-and-forget from the conductor's
+ * perspective: kick it off, stash the result in instance state when it resolves, call
+ * `host.requestRerun()` to trigger a fresh `conduct()` pass that emits the commands.
+ */
+export interface CompletionRequest {
+	/** Optional system instruction — e.g. a compaction template or persona. */
+	system?: string;
+	/** The user-role content to operate on — e.g. aged context blocks to summarize. */
+	prompt: string;
+	/**
+	 * Soft cap on the number of output tokens. The host may silently clamp this to its
+	 * own ceiling (model limits, safety margins). Omit to use the host default.
+	 */
+	maxOutputTokens?: number;
+	/**
+	 * Abort signal the host will fire if the in-flight call should be cancelled (e.g.
+	 * because the conductor is being detached or swapped). The conductor should hold a
+	 * reference to an `AbortController`, pass its `signal` here, and call
+	 * `controller.abort()` from `detach()` so stale completions do not race back.
+	 */
+	signal?: AbortSignal;
+	/**
+	 * Which model to use. `"current"` (the default, applied when omitted) means "whatever
+	 * model the user's live session is running" — this is the ONLY value honored in this
+	 * version. A specific model id string is RESERVED for future use and is not yet plumbed
+	 * through the wire; it is currently treated as `"current"` rather than selecting a
+	 * different model.
+	 */
+	model?: "current" | string;
+}
+
+/** The fulfilled result of a `CompletionRequest`. */
+export interface CompletionResult {
+	/** The model's full text output. */
+	text: string;
+	/** The model id that actually ran (resolved from `request.model`). */
+	model: string;
+	/**
+	 * Host-counted input token usage for this call, when the host can supply it.
+	 * Conductors that want to budget their own model calls can use this to track spend.
+	 */
+	inputTokens?: number;
+	/** Host-counted output token usage for this call, when available. */
+	outputTokens?: number;
+}
+
 /**
  * Host services available to an in-process conductor. The object is deliberately tiny and
  * dependency-free so the contract remains importable everywhere the wire contract is used.
  *
- * `requestRerun()` is the async bridge: a conductor can return `null` from `conduct()` while
- * it computes off-thread, then call this when fresh commands are ready in its own cache. The
- * host debounces the poke and re-enters `conduct()` on a later microtask; the conductor must
- * still return synchronously from that next call.
+ * The async pattern: `conduct(view)` is and MUST remain synchronous. A conductor that
+ * needs model work starts `host.complete(req)` in the background, returns `null` to hold
+ * its previous state, stores the completion result on its instance when it resolves, then
+ * calls `host.requestRerun()` so the host re-enters `conduct()` on a later microtask.
+ *
+ * `requestRerun()` captures the conductor/epoch that received this host handle; stale
+ * calls from a detached conductor are ignored.
  */
 export interface ConductorHost {
+	/** Is `capability` available right now? */
+	can(capability: HostCapabilityId): boolean;
+	/** Run an out-of-band model completion asynchronously; reject if unavailable. */
+	complete(req: CompletionRequest): Promise<CompletionResult>;
+	/** Synchronous token estimate for `text`, using the host's tokenizer. */
+	countTokens(text: string): number;
+	/** The engine's per-kind folded digest for block `id`, or `null` if unknown. */
+	digestOf(id: string): string | null;
+	/** Surface display-only conductor status to the human; `null`/empty clears it. */
+	setStatus(text: string | null, metrics?: Record<string, number | string | boolean>): void;
+	/** Ask the host to re-run `conduct()` after async work completes. */
 	requestRerun(): void;
 }
 
@@ -241,9 +316,9 @@ export interface ConductorHost {
  *    raw. Used by an async conductor that is still thinking; it must never block a model call.
  *
  * `conduct()` MUST be synchronous and side-effect-free with respect to the view.
- * An in-process conductor can use `ConductorHost.requestRerun()` to re-enter after async
- * work; an out-of-process conductor does the same through a synchronous runner (see
- * `RemoteRunner` in the live layer).
+ * In-process conductors can use `attach(host)` / `detach()` and `host.requestRerun()`
+ * for async work; out-of-process conductors do the same through a synchronous runner
+ * (see `RemoteRunner` in the live layer).
  */
 export interface Conductor {
 	/** Stable identifier, e.g. "builtin" or a remote session id. Drives actor attribution. */
@@ -272,9 +347,6 @@ export interface Conductor {
 	 * `protected: true` and the conductor folds only older content. Ignored entirely if the
 	 * conductor does not hold the `tail-size` lock. Remote conductors (WebSocket) always read
 	 * as 0 (whole-context ownership); remote-wire `tailTokens` support is a follow-up.
-	 *
-	 * Example: `tailTokens = 8000` keeps the newest ~8 k tokens protected while the conductor
-	 * manages everything older. `tailTokens` omitted (or 0) owns everything — no protected tail.
 	 */
 	readonly tailTokens?: number;
 	/**
@@ -283,7 +355,12 @@ export interface Conductor {
 	 * conductors can ignore it.
 	 */
 	attach?(host: ConductorHost): void;
-	/** Optional lifecycle hook called when the store detaches or replaces this conductor. */
+	/**
+	 * Optional lifecycle hook called when the store detaches or replaces this conductor.
+	 * A conductor that kicks off `host.complete()` calls should cancel them here (e.g. via
+	 * the `AbortSignal` it passed in `CompletionRequest.signal`) so stale completions do not
+	 * call `host.requestRerun()` after the conductor is gone.
+	 */
 	detach?(): void;
 	conduct(view: ConductorView): Command[] | null;
 }

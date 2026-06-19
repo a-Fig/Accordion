@@ -462,6 +462,29 @@ describe("ADR 0011 — detach freezes the folded view and unlocks", () => {
 		expect(s.isFolded(s.get(frozen[0])!)).toBe(false);
 	});
 
+	it("a replace-conductor's substitution SURVIVES the freeze (exact view, not a digest)", () => {
+		// ADR 0011 §6: detach freezes the current folded view IN PLACE. For a `replace`-based
+		// conductor (e.g. naive compaction) the carrier block's content is the conductor's
+		// generated text; the freeze must preserve it, not revert to the engine digest.
+		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		const c = new LockingConductor(["human-steering"]);
+		c.cmds = [{ kind: "replace", id: "m0:p0", content: "COMPACTED SUMMARY" }];
+		s.attach(c);
+		const carrier = s.get("m0:p0")!;
+		expect(s.isFolded(carrier)).toBe(true);
+		expect(s.digestOf(carrier)).toBe("COMPACTED SUMMARY"); // shown before detach
+
+		s.detach();
+
+		// Frozen, human-owned, and STILL carrying the summary (subst preserved).
+		expect(s.isFolded(carrier)).toBe(true);
+		expect(carrier.override).toBe("folded");
+		expect(carrier.by).toBe("you");
+		expect(carrier.subst).toBe("COMPACTED SUMMARY");
+		expect(s.digestOf(carrier)).toBe("COMPACTED SUMMARY"); // exact view preserved
+	});
+
 	it("detach does NOT reset to raw (a folded block is not dumped back to full)", () => {
 		const s = makeStore(Array.from({ length: 5 }, (_, i) => blk(i)));
 		s.setProtect(0);

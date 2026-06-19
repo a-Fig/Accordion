@@ -16,6 +16,7 @@ import { ColdEpochConductor } from "./cold-epoch/cold-epoch";
 import { SlidingWindowConductor } from "./sliding-window/sliding-window";
 import { AutopilotConductor } from "./autopilot/autopilot";
 import { GarbageCollectorConductor } from "./garbage-collector/garbage-collector";
+import { NaiveCompactionConductor } from "./compaction-naive/compaction-naive";
 import type { Conductor, LockName } from "./contract";
 
 export { BuiltinConductor } from "./builtin/builtin";
@@ -24,6 +25,7 @@ export { ColdEpochConductor } from "./cold-epoch/cold-epoch";
 export { SlidingWindowConductor } from "./sliding-window/sliding-window";
 export { AutopilotConductor } from "./autopilot/autopilot";
 export { GarbageCollectorConductor } from "./garbage-collector/garbage-collector";
+export { NaiveCompactionConductor } from "./compaction-naive/compaction-naive";
 
 /**
  * A conductor compiled into the app (in-process).
@@ -52,6 +54,12 @@ export const IN_PROCESS_CONDUCTORS: InProcessConductor[] = [
     create: () => new AutopilotConductor(),
   },
   { id: "garbage-collector", label: "Garbage collector", create: () => new GarbageCollectorConductor() },
+  {
+    id: "compaction-naive",
+    label: "Naive compaction",
+    locks: ["human-steering", "agent-unfold"],
+    create: () => new NaiveCompactionConductor(),
+  },
 ];
 
 /** Look up an in-process conductor by id (null if not one). */

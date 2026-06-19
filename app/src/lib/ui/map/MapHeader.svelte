@@ -27,6 +27,7 @@
 	});
 
 	const denom = $derived(Math.max(store.fullTokens, store.budget, 1));
+	const conductorStatusText = $derived(store.conductorStatus.text || conductorStatus.text);
 	// fmt/k formatters must round their input because AnimatedNumber passes a float mid-tween
 	const fmt = (n: number) => Math.round(n).toLocaleString();
 	const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
@@ -246,12 +247,11 @@
 		</div>
 	</div>
 
-	<!-- ── Conductor telemetry (display-only): one-line status from the active conductor.
-	     Empty unless a remote conductor pushed a conductor/status; in-process/Raw show nothing. -->
-	{#if conductorStatus.text}
-		<div class="cond-telemetry" role="status" title={conductorStatus.text}>
+	<!-- ── Conductor telemetry (display-only): one-line status from the active conductor. -->
+	{#if conductorStatusText}
+		<div class="cond-telemetry" role="status" title={conductorStatusText}>
 			<Icon name="activity" size={11} />
-			<span class="cond-telemetry-text mono">{conductorStatus.text}</span>
+			<span class="cond-telemetry-text mono">{conductorStatusText}</span>
 		</div>
 	{/if}
 

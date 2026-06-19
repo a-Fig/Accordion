@@ -40,7 +40,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { linearize, applyPlan, type PiMessage } from "../app/src/lib/live/mapping";
-import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent } from "../app/src/lib/live/protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
 
 /** The GUI's reply to a sync: in-place fold ops + group-collapse ops (ADR 0006). */
 type Plan = { ops: FoldOp[]; groups: GroupOp[] };
@@ -241,6 +241,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// session that already has turns (especially a RESUMED session, where no
 	// `context`/`agent_end` has fired yet so `lastMessages` would still be empty).
 	let latestCtx: ExtensionContext | null = null;
+	// Most recent model object, updated both from full hook contexts and the immediate
+	// `/model` event. Completion requests use this so `model: "current"` really follows a
+	// just-selected model instead of waiting for the next `context` hook to refresh latestCtx.
+	let latestModel: any = null;
 
 	// ── discovery (registry) state ──────────────────────────────────────────────
 	let port = 0; // actual ephemeral port, filled once the server is listening
@@ -380,6 +384,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	/** Adopt a model's id + context window into the live + meta state (best-effort). */
 	function applyModel(m: { id?: string; contextWindow?: number } | undefined): void {
 		if (!m) return;
+		latestModel = m;
 		if (m.id) {
 			model = m.id;
 			meta.model = m.id;
@@ -491,6 +496,79 @@ export default function accordionLive(pi: ExtensionAPI): void {
 							missing: Array.isArray(msg.missing) ? msg.missing : [],
 						});
 					}
+				}
+				if (msg?.type === "completeRequest" && typeof msg.reqId === "number") {
+					// Out-of-band: fire async and NEVER block the message handler or any hook.
+					// Dynamic import so the module is resolved lazily — at pi load time pi's jiti
+					// alias table maps "@earendil-works/pi-ai" to its bundled copy; the smoke test
+					// never triggers a real model call so it never reaches this import.
+					const req = msg as CompleteRequestMessage;
+					const capturedWs = ws;
+					void (async () => {
+						const reply = (r: CompleteResultMessage): void => {
+							// Only send if this GUI is still the active client (reconnect guard).
+							if (capturedWs === client && capturedWs.readyState === 1) send(capturedWs, r);
+						};
+						// Validate prompt before doing any async work.
+						if (typeof req.prompt !== "string" || req.prompt.length === 0) {
+							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "missing or empty prompt" });
+							return;
+						}
+						try {
+							const ctx = latestCtx;
+							const m = latestModel ?? ctx?.model;
+							if (!ctx || !m) {
+								reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "no model available" });
+								return;
+							}
+							const auth = await ctx.modelRegistry.getApiKeyAndHeaders(m);
+							if (!auth.ok) {
+								reply({ type: "completeResult", reqId: req.reqId, ok: false, error: `could not resolve API key: ${(auth as any).error ?? "unknown"}` });
+								return;
+							}
+							const { complete } = await import("@earendil-works/pi-ai");
+							// Pass system only if it's a string; treat as optional.
+							const context = {
+								...(typeof req.system === "string" ? { systemPrompt: req.system } : {}),
+								messages: [{ role: "user" as const, content: req.prompt, timestamp: Date.now() }],
+							};
+							// Clamp requested maxOutputTokens to the model's own output ceiling
+							// so a conductor requesting more than the model allows can't trigger a provider
+							// rejection; the model still hard-caps generation (truncates at the limit).
+							let maxTokens: number | undefined;
+							if (typeof req.maxOutputTokens === "number" && req.maxOutputTokens > 0) {
+								const modelCeiling = typeof m.maxTokens === "number" && m.maxTokens > 0 ? m.maxTokens : undefined;
+								maxTokens = modelCeiling !== undefined ? Math.min(req.maxOutputTokens, modelCeiling) : req.maxOutputTokens;
+							}
+							const result = await complete(m, context, {
+								apiKey: auth.apiKey,
+								headers: auth.headers,
+								...(maxTokens !== undefined ? { maxTokens } : {}),
+							});
+							// Concatenate ALL text parts in order (a multi-part response must not be
+							// truncated to the first part only). Defensively guard non-array content
+							// and missing/non-string part text.
+							let text = "";
+							if (Array.isArray(result.content)) {
+								text = result.content
+									.filter((p: any) => p?.type === "text")
+									.map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+									.join("");
+							}
+							reply({
+								type: "completeResult",
+								reqId: req.reqId,
+								ok: true,
+								text,
+								model: result.model,
+								inputTokens: typeof result.usage?.input === "number" ? result.usage.input : undefined,
+								outputTokens: typeof result.usage?.output === "number" ? result.usage.output : undefined,
+							});
+						} catch (err: unknown) {
+							const errMsg = err instanceof Error ? err.message : String(err);
+							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: errMsg });
+						}
+					})();
 				}
 			});
 			const drop = () => {

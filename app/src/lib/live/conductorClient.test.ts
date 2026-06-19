@@ -112,6 +112,7 @@ function connectRunner(store: AccordionStore): { runner: RemoteRunner; ws: FakeW
 }
 
 function sendHello(ws: FakeWebSocket, content: "full" | "shape" | "onDemand" = "full", locks?: string[]): void {
+	// The mismatch test uses an explicit wrong version (999) to test the guard independently.
 	const msg: Record<string, unknown> = { type: "conductor/hello", conductorProtocol: CONDUCTOR_PROTOCOL_VERSION, id: "remote-test", label: "Remote Test", wants: { content } };
 	if (locks !== undefined) msg.locks = locks;
 	ws.emit(msg);

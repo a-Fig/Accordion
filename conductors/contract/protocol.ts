@@ -24,8 +24,10 @@ import type { Command, ClampReport, ViewBlock, LockName } from "./conductor";
 
 /**
  * Bumped on any breaking change to the messages below. Independent of the pi wire's
- * PROTOCOL_VERSION. v3 adds the conductor's `locks` declaration to the `conductor/hello`
- * handshake (ADR 0011).
+ * PROTOCOL_VERSION. History:
+ *  - v2: initial conductor protocol (ConductorView, Command vocab, cap/request).
+ *  - v3: conductor lock declarations in `conductor/hello` (ADR 0011) plus the
+ *        "complete" capability for out-of-band model completions over the wire.
  */
 export const CONDUCTOR_PROTOCOL_VERSION = 3;
 
@@ -79,13 +81,29 @@ export interface CommandResultMessage {
 	reports: ClampReport[];
 }
 
-/** Answer to a `cap/request`. `ok:false` carries an `error` string instead of `value`. */
+/**
+ * Answer to a `cap/request`. `ok:false` carries an `error` string instead of `value`.
+ *
+ * For a "complete" result:
+ *  - `value` carries the completion text (the model's output).
+ *  - `model` carries the model id that ran (resolved from `request.completion.model`).
+ *  - `inputTokens` / `outputTokens` carry host-counted usage, when available — for the
+ *    conductor's own accounting (e.g. tracking distillation spend across turns).
+ *  - `error` is present (and `value` absent) when the call failed (no model link,
+ *    key resolution error, model error, or the conductor closed before the reply arrived).
+ */
 export interface CapResultMessage {
 	type: "cap/result";
 	reqId: string;
 	ok: boolean;
 	value?: string | number;
 	error?: string;
+	/** Present on a successful "complete" result: the model id that actually ran. */
+	model?: string;
+	/** Present on a "complete" result: host-counted input token usage, when available. */
+	inputTokens?: number;
+	/** Present on a "complete" result: host-counted output token usage, when available. */
+	outputTokens?: number;
 }
 
 /**
@@ -137,19 +155,40 @@ export interface ConductorCommandsMessage {
 }
 
 /**
- * Ask the host to do something only it can (it owns the engine + tokenizer). The host
- * answers with a `cap/result` carrying the same `reqId`.
+ * Ask the host to do something only it can (it owns the engine + tokenizer + model
+ * link). The host answers with a `cap/result` carrying the same `reqId`.
  *  - "summarize"   — engine digest for `ids` (a single block, or a group head).
  *  - "countTokens" — token estimate for `text`.
  *  - "getContent"  — full text of block `ids[0]` (for `wants:"onDemand"`).
  *  - "getDigest"   — the engine's per-kind folded digest for block `ids[0]` (incl. the {#code FOLDED} tag).
+ *  - "complete"    — run a model completion on the user's live session model; the host
+ *                    fulfils it via `ConductorHost.complete` (see `conductor.ts`). The
+ *                    result arrives in `cap/result.value` (the completion text), with
+ *                    optional `model`/`inputTokens`/`outputTokens` usage fields. Rejected
+ *                    (ok:false) if no live model link or the model call fails.
+ *
+ * NOTE on AbortSignal: `AbortSignal` is NOT serializable, so wire-side per-request
+ * cancellation is NOT supported in this version. A wire conductor that no longer wants a
+ * result should simply ignore the arriving `cap/result` by `reqId`. The in-process path
+ * (`ConductorHost.complete`) supports `AbortSignal` fully via `CompletionRequest.signal`.
  */
 export interface CapRequestMessage {
 	type: "cap/request";
 	reqId: string;
-	capability: "summarize" | "countTokens" | "getContent" | "getDigest";
+	capability: "summarize" | "countTokens" | "getContent" | "getDigest" | "complete";
 	ids?: string[];
 	text?: string;
+	/**
+	 * Present when `capability === "complete"`. The prompt to run — same semantics as
+	 * `CompletionRequest` in `conductor.ts` (system/prompt/maxOutputTokens), but without
+	 * the in-process-only `signal` and `model` fields. The host uses the user's live
+	 * session model.
+	 */
+	completion?: {
+		system?: string;
+		prompt: string;
+		maxOutputTokens?: number;
+	};
 }
 
 /**

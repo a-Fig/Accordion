@@ -15,7 +15,7 @@ import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
 import { digest, digestTokens, groupDigest, groupDigestTokens, substTokens, wireFoldable } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { messageKey } from "./ids";
-import type { Conductor, ConductorView, Command, ClampReport, ClampReason, LockName, ConductorHost } from "$conductors/contract";
+import type { Conductor, ConductorView, Command, ClampReport, ClampReason, LockName, ConductorHost, CompletionRequest, CompletionResult } from "$conductors/contract";
 import { hasLock } from "$conductors/contract";
 import { BuiltinConductor } from "$conductors";
 
@@ -119,6 +119,22 @@ export class AccordionStore {
 	 * the wire layer. Only ever fired for human ("you") actions; null ⇒ nobody is listening.
 	 */
 	onHumanOverride: ((ids: string[], action: string) => void) | null = null;
+	/** Display-only status from the active in-process conductor. */
+	conductorStatus = $state<{ text: string; metrics: Record<string, number | string | boolean> }>({
+		text: "",
+		metrics: {},
+	});
+
+	/**
+	 * Optional completion backend injected by the live layer. The live client sets this
+	 * once the WebSocket connection to the pi extension is established (and clears it on
+	 * disconnect); the host exposes it to conductors via `ConductorHost.complete()`.
+	 *
+	 * Null whenever there is no live model link — demo sessions, read-only Claude Code
+	 * transcripts, or a disconnected extension. Conductors MUST call `host.can("complete")`
+	 * before depending on it; the host rejects if it is called while null.
+	 */
+	completer: ((req: CompletionRequest) => Promise<CompletionResult>) | null = null;
 
 	// ---- involvement locks (ADR 0011) -------------------------------------
 	/**
@@ -205,6 +221,7 @@ export class AccordionStore {
 		this.detachConductorHost(this.conductor);
 		this.conductorEpoch++;
 		this.conductorRerunQueuedFor = null;
+		this.clearConductorStatus();
 		this.conductor = c;
 		// Mirror the new conductor's locks (and tailTokens) into the reactive snapshots BEFORE
 		// any gate reads them (releaseLockedDomains → isLocked, the refold's protectedFromIndex
@@ -242,6 +259,7 @@ export class AccordionStore {
 		this.detachConductorHost(oldConductor);
 		this.conductorEpoch++;
 		this.conductorRerunQueuedFor = null;
+		this.clearConductorStatus();
 		this.conductor = null;
 		// Kill switch unlocks every control — clear the reactive lock snapshot to match the now-null
 		// conductor (otherwise stale locks would keep the gates closed and the UI showing "locked").
@@ -328,14 +346,18 @@ export class AccordionStore {
 	 *
 	 * FOLD FREEZE: a block the human already holds (`override !== null`) is untouched. A block
 	 * the conductor folds individually (via `autoFolded`/`subst`, `override === null`, NOT
-	 * inside a folded group) becomes `override:"folded"`, `by:"you"`, `subst` cleared → folds
-	 * to the engine digest, individually reversible. Members of a folded group are NOT
-	 * individually frozen here — the group itself IS the frozen view. This matters because
-	 * group collapse legitimately includes non-foldable kinds (`user`, `tool_call`) whose
-	 * individual `override:"folded"` would be an illegal state (the wire refuses non-foldable
-	 * per-block folds via `wireFoldable`) — exactly the view↔wire divergence this repo forbids.
-	 * A conductor-owned folded group is reassigned to `by:"you"` (just the provenance change —
-	 * no `frozen` flag needed, since the inherited tail prevents the snap-back that required it).
+	 * inside a folded group) becomes `override:"folded"`, `by:"you"`, individually reversible.
+	 * Members of a folded group are NOT individually frozen here — the group itself IS the
+	 * frozen view. This matters because group collapse legitimately includes non-foldable kinds
+	 * (`user`, `tool_call`) whose individual `override:"folded"` would be an illegal wire state.
+	 *
+	 * The conductor's `subst` is PRESERVED, not cleared, so the kill switch freezes the EXACT
+	 * on-screen view. For a digest-folding conductor (built-in / autopilot) `subst` is already
+	 * `undefined`, so the block freezes to the engine digest exactly as before. For a
+	 * `replace`-based conductor (naive compaction) `subst` carries the generated summary —
+	 * preserving it means detach keeps the summary visible rather than reverting to a generic
+	 * digest. A conductor-owned folded group is reassigned to `by:"you"` so
+	 * `clearConductorState` keeps it.
 	 * From then on the normal heal-and-prune invariant governs: if the HUMAN later grows the
 	 * protected tail over a detach-frozen fold or group, `healProtected`/`pruneProtectedGroups`
 	 * handles it as an ordinary human override — "position one."
@@ -362,7 +384,7 @@ export class AccordionStore {
 			if (this.inFoldedGroup(b.id)) continue;
 			b.override = "folded";
 			b.by = "you";
-			b.subst = undefined;
+			// `subst` is intentionally NOT cleared (see docstring) — freeze the exact view.
 			// State hygiene: the fold is now a human override, not a conductor auto-fold —
 			// clear the stale `autoFolded` left over from the conductor pass.
 			b.autoFolded = false;
@@ -387,15 +409,59 @@ export class AccordionStore {
 		for (let i = 0; i < this.blocks.length; i++) this.index.set(this.blocks[i].id, i);
 	}
 
-	/** Give the current in-process conductor a tiny host API, if it asked for one. */
+	private clearConductorStatus(): void {
+		this.conductorStatus.text = "";
+		this.conductorStatus.metrics = {};
+	}
+
+	/**
+	 * Build the host-capabilities object the store hands to a conductor on attach.
+	 *
+	 * A fresh object is built once per `attach()` call and handed to the conductor's
+	 * `attach(host)`. The conductor holds the reference for its lifetime; `requestRerun()`
+	 * captures this attach's epoch while the capability methods read through live store state,
+	 * so `can("complete")` reflects a model link becoming available or disappearing later.
+	 */
+	private buildHost(forConductor: Conductor, epoch: number): ConductorHost {
+		const store = this;
+		return {
+			can(capability) {
+				if (capability === "complete") {
+					return store.conductor === forConductor && store.conductorEpoch === epoch && store.completer != null;
+				}
+				if (capability === "countTokens") return true;
+				if (capability === "digest") return true;
+				return false;
+			},
+			complete(req: CompletionRequest): Promise<CompletionResult> {
+				if (store.conductor !== forConductor || store.conductorEpoch !== epoch) {
+					return Promise.reject(new Error("stale conductor host"));
+				}
+				if (!store.completer) return Promise.reject(new Error("completion capability unavailable"));
+				return store.completer(req);
+			},
+			countTokens(text: string): number {
+				return estTokens(text);
+			},
+			digestOf(id: string): string | null {
+				const b = store.get(id);
+				return b ? digest(b) : null;
+			},
+			setStatus(text: string | null, metrics: Record<string, number | string | boolean> = {}): void {
+				if (store.conductor !== forConductor || store.conductorEpoch !== epoch) return;
+				store.conductorStatus.text = text ?? "";
+				store.conductorStatus.metrics = text ? metrics : {};
+			},
+			requestRerun: () => store.requestConductorRerun(forConductor, epoch),
+		};
+	}
+
+	/** Give the current in-process conductor a host API, if it asked for one. */
 	private attachConductorHost(c: Conductor | null): void {
 		if (!c?.attach) return;
 		const epoch = this.conductorEpoch;
-		const host: ConductorHost = {
-			requestRerun: () => this.requestConductorRerun(c, epoch),
-		};
 		try {
-			c.attach(host);
+			c.attach(this.buildHost(c, epoch));
 		} catch (e) {
 			// Lifecycle failures are conductor bugs, not store bugs. Keep the model-call path live
 			// and let the upcoming refold fall back to the conductor's normal `conduct()` handling.

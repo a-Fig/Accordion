@@ -161,6 +161,7 @@ A **`ClampReport`** is `{ command, ids, reason, detail }`. `reason` is one of:
 | `grouped`        | the block is inside a folded group; the group overlay owns it                  |
 | `invalid-group`  | a `group`'s ids were not a valid contiguous, ungrouped, ≥1-member run entirely outside the protected tail |
 | `protected`      | the block is inside the active protected working tail; the host refuses to fold it. Without `tail-size` this is the human's `protectTokens` tail; with `tail-size` it is the conductor's declared `tailTokens` tail (`tailTokens = 0` ⇒ no tail, no `protected` clamps). See ADR 0011 |
+| `not-foldable`   | the command targeted a kind the engine never folds/replaces (`user` or `tool_call`) |
 | `noop`           | the command was a no-op (e.g. restoring an already-live block)                 |
 
 In-process, `conduct()` returns and the host applies synchronously; the clamp reports are
@@ -311,7 +312,7 @@ reverted by host healing). Each `block` is a `ViewBlock` — its `text` is prese
 ```
 
 `reason` is one of the `ClampReason`s tabled in Part 1 (`unknown-id`, `human-override`,
-`grouped`, `invalid-group`, `protected`, `noop`). Commands are never silently dropped — every
+`grouped`, `invalid-group`, `protected`, `not-foldable`, `noop`). Commands are never silently dropped — every
 clamp is reported.
 
 **`cap/result`** — answer to a `cap/request` you sent (same `reqId`).
@@ -378,6 +379,7 @@ tokenizer). The host answers with a `cap/result` carrying the same `reqId`.
 | `countTokens`  | `text`           | token estimate (number) for `text`                               |
 | `getContent`   | `ids[0]`         | full text of that block (for `wants:"onDemand"`)                 |
 | `getDigest`    | `ids[0]`         | the engine's per-kind folded digest (incl. the `{#code FOLDED}` tag) |
+| `complete`     | `completion`     | out-of-band model completion result (text/model/usage); see Part 3 |
 
 **`conductor/status`** — *display-only* telemetry: a one-line summary of what you are
 calculating, for the host to surface to a human near the conductor switcher.
@@ -453,3 +455,216 @@ This is intentionally minimal (it ignores `host/commandResult` and `host/event`)
 conductor reads the clamp reports, respects `human-override`, and may use `countTokens` for
 exact accounting. But it is correct against the real message shapes and Accordion will
 attach to it, fold tiles, and report back.
+
+---
+
+# Part 3 — Host capabilities
+
+Some conductors need services only the host can provide: a tokenizer, access to the engine's
+digest function, or — the most powerful one — the ability to run an out-of-band model
+completion to summarize aged context. The **`ConductorHost`** interface delivers these.
+
+## Receiving the host — `attach(host)` and `detach()`
+
+The host injects its services via an optional lifecycle hook:
+
+```ts
+interface Conductor {
+  attach?(host: ConductorHost): void;   // called once, before the first conduct()
+  conduct(view: ConductorView): Command[] | null;
+  detach?(): void;                    // called when the conductor is detached/swapped
+}
+```
+
+- **`attach(host)`** is called once per conductor instance, before the first `conduct()` call.
+  A pure stateless conductor (the built-in) omits it entirely — `attach` is not called if
+  absent. Hold a reference to `host` on the instance.
+- **`detach()`** is called when the conductor is detached or swapped out. Use it to cancel
+  in-flight async work (abort any outstanding `host.complete()` calls via the `AbortSignal`
+  you passed in the request, so stale completions do not call `host.requestRerun()` after the
+  conductor is gone). Optional.
+
+## The `conduct()` contract stays synchronous
+
+`conduct()` **must remain synchronous**. A conductor that needs a model completion follows
+the fire-and-forget / requestRerun pattern:
+
+1. From `conduct()`: detect that a completion is needed. If one is already in-flight, return
+   `null` (hold — keep last state). If not, kick off `host.complete(req)` in the background
+   (stash the promise on the instance) and return `null` immediately.
+2. When the promise resolves: stash the result in instance state, then call
+   `host.requestRerun()`. This asks the host to schedule a fresh `conduct()` pass.
+3. On the **next** `conduct()` call: the result is already in instance state. Emit the
+   commands based on it.
+
+This is exactly how the out-of-process `RemoteRunner` already works (it caches the last
+`conductor/commands` batch and returns it synchronously while the remote is thinking). The
+key invariant: `conduct()` never awaits, never blocks, never has side effects — only
+instance-state reads and command emission.
+
+## `ConductorHost` method reference
+
+| method | signature | meaning |
+|--------|-----------|---------|
+| `can` | `(capability: HostCapabilityId) => boolean` | Is this capability available right now? Always call this before depending on `complete`. Returns `false` when the extension is disconnected, the session is read-only (Claude Code transcript), or no model link exists. `"countTokens"` and `"digest"` are always `true`. |
+| `complete` | `(req: CompletionRequest) => Promise<CompletionResult>` | Run an out-of-band model completion asynchronously. Not on the `conduct()` hot path — use the async pattern above. Rejects if `"complete"` is unavailable or the `AbortSignal` fires. In this version, specific model id strings are reserved for future use and treated as `"current"`. |
+| `countTokens` | `(text: string) => number` | Synchronous token estimate for `text` using the host's tokenizer (chars/4 for Accordion's default). Safe to call inside `conduct()`. |
+| `digestOf` | `(id: string) => string \| null` | The engine's per-kind folded digest for block `id` — the exact string the agent receives when that block is folded (including the `{#code FOLDED}` tag). Returns `null` if the block is unknown. Synchronous; safe inside `conduct()`. |
+| `setStatus` | `(text: string \| null, metrics?: Record<string, number \| string \| boolean>) => void` | Surface display-only conductor status to the human. `null`/empty clears it. This never steers context; it is for visible unavailable/working/error states. |
+| `requestRerun` | `() => void` | Ask the host to re-run `conduct()` now. Call this from an async completion handler after stashing the result. Has no effect if the conductor is no longer attached (stale calls after `detach()` are ignored). |
+
+`HostCapabilityId` is `"complete" | "countTokens" | "digest"`.
+
+## `CompletionRequest` fields
+
+| field | type | meaning |
+|-------|------|---------|
+| `prompt` | `string` | The user-role content to operate on (required). |
+| `system` | `string?` | Optional system instruction — e.g. a compaction persona or template. |
+| `maxOutputTokens` | `number?` | Requested cap on output tokens. The extension clamps this to the model's own max-output ceiling before forwarding, so a conductor can safely pass any positive number without risking a provider rejection. The model enforces the (clamped) value as a hard cap — over-long output is truncated, not rejected. Omit to use the model default. |
+| `signal` | `AbortSignal?` | Abort signal from an `AbortController` you hold. Pass `controller.signal` here; call `controller.abort()` from `detach()` so stale completions do not race back after the conductor is gone. |
+| `model` | `"current" \| string?` | `"current"` (default when omitted) = the user's live session model. A specific model id string is reserved for future use and, in this version, is treated as `"current"`. |
+
+## `CompletionResult` fields
+
+| field | type | meaning |
+|-------|------|---------|
+| `text` | `string` | The model's full text output. |
+| `model` | `string` | The model id that actually ran (resolved from `request.model`). |
+| `inputTokens` | `number?` | Host-counted input token usage for this call, when available. |
+| `outputTokens` | `number?` | Host-counted output token usage for this call, when available. |
+
+## `can("complete")` and degradation
+
+`host.can("complete")` returns `false` when:
+
+- The app is in **browser dev mode** (no pi extension, no model link).
+- The session is a **read-only Claude Code transcript** (`session.readOnly`).
+- The pi extension is **disconnected** or the model is currently unavailable.
+
+A conductor that depends on `"complete"` should always check `can` first and handle
+unavailability deliberately — e.g. emit an explicit non-LLM command set, or call
+`host.setStatus(...)` and hold/preserve the last state until the model link recovers.
+
+## Minimal worked example
+
+A conductor that, when over budget, summarizes the oldest non-protected block via
+`host.complete()` and replaces it with the summary — illustrative only, not production-ready:
+
+```ts
+import type { Conductor, ConductorHost, ConductorView, Command } from "../contract";
+
+export class SummarizingConductor implements Conductor {
+  readonly id = "summarizing";
+  readonly label = "Summarizing";
+
+  private host: ConductorHost | null = null;
+  private summary: string | null = null;
+  private headId: string | null = null;
+  private inflight: AbortController | null = null;
+
+  attach(host: ConductorHost): void { this.host = host; }
+
+  detach(): void {
+    this.inflight?.abort();
+    this.inflight = null;
+    this.host = null;
+  }
+
+  conduct(view: ConductorView): Command[] | null {
+    if (!this.host) return null;
+    if (view.liveTokens <= view.budget) return [];   // fits — clear to raw
+
+    // If a completion is in-flight, hold last state.
+    if (this.inflight) {
+      return this.headId ? [{ kind: "replace", id: this.headId, content: this.summary! }] : null;
+    }
+
+    // Find the oldest non-protected, non-held block to summarize.
+    const target = view.blocks.find(b => !b.protected && !b.held && b.text);
+    if (!target || !target.text) return [];
+
+    if (!this.host.can("complete")) {
+      // Degrade: no model link — emit a fold instead.
+      return [{ kind: "fold", ids: [target.id] }];
+    }
+
+    // Launch summary in the background; return null (hold) until it resolves.
+    const ctrl = new AbortController();
+    this.inflight = ctrl;
+    this.host.complete({ prompt: target.text, signal: ctrl.signal }).then(
+      result => {
+        this.inflight = null;
+        this.summary = result.text;
+        this.headId = target.id;
+        this.host?.requestRerun();   // triggers a fresh conduct() pass
+      },
+      _err => { this.inflight = null; }
+    );
+
+    return null;
+  }
+}
+```
+
+## The wire transport for `"complete"` (out-of-process conductors)
+
+An out-of-process conductor accessing `"complete"` uses the `cap/request` / `cap/result`
+message pair over the existing WebSocket — the same channel used for `countTokens` and
+`getDigest`. Internally, the host fulfils the request via the same `ConductorHost.complete`
+path (which in turn relays over the pi wire as `completeRequest` / `completeResult`).
+
+**Sending a completion request:**
+
+```json
+{
+  "type": "cap/request",
+  "reqId": "r1",
+  "capability": "complete",
+  "completion": {
+    "system": "You are a compaction assistant …",
+    "prompt": "… aged context blocks …",
+    "maxOutputTokens": 8000
+  }
+}
+```
+
+The `completion` object accepts `system`, `prompt`, and `maxOutputTokens`. The host uses the
+user's live session model (there is no `model` override on the wire in this version). Remote
+completion requests are not cancellable over JSON/WS; if the conductor detaches or no longer
+wants the result, the in-flight model call may still finish and the stale result is ignored.
+
+**Receiving the result:**
+
+```json
+{
+  "type": "cap/result",
+  "reqId": "r1",
+  "ok": true,
+  "value": "## Goal\nFix the parser …",
+  "model": "google/gemini-2.5-flash",
+  "inputTokens": 4320,
+  "outputTokens": 218
+}
+```
+
+On failure: `{ "type": "cap/result", "reqId": "r1", "ok": false, "error": "no model link" }`.
+
+`value` carries the completion text. `model`, `inputTokens`, and `outputTokens` are present
+on success when the host can supply them — for a conductor's own accounting.
+
+**AbortSignal note:** `AbortSignal` is not serializable, so per-request wire cancellation is
+**not supported** in this version. A wire conductor that no longer wants a result should
+simply ignore the arriving `cap/result` by `reqId`. The in-process path supports `AbortSignal`
+fully via `CompletionRequest.signal`.
+
+## Version notes
+
+- **Conductor protocol version 3** (`CONDUCTOR_PROTOCOL_VERSION = 3`): adds the `"complete"`
+  capability — `cap/request` gains the `completion` payload; `cap/result` gains `model`,
+  `inputTokens`, `outputTokens` on a successful "complete" result.
+- **Pi wire protocol version 5** (`PROTOCOL_VERSION = 5`): adds `completeRequest` /
+  `completeResult` — the relay messages the GUI sends to the extension to fulfil a
+  conductor's model call. This is the underlying transport for `ConductorHost.complete` in
+  a live session. It is a separate model invocation, completely outside the `sync→plan→apply`
+  loop, and **never blocks or alters the agent's own model call or the `context` hook**.
