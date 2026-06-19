@@ -149,17 +149,26 @@ pin or group a block inside the aged region, so the region stays contiguous and 
 
 ### 5. Recursive amnesia: the compaction prompt is built from the summary, not the originals
 
-On the first compaction, `buildPrompt(newlyAged)` concatenates the text of every newly-aged
-block labeled by role/kind, under `=== CONVERSATION HISTORY TO SUMMARIZE ===`.
+On the first compaction, `buildPrompt(newlyAged)` wraps the text of every newly-aged block
+(labeled by role/kind) in a `<conversation>` tag, followed by a one-line "Create a
+structured summary …" preamble. The format spec itself lives in `COMPACTION_SYSTEM` and is
+identical for both passes.
 
-On subsequent compactions, `buildPrompt` includes:
+On subsequent compactions, `buildPrompt` emits:
 
 ```
-=== PRIOR SUMMARY (previous compaction output) ===
+<previous-summary>
 <this.summary>
+</previous-summary>
 
-=== NEWLY ADDED MESSAGES (append to the above) ===
+<conversation>
 <newlyAged blocks>
+</conversation>
+
+Update the summary in <previous-summary> using the new conversation history in
+<conversation>. PRESERVE all still-relevant details …; remove stale ones; merge in new
+facts. … Carry forward every verbatim user message from the previous summary and append
+the new user messages from the conversation …
 ```
 
 The original blocks already compressed into the prior summary are **never re-read**. The
@@ -168,6 +177,14 @@ conductor uses `compactedIds` to track which ids are already represented and onl
 `[prior summary + newly aged]` — exactly the compounding quality decay the design comment
 calls "recursive amnesia." This is the point: it faithfully reproduces the failure mode
 that Accordion's reversible approach is designed to avoid.
+
+The explicit PRESERVE/merge instructions do **not** mitigate that amnesia — the originals
+are gone and no prompt can recover them. They exist to stop a distinct prompt defect: a
+model that, faced with two inputs, summarizes only the new blocks and silently drops the
+prior summary. Real tools (pi's `UPDATE_SUMMARIZATION_PROMPT`, OpenCode's update branch)
+carry the same preserve/merge wording, so the foil does too. A baseline that degrades
+*despite* best-effort preservation is a stronger case for Accordion than one that degrades
+from weak prompting.
 
 **User messages are the exception.** The system prompt instructs the model to reproduce
 every user message VERBATIM in a dedicated section (Claude-Code `/compact` behaviour). User
@@ -208,16 +225,19 @@ unavailable and would introduce a second strategy under the same selector.
 
 ### 8. System prompt for the compaction call
 
-The model is given a structured `COMPACTION_SYSTEM` prompt. Its first, sacred rule — lifted
-from Claude Code's `/compact` — is that **user messages are reproduced VERBATIM** in a
-dedicated `## User messages` section; only assistant text/thinking/tool calls/tool results
-are summarized. The output is then structured into sections: User messages, Goal, Progress,
-Key decisions, Next steps, Critical context. The output is capped at
-`MAX_SUMMARY_TOKENS = 8000` tokens — sized for the ~20k–200k-token spans this conductor
-compacts (1.5k was far too tight). The extension clamps the requested max to the model's own
-max-output ceiling before sending; the model enforces it as a hard generation cap. If the
-summary would exceed that ceiling, the output is truncated (finish-reason "length") and used
-as-is — acceptable for a lossy baseline.
+The model is given a structured `COMPACTION_SYSTEM` prompt. It opens with a "do NOT
+continue the conversation" guard (pi's `SUMMARIZATION_SYSTEM_PROMPT` convention) so the
+model summarizes rather than answering. Its first, sacred rule — lifted from Claude Code's
+`/compact` — is that **user messages are reproduced VERBATIM** in a dedicated `## User
+messages` section; only assistant text/thinking/tool calls/tool results are summarized. The
+output is then structured into sections: User messages, Goal, Progress, Key decisions, Next
+steps, Critical context, and Relevant files (the file section mirrors OpenCode; pi tracks
+files via XML tags). Empty sections are kept with a `(none)` placeholder. The output is
+capped at `MAX_SUMMARY_TOKENS = 8000` tokens — sized for the ~20k–200k-token spans this
+conductor compacts (1.5k was far too tight). The extension clamps the requested max to the
+model's own max-output ceiling before sending; the model enforces it as a hard generation
+cap. If the summary would exceed that ceiling, the output is truncated (finish-reason
+"length") and used as-is — acceptable for a lossy baseline.
 
 ## Consequences
 

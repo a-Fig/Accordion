@@ -67,19 +67,31 @@ current work.
    single summary message on the wire. No `replace`/`fold` commands are emitted — the group
    is the sole command shape.
 
-**Recursive path:** if a prior summary already exists, the compaction prompt is:
+**Recursive path:** if a prior summary already exists, the compaction prompt wraps the two
+inputs in XML tags and gives explicit merge instructions:
 
 ```
-=== PRIOR SUMMARY (previous compaction output) ===
+<previous-summary>
 <prior summary text>
+</previous-summary>
 
-=== NEWLY ADDED MESSAGES (append to the above) ===
+<conversation>
 <newly aged blocks>
+</conversation>
+
+Update the summary in <previous-summary> using the new conversation history in
+<conversation>. PRESERVE all still-relevant details …; remove stale ones; merge in new
+facts. … Carry forward every verbatim user message from the previous summary and append
+the new user messages from the conversation — all still reproduced word-for-word in
+"## User messages".
 ```
 
 The originals already compressed into the prior summary are intentionally absent — the
 conductor only sees what was previously fed to the LLM, not the raw history. This is the
-recursive amnesia at the centre of the baseline.
+recursive amnesia at the centre of the baseline. The merge instructions do NOT mitigate
+that amnesia (the originals are gone, unfixable by any prompt); they only stop the model
+from silently dropping the prior summary — a prompt defect, not the structural loss the
+foil demonstrates.
 
 **User messages are preserved verbatim.** The system prompt instructs the model to reproduce
 every user message word-for-word in a dedicated `## User messages` section (Claude-Code
@@ -102,12 +114,16 @@ time to return to reversible folding and recover the full visible history in Acc
 
 ## The system prompt
 
-The compaction system prompt asks for a structured briefing with a sacred rule first:
-**user messages reproduced verbatim**, then sections — **User messages**, **Goal**,
-**Progress**, **Key decisions**, **Next steps**, and **Critical context**. Output is capped
-at 8 000 tokens (`MAX_SUMMARY_TOKENS`) — sized for the 20k–200k-token spans this conductor
-compacts. The extension clamps the request to the model's own max-output ceiling, and the
-model enforces it as a hard cap (over-long output is truncated, not rejected).
+The compaction system prompt opens with a "do NOT continue the conversation" guard (so the
+model summarizes rather than answers), then states its sacred rule first — **user messages
+reproduced verbatim** — followed by the structured sections: **User messages**, **Goal**,
+**Progress**, **Key decisions**, **Next steps**, **Critical context**, and **Relevant
+files**. Empty sections are kept with a `(none)` placeholder so the structure stays
+parseable. The shape mirrors what mainstream tools converge on (pi, OpenCode, Claude Code
+`/compact`), keeping the foil faithful rather than a strawman. Output is capped at 8 000
+tokens (`MAX_SUMMARY_TOKENS`) — sized for the 20k–200k-token spans this conductor compacts.
+The extension clamps the request to the model's own max-output ceiling, and the model
+enforces it as a hard cap (over-long output is truncated, not rejected).
 
 ## Limitations (by design)
 

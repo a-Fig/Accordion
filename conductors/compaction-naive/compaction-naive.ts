@@ -83,15 +83,36 @@ const TRIGGER = 0.9;
 const MAX_SUMMARY_TOKENS = 8000;
 
 /**
- * System prompt for the compaction LLM call. Industry-standard structured-briefing template,
- * with one sacred rule lifted from Claude Code's `/compact`: user messages are reproduced
+ * System prompt for the compaction LLM call. Industry-standard structured-briefing template
+ * (pi, OpenCode, and Claude Code `/compact` all converge on a near-identical shape), with
+ * one sacred rule lifted from Claude Code's `/compact`: user messages are reproduced
  * VERBATIM so the human's intent and instructions survive every compaction intact. Only
  * assistant text/thinking/tool calls/tool results are summarized.
+ *
+ * The prompt is the FAITHFUL FOIL's voice, so it mirrors what real tools actually do
+ * rather than over- or under-specifying:
+ *   - A "do NOT continue the conversation" guard (pi's `SUMMARIZATION_SYSTEM_PROMPT`) —
+ *     this prevents a non-compaction failure mode (the model answering the conversation
+ *     instead of summarizing it); it does NOT reduce the recursive-amnesia loss the foil
+ *     is built to demonstrate.
+ *   - A `## Relevant files` section (OpenCode has this; pi tracks files via XML tags).
+ *     File paths are the #1 artifact lost in recursive compaction, and real tools retain
+ *     them, so the foil does too — yet they still degrade across recursive passes because
+ *     the model re-summarizes them from the prior summary, never the originals.
+ *   - The "(none)" placeholder convention (OpenCode) keeps the structure parseable even
+ *     when a section is empty.
+ *
+ * The format spec lives in the SYSTEM prompt (not the user prompt) because it is identical
+ * for the first and recursive passes; only the user-prompt preamble differs (see
+ * `buildPrompt`), which carries the recursive merge instructions.
  */
 const COMPACTION_SYSTEM = `\
-You are a context-compaction assistant. Your job is to summarize a segment of an AI \
-assistant's conversation history into a compact, structured briefing that the assistant \
-can use to continue working effectively without seeing the original messages.
+You are a context-compaction assistant. Your task is to read a segment of an AI \
+assistant's conversation history and produce a compact, structured briefing that the \
+assistant can use to continue working effectively without seeing the original messages.
+
+Do NOT continue the conversation. Do NOT respond to any questions in the conversation. \
+ONLY output the structured summary.
 
 USER MESSAGES ARE SACRED. Reproduce EVERY user message VERBATIM, in order, exactly as \
 originally written, in the "## User messages" section. Do not paraphrase, abbreviate, \
@@ -99,12 +120,12 @@ summarize, or omit a single user message — the human's intent and instructions
 survive compaction intact. (Assistant text, thinking, tool calls, and tool results ARE \
 summarized; only user messages are preserved word-for-word.)
 
-Produce your output in EXACTLY this structure — no prose outside the sections, no \
-omissions:
+Produce your output in EXACTLY this structure — no prose outside the sections. Keep \
+every section even when empty; write "(none)" where nothing applies:
 
 ## User messages
 Every user message from the summarized segment, reproduced verbatim, in order, each \
-clearly separated. If there are no user messages, write "none".
+clearly separated. If there are no user messages, write "(none)".
 
 ## Goal
 One sentence: what is the overall task or objective being pursued?
@@ -125,6 +146,10 @@ Any facts, invariants, or constraints the assistant MUST remember: API keys patt
 (never actual values), file paths, environment quirks, non-obvious rules from the \
 human's instructions, hard constraints on scope. Err on the side of including \
 something here if it would be surprising to lose it.
+
+## Relevant files
+- {file path}: why it matters. List files that were read, written, or are central to \
+the task. Write "(none)" if none.
 
 Be terse everywhere EXCEPT the verbatim user messages, which must be complete. Omit \
 pleasantries, meta-commentary, and filler. The output will be placed directly into the \
@@ -491,44 +516,75 @@ export class NaiveCompactionConductor implements Conductor {
 	}
 
 	/**
-	 * Build the user-role prompt for the compaction completion.
+	 * Build the user-role prompt for the compaction completion. The format spec itself lives
+	 * in `COMPACTION_SYSTEM` (identical for both passes); this method only varies the INPUT
+	 * wrapper and the one-line mode preamble.
+	 *
+	 * Inputs are wrapped in XML tags (`<conversation>`, `<previous-summary>`) — pi's
+	 * convention — so the boundary between "stuff to summarize" and the instructions is
+	 * unambiguous, which matters most on the recursive pass where two inputs coexist.
 	 *
 	 * FIRST compaction (summary == null):
-	 *   Concatenate the text of ALL newly-aged blocks, labeled by role/kind.
-	 *   Every block that has just aged is included verbatim (all kinds).
+	 *   `<conversation>` … `</conversation>` + "Create a structured summary …".
+	 *   Every newly-aged block is included verbatim (all kinds), labeled by role/kind.
 	 *
 	 * RECURSIVE compaction (summary != null):
-	 *   Prepend the PRIOR SUMMARY, then append only the NEWLY AGED blocks.
-	 *   The originals already compressed into the prior summary are DELIBERATELY NOT
-	 *   re-read — this recursive amnesia is the entire point of the baseline: it
-	 *   faithfully reproduces the compounding quality loss that mainstream tools impose
-	 *   (each compaction can only see the previous summary, not the originals). User
-	 *   messages fare better: they were baked verbatim into the prior summary, so they
-	 *   survive intact across compactions; only assistant reasoning degrades.
+	 *   `<previous-summary>` … `</previous-summary>` + `<conversation>` … `</conversation>`
+	 *   + explicit PRESERVE/REMOVE/MERGE instructions. The originals already compressed
+	 *   into the prior summary are DELIBERATELY NOT re-read — this recursive amnesia is the
+	 *   entire point of the baseline: it faithfully reproduces the compounding quality loss
+	 *   mainstream tools impose (each compaction can only see the previous summary, not the
+	 *   originals).
+	 *
+	 *   The merge instructions are deliberate, NOT a mitigation that defeats the foil:
+	 *   structural amnesia (originals gone, unfixable by any prompt) is what the foil
+	 *   demonstrates, and it is unaffected. Without merge instructions the model can
+	 *   silently DROP the prior summary and summarize only the new blocks — a prompt
+	 *   defect, not the structural loss the foil is built to show. Real tools (pi's
+	 *   `UPDATE_SUMMARIZATION_PROMPT`, OpenCode's update branch) all carry explicit
+	 *   preserve/merge wording, so the foil does too: a baseline that degrades DESPITE
+	 *   best-effort preservation is a more convincing case for Accordion than one that
+	 *   degrades from weak prompting. User messages fare better still: the instructions
+	 *   require carrying every verbatim user message forward, so they survive intact across
+	 *   compactions; only assistant reasoning degrades.
 	 */
 	private buildPrompt(newlyAged: ViewBlock[]): string {
-		const parts: string[] = [];
+		const conversation = newlyAged
+			.map((b) => {
+				const label = blockLabel(b);
+				const text = (b.text ?? "").trim();
+				return text ? `[${label}]\n${text}` : `[${label}]`;
+			})
+			.join("\n\n");
 
 		if (this.summary !== null) {
-			// Recursive path: start from the prior summary (already amnesiac).
-			parts.push("=== PRIOR SUMMARY (previous compaction output) ===");
-			parts.push(this.summary);
-			parts.push("");
-			parts.push("=== NEWLY ADDED MESSAGES (append to the above) ===");
-		} else {
-			// First compaction: label the section for the model.
-			parts.push("=== CONVERSATION HISTORY TO SUMMARIZE ===");
+			// Recursive path: feed the PRIOR SUMMARY + only the NEWLY AGED blocks. The
+			// originals already compressed are DELIBERATELY NOT re-read (recursive amnesia).
+			// The merge instructions make the model carry the prior summary forward (so it
+			// does not silently drop it) and keep every verbatim user message intact; the
+			// structural amnesia is unaffected, so the compounding loss the foil demonstrates
+			// is preserved.
+			return [
+				"<previous-summary>",
+				this.summary,
+				"</previous-summary>",
+				"",
+				"<conversation>",
+				conversation,
+				"</conversation>",
+				"",
+				"Update the summary in <previous-summary> using the new conversation history in <conversation>. PRESERVE all still-relevant details from the previous summary; remove stale ones; merge in new facts. Move completed work into \"Progress\" and revise \"Next Steps\" accordingly. Preserve exact file paths, function names, and error messages when known. Carry forward every verbatim user message from the previous summary and append the new user messages from the conversation — all still reproduced word-for-word in \"## User messages\".",
+			].join("\n");
 		}
 
-		for (const b of newlyAged) {
-			const label = blockLabel(b);
-			const text = (b.text ?? "").trim();
-			parts.push(`[${label}]`);
-			if (text) parts.push(text);
-			parts.push("");
-		}
-
-		return parts.join("\n");
+		// First compaction.
+		return [
+			"<conversation>",
+			conversation,
+			"</conversation>",
+			"",
+			"Create a structured summary from the conversation history above.",
+		].join("\n");
 	}
 }
 

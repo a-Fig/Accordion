@@ -544,7 +544,7 @@ describe("NaiveCompactionConductor — recursive compaction (amnesia)", () => {
 		expect(secondPrompt).not.toContain("ORIGINAL BLOCK A1 CONTENT");
 	});
 
-	it("second compaction uses the prior-summary and newly-added section headers", async () => {
+	it("second compaction uses the <previous-summary> and <conversation> wrappers with merge instructions", async () => {
 		const c = new NaiveCompactionConductor();
 		const host = new MockHost();
 		c.attach(host);
@@ -564,8 +564,14 @@ describe("NaiveCompactionConductor — recursive compaction (amnesia)", () => {
 		expect(host.completeCalls).toHaveLength(2);
 		const prompt2 = host.completeCalls[1].prompt;
 
-		expect(prompt2).toContain("PRIOR SUMMARY");
-		expect(prompt2).toContain("NEWLY ADDED MESSAGES");
+		expect(prompt2).toContain("<previous-summary>");
+		expect(prompt2).toContain("</previous-summary>");
+		expect(prompt2).toContain("<conversation>");
+		expect(prompt2).toContain("</conversation>");
+		// Merge instructions carry the prior summary forward (no silent drop) and keep
+		// verbatim user messages intact across compactions.
+		expect(prompt2).toContain("PRESERVE");
+		expect(prompt2).toMatch(/verbatim/i);
 	});
 
 	it("after the second compaction resolves, the group covers ALL aged blocks (a0+a1+b0)", async () => {
@@ -919,7 +925,8 @@ describe("NaiveCompactionConductor — prompt construction", () => {
 		expect(host.completeCalls).toHaveLength(1);
 		const prompt = host.completeCalls[0].prompt;
 
-		expect(prompt).toContain("CONVERSATION HISTORY TO SUMMARIZE");
+		expect(prompt).toContain("<conversation>");
+		expect(prompt).toContain("</conversation>");
 		expect(prompt).toContain("do the thing");
 		expect(prompt).toContain("assistant reply text");
 	});
@@ -936,9 +943,12 @@ describe("NaiveCompactionConductor — prompt construction", () => {
 		const { system } = host.completeCalls[0];
 		expect(system).toBeDefined();
 		expect(system!.length).toBeGreaterThan(50);
+		// Guard: must summarize, not continue the conversation.
+		expect(system).toMatch(/do NOT continue the conversation/i);
 		// Structured output sections.
 		expect(system).toContain("Goal");
 		expect(system).toContain("Progress");
+		expect(system).toContain("Relevant files");
 		// The sacred rule: user messages reproduced verbatim.
 		expect(system).toContain("User messages".toLowerCase());
 		expect(system).toMatch(/VERBATIM/i);
