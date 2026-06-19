@@ -24,8 +24,8 @@
 
 import { buildFoldUnits, unitTokensAtLevel } from "./units.mjs";
 import { trimEligible } from "./trim.mjs";
-import { parseRiskFlags } from "./salience.mjs";
-import { deterministicDigest } from "./digest.mjs";
+import { parseRiskFlags, textHash } from "./salience.mjs";
+import { deterministicDigest, digestContent } from "./digest.mjs";
 
 export const DEFAULT_CFG = {
 	highWater: 0.9, // cross this fraction of cap → compress
@@ -194,13 +194,19 @@ function formGroups(candidates, levels, minUnits, costFn, getRendered, subtract,
 }
 
 /** Stable signature of a tier result for change detection (only emit when this changes). */
-export function tierSignature(result) {
+export function tierSignature(result, summaryFor = null) {
 	const grouped = new Set(result.groups.flatMap((g) => g.unitIds));
 	const parts = [];
 	for (const u of result.candidates) {
 		if (grouped.has(u.id)) continue;
 		const lvl = result.levels.get(u.id);
-		if (lvl > 0) parts.push(`${u.id}:${lvl}`);
+		if (lvl > 0) {
+			let digestSig = "";
+			if (lvl === 2 && summaryFor) {
+				digestSig = ":" + textHash(u.blocks.map((b) => digestContent(b, summaryFor(b))).join("\n"));
+			}
+			parts.push(`${u.id}:${lvl}${digestSig}`);
+		}
 	}
 	parts.sort();
 	const groupSig = result.groups.map((g) => `g[${g.blockIds.join(",")}]`).sort();

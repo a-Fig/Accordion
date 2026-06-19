@@ -60,8 +60,9 @@ export function buildFoldUnits(blocks) {
  *  LLM summary (for L2 digests); absent → deterministic digest cost. */
 export function blockTokensAtLevel(block, level, summaryFor) {
 	if (level <= 0) return block.tokens;
-	if (level === 1) return trimTokens(block);
 	if (level === 3) return tokensOf(groupMemberText(block));
+	if (!FOLDABLE_KINDS.has(block.kind)) return block.tokens;
+	if (level === 1) return trimTokens(block);
 	return digestTokens(block, summaryFor ? summaryFor(block) : undefined);
 }
 

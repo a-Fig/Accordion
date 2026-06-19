@@ -11,6 +11,7 @@
 
 import { digestContent } from "./digest.mjs";
 import { trimmedText } from "./trim.mjs";
+import { FOLDABLE_KINDS } from "./salience.mjs";
 
 export function buildCommands(result, { summaryFor, segmentRelevanceFn }) {
 	const grouped = new Set(result.groups.flatMap((g) => g.unitIds));
@@ -22,9 +23,9 @@ export function buildCommands(result, { summaryFor, segmentRelevanceFn }) {
 		const lvl = result.levels.get(u.id);
 		if (!lvl) continue;
 		if (lvl === 1) {
-			for (const b of u.blocks) commands.push({ kind: "replace", id: b.id, content: trimmedText(b, relFn) });
+			for (const b of u.blocks) if (FOLDABLE_KINDS.has(b.kind)) commands.push({ kind: "replace", id: b.id, content: trimmedText(b, relFn) });
 		} else if (lvl === 2) {
-			for (const b of u.blocks) commands.push({ kind: "fold", ids: [b.id], digest: digestContent(b, summaryFor?.(b)) });
+			for (const b of u.blocks) if (FOLDABLE_KINDS.has(b.kind)) commands.push({ kind: "fold", ids: [b.id], digest: digestContent(b, summaryFor?.(b)) });
 		}
 	}
 	for (const g of result.groups) commands.push({ kind: "group", ids: g.blockIds });

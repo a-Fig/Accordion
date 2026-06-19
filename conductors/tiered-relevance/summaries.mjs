@@ -5,8 +5,8 @@
 //   1. L2 block digests — higher-fidelity summaries that replace the deterministic digest.
 //   2. The relevance task summary — a compact "current objective" used to enrich the goal.
 //
-// Provider chain: local Ollama first (DEFAULT_OLLAMA_*), then Anthropic Haiku if
-// ANTHROPIC_API_KEY is set, then nothing (deterministic-only). Block summaries are cached by
+// Provider chain: local Ollama first (DEFAULT_OLLAMA_*), then Gemini if configured,
+// then Anthropic if configured, then nothing (deterministic-only). Block summaries are cached by
 // content hash; when one lands it is picked up on the next re-tier (digest upgrades in place).
 
 import { textHash } from "./salience.mjs";
@@ -135,9 +135,10 @@ function blockSummaryPrompt(block, digest) {
 
 /** Manages async block-digest summaries + the task summary behind one provider. */
 export class Summarizer {
-	constructor(provider, { log = () => {} } = {}) {
+	constructor(provider, { log = () => {}, onSummaryReady = () => {} } = {}) {
 		this.provider = provider; // { name, chat } or null
 		this.log = log;
+		this.onSummaryReady = onSummaryReady;
 		this.cache = new Map(); // content hash → summary string
 		this.pending = new Set(); // content hashes in flight
 		this.queue = [];
@@ -171,7 +172,12 @@ export class Summarizer {
 				system: "You summarize folded context blocks. Return only the summary, no preamble.",
 				user: blockSummaryPrompt(job.block, job.digest),
 			}))
-				.then((s) => { if (s) this.cache.set(job.hash, s); })
+				.then((s) => {
+					if (s) {
+						this.cache.set(job.hash, s);
+						this.onSummaryReady(job.hash);
+					}
+				})
 				.catch((e) => this.log(`block summary failed: ${e.message}`))
 				.finally(() => { this.pending.delete(job.hash); this.active--; this.#drain(); });
 		}

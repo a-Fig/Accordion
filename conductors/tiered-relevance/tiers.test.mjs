@@ -107,6 +107,33 @@ test("tool-pair atomicity — a call/result pair is one unit that moves together
 	assert.equal(pair.blockIds.length, 2, "both blocks move as a unit");
 });
 
+test("command mapping — tool_call half of a pair is never emitted as fold/replace", () => {
+	order = turn = 0;
+	const call = block("c1", "tool_call", 0.01, 10, { callId: "x1" });
+	const res = block("r1", "tool_result", 0.01, 300, { callId: "x1" });
+	const keep = block("k", "text", 0.99, 300);
+	const blocks = [call, res, keep];
+	const r = computeTiers(view(blocks, 350), relOf, noSummary, null, DEFAULT_CFG);
+	assert.ok((r.levels.get("pair:x1") ?? 0) > 0, "pair is selected for compression");
+
+	const cmds = buildCommands(r, { summaryFor: noSummary, segmentRelevanceFn: () => null });
+	assert.ok(cmds.some((c) => c.kind === "fold" && c.ids.includes("r1")), "folds the foldable tool_result");
+	assert.ok(!cmds.some((c) => c.kind === "fold" && c.ids.includes("c1")), "does not fold the non-foldable tool_call");
+	assert.ok(!cmds.some((c) => c.kind === "replace" && c.id === "c1"), "does not replace the non-foldable tool_call");
+});
+
+test("tier signature includes upgraded digest text for stable L2 blocks", () => {
+	order = turn = 0;
+	const b = block("d1", "text", 0.05, 200);
+	const prev = { levels: new Map([["d1", 2]]), grouped: new Set() };
+	const r = computeTiers(view([b], 100_000), relOf, noSummary, prev, DEFAULT_CFG);
+	assert.equal(r.levels.get("d1"), 2, "block remains at digest tier");
+
+	const before = tierSignature(r, () => undefined);
+	const after = tierSignature(r, () => "LLM summary landed later");
+	assert.notEqual(after, before, "summary cache upgrade changes the send signature");
+});
+
 test("protected + held blocks are never candidates", () => {
 	order = turn = 0;
 	const prot = block("p", "text", 0.0, 300, { protected: true });

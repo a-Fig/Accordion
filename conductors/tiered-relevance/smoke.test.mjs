@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
+import { CONDUCTOR_PROTOCOL_VERSION } from "../contract/protocol.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PORT = 7799;
@@ -40,7 +41,7 @@ test("WS round-trip: hello → context/update → conductor/commands", { timeout
 
 		const hello = await nextMessage(ws, (m) => m.type === "conductor/hello");
 		assert.equal(hello.id, "tiered-relevance");
-		assert.equal(hello.conductorProtocol, 2);
+		assert.equal(hello.conductorProtocol, CONDUCTOR_PROTOCOL_VERSION);
 		assert.equal(hello.wants.content, "full");
 
 		// 8 text blocks ~300 tok each, budget 900 → ~240% full → must compress.

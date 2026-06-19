@@ -10,9 +10,9 @@
 // advertises under ~/.accordion/conductors/ for desktop auto-discovery, and Accordion dials in.
 //
 // Run:  npm install   then   npm start
-//       Embeddings need @huggingface/transformers; summaries use a local Ollama or
-//       ANTHROPIC_API_KEY. Missing either degrades gracefully (keyword relevance /
-//       deterministic digests) — the conductor still runs.
+//       Embeddings default to Ollama embeddinggemma; summaries use local Ollama,
+//       then Gemini/Anthropic if configured. Missing providers degrade gracefully (keyword
+//       relevance / deterministic digests) — the conductor still runs.
 
 import { WebSocketServer } from "ws";
 import { mkdirSync, writeFileSync, renameSync, rmSync, readFileSync, existsSync } from "node:fs";
@@ -42,6 +42,7 @@ import { RelevanceEngine, createEmbeddingProvider, EMBEDDING_MODEL } from "./rel
 import { Summarizer, detectChatProvider } from "./summaries.mjs";
 import { deterministicDigest } from "./digest.mjs";
 import { buildFoldUnits } from "./units.mjs";
+import { CONDUCTOR_PROTOCOL_VERSION } from "../contract/protocol.ts";
 
 const ID = "tiered-relevance";
 const LABEL = "Tiered relevance";
@@ -68,7 +69,7 @@ const startedAt = Date.now();
 function advertise() {
 	mkdirSync(REG_DIR, { recursive: true });
 	const entry = {
-		registryProtocol: 1, conductorProtocol: 2,
+		registryProtocol: 1, conductorProtocol: CONDUCTOR_PROTOCOL_VERSION,
 		id: ID, label: LABEL, url: URL,
 		pid: process.pid, startedAt, heartbeatAt: Date.now(),
 	};
@@ -138,7 +139,7 @@ function recomputeAndSend(ws, state, rev) {
 		{ ...CFG, keepLive: state.keepLive },
 	);
 
-	const sig = tierSignature(result);
+	const sig = tierSignature(result, (b) => state.summarizer.summaryFor(b));
 
 	// Schedule LLM digests for everything heading to Digest (off the critical path).
 	const grouped = new Set(result.groups.flatMap((g) => g.unitIds));
@@ -167,7 +168,8 @@ function recomputeAndSend(ws, state, rev) {
 function sendStatus(ws, state, result) {
 	if (ws.readyState !== 1) return;
 	const pct = Math.round((result.fullness || 0) * 100);
-	const folded = [...result.levels.values()].filter((l) => l > 0).length + result.groups.flatMap((g) => g.unitIds).length;
+	const grouped = new Set(result.groups.flatMap((g) => g.unitIds));
+	const folded = [...result.levels.entries()].filter(([id, l]) => l > 0 || grouped.has(id)).length;
 	const rmode = state.relevance.mode; // "keyword" | "loading" | "semantic"
 	const relTag = rmode === "keyword" ? "keyword (no embeddings)" : `${rmode} · ${state.relevance.embeddingModel}`;
 	const text = `${pct}% · ${result.action} · band ${Math.round(CFG.lowWater * 100)}–${Math.round(CFG.highWater * 100)}% · ${folded} folded · ${relTag}`;
@@ -201,13 +203,16 @@ wss.on("connection", (ws) => {
 	// Wire the shared models into this connection's engines (async, non-blocking).
 	embeddingProvider().then((p) => { if (p) state.relevance.embed = p; });
 	chatProvider().then((p) => {
-		const summarizer = new Summarizer(p, { log });
+		const summarizer = new Summarizer(p, {
+			log,
+			onSummaryReady: () => recomputeAndSend(ws, state, state.lastView?.rev ?? -1),
+		});
 		state.summarizer = summarizer;
 		if (p) state.relevance.summaryProvider = summarizer.taskSummaryProvider();
 	});
 
 	ws.send(JSON.stringify({
-		type: "conductor/hello", conductorProtocol: 2, id: ID, label: LABEL,
+		type: "conductor/hello", conductorProtocol: CONDUCTOR_PROTOCOL_VERSION, id: ID, label: LABEL,
 		wants: { content: "full" },
 	}));
 
@@ -249,6 +254,8 @@ wss.on("connection", (ws) => {
 			protectTokens: msg.protectTokens,
 			rev: msg.rev,
 		};
+		const currentIds = new Set(msg.blocks.map((b) => b.id));
+		for (const id of state.keepLive) if (!currentIds.has(id)) state.keepLive.delete(id);
 
 		const prompt = latestPrompt(msg.blocks);
 		if (prompt !== state.lastPrompt) {
