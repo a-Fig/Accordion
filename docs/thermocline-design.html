@@ -1,0 +1,793 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Thermocline — a conductor design</title>
+<style>
+  :root{
+    /* kind colors (load-bearing, from app.css) */
+    --k-user:#6ea8fe; --k-text:#aab2c2; --k-thinking:#b483e0;
+    --k-tool_call:#34d3c2; --k-tool_result:#f0a35e; --k-summary:#4a3528;
+    /* surfaces */
+    --bg:#0b0d12; --panel:#14171f; --panel-2:#1a1e28; --panel-3:#232834; --panel-4:#2c3340;
+    /* text + lines */
+    --text:#eef1f6; --muted:#9aa3b4; --faint:#828b9e;
+    --line:#2c3342; --line-soft:#20252f; --line-strong:#3a4252;
+    /* accent + semantic */
+    --accent:#6ea8fe; --accent-hover:#8bbcff; --accent-dim:#2d4a7a;
+    --accent-soft:rgba(110,168,254,.14);
+    --danger:#ff6b6b; --ok:#46d39a; --warn:#f0b450;
+    /* groups / strata */
+    --group:#6f4a32; --group-accent:#d39455; --group-edge:#9c6b43;
+    --group-band:rgba(211,148,85,.07); --group-ink:#1a0f06;
+    /* type */
+    --sans:"Inter Variable",Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    --mono:"JetBrains Mono Variable",ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+    --radius:10px; --radius-lg:14px; --radius-sm:6px; --radius-xs:4px; --radius-pill:999px;
+    --shadow-1:0 1px 2px rgba(0,0,0,.4);
+    --shadow-2:0 4px 12px rgba(0,0,0,.45),0 1px 2px rgba(0,0,0,.4);
+    --shadow-3:0 12px 32px rgba(0,0,0,.5),0 2px 8px rgba(0,0,0,.4);
+    /* temperature ramp */
+    --hot:#f0673e; --warm:#f0a35e; --tepid:#d6cf7a; --cool:#5fa7d6; --cold:#3f6fb0;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(110,168,254,.06), transparent 60%),
+      radial-gradient(900px 500px at -10% 10%, rgba(240,103,62,.05), transparent 55%),
+      var(--bg);
+    color:var(--text); font-family:var(--sans); font-size:14px; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1080px; margin:0 auto; padding:40px 28px 120px}
+  h1,h2,h3{line-height:1.2; font-weight:650}
+  h2{font-size:22px; margin:56px 0 6px; letter-spacing:-.01em}
+  h3{font-size:15px; margin:26px 0 6px; color:var(--text)}
+  p{margin:10px 0; color:var(--muted)}
+  p strong, li strong{color:var(--text); font-weight:620}
+  a{color:var(--accent-hover); text-decoration:none}
+  code{font-family:var(--mono); font-size:.86em; background:var(--panel-2);
+    border:1px solid var(--line-soft); border-radius:var(--radius-xs); padding:1px 5px; color:#dfe6f2}
+  .mono{font-family:var(--mono)}
+  .sec-num{color:var(--faint); font-weight:600; font-size:13px; margin-right:8px;
+    font-family:var(--mono)}
+  .lede{font-size:15.5px; color:#cdd5e3; max-width:78ch}
+  .rule{height:1px; background:linear-gradient(90deg,var(--line),transparent); margin:8px 0 0}
+
+  /* hero */
+  .hero{padding:30px 32px; border:1px solid var(--line); border-radius:var(--radius-lg);
+    background:linear-gradient(180deg,var(--panel),var(--panel-2)); box-shadow:var(--shadow-2);
+    position:relative; overflow:hidden}
+  .hero::before{content:""; position:absolute; inset:0;
+    background:linear-gradient(180deg,
+      rgba(240,103,62,.10) 0%, rgba(240,163,94,.06) 22%,
+      rgba(214,207,122,.03) 40%, rgba(95,167,214,.05) 62%, rgba(63,111,176,.10) 100%);
+    mask:linear-gradient(90deg,transparent,#000 30%); pointer-events:none; opacity:.5}
+  .hero > *{position:relative}
+  .eyebrow{font-family:var(--mono); font-size:12px; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--group-accent)}
+  .hero h1{font-size:40px; margin:6px 0 4px; letter-spacing:-.02em}
+  .hero .tag{font-size:16px; color:#d3dae6; max-width:70ch; margin:8px 0 0}
+  .chips{display:flex; flex-wrap:wrap; gap:8px; margin-top:20px}
+  .chip{font-family:var(--mono); font-size:11.5px; padding:5px 10px; border-radius:var(--radius-pill);
+    border:1px solid var(--line-strong); background:var(--panel-3); color:var(--muted); white-space:nowrap}
+  .chip b{color:var(--text); font-weight:600}
+
+  /* cards / grid */
+  .grid{display:grid; gap:16px}
+  .g2{grid-template-columns:1fr 1fr}
+  .g3{grid-template-columns:1fr 1fr 1fr}
+  @media(max-width:820px){.g2,.g3{grid-template-columns:1fr}}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    padding:18px 18px; box-shadow:var(--shadow-1)}
+  .card h3{margin-top:0}
+  .card.parent{position:relative}
+  .badge{display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11px;
+    padding:3px 8px; border-radius:var(--radius-pill); border:1px solid var(--line-strong)}
+  .badge.good{color:var(--ok); border-color:color-mix(in srgb,var(--ok) 40%,transparent);
+    background:color-mix(in srgb,var(--ok) 10%,transparent)}
+  .badge.bad{color:var(--danger); border-color:color-mix(in srgb,var(--danger) 40%,transparent);
+    background:color-mix(in srgb,var(--danger) 10%,transparent)}
+  .badge.warn{color:var(--warn); border-color:color-mix(in srgb,var(--warn) 40%,transparent);
+    background:color-mix(in srgb,var(--warn) 10%,transparent)}
+  .kv{margin:10px 0 0; padding:0; list-style:none}
+  .kv li{padding:7px 0; border-top:1px solid var(--line-soft); color:var(--muted); font-size:13.5px}
+  .kv li:first-child{border-top:0}
+
+  ul.clean{margin:10px 0; padding-left:18px}
+  ul.clean li{margin:6px 0; color:var(--muted)}
+  .pill-kind{display:inline-block; width:9px; height:9px; border-radius:3px; vertical-align:middle;
+    margin-right:6px}
+
+  /* callout */
+  .callout{border-left:3px solid var(--accent); background:var(--accent-soft);
+    border-radius:0 var(--radius) var(--radius) 0; padding:14px 16px; margin:18px 0}
+  .callout.amber{border-left-color:var(--group-accent); background:var(--group-band)}
+  .callout.green{border-left-color:var(--ok); background:color-mix(in srgb,var(--ok) 8%,transparent)}
+  .callout .lab{font-family:var(--mono); font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--faint)}
+
+  /* tables */
+  table{width:100%; border-collapse:collapse; margin:14px 0; font-size:13.5px}
+  th,td{text-align:left; padding:10px 12px; border-bottom:1px solid var(--line-soft); vertical-align:top}
+  th{color:var(--faint); font-weight:600; font-family:var(--mono); font-size:11.5px;
+    text-transform:uppercase; letter-spacing:.06em}
+  tbody tr:hover{background:var(--panel-2)}
+  td .yes{color:var(--ok)} td .no{color:var(--danger)} td .mid{color:var(--warn)}
+
+  /* diagram shell */
+  .fig{background:var(--panel-2); border:1px solid var(--line); border-radius:var(--radius);
+    padding:20px; margin:16px 0; box-shadow:var(--shadow-1)}
+  .fig .cap{font-size:12.5px; color:var(--faint); margin-top:14px; font-family:var(--mono)}
+  .fig .cap b{color:var(--muted); font-weight:600}
+
+  /* stratification figure */
+  .strata{display:grid; grid-template-columns:54px 1fr; gap:0}
+  .therm{position:relative; border-radius:var(--radius-sm); margin-right:14px;
+    background:linear-gradient(180deg,var(--hot),var(--warm) 26%,var(--tepid) 46%,var(--cool) 68%,var(--cold));
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.06)}
+  .therm .tk{position:absolute; left:-2px; right:-2px; height:1px; background:rgba(255,255,255,.25)}
+  .therm .lbl{position:absolute; left:60px; white-space:nowrap; font-family:var(--mono);
+    font-size:10.5px; color:var(--faint); transform:translateY(-50%)}
+  .layers{display:flex; flex-direction:column; gap:8px}
+  .layer{border-radius:var(--radius-sm); padding:11px 13px; border:1px solid var(--line)}
+  .layer .h{display:flex; align-items:center; justify-content:space-between; gap:10px}
+  .layer .h .name{font-weight:650; font-size:13.5px; letter-spacing:.01em}
+  .layer .h .meta{font-family:var(--mono); font-size:10.5px; color:var(--faint)}
+  .layer .d{font-size:12.5px; color:var(--muted); margin-top:5px}
+  .layer.live{background:linear-gradient(180deg,#171b24,#141821);
+    border-color:var(--accent-dim); box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 14%,transparent) inset}
+  .layer.folded{background:var(--panel);
+    background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.05) 0 1px,transparent 1px 6px)}
+  .layer.compact{background:var(--group); border-color:var(--group-edge)}
+  .blocks{display:flex; gap:5px; margin-top:9px; flex-wrap:wrap}
+  .blk{height:18px; border-radius:3px; flex:0 0 auto; box-shadow:inset 0 0 0 1px rgba(0,0,0,.25)}
+  .blk.sm{width:18px} .blk.md{width:30px} .blk.lg{width:46px}
+  .blk.fold{opacity:.4; filter:saturate(.5);
+    background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.18) 0 1px,transparent 1px 5px)}
+  .stratile{display:flex; align-items:center; gap:9px; background:#2a1c12; border:1px solid var(--group-edge);
+    border-radius:var(--radius-sm); padding:7px 10px; margin-top:7px}
+  .stratile .tag{font-family:var(--mono); font-size:10px; color:var(--group-accent);
+    background:#3a2718; border:1px solid var(--group-edge); border-radius:var(--radius-xs); padding:2px 6px}
+  .stratile .txt{font-size:11.5px; color:#cbb69e}
+  .lock{font-family:var(--mono); font-size:10px; color:var(--faint)}
+
+  /* pipeline */
+  .pipe{display:flex; align-items:stretch; gap:0; flex-wrap:wrap}
+  .stage{flex:1 1 150px; min-width:150px; background:var(--panel); border:1px solid var(--line);
+    border-radius:var(--radius); padding:13px; position:relative}
+  .stage .s-h{font-weight:650; font-size:13px; display:flex; align-items:center; gap:7px}
+  .stage .s-d{font-size:11.5px; color:var(--muted); margin-top:6px}
+  .arrow{flex:0 0 38px; display:flex; align-items:center; justify-content:center; color:var(--faint);
+    font-size:20px}
+  .arrow .t{font-family:var(--mono); font-size:9px; color:var(--faint); position:absolute; margin-top:30px}
+  .gate{margin-top:9px; border-top:1px dashed var(--line-strong); padding-top:8px}
+  .gate .gh{font-family:var(--mono); font-size:10px; color:var(--group-accent); letter-spacing:.05em}
+  .gate ul{margin:5px 0 0; padding-left:15px} .gate li{font-size:11.5px; color:var(--muted); margin:3px 0}
+  .reset{margin-top:12px; display:flex; align-items:center; gap:9px; font-size:12px; color:var(--cool);
+    background:color-mix(in srgb,var(--cool) 9%,transparent); border:1px solid color-mix(in srgb,var(--cool) 30%,transparent);
+    border-radius:var(--radius-sm); padding:9px 12px}
+
+  /* buoyancy strip */
+  .convo{display:flex; gap:3px; align-items:flex-end; padding:18px 6px 30px; position:relative;
+    border-bottom:1px solid var(--line); overflow-x:auto}
+  .u{position:relative; width:20px; border-radius:3px 3px 0 0; flex:0 0 auto}
+  .u .buoy{position:absolute; top:-15px; left:50%; transform:translateX(-50%); font-size:12px}
+  .bracket{position:relative; margin-top:8px; height:26px}
+  .legend{display:flex; gap:16px; flex-wrap:wrap; margin-top:14px; font-size:11.5px; color:var(--muted)}
+  .legend span{display:inline-flex; align-items:center; gap:6px}
+  .sw{width:12px; height:12px; border-radius:3px; display:inline-block}
+
+  /* epoch timeline svg holder */
+  .tl{width:100%; height:auto; display:block}
+
+  /* architecture */
+  .arch{display:grid; grid-template-columns:1fr; gap:0}
+  .node{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:13px 15px}
+  .node .nh{font-weight:650; font-size:13.5px; display:flex; gap:8px; align-items:center}
+  .node .nd{font-size:12px; color:var(--muted); margin-top:5px}
+  .node .tagrow{margin-top:8px; display:flex; gap:6px; flex-wrap:wrap}
+  .ntag{font-family:var(--mono); font-size:10px; color:var(--faint); border:1px solid var(--line-soft);
+    border-radius:var(--radius-xs); padding:2px 6px}
+  .wirelbl{font-family:var(--mono); font-size:10.5px; color:var(--group-accent); text-align:center; padding:6px 0}
+  .conn{display:flex; justify-content:center; color:var(--line-strong); font-size:18px; line-height:1}
+
+  /* code block */
+  pre{background:#0d1017; border:1px solid var(--line); border-radius:var(--radius); padding:15px 16px;
+    overflow:auto; font-family:var(--mono); font-size:12px; line-height:1.6; color:#c8d2e0}
+  pre .c{color:var(--faint)} pre .k{color:#7aa2f7} pre .s{color:#9ece6a} pre .n{color:#e0af68}
+  pre .f{color:#7dcfff}
+
+  /* evolution */
+  .evo{display:flex; flex-direction:column; gap:10px}
+  .evo .row{display:grid; grid-template-columns:1fr 26px 1fr; gap:0; align-items:stretch}
+  .evo .from,.evo .to{padding:12px 14px; border-radius:var(--radius); font-size:12.5px}
+  .evo .from{background:color-mix(in srgb,var(--danger) 7%,var(--panel)); border:1px solid color-mix(in srgb,var(--danger) 28%,transparent)}
+  .evo .to{background:color-mix(in srgb,var(--ok) 7%,var(--panel)); border:1px solid color-mix(in srgb,var(--ok) 28%,transparent)}
+  .evo .mid{display:flex; align-items:center; justify-content:center; color:var(--faint)}
+  .evo .lab{font-family:var(--mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); margin-bottom:4px}
+  @media(max-width:820px){.evo .row{grid-template-columns:1fr; gap:6px} .evo .mid{transform:rotate(90deg); height:18px}}
+
+  .toc{display:flex; flex-wrap:wrap; gap:8px 18px; margin:18px 0 0; padding:14px 16px;
+    border:1px solid var(--line-soft); border-radius:var(--radius); background:var(--panel-2)}
+  .toc a{font-size:12.5px; color:var(--muted); font-family:var(--mono)}
+  .toc a:hover{color:var(--accent-hover)}
+  .footnote{font-size:12px; color:var(--faint); margin-top:8px}
+  .risk{display:flex; gap:12px; padding:12px 0; border-top:1px solid var(--line-soft)}
+  .risk:first-child{border-top:0}
+  .risk .sev{flex:0 0 86px}
+  .risk .body{flex:1}
+  .risk .body .t{color:var(--text); font-weight:600; font-size:13.5px}
+  .risk .body .x{font-size:12.5px; color:var(--muted); margin-top:3px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ───────────────────────── HERO ───────────────────────── -->
+  <div class="hero">
+    <div class="eyebrow">Conductor design proposal · joins the cold-score / cold-epoch thermal family</div>
+    <h1>Thermocline</h1>
+    <div class="tag">Attention-gated <b style="color:#d3dae6">sedimentary compaction</b>. The attention probe decides
+      <i>what</i> the agent is still using; reversible folding is a probation period; only content that two
+      independent signals agree is cold gets summarized away for real — sinking into immutable strata.</div>
+    <div class="chips">
+      <span class="chip"><b>id</b> thermocline</span>
+      <span class="chip"><b>type</b> external · WebSocket</span>
+      <span class="chip"><b>signal</b> Qwen-0.5B attention</span>
+      <span class="chip"><b>compresses via</b> host.complete (agent's own model)</span>
+      <span class="chip"><b>locks</b> human-steering</span>
+      <span class="chip"><b>parents</b> attention-folder × compaction-naive</span>
+    </div>
+  </div>
+
+  <div class="toc">
+    <a href="#parents">01 · the two parents</a>
+    <a href="#insight">02 · the insight</a>
+    <a href="#mechanism">03 · mechanism</a>
+    <a href="#arch">04 · architecture</a>
+    <a href="#gov">05 · governance</a>
+    <a href="#beats">06 · how it beats both</a>
+    <a href="#evo">07 · design evolution</a>
+    <a href="#risks">08 · honest risks</a>
+    <a href="#spec">09 · spec appendix</a>
+  </div>
+
+  <!-- ───────────────────────── 01 PARENTS ───────────────────────── -->
+  <h2 id="parents"><span class="sec-num">01</span>The two parents — one strength, one fatal flaw each</h2>
+  <p class="lede">Both conductors already exist in the repo. Each is excellent at one half of the problem and
+    structurally bad at the other half. Thermocline is built on the observation that <b>each parent's strength is
+    precisely the cure for the other's flaw.</b></p>
+
+  <div class="grid g2">
+    <div class="card parent">
+      <h3 style="color:var(--k-tool_result)">attention-folder <span class="lock">· external, GPU probe</span></h3>
+      <p style="margin-top:4px">A Qwen2.5-0.5B probe measures <b>structural gravity</b> — how much the working tail's
+        last-token readout attends back to each earlier block. Folds the least-attended blocks at hysteresis epochs.</p>
+      <div style="margin:12px 0 4px"><span class="badge good">▲ strength</span></div>
+      <ul class="kv">
+        <li><b>A learned signal of what the model actually needs</b> — semantic dependency, not lexical overlap or age.</li>
+        <li>Epoch / hold model keeps the prompt prefix cache-warm between fold events.</li>
+        <li>Folds are <b>reversible</b> (<code>{#code FOLDED}</code> tags); the agent can <code>unfold</code>.</li>
+      </ul>
+      <div style="margin:14px 0 4px"><span class="badge bad">▼ fatal flaw</span></div>
+      <ul class="kv">
+        <li><b>Shallow + one-directional.</b> It only ever <i>folds to a per-block digest</i> — it never achieves deep
+          "whole region → one paragraph" compression, and it only <i>grows</i> the fold set. A long session eventually
+          runs out of reversible savings, and a block that becomes relevant again never re-surfaces on its own.</li>
+      </ul>
+    </div>
+
+    <div class="card parent">
+      <h3 style="color:var(--group-accent)">compaction-naive <span class="lock">· in-process, host.complete</span></h3>
+      <p style="margin-top:4px">At ~90% of budget it summarizes the whole aged region into one LLM prose summary and
+        collapses it into a single <code>group(digest)</code>. User messages kept verbatim.</p>
+      <div style="margin:12px 0 4px"><span class="badge good">▲ strength</span></div>
+      <ul class="kv">
+        <li><b>Real token reduction.</b> A 40-block region becomes one paragraph — compression no per-block fold can match.</li>
+        <li>Human intent survives: user messages reproduced verbatim, Claude-Code <code>/compact</code> style.</li>
+      </ul>
+      <div style="margin:14px 0 4px"><span class="badge bad">▼ fatal flaw</span></div>
+      <ul class="kv">
+        <li><b>Blind + irreversible + amnesiac.</b> It compacts by <i>age</i>, with no notion of importance — it will
+          summarize away a block the model is actively depending on. Once compacted there is no <code>unfold</code>/<code>recall</code>,
+          and each pass re-summarizes a summary (<b>recursive amnesia</b>) so errors compound.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout amber">
+    <div class="lab">the symmetry</div>
+    <p style="margin:6px 0 0; color:#d8cbb6">Attention has the <b>signal</b> but only does <b>shallow, reversible</b> compression.
+    Naive compaction does <b>deep, real</b> compression but is <b>blind and irreversible</b>. Give the deep-compression
+    engine the attention signal as an admission test, and stage it behind a reversible probation period — and both flaws cancel.</p>
+  </div>
+
+  <!-- ───────────────────────── 02 INSIGHT ───────────────────────── -->
+  <h2 id="insight"><span class="sec-num">02</span>The insight: attention is <i>admission control</i> for irreversibility</h2>
+  <p class="lede">The load-bearing idea — the thing neither parent can express — is to use attention not to decide
+    <i>folding</i>, but to decide <b>who is allowed to be deleted</b>.</p>
+  <div class="grid g3" style="margin-top:14px">
+    <div class="card"><h3 style="margin-top:0">Reversible is cheap</h3>
+      <p>Folding to a tagged digest costs little and is fully recoverable. So fold generously and early — this is just
+        a <b>staging area</b>, not a commitment.</p></div>
+    <div class="card"><h3 style="margin-top:0">Irreversible must be earned</h3>
+      <p>Summarizing-away is permanent. A block earns it only by <b>proving</b> it is cold — over time, by two
+        independent signals — while sitting safely in the reversible stage.</p></div>
+    <div class="card"><h3 style="margin-top:0">Two signals, one behavioral</h3>
+      <p>The 0.5B probe is a proxy. So we don't trust it alone: graduation also requires that the <b>agent itself</b>
+        declined to <code>recall</code>/<code>unfold</code> the block while it had the chance.</p></div>
+  </div>
+  <div class="callout">
+    <div class="lab">thesis</div>
+    <p style="margin:6px 0 0; color:#cdd5e3"><b>Attention's reversible-fold signal becomes the admission test for naive
+      compaction's irreversible deletion.</b> attention-folder never deletes; compaction-naive never measures.
+      The pipeline between them — probation, dwell, double-gate, sedimentation — <i>is</i> the synthesis, not a bolt-on.</p>
+  </div>
+
+  <!-- ───────────────────────── 03 MECHANISM ───────────────────────── -->
+  <h2 id="mechanism"><span class="sec-num">03</span>Mechanism</h2>
+
+  <h3>3.1 · Temperature — the signal</h3>
+  <p><code>temperature(unit) ∈ [0,1]</code> is the attention mass the probe assigns a block against the current working
+    tail ("where the agent is heading"). Two rules borrowed straight from the red-team:</p>
+  <ul class="clean">
+    <li><b>Re-scored fresh at compaction time.</b> A block scored cold <i>once</i>, ten epochs ago, is not "continuously
+      cold" — it's stale. Graduation requires a probe reading from <i>this</i> epoch, or the dwell clock resets.</li>
+    <li><b>Tool pairs are one unit.</b> A <code>tool_call</code> + its <code>tool_result</code> (shared <code>callId</code>)
+      carry one temperature and move together — the host refuses a group that orphans a pair, so the conductor never offers one.</li>
+  </ul>
+
+  <h3>3.2 · Three states — the thermal column</h3>
+  <div class="fig">
+    <div class="strata">
+      <div class="therm" style="height:312px">
+        <div class="tk" style="top:0"></div><div class="lbl" style="top:0">1.0 · hot</div>
+        <div class="tk" style="top:33%"></div><div class="lbl" style="top:33%">thermocline</div>
+        <div class="tk" style="top:66%"></div><div class="lbl" style="top:66%">cold threshold</div>
+        <div class="tk" style="top:100%"></div><div class="lbl" style="top:100%">0.0 · cold</div>
+      </div>
+      <div class="layers">
+        <div class="layer live">
+          <div class="h"><span class="name" style="color:var(--accent)">LIVE — warm</span>
+            <span class="meta">full text · no command</span></div>
+          <div class="d">The protected tail, plus any unit the probe still attends to. Costs full <code>tokens</code>.</div>
+          <div class="blocks">
+            <span class="blk md" style="background:var(--k-user)"></span>
+            <span class="blk lg" style="background:var(--k-thinking)"></span>
+            <span class="blk md" style="background:var(--k-tool_call)"></span>
+            <span class="blk lg" style="background:var(--k-tool_result)"></span>
+            <span class="blk md" style="background:var(--k-text)"></span>
+          </div>
+        </div>
+        <div class="layer folded">
+          <div class="h"><span class="name" style="color:var(--k-text)">FOLDED — cool · probation</span>
+            <span class="meta">reversible · fold(ids) · {#code FOLDED}</span></div>
+          <div class="d">Attention dropped. Folded to a tagged digest — cheap, recoverable. The agent may
+            <code>unfold</code>/<code>recall</code> at any time. <b>This is where blocks await judgment.</b></div>
+          <div class="blocks">
+            <span class="blk lg fold" style="background:var(--k-tool_result)"></span>
+            <span class="blk md fold" style="background:var(--k-thinking)"></span>
+            <span class="blk md fold" style="background:var(--k-text)"></span>
+            <span class="blk lg fold" style="background:var(--k-tool_result)"></span>
+          </div>
+        </div>
+        <div class="layer compact">
+          <div class="h"><span class="name" style="color:var(--group-accent)">COMPACTED — cold · strata</span>
+            <span class="meta">irreversible · group(digest) · conductor-owned</span></div>
+          <div class="d">Two signals agreed it was cold for K epochs. Summarized <b>once</b> from the originals into an
+            immutable stratum. User messages verbatim inside. No <code>unfold</code> — the budget payoff is real.</div>
+          <div class="stratile"><span class="tag">stratum 2</span><span class="txt">"…ran the migration, 14 msgs · 3 user msgs verbatim · ~480 tok"</span></div>
+          <div class="stratile"><span class="tag">stratum 1</span><span class="txt">"…initial scaffolding, 22 msgs · 5 user msgs verbatim · ~610 tok"</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="cap"><b>The column</b> — newest at top. Stable stratification: cold/deep content can't sit on warm. A unit
+      sinks LIVE → FOLDED → COMPACTED only by cooling, and can rise back up until the moment it sediments.</div>
+  </div>
+
+  <h3>3.3 · Graduation — the double-gate pipeline</h3>
+  <div class="fig">
+    <div class="pipe">
+      <div class="stage">
+        <div class="s-h"><span class="pill-kind" style="background:var(--accent)"></span>LIVE</div>
+        <div class="s-d">Full fidelity. Either in the protected tail or still attended-to.</div>
+      </div>
+      <div class="arrow">→<span class="t">cool down</span></div>
+      <div class="stage">
+        <div class="s-h"><span class="pill-kind" style="background:var(--k-text)"></span>FOLDED</div>
+        <div class="s-d">Coldest live units fold at a fold-epoch. Reversible. Dwell clock starts.</div>
+      </div>
+      <div class="arrow">→<span class="t">graduate</span></div>
+      <div class="stage" style="border-color:var(--group-edge)">
+        <div class="s-h"><span class="pill-kind" style="background:var(--group-accent)"></span>COMPACTED</div>
+        <div class="s-d">Sediments into a stratum. Permanent.</div>
+        <div class="gate">
+          <div class="gh">BOTH gates, sustained ≥ K epochs:</div>
+          <ul>
+            <li>① probe temperature below cold threshold <i>(fresh this epoch)</i></li>
+            <li>② agent did <b>not</b> <code>recall</code>/<code>unfold</code> it while folded</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+    <div class="reset">
+      <span style="font-size:15px">↩︎</span>
+      <span><b style="color:var(--text)">Any re-warm resets the clock back to LIVE:</b> the probe re-attends to it · the agent
+      <code>unfold</code>s or <code>recall</code>s it · its lifetime-max temperature was ever hot (then it needs <b>2K</b> epochs, not K).</span>
+    </div>
+    <div class="cap"><b>Why two gates</b> — gate ① is a 0.5B proxy and can be wrong. Gate ② is the agent's own behavior:
+      it had the digest and the fold-tag in front of it and chose not to pull the content back. Two independent cold votes,
+      one of them from the model that actually matters.</div>
+  </div>
+
+  <h3>3.4 · Sedimentation is per-run — which dissolves the "buoyancy trap"</h3>
+  <p>The compacted layer is <b>not</b> one descending frontier (v1's mistake — see §07). It is <b>every maximal
+    contiguous run of graduated-cold units</b>, each sedimented into its own stratum. Hot or human-pinned units are
+    <b>buoys</b> that bound a run; they are never buried, and the cold pockets on either side of them still sediment independently.</p>
+  <div class="fig">
+    <div class="convo" id="convo"></div>
+    <div class="legend">
+      <span><i class="sw" style="background:var(--hot)"></i> hot (live)</span>
+      <span><i class="sw" style="background:var(--warm)"></i> warm (live)</span>
+      <span><i class="sw" style="background:var(--cool)"></i> cool (folded)</span>
+      <span><i class="sw" style="background:var(--cold)"></i> cold · graduated</span>
+      <span>⚓ buoy — hot / pinned / protected, halts a run</span>
+      <span style="color:var(--group-accent)">▭ a stratum forms over each cold run</span>
+    </div>
+    <div class="cap"><b>Worst case dissolved</b> — in v1 a single hot block could trap a 200-block cold region forever,
+      and alternating hot/cold gave zero compaction. Per-run sedimentation compacts each cold pocket on its own; only a
+      <i>lone</i> cold unit wedged between two buoys stays merely folded — and a single block isn't worth a stratum anyway.</div>
+  </div>
+
+  <h3>3.5 · Float-up — closing attention-folder's one-directional gap</h3>
+  <p>A <b>folded</b> unit returns to LIVE when its fresh temperature clearly out-ranks the live set's floor (a margin
+    deadband makes this thrash-free, borrowed from tiered-relevance), or when the agent <code>unfold</code>s/<code>recall</code>s it.
+    Compacted strata cannot float — which is exactly why graduation is slow and double-gated.</p>
+
+  <h3>3.6 · Epochs and the <i>honest</i> cache-cost ladder</h3>
+  <p>Hysteresis band <code>[0.70, 0.90]</code> of <code>cap = min(budget, contextWindow)</code>. The v1 doc claimed the
+    front-summary rewrite was "the cheapest cache miss." That was <b>backwards</b> — the front of context is the
+    <i>worst</i> place to change a token. Here is the corrected story, and the design choices that follow from it:</p>
+  <div class="fig">
+    <svg class="tl" viewBox="0 0 920 250" role="img" aria-label="epoch timeline">
+      <defs>
+        <linearGradient id="band" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0" stop-color="#f0673e" stop-opacity=".10"/>
+          <stop offset="1" stop-color="#f0673e" stop-opacity=".02"/>
+        </linearGradient>
+      </defs>
+      <!-- band -->
+      <rect x="60" y="40" width="820" height="70" fill="url(#band)"/>
+      <line x1="60" y1="40" x2="880" y2="40" stroke="#f0673e" stroke-opacity=".5" stroke-dasharray="4 4"/>
+      <line x1="60" y1="110" x2="880" y2="110" stroke="#5fa7d6" stroke-opacity=".5" stroke-dasharray="4 4"/>
+      <text x="64" y="34" fill="#f0a35e" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11">0.90 · high-water</text>
+      <text x="64" y="125" fill="#7fb6df" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="11">0.70 · low-water</text>
+      <!-- axes -->
+      <line x1="60" y1="210" x2="880" y2="210" stroke="#3a4252"/>
+      <text x="60" y="232" fill="#828b9e" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10">turns →</text>
+      <text x="20" y="50" fill="#828b9e" font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10" transform="rotate(-90 20,50)">live tokens</text>
+      <!-- live-token line: climbs, fold-epoch sawteeth, one big compaction drop -->
+      <polyline fill="none" stroke="#eef1f6" stroke-width="2"
+        points="60,170 150,120 150,150 250,95 250,150 360,60 360,118 470,70 470,118 560,55 560,150 560,150 680,80 760,45 760,170 880,120"/>
+      <!-- HOLD shading callouts -->
+      <g font-family="ui-monospace,Menlo,Consolas,monospace" font-size="10">
+        <!-- fold epochs -->
+        <circle cx="250" cy="95" r="4" fill="#aab2c2"/><text x="232" y="84" fill="#aab2c2">fold</text>
+        <circle cx="360" cy="60" r="4" fill="#aab2c2"/><text x="342" y="50" fill="#aab2c2">fold</text>
+        <circle cx="470" cy="70" r="4" fill="#aab2c2"/><text x="452" y="60" fill="#aab2c2">fold</text>
+        <!-- compaction epoch -->
+        <circle cx="560" cy="55" r="6" fill="#d39455"/><text x="520" y="44" fill="#d39455">COMPACTION</text>
+        <circle cx="760" cy="45" r="6" fill="#d39455"/><text x="724" y="34" fill="#d39455">COMPACTION</text>
+        <!-- hold spans -->
+        <rect x="150" y="200" width="100" height="0"/>
+        <text x="95" y="200" fill="#5fa7d6">hold</text>
+        <text x="600" y="200" fill="#5fa7d6">hold</text>
+      </g>
+    </svg>
+    <div class="cap"><b>Three events, three cache costs.</b></div>
+    <table style="margin-top:4px">
+      <thead><tr><th>event</th><th>frequency</th><th>LLM?</th><th>cache impact</th><th>design response</th></tr></thead>
+      <tbody>
+        <tr><td><b style="color:var(--cool)">HOLD</b></td><td>most turns</td><td>no</td>
+          <td><span class="yes">full hit</span> — re-send identical commands, byte-stable prefix</td>
+          <td>the default; do nothing well</td></tr>
+        <tr><td><b style="color:var(--k-text)">FOLD-EPOCH</b></td><td>periodic</td><td>no</td>
+          <td><span class="mid">partial</span> — invalid from the fold point forward</td>
+          <td><b>maximize these</b> to defer compaction; reversible savings are free of LLM cost</td></tr>
+        <tr><td><b style="color:var(--group-accent)">COMPACTION</b></td><td>rare</td><td>yes</td>
+          <td><span class="no">expensive</span> — a new stratum near the front invalidates forward</td>
+          <td><b>gate hard</b> (dwell + reversible-exhaustion). Prior strata are <b>immutable</b>, so we never re-pay.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout green" style="margin-top:14px">
+      <div class="lab">the cache win that's actually true</div>
+      <p style="margin:6px 0 0; color:#bfe6d2">Naive compaction rewrites its <i>single running summary</i> at the very
+        front <b>every</b> time it compacts — a full flush, repeatedly. Thermocline's strata are <b>append-only and
+        immutable</b>: a stratum is written once and never touched again, so once-compacted content is never re-invalidated
+        and never re-summarized. We still pay one forward-invalidation when a <i>new</i> stratum forms — but that is rarer,
+        and it is the deliberate price of real budget recovery, not a free lunch we pretended to have.</p>
+    </div>
+  </div>
+
+  <!-- ───────────────────────── 04 ARCHITECTURE ───────────────────────── -->
+  <h2 id="arch"><span class="sec-num">04</span>Architecture</h2>
+  <p class="lede">The attention signal needs a GPU process, so Thermocline is an <b>external WebSocket conductor</b>
+    (the webview can't host a server or spawn Python). The decisive fact that makes the synthesis clean:
+    <b>external conductors <i>can</i> summarize with the agent's own model.</b></p>
+  <div class="callout">
+    <div class="lab">verified in protocol.ts (CONDUCTOR_PROTOCOL_VERSION 3)</div>
+    <p style="margin:6px 0 0; color:#cdd5e3"><code>cap/request { capability:"complete" }</code> is proxied by
+      <code>RemoteRunner.serveCapability</code> to <b>the same <code>host.complete()</code></b> an in-process conductor uses —
+      running on the user's live session model, off the model-call path. So Thermocline gets naive-compaction-grade
+      summaries from the agent's <i>own</i> model, over the wire — no side LLM, no extra API keys, better quality than
+      tiered-relevance's bring-your-own-Ollama approach.</p>
+  </div>
+  <div class="fig">
+    <div class="arch">
+      <div class="node">
+        <div class="nh"><span class="pill-kind" style="background:var(--accent)"></span>Accordion app · <span class="mono" style="font-size:12px">RemoteRunner</span></div>
+        <div class="nd">Bridges the synchronous <code>conduct()</code> contract to the async wire. Owns the engine,
+          tokenizer, fold-tag digests, and the model link.</div>
+        <div class="tagrow"><span class="ntag">context/update → view</span><span class="ntag">conductor/commands ← plan</span>
+          <span class="ntag">host/event: agentUnfold</span></div>
+      </div>
+      <div class="conn">↕</div>
+      <div class="wirelbl">ws:// loopback &nbsp;·&nbsp; advertised in ~/.accordion/conductors/thermocline.json (5 s heartbeat)</div>
+      <div class="conn">↕</div>
+      <div class="node" style="border-color:var(--group-edge)">
+        <div class="nh"><span class="pill-kind" style="background:var(--group-accent)"></span>thermocline.mjs · the conductor (Node)</div>
+        <div class="nd">Pure policy: dwell clocks, the two gates, per-run sedimentation, the epoch state machine. Holds the
+          confirmed/pending fold + compacted sets. <b>Persists strata</b> to a session-keyed file so reconnect restores
+          them without a new LLM call.</div>
+        <div class="tagrow"><span class="ntag">cap/request: complete →</span><span class="ntag">← cap/result: summary</span>
+          <span class="ntag">conductor/status: "compacting…"</span></div>
+      </div>
+      <div class="grid g2" style="margin-top:14px">
+        <div class="node">
+          <div class="nh">⇢ spawn · probe.py (Python · GPU)</div>
+          <div class="nd">Qwen2.5-0.5B last-token attention over 2048-tok windows. Warm-water pre-warm at 80% so scores
+            are ready before an epoch. 180 s watchdog; OOM ladder; reused verbatim from attention-folder.</div>
+        </div>
+        <div class="node">
+          <div class="nh">⇢ host.complete · agent's live model</div>
+          <div class="nd">One summarization call per compaction-epoch over the originals of a single cold run.
+            Async, off-path, held with last-state while in flight. User messages verbatim.</div>
+        </div>
+      </div>
+    </div>
+    <div class="cap"><b>Two out-of-band compute paths</b>, neither on the agent's model-call path: the GPU probe (relevance)
+      and <code>host.complete</code> (summaries). The wire loop itself only ever ships <code>fold</code> + <code>group</code> commands.</div>
+  </div>
+
+  <!-- ───────────────────────── 05 GOVERNANCE ───────────────────────── -->
+  <h2 id="gov"><span class="sec-num">05</span>Governance — locked where it must be, open where it counts</h2>
+  <p class="lede">The red-team proved a fully-collaborative posture can't keep the compacted layer wire-valid (a hand-pin
+    inside a stratum fragments the group; hand-folds corrupt the dwell clocks). So Thermocline is <b>exclusive</b> — but
+    it locks the <i>minimum</i>, and deliberately leaves the one control that makes it better than its parent open.</p>
+  <table>
+    <thead><tr><th>control</th><th>state</th><th>why</th></tr></thead>
+    <tbody>
+      <tr><td><code>human-steering</code></td><td><span class="no">LOCKED</span></td>
+        <td>The strata need a single owner to stay contiguous and to keep dwell bookkeeping honest. Same reason
+          compaction-naive locks it. Consent gate on attach shows this table.</td></tr>
+      <tr><td><code>agent-unfold</code></td><td><span class="yes">OPEN — on purpose</span></td>
+        <td><b>The agent's <code>unfold</code> is elevated to a first-class compaction veto.</b> It is gate ②.
+          compaction-naive locks this (the agent is powerless); Thermocline keeps the agent in the loop.</td></tr>
+      <tr><td><code>tail-size</code></td><td><span class="yes">OPEN</span></td>
+        <td>The human's protected-tail dial is respected. Thermocline never needs to fold into the working tail.</td></tr>
+      <tr><td><code>recall</code> · budget · observation · detach</td><td><span class="yes">NEVER LOCKABLE</span></td>
+        <td>ADR 0011 floor. <code>recall</code> always returns a compacted block's <i>original</i> text as a tool result —
+          even after sedimentation — and <b>detach freezes the strata in place, individually reversible</b>.</td></tr>
+    </tbody>
+  </table>
+  <div class="callout amber">
+    <div class="lab">the honest concession</div>
+    <p style="margin:6px 0 0; color:#d8cbb6">I wanted Thermocline fully collaborative — "a human pin means <i>protect from
+      compaction</i>." The red-team showed that breaks the <code>group</code> contiguity invariant and the dwell clocks.
+      Locking <code>human-steering</code> is a real loss of the founding "human overrides always win" posture; the
+      compensations are that the human keeps budget + detach (a freeze, not a reset), the <b>agent</b> keeps a true veto, and
+      <code>recall</code> can always exhume an original.</p>
+  </div>
+
+  <!-- ───────────────────────── 06 BEATS BOTH ───────────────────────── -->
+  <h2 id="beats"><span class="sec-num">06</span>How it beats each parent — and where it doesn't</h2>
+  <table>
+    <thead><tr><th>property</th><th>attention-folder</th><th>compaction-naive</th><th>Thermocline</th></tr></thead>
+    <tbody>
+      <tr><td>relevance signal</td><td class="yes">attention</td><td class="no">age only</td><td class="yes">attention + agent behavior</td></tr>
+      <tr><td>deep token recovery</td><td class="no">shallow folds only</td><td class="yes">yes</td><td class="yes">yes (sedimentation)</td></tr>
+      <tr><td>can re-surface a block</td><td class="no">no (one-directional)</td><td class="no">no</td><td class="yes">yes (float-up, until compacted)</td></tr>
+      <tr><td>protects what's needed</td><td class="yes">reversibly</td><td class="no">blind</td><td class="yes">double-gated before any loss</td></tr>
+      <tr><td>recursive amnesia</td><td class="yes">n/a (no summary)</td><td class="no">yes, compounding</td><td class="yes">none (immutable strata)</td></tr>
+      <tr><td>agent can recover content</td><td class="yes">unfold</td><td class="no">no</td><td class="yes">unfold (folded) · recall (any)</td></tr>
+      <tr><td>survives reconnect</td><td class="no">reverts to raw</td><td class="no">reverts to raw</td><td class="yes">strata persisted</td></tr>
+      <tr><td>cache cost of compaction</td><td>—</td><td class="no">full flush every pass</td><td class="mid">forward-invalidate, rare, never re-paid</td></tr>
+      <tr><td>summary quality</td><td>—</td><td class="mid">agent's model</td><td class="mid">agent's model (≈ equal — see §08)</td></tr>
+      <tr><td>posture</td><td class="yes">collaborative</td><td class="no">exclusive (locks agent out)</td><td class="mid">exclusive, but agent keeps veto</td></tr>
+    </tbody>
+  </table>
+  <p class="footnote">Honest reading: the genuinely multiplicative wins are <b>admission-controlled irreversibility</b>,
+    <b>immutable strata</b>, and <b>float-up</b>. Summary <i>prose quality</i> is roughly naive-compaction-equal — the
+    "weight detail by temperature" idea is a minor heuristic, not a pillar (§08).</p>
+
+  <!-- ───────────────────────── 07 EVOLUTION ───────────────────────── -->
+  <h2 id="evo"><span class="sec-num">07</span>Design evolution — what a red-team pass changed</h2>
+  <p class="lede">The first cut was an attention-folder with a compaction bolted on, and it had three load-bearing bugs.
+    Showing the deltas because the corrections <i>are</i> the design.</p>
+  <div class="evo">
+    <div class="row">
+      <div class="from"><div class="lab">v1 · broke</div>One running summary, rewritten at the front each compaction.
+        Claimed "front = cheapest cache miss."</div>
+      <div class="mid">→</div>
+      <div class="to"><div class="lab">v2 · fixed</div><b>Immutable append-only strata.</b> Each cold run summarized once
+        from originals, never rewritten. Kills recursive amnesia <i>and</i> the front-flush — one change, two parent-flaws gone.</div>
+    </div>
+    <div class="row">
+      <div class="from"><div class="lab">v1 · broke</div>Single descending frontier with "buoyant floors." A lone hot
+        block traps a 200-block cold region forever; alternating hot/cold → zero compaction; tool-pairs straddle the frontier → invalid groups.</div>
+      <div class="mid">→</div>
+      <div class="to"><div class="lab">v2 · fixed</div><b>Per-run sedimentation</b> at <b>whole-message / tool-pair</b>
+        granularity. Every cold pocket sediments on its own; buoys only bound runs, never trap them. Groups are always valid.</div>
+    </div>
+    <div class="row">
+      <div class="from"><div class="lab">v1 · broke</div>Fully collaborative. A hand-pin fragments a stratum's group;
+        hand-folds and pin/unpin cycles corrupt the dwell clocks.</div>
+      <div class="mid">→</div>
+      <div class="to"><div class="lab">v2 · fixed</div>Lock <code>human-steering</code> (minimum needed) —
+        but <b>keep <code>agent-unfold</code> open as the compaction veto</b>. Beats naive compaction, stays wire-valid.</div>
+    </div>
+    <div class="row">
+      <div class="from"><div class="lab">v1 · broke</div>One stale attention score, K quiet epochs later, drives an
+        irreversible delete. Proxy-of-a-proxy gating permanent loss.</div>
+      <div class="mid">→</div>
+      <div class="to"><div class="lab">v2 · fixed</div><b>Double gate</b> (fresh probe score <i>and</i> agent didn't
+        recall) + ever-warm units need <b>2K</b> + <b>no probe ⇒ compaction disabled</b>. Never delete on the proxy alone.</div>
+    </div>
+    <div class="row">
+      <div class="from"><div class="lab">v1 · broke</div>Disconnect silently un-forgets the whole session — the agent
+        suddenly re-sees content it had "forgotten."</div>
+      <div class="mid">→</div>
+      <div class="to"><div class="lab">v2 · fixed</div><b>Persist strata</b> (ids + summary text + clocks) to the session
+        file; reconnect restores them with no new LLM call.</div>
+    </div>
+  </div>
+
+  <!-- ───────────────────────── 08 RISKS ───────────────────────── -->
+  <h2 id="risks"><span class="sec-num">08</span>Honest residual risks</h2>
+  <p class="lede">None of these are fixed by the design — they are the price of admission, stated plainly so the design
+    call is informed.</p>
+  <div class="card">
+    <div class="risk"><div class="sev"><span class="badge bad">serious</span></div>
+      <div class="body"><div class="t">Attention-biased amnesia</div>
+        <div class="x">The probe has documented recency + cross-window bias (ADR 0010). So the content we lose isn't random —
+          it's skewed toward old, far-from-tail blocks the probe <i>underestimates</i>. The double-gate, ever-warm 2K rule,
+          and <code>recall</code> are the net; they reduce, not eliminate, this. Irreversibility is the cost we're buying budget with.</div></div></div>
+    <div class="risk"><div class="sev"><span class="badge warn">moderate</span></div>
+      <div class="body"><div class="t">Summary quality ≈ naive compaction</div>
+        <div class="x">"Preserve detail proportional to temperature" is an instruction an LLM follows unreliably. Kept as a
+          minor heuristic only; the verbatim-user-messages rule is the real guarantee, and the structural win is the
+          <i>immutable</i> strata (no recursion), not magic prompt-weighting.</div></div></div>
+    <div class="risk"><div class="sev"><span class="badge warn">moderate</span></div>
+      <div class="body"><div class="t">First-fill latency</div>
+        <div class="x">Probe load + scoring is ~8–18 s. If context fills 0→90% faster than that, the first fold-epoch uses the
+          FOLD_RANK fallback and <b>compaction stays disabled until real scores exist</b> — correct, but it means no deep
+          recovery in the opening burst of a huge pre-existing context.</div></div></div>
+    <div class="risk"><div class="sev"><span class="badge warn">moderate</span></div>
+      <div class="body"><div class="t">Lone-cold-unit gaps</div>
+        <div class="x">A single cold unit wedged between two buoys never reaches a stratum (a 1-unit run isn't worth one).
+          It stays folded — its cost is mostly recovered already, so this is an accepted ceiling, not a bug.</div></div></div>
+    <div class="risk"><div class="sev"><span class="badge warn">moderate</span></div>
+      <div class="body"><div class="t">Persistence I/O the other conductors avoid</div>
+        <div class="x">Strata must survive reconnect, so Thermocline writes session-keyed state to disk. That's new surface
+          (staleness, cleanup, a session-id key) the in-process conductors never needed.</div></div></div>
+    <div class="risk"><div class="sev"><span class="badge good">minor</span></div>
+      <div class="body"><div class="t">Two LLM costs, not one</div>
+        <div class="x">Probe (GPU) + per-stratum <code>host.complete</code>. Both are off-path and gated, but it's more moving
+          machinery than either parent. The <code>conductor/status</code> readout must make in-flight state visible.</div></div></div>
+  </div>
+
+  <!-- ───────────────────────── 09 SPEC ───────────────────────── -->
+  <h2 id="spec"><span class="sec-num">09</span>Spec appendix</h2>
+
+  <h3>conduct() — the per-update flow (pure policy, synchronous reply)</h3>
+  <pre><span class="c">// every context/update, against the conductor's own confirmed sets (host clears its folds each pass)</span>
+<span class="k">fun</span> <span class="f">onUpdate</span>(view):
+  prune(foldedIds, compactedIds, dwell)              <span class="c">// drop ids gone / now held / protected / re-warmed</span>
+  units   = buildUnits(view.blocks)                  <span class="c">// tool-pairs &amp; assistant msgs = atomic units</span>
+  visible = view.liveTokens
+          − Σ(foldedIds:   tokens − foldedTokens)    <span class="c">// reversible savings</span>
+          − Σ(compactedIds: tokens − strataShare)    <span class="c">// realized savings, no double-count</span>
+  cap = min(view.budget, view.contextWindow); hi = .90·cap; lo = .70·cap
+
+  <span class="k">if</span> visible ≤ hi:                                  <span class="c">// HOLD — byte-stable, cache-warm</span>
+     maybePrewarmProbe(visible ≥ .80·cap)
+     <span class="k">return</span> emit(foldedIds, strata)               <span class="c">// re-send identical commands</span>
+
+  <span class="c">// ── over high-water: a FOLD-EPOCH (cheap, no LLM) ──</span>
+  scores = freshScores(units)                        <span class="c">// from probe; FOLD_RANK fallback if cold/absent</span>
+  <span class="k">for</span> u <span class="k">in</span> coldestFirst(liveCandidates, scores):
+     <span class="k">if</span> visible ≤ lo: <span class="k">break</span>
+     foldedIds.add(u); dwell[u] ??= 0; visible += foldedTokens(u) − tokens(u)
+  floatUpReWarmed(foldedIds, scores)                 <span class="c">// thrash-free margin guard</span>
+
+  <span class="c">// ── graduate: who has earned a stratum? (double gate, ≥K epochs) ──</span>
+  <span class="k">for</span> u <span class="k">in</span> foldedIds: dwell[u] += (gateA(u,scores) &amp;&amp; gateB(u)) ? 1 : reset(u)
+  runs = maximalColdRuns(units, graduated = dwell ≥ K·(everWarm(u)?2:1))   <span class="c">// snapped to whole msgs, bounded by buoys</span>
+
+  <span class="k">if</span> runs.empty <span class="k">or</span> !host.can(<span class="s">"complete"</span>): <span class="k">return</span> emit(foldedIds, strata)   <span class="c">// no probe/model ⇒ reversible-only</span>
+
+  <span class="c">// ── a COMPACTION-EPOCH (rare, one LLM call, off-path) ──</span>
+  <span class="k">if</span> !inflight:
+     run = oldest(runs); inflight = run
+     host.complete({ system: COMPACT_SYS, prompt: build(run.originals) })   <span class="c">// user msgs verbatim</span>
+       .then(text =&gt; { strata.push(freeze(run, text)); persist(); reconductor() })
+  setStatus(<span class="s">"compacting "</span> + inflight.size + <span class="s">" units…"</span>)
+  <span class="k">return</span> emit(foldedIds, strata)                   <span class="c">// HOLD last state while in flight</span></pre>
+  <p class="footnote">On resolve, any unit that received an <code>agentUnfold</code>/<code>recall</code> during the in-flight
+    window is dropped from the run before the stratum is frozen — the agent's veto wins the race.</p>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3 style="margin-top:0">Instance state</h3>
+      <ul class="kv">
+        <li><code>foldedIds</code> / <code>compactedIds</code> — explicit, separate (no view-flag inference)</li>
+        <li><code>dwell: Map&lt;unitId, epochs&gt;</code> — the graduation clock</li>
+        <li><code>everWarm: Set&lt;unitId&gt;</code> — lifetime-max temp was hot ⇒ needs 2K</li>
+        <li><code>strata: Stratum[]</code> — <code>{ firstId, lastId, summary, unitIds }</code>, immutable once pushed</li>
+        <li><code>scores</code>, <code>confirmedApplied</code>/<code>pending</code>/<code>rev</code> — from attention-folder</li>
+        <li><code>vetoedDuringFlight: Set</code> — agent unfolds/recalls mid-compaction</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Config knobs</h3>
+      <ul class="kv">
+        <li><code>highWater 0.90</code> · <code>lowWater 0.70</code> · <code>warmWater 0.80</code></li>
+        <li><code>coldThreshold</code> — temperature percentile for "cold"</li>
+        <li><code>K 3</code> — dwell epochs to graduate (<code>2K</code> if ever-warm)</li>
+        <li><code>minRunUnits 3</code> — don't sediment shorter runs</li>
+        <li><code>floatMargin</code> — thrash-free deadband</li>
+        <li><code>maxSummaryTokens 8000</code> — per-stratum soft cap</li>
+      </ul>
+    </div>
+  </div>
+
+  <h3>Wire commands emitted (full desired state, every pass)</h3>
+  <ul class="clean">
+    <li><span class="pill-kind" style="background:var(--k-text)"></span><code>fold(ids)</code> — the probation layer. Host stamps
+      <code>{#code FOLDED}</code> tags ⇒ agent can <code>unfold</code>/<code>recall</code>. Reversible.</li>
+    <li><span class="pill-kind" style="background:var(--group-accent)"></span><code>group(ids:[first,last], digest: strataText)</code>
+      — one per stratum, re-derived from the live view each pass (robust to resync). Irreversible. User messages verbatim inside.</li>
+    <li>Everything else: no command ⇒ live. <code>null</code> is never returned except as the in-flight hold, which re-sends the last batch.</li>
+  </ul>
+
+  <div class="rule" style="margin-top:40px"></div>
+  <p class="footnote" style="margin-top:18px">Thermocline · attention-gated sedimentary compaction · a design proposal for the
+    Accordion conductor framework. Parents: <code>conductors/attention-folder</code> (ADR 0010) ×
+    <code>conductors/compaction-naive</code> (ADR 0014). Contract: <code>conductors/contract</code> · ADR 0007/0011/0013.
+    Not yet implemented — this document is the design for review.</p>
+
+</div>
+
+<script>
+  // buoyancy strip — generate a believable conversation of temperatures
+  (function(){
+    const ramp = t => t>0.78?'var(--hot)': t>0.6?'var(--warm)': t>0.42?'var(--tepid)': t>0.24?'var(--cool)':'var(--cold)';
+    // hand-tuned temperature sequence (newest at right). buoys = local hot blocks.
+    const T = [0.05,0.08,0.06,0.10,0.07,  0.85,  0.09,0.12,0.08,0.06,0.11,0.07,0.09,  0.62,  0.10,0.08,
+               0.34,0.20,0.16,0.22,0.18,  0.90,  0.30,0.45,0.55,0.70,0.82,0.95,0.88,0.92];
+    const strip = document.getElementById('convo');
+    T.forEach((t,i)=>{
+      const u = document.createElement('div'); u.className='u';
+      const h = 22 + Math.round(t*64); u.style.height = h+'px'; u.style.background = ramp(t);
+      // graduated-cold (left, in a run) get the recessed hatch + a thin amber under-border via box-shadow
+      if(t<0.24 && i<16){ u.style.boxShadow='inset 0 -3px 0 var(--group-accent)'; }
+      if(t>0.78){ const b=document.createElement('div'); b.className='buoy'; b.textContent='⚓'; u.appendChild(b); u.style.background='var(--hot)'; }
+      strip.appendChild(u);
+    });
+  })();
+</script>
+</body>
+</html>
