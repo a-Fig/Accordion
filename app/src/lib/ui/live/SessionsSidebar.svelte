@@ -84,7 +84,6 @@
 	}
 
 	const activeCount = $derived(source === "pi" ? sessions.length : claudeSessions.length);
-	const railCCSessions = $derived(claudeSessions.slice(0, 12));
 </script>
 
 <aside class="rail" class:collapsed>
@@ -146,7 +145,7 @@
 			</div>
 		{:else}
 			<div class="icon-list">
-				{#each railCCSessions as s (s.sessionId)}
+				{#each claudeSessions.slice(0, 12) as s (s.sessionId)}
 					{@const isSel = s.sessionId === claudeSelected}
 					<button
 						class="rail-btn dot-btn"

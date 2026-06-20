@@ -10,14 +10,6 @@
 
 	let { value, format = (n: number) => String(Math.round(n)), duration = 320 }: Props = $props();
 
-	// Snap (don't tween) when the user prefers reduced motion.
-	function effectiveDuration(): number {
-		if (typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-			return 0;
-		}
-		return duration;
-	}
-
 	// Initialise at 0 with duration 0 so construction doesn't capture the prop early
 	// (avoids a Svelte warning); the effect immediately drives it to `value`, giving a
 	// count-up on first mount and a smooth tween on every change.
@@ -28,6 +20,9 @@
 	const tween = new Tween(0, { duration: 0, easing: cubicOut });
 
 	$effect(() => {
-		tween.set(value, { duration: effectiveDuration() });
+		// Snap (don't tween) when the user prefers reduced motion. This SPA is
+		// ssr=false so window always exists at runtime.
+		const d = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? 0 : duration;
+		tween.set(value, { duration: d });
 	});
 </script>{format(tween.current)}

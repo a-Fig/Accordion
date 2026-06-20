@@ -30,34 +30,6 @@
 		}
 	});
 
-	// ── Section/row data shape ──────────────────────────────────────────────
-	// To add a new setting: (1) add a row object to the relevant section's
-	// `rows` array (or push a new section object to add a whole section), AND
-	// (2) add a matching `{#if row.id === "..."}` branch in the control slot
-	// below — one branch per row id is required because Svelte 5 snippets
-	// can't live in plain JS objects.
-	//
-	// Row shape:
-	//   { id, label, helper? }
-	// Section shape:
-	//   { title, rows }
-
-	type SettingRow = { id: string; label: string; helper?: string };
-	type Section = { title: string; rows: SettingRow[] };
-
-	const sections: Section[] = [
-		{
-			title: "Appearance",
-			rows: [
-				{
-					id: "foldDisplayMode",
-					label: "Folded blocks",
-					helper: "Classic = dimmed tiles · Sliver = compact slivers with a summary",
-				},
-			],
-		},
-	];
-
 	// Escape key closes the panel
 	$effect(() => {
 		if (!open) return;
@@ -94,35 +66,26 @@
 		</div>
 
 		<div class="panel-body">
-			{#each sections as section}
-				<section class="s-section">
-					<h2 class="s-title">{section.title}</h2>
-					{#each section.rows as row}
-						<div class="s-row">
-							<div class="s-label-wrap">
-								<span class="s-label">{row.label}</span>
-								{#if row.helper}
-									<span class="s-helper">{row.helper}</span>
-								{/if}
-							</div>
-							<div class="s-control">
-								<!-- Add a new {#if row.id === "..."} branch per setting -->
-								{#if row.id === "foldDisplayMode"}
-									<SegControl
-										options={[
-											{ id: "classic", label: "Classic" },
-											{ id: "sliver", label: "Sliver" },
-										]}
-										value={settings.foldDisplayMode}
-										onchange={(v) => settings.set("foldDisplayMode", v as import("$lib/settings.svelte").FoldDisplayMode)}
-										ariaLabel="Folded block display mode"
-									/>
-								{/if}
-							</div>
-						</div>
-					{/each}
-				</section>
-			{/each}
+			<section class="s-section">
+				<h2 class="s-title">Appearance</h2>
+				<div class="s-row">
+					<div class="s-label-wrap">
+						<span class="s-label">Folded blocks</span>
+						<span class="s-helper">Classic = dimmed tiles · Sliver = compact slivers with a summary</span>
+					</div>
+					<div class="s-control">
+						<SegControl
+							options={[
+								{ id: "classic", label: "Classic" },
+								{ id: "sliver", label: "Sliver" },
+							]}
+							value={settings.foldDisplayMode}
+							onchange={(v) => settings.set("foldDisplayMode", v as import("$lib/settings.svelte").FoldDisplayMode)}
+							ariaLabel="Folded block display mode"
+						/>
+					</div>
+				</div>
+			</section>
 		</div>
 	</div>
 {/if}
