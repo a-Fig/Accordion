@@ -41,6 +41,7 @@
 	button:active { filter: brightness(0.94); }
 	button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
 	button.play.is-playing { background: var(--orange); }
+	button.focus { width: 100%; margin-top: 10px; background: var(--blue); }
 	button:disabled { opacity: 0.45; cursor: not-allowed; }
 	.lbl { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 10px; }
 	.tps-head { display: flex; align-items: baseline; justify-content: space-between; }
@@ -72,6 +73,7 @@
 			<button class="play" id="play" disabled>Play</button>
 			<button class="ghost" id="restart" disabled style="flex: 0 0 38%">↺ Restart</button>
 		</div>
+		<button class="focus" id="focus" disabled title="Simulate /accordion — focus Accordion and open this session">⤢ Focus in Accordion</button>
 	</div>
 
 	<div class="panel">
@@ -111,7 +113,7 @@
 	function setLink(on) {
 		connected = on;
 		$("dot").classList.toggle("on", on);
-		const ctrls = ["play", "restart", "tps"];
+		const ctrls = ["play", "restart", "tps", "focus"];
 		ctrls.forEach((id) => ($(id).disabled = !on));
 		if (!on) $("sub").textContent = "control link lost — retrying…";
 	}
@@ -162,6 +164,12 @@
 
 	$("play").onclick = () => sendCmd({ cmd: playing ? "pause" : "play" });
 	$("restart").onclick = () => sendCmd({ cmd: "restart" });
+	$("focus").onclick = () => {
+		sendCmd({ cmd: "focus" });
+		const b = $("focus");
+		b.textContent = "✓ sent — check Accordion";
+		setTimeout(() => (b.textContent = "⤢ Focus in Accordion"), 1600);
+	};
 	$("tps").oninput = (e) => {
 		const v = Number(e.target.value);
 		$("tpsVal").innerHTML = `${fmt(v)}<span>tok/s</span>`;

@@ -51,7 +51,7 @@ const jiti = createJiti(import.meta.url);
 const { parse } = await jiti.import("../app/src/lib/engine/parse.ts");
 const { PROTOCOL_VERSION, DEFAULT_PORT } = await jiti.import("../app/src/lib/live/protocol.ts");
 const { isDurableId } = await jiti.import("../app/src/lib/live/mapping.ts");
-const { REGISTRY_PROTOCOL, REGISTRY_DIR, SESSIONS_SUBDIR, HEARTBEAT_INTERVAL_MS } = await jiti.import(
+const { REGISTRY_PROTOCOL, REGISTRY_DIR, SESSIONS_SUBDIR, FOCUS_FILE, HEARTBEAT_INTERVAL_MS } = await jiti.import(
 	"../app/src/lib/live/registry.ts",
 );
 
@@ -284,6 +284,17 @@ function removeEntry() {
 		/* already gone */
 	}
 }
+// Simulate `/accordion`: write the one-shot focus request the app polls for. The desktop
+// app consumes it (take_focus_request), selects THIS session, and foregrounds its window.
+const focusPath = path.join(accordionHome, REGISTRY_DIR, FOCUS_FILE);
+function writeFocus() {
+	try {
+		fs.writeFileSync(focusPath, JSON.stringify({ sessionId, ts: Date.now() }));
+		console.log("focus request written (simulated /accordion)");
+	} catch {
+		/* best-effort */
+	}
+}
 fs.mkdirSync(sessionsDir, { recursive: true });
 writeEntry();
 const heartbeat = setInterval(writeEntry, HEARTBEAT_INTERVAL_MS);
@@ -384,6 +395,9 @@ controlWss.on("connection", (ws) => {
 				break;
 			case "restart":
 				doRestart();
+				break;
+			case "focus":
+				writeFocus();
 				break;
 			case "tps":
 				if (Number.isFinite(m.value)) tps = Math.max(1, Math.min(100_000, m.value));
