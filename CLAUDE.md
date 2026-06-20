@@ -275,6 +275,15 @@ the conductor).
     swallowed by the group; the host's whole-message snap + pair-balance keeps the result
     wire-valid. User messages are baked VERBATIM into the summary (Claude-Code `/compact`
     style) so human intent survives compaction; only assistant reasoning degrades. See [ADR 0013](docs/adr/0013-conductor-host-capabilities.md) / [ADR 0014](docs/adr/0014-naive-compaction-conductor.md).
+  - `thermocline/` — external (WS). Combines the attention probe (Qwen2.5-0.5B relevance
+    scores) with LLM compaction (`host.complete`) under a hard budget invariant, in
+    double-buffered epochs. Attention decides order; the budget decides depth. Fidelity ladder
+    Full → Trim → LLM-Digest (recoverable, unfold/recall-able) → Stratum (LLM holistic
+    summary, bounded re-compressible deep zone) → merged/drop. Double-gated irreversible
+    compaction (probe cold AND agent-didn't-recall, K epochs); persists the deep zone across
+    reconnect. Locks `human-steering`; keeps `agent-unfold` open as a compaction veto;
+    `recall` always works. See [docs/thermocline-design.html](docs/thermocline-design.html) /
+    [ADR 0015](docs/adr/0015-thermocline-conductor.md).
 
 ## Visual grammar (consistent across ALL views)
 

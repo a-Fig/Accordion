@@ -1,0 +1,598 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Thermocline v4 — a conductor design</title>
+<style>
+  :root{
+    --k-user:#6ea8fe; --k-text:#aab2c2; --k-thinking:#b483e0;
+    --k-tool_call:#34d3c2; --k-tool_result:#f0a35e; --k-summary:#4a3528;
+    --bg:#0b0d12; --panel:#14171f; --panel-2:#1a1e28; --panel-3:#232834; --panel-4:#2c3340;
+    --text:#eef1f6; --muted:#9aa3b4; --faint:#828b9e;
+    --line:#2c3342; --line-soft:#20252f; --line-strong:#3a4252;
+    --accent:#6ea8fe; --accent-hover:#8bbcff; --accent-dim:#2d4a7a; --accent-soft:rgba(110,168,254,.14);
+    --danger:#ff6b6b; --ok:#46d39a; --warn:#f0b450;
+    --group:#6f4a32; --group-accent:#d39455; --group-edge:#9c6b43; --group-band:rgba(211,148,85,.07);
+    --sans:"Inter Variable",Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    --mono:"JetBrains Mono Variable",ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+    --radius:10px; --radius-lg:14px; --radius-sm:6px; --radius-xs:4px; --radius-pill:999px;
+    --shadow-1:0 1px 2px rgba(0,0,0,.4);
+    --shadow-2:0 4px 12px rgba(0,0,0,.45),0 1px 2px rgba(0,0,0,.4);
+    --shadow-3:0 12px 32px rgba(0,0,0,.5),0 2px 8px rgba(0,0,0,.4);
+    --hot:#f0673e; --warm:#f0a35e; --tepid:#d6cf7a; --cool:#5fa7d6; --cold:#3f6fb0;
+    --mono-stack:ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0; color:var(--text); font-family:var(--sans); font-size:14px; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+    background:
+      radial-gradient(1200px 600px at 80% -10%, rgba(110,168,254,.06), transparent 60%),
+      radial-gradient(900px 500px at -10% 8%, rgba(240,103,62,.05), transparent 55%), var(--bg);}
+  .wrap{max-width:1080px; margin:0 auto; padding:40px 28px 120px}
+  h1,h2,h3{line-height:1.2; font-weight:650}
+  h2{font-size:22px; margin:58px 0 6px; letter-spacing:-.01em}
+  h3{font-size:15px; margin:26px 0 6px}
+  p{margin:10px 0; color:var(--muted)} p strong,li strong{color:var(--text); font-weight:620}
+  a{color:var(--accent-hover); text-decoration:none}
+  code{font-family:var(--mono); font-size:.86em; background:var(--panel-2);
+    border:1px solid var(--line-soft); border-radius:var(--radius-xs); padding:1px 5px; color:#dfe6f2}
+  .sec-num{color:var(--faint); font-weight:600; font-size:13px; margin-right:8px; font-family:var(--mono)}
+  .lede{font-size:15.5px; color:#cdd5e3; max-width:80ch}
+  .rule{height:1px; background:linear-gradient(90deg,var(--line),transparent); margin:8px 0 0}
+
+  .hero{padding:30px 32px; border:1px solid var(--line); border-radius:var(--radius-lg);
+    background:linear-gradient(180deg,var(--panel),var(--panel-2)); box-shadow:var(--shadow-2); position:relative; overflow:hidden}
+  .hero::before{content:""; position:absolute; inset:0; opacity:.5; pointer-events:none;
+    background:linear-gradient(180deg,rgba(240,103,62,.10),rgba(240,163,94,.06) 22%,rgba(214,207,122,.03) 40%,rgba(95,167,214,.05) 62%,rgba(63,111,176,.10));
+    -webkit-mask:linear-gradient(90deg,transparent,#000 30%); mask:linear-gradient(90deg,transparent,#000 30%)}
+  .hero>*{position:relative}
+  .eyebrow{font-family:var(--mono); font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--group-accent)}
+  .hero h1{font-size:40px; margin:6px 0 4px; letter-spacing:-.02em}
+  .hero .tag{font-size:16px; color:#d3dae6; max-width:74ch; margin:8px 0 0}
+  .chips{display:flex; flex-wrap:wrap; gap:8px; margin-top:20px}
+  .chip{font-family:var(--mono); font-size:11.5px; padding:5px 10px; border-radius:var(--radius-pill);
+    border:1px solid var(--line-strong); background:var(--panel-3); color:var(--muted); white-space:nowrap}
+  .chip b{color:var(--text); font-weight:600}
+
+  .grid{display:grid; gap:16px}
+  .g2{grid-template-columns:1fr 1fr} .g3{grid-template-columns:1fr 1fr 1fr}
+  @media(max-width:820px){.g2,.g3{grid-template-columns:1fr}}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:18px; box-shadow:var(--shadow-1)}
+  .card h3{margin-top:0}
+  .kv{margin:10px 0 0; padding:0; list-style:none}
+  .kv li{padding:7px 0; border-top:1px solid var(--line-soft); color:var(--muted); font-size:13.5px}
+  .kv li:first-child{border-top:0}
+  ul.clean{margin:10px 0; padding-left:18px} ul.clean li{margin:6px 0; color:var(--muted)}
+  .pill-kind{display:inline-block; width:9px; height:9px; border-radius:3px; vertical-align:middle; margin-right:6px}
+
+  .badge{display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:11px; padding:3px 8px; border-radius:var(--radius-pill); border:1px solid var(--line-strong)}
+  .badge.good{color:var(--ok); border-color:color-mix(in srgb,var(--ok) 40%,transparent); background:color-mix(in srgb,var(--ok) 10%,transparent)}
+  .badge.bad{color:var(--danger); border-color:color-mix(in srgb,var(--danger) 40%,transparent); background:color-mix(in srgb,var(--danger) 10%,transparent)}
+  .badge.warn{color:var(--warn); border-color:color-mix(in srgb,var(--warn) 40%,transparent); background:color-mix(in srgb,var(--warn) 10%,transparent)}
+  .badge.info{color:var(--accent-hover); border-color:var(--accent-dim); background:var(--accent-soft)}
+
+  .callout{border-left:3px solid var(--accent); background:var(--accent-soft); border-radius:0 var(--radius) var(--radius) 0; padding:14px 16px; margin:18px 0}
+  .callout.amber{border-left-color:var(--group-accent); background:var(--group-band)}
+  .callout.green{border-left-color:var(--ok); background:color-mix(in srgb,var(--ok) 8%,transparent)}
+  .callout.red{border-left-color:var(--danger); background:color-mix(in srgb,var(--danger) 7%,transparent)}
+  .callout .lab{font-family:var(--mono); font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--faint)}
+
+  table{width:100%; border-collapse:collapse; margin:14px 0; font-size:13.5px}
+  th,td{text-align:left; padding:10px 12px; border-bottom:1px solid var(--line-soft); vertical-align:top}
+  th{color:var(--faint); font-weight:600; font-family:var(--mono); font-size:11.5px; text-transform:uppercase; letter-spacing:.06em}
+  tbody tr:hover{background:var(--panel-2)}
+  td .yes,.yes{color:var(--ok)} td .no,.no{color:var(--danger)} td .mid,.mid{color:var(--warn)}
+
+  .fig{background:var(--panel-2); border:1px solid var(--line); border-radius:var(--radius); padding:20px; margin:16px 0; box-shadow:var(--shadow-1)}
+  .fig .cap{font-size:12.5px; color:var(--faint); margin-top:14px; font-family:var(--mono)}
+  .fig .cap b{color:var(--muted); font-weight:600}
+
+  /* enforcement staircase */
+  .stair{position:relative; padding:6px 0}
+  .budgetline{position:relative; border-top:2px dashed var(--danger); margin:4px 0 16px}
+  .budgetline span{position:absolute; right:0; top:-9px; background:var(--panel-2); padding:0 8px;
+    font-family:var(--mono); font-size:11px; color:var(--danger)}
+  .rung{display:flex; align-items:center; gap:14px; padding:11px 14px; border:1px solid var(--line);
+    border-radius:var(--radius); background:var(--panel); margin:8px 0}
+  .rung .n{flex:0 0 26px; height:26px; border-radius:50%; display:grid; place-items:center;
+    font-family:var(--mono); font-size:12px; color:var(--bg); font-weight:700}
+  .rung .b{flex:1}
+  .rung .t{font-weight:650; font-size:13.5px}
+  .rung .d{font-size:12px; color:var(--muted); margin-top:2px}
+  .rung .cost{flex:0 0 auto; font-family:var(--mono); font-size:10.5px; color:var(--faint);
+    border:1px solid var(--line-soft); border-radius:var(--radius-xs); padding:3px 7px}
+  .rung.floor{border-color:var(--danger); background:color-mix(in srgb,var(--danger) 7%,var(--panel))}
+  .rung.floor .n{background:var(--danger)}
+
+  /* fidelity ladder */
+  .ladder{display:flex; flex-direction:column; gap:0}
+  .step{display:grid; grid-template-columns:120px 1fr 220px; gap:0; align-items:stretch; border:1px solid var(--line);
+    border-bottom:0; background:var(--panel)}
+  .step:first-child{border-radius:var(--radius) var(--radius) 0 0}
+  .step:last-child{border-bottom:1px solid var(--line); border-radius:0 0 var(--radius) var(--radius)}
+  .step .lvl{padding:13px 14px; border-right:1px solid var(--line-soft); font-weight:700; font-size:13px; display:flex; flex-direction:column; gap:3px; justify-content:center}
+  .step .lvl small{font-family:var(--mono); font-size:10px; color:var(--faint); font-weight:400}
+  .step .desc{padding:13px 14px; font-size:12.5px; color:var(--muted)}
+  .step .meta{padding:13px 14px; border-left:1px solid var(--line-soft); font-size:11.5px; display:flex; flex-direction:column; gap:5px; justify-content:center}
+  .step .meta .row{display:flex; gap:7px; align-items:center}
+  @media(max-width:760px){.step{grid-template-columns:1fr} .step .lvl,.step .meta{border:0}}
+  .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;display:inline-block}
+
+  /* deep zone conveyor */
+  .deep{display:flex; align-items:stretch; gap:0; border:1px solid var(--line); border-radius:var(--radius); overflow:hidden}
+  .deep .ceil{flex:1; background:var(--panel); position:relative; padding:14px}
+  .deep .ceil .hd{display:flex; justify-content:space-between; font-family:var(--mono); font-size:10.5px; color:var(--faint); margin-bottom:8px}
+  .strow{display:flex; gap:6px; align-items:flex-end; height:74px}
+  .st{border-radius:var(--radius-xs) var(--radius-xs) 0 0; background:linear-gradient(180deg,var(--group-accent),var(--group)); position:relative; display:flex; align-items:flex-end; justify-content:center; padding-bottom:3px}
+  .st small{font-family:var(--mono); font-size:8.5px; color:#1a0f06; font-weight:700}
+  .st.merged{background:linear-gradient(180deg,#7a5638,#3d2a1a); outline:1px dashed var(--group-accent); outline-offset:-3px}
+  .deep .io{flex:0 0 96px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px; padding:10px; background:var(--panel-2); border-left:1px solid var(--line)}
+  .deep .io .a{font-size:11px; color:var(--muted); text-align:center; font-family:var(--mono)}
+
+  /* thermal column (reused) */
+  .strata{display:grid; grid-template-columns:54px 1fr}
+  .therm{position:relative; border-radius:var(--radius-sm); margin-right:14px;
+    background:linear-gradient(180deg,var(--hot),var(--warm) 26%,var(--tepid) 46%,var(--cool) 68%,var(--cold)); box-shadow:inset 0 0 0 1px rgba(255,255,255,.06)}
+  .therm .tk{position:absolute; left:-2px; right:-2px; height:1px; background:rgba(255,255,255,.25)}
+  .therm .lbl{position:absolute; left:60px; white-space:nowrap; font-family:var(--mono); font-size:10.5px; color:var(--faint); transform:translateY(-50%)}
+  .layers{display:flex; flex-direction:column; gap:8px}
+  .layer{border-radius:var(--radius-sm); padding:11px 13px; border:1px solid var(--line)}
+  .layer .h{display:flex; align-items:center; justify-content:space-between; gap:10px}
+  .layer .h .name{font-weight:650; font-size:13.5px} .layer .h .meta{font-family:var(--mono); font-size:10.5px; color:var(--faint)}
+  .layer .d{font-size:12.5px; color:var(--muted); margin-top:5px}
+  .layer.live{background:linear-gradient(180deg,#171b24,#141821); border-color:var(--accent-dim)}
+  .layer.folded{background:var(--panel); background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.05) 0 1px,transparent 1px 6px)}
+  .layer.compact{background:var(--group); border-color:var(--group-edge)}
+
+  /* pipeline */
+  .pipe{display:flex; align-items:stretch; gap:0; flex-wrap:wrap}
+  .stage{flex:1 1 150px; min-width:150px; background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:13px}
+  .stage .s-h{font-weight:650; font-size:13px; display:flex; align-items:center; gap:7px}
+  .stage .s-d{font-size:11.5px; color:var(--muted); margin-top:6px}
+  .arrow{flex:0 0 34px; display:flex; align-items:center; justify-content:center; color:var(--faint); font-size:20px}
+  .gate{margin-top:9px; border-top:1px dashed var(--line-strong); padding-top:8px}
+  .gate .gh{font-family:var(--mono); font-size:10px; color:var(--group-accent); letter-spacing:.05em}
+  .gate ul{margin:5px 0 0; padding-left:15px} .gate li{font-size:11.5px; color:var(--muted); margin:3px 0}
+  .reset{margin-top:12px; display:flex; align-items:center; gap:9px; font-size:12px; color:var(--cool);
+    background:color-mix(in srgb,var(--cool) 9%,transparent); border:1px solid color-mix(in srgb,var(--cool) 30%,transparent); border-radius:var(--radius-sm); padding:9px 12px}
+
+  /* architecture */
+  .node{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:13px 15px}
+  .node .nh{font-weight:650; font-size:13.5px; display:flex; gap:8px; align-items:center}
+  .node .nd{font-size:12px; color:var(--muted); margin-top:5px}
+  .node .tagrow{margin-top:8px; display:flex; gap:6px; flex-wrap:wrap}
+  .ntag{font-family:var(--mono); font-size:10px; color:var(--faint); border:1px solid var(--line-soft); border-radius:var(--radius-xs); padding:2px 6px}
+  .wirelbl{font-family:var(--mono); font-size:10.5px; color:var(--group-accent); text-align:center; padding:6px 0}
+  .conn{display:flex; justify-content:center; color:var(--line-strong); font-size:18px}
+
+  pre{background:#0d1017; border:1px solid var(--line); border-radius:var(--radius); padding:15px 16px; overflow:auto; font-family:var(--mono); font-size:12px; line-height:1.6; color:#c8d2e0}
+  pre .c{color:var(--faint)} pre .k{color:#7aa2f7} pre .s{color:#9ece6a} pre .n{color:#e0af68} pre .f{color:#7dcfff} pre .hl{color:#ffd479}
+
+  .evo{display:flex; flex-direction:column; gap:10px}
+  .evo .row{display:grid; grid-template-columns:1fr 26px 1fr; align-items:stretch}
+  .evo .from,.evo .to{padding:12px 14px; border-radius:var(--radius); font-size:12.5px}
+  .evo .from{background:color-mix(in srgb,var(--danger) 7%,var(--panel)); border:1px solid color-mix(in srgb,var(--danger) 28%,transparent)}
+  .evo .to{background:color-mix(in srgb,var(--ok) 7%,var(--panel)); border:1px solid color-mix(in srgb,var(--ok) 28%,transparent)}
+  .evo .mid{display:flex; align-items:center; justify-content:center; color:var(--faint)}
+  .evo .lab{font-family:var(--mono); font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--faint); margin-bottom:4px}
+  .evo .tagv{font-family:var(--mono); font-size:9px; color:var(--faint)}
+  @media(max-width:820px){.evo .row{grid-template-columns:1fr; gap:6px} .evo .mid{transform:rotate(90deg); height:18px}}
+
+  .toc{display:flex; flex-wrap:wrap; gap:8px 16px; margin:18px 0 0; padding:14px 16px; border:1px solid var(--line-soft); border-radius:var(--radius); background:var(--panel-2)}
+  .toc a{font-size:12.5px; color:var(--muted); font-family:var(--mono)} .toc a:hover{color:var(--accent-hover)}
+  .footnote{font-size:12px; color:var(--faint); margin-top:8px}
+  .risk{display:flex; gap:12px; padding:12px 0; border-top:1px solid var(--line-soft)} .risk:first-child{border-top:0}
+  .risk .sev{flex:0 0 86px} .risk .body{flex:1}
+  .risk .body .t{color:var(--text); font-weight:600; font-size:13.5px} .risk .body .x{font-size:12.5px; color:var(--muted); margin-top:3px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- HERO -->
+  <div class="hero">
+    <div class="eyebrow">Conductor design · v4 · cold-score → cold-epoch → thermocline</div>
+    <h1>Thermocline</h1>
+    <div class="tag">Attention-gated, <b style="color:#d3dae6">LLM-quality</b> compression that moves in <b style="color:#ffd9b0">deliberate epochs</b>, not a constant trickle.
+      It starts preparing the next state early, decides the whole thing slowly and off to the side, then swaps it in <i>all at once</i> —
+      while a hard budget floor guarantees the agent never overflows.</div>
+    <div class="chips">
+      <span class="chip"><b>updates</b> discrete atomic epochs</span>
+      <span class="chip"><b>invariant</b> live ≤ budget, always</span>
+      <span class="chip"><b>digests</b> LLM (host.complete), recoverable</span>
+      <span class="chip"><b>signal</b> Qwen-0.5B attention</span>
+      <span class="chip"><b>deep history</b> bounded · re-compressible</span>
+      <span class="chip"><b>type</b> external · WebSocket</span>
+      <span class="chip"><b>parents</b> attention-folder × compaction-naive</span>
+    </div>
+  </div>
+
+  <div class="callout red" style="margin-top:18px">
+    <div class="lab">what changed since v2 — two flaws you caught</div>
+    <p style="margin:6px 0 0; color:#e7d2cf"><b>① The fold digest was mechanical and lossy</b> (the engine's per-kind stub, zero LLM) — and it lived in the
+      <i>most-populated</i> layer. <b>② Immutable strata break the budget</b>: they only accumulate, so over a long session their sum alone
+      eventually exceeds the ceiling with no way to reclaim it. The design is rebuilt around fixing both — and they turn out to share one keystone.</p>
+  </div>
+
+  <div class="callout green">
+    <div class="lab">the keystone — prepare ahead, commit all at once</div>
+    <p style="margin:6px 0 0; color:#bfe6d2">Thermocline runs like <b>double-buffered graphics</b>: it computes the <i>entire</i> next state off to the side —
+      every fold decision and every LLM summary — while the agent keeps seeing the current, byte-stable state. When the whole next state is ready, it
+      <b>swaps in atomically, in one update</b>, and drops back under budget. Between swaps, nothing changes — no continuous compaction, no per-turn fiddling.
+      The budget guarantee survives because each epoch is started <i>early</i>, with one instant deterministic fallback for a sudden burst.</p>
+  </div>
+
+  <div class="toc">
+    <a href="#budget">01 · the budget invariant</a>
+    <a href="#parents">02 · the two parents</a>
+    <a href="#ladder">03 · LLM fidelity ladder</a>
+    <a href="#deep">04 · bounded deep history</a>
+    <a href="#gate">05 · attention &amp; the gate</a>
+    <a href="#arch">06 · architecture</a>
+    <a href="#gov">07 · governance</a>
+    <a href="#beats">08 · beats both</a>
+    <a href="#evo">09 · evolution</a>
+    <a href="#risks">10 · honest risks</a>
+    <a href="#spec">11 · spec</a>
+  </div>
+
+  <!-- 01 BUDGET -->
+  <h2 id="budget"><span class="sec-num">01</span>The budget invariant — the spine of the whole design</h2>
+  <p class="lede">A conductor that can drift over budget is broken, full stop. Thermocline's first commitment, above relevance,
+    above cache, above everything: <b>the agent is never over budget.</b> It keeps that promise with deliberately-timed epochs — each one
+    started early and prepared off to the side — backed by a move that <i>always</i> frees space, terminating in a hard delete.</p>
+
+  <div class="fig">
+    <div class="stair">
+      <div class="budgetline"><span>budget ceiling — never crossed</span></div>
+      <p style="font-size:12.5px; color:var(--faint); margin:0 0 12px; font-family:var(--mono)">to plan an epoch's target: walk down until
+        the projected state fits, composing the cheapest moves first ↓</p>
+
+      <div class="rung"><div class="n" style="background:var(--k-text)">1</div>
+        <div class="b"><div class="t">Deepen the coldest active unit &nbsp;<span style="color:var(--cool); font-weight:400">Full → Trim → Digest</span></div>
+          <div class="d">Reversible. Deterministic Trim/stub applies <b>now</b> (frees tokens immediately); the LLM digest upgrades the same slot later.</div></div>
+        <div class="cost">cheap · reversible</div></div>
+
+      <div class="rung"><div class="n" style="background:var(--group-accent)">2</div>
+        <div class="b"><div class="t">Graduate a double-gated cold run &nbsp;<span style="color:var(--group-accent); font-weight:400">→ new Stratum</span></div>
+          <div class="d">Deep compression of a contiguous cold run into one holistic LLM summary, committed with its epoch (deterministic recap only as the emergency stand-in).</div></div>
+        <div class="cost">rare · gated</div></div>
+
+      <div class="rung"><div class="n" style="background:#9c6b43">3</div>
+        <div class="b"><div class="t">Deep zone over ceiling? &nbsp;<span style="color:#c89; font-weight:400">merge oldest strata → coarser</span></div>
+          <div class="d">Graded forgetting: the oldest summaries fuse into one coarser super-stratum. Keeps the deep zone bounded.</div></div>
+        <div class="cost">rarer · graded</div></div>
+
+      <div class="rung floor"><div class="n">4</div>
+        <div class="b"><div class="t">Floor — drop the oldest stratum &nbsp;<span style="font-weight:400">group(digest: null)</span></div>
+          <div class="d"><b>Always available, always frees tokens.</b> A hard delete of the most ancient, coldest summary. This rung is what makes the
+            invariant a guarantee rather than a hope.</div></div>
+        <div class="cost">last resort</div></div>
+    </div>
+    <div class="cap"><b>Why it provably terminates</b> — rung 4 strictly reduces tokens and is available whenever any stratum exists, so the loop
+      cannot get stuck above budget. It bottoms out at "protected tail + one minimal stratum." Below <i>that</i> is the human's budget/tail dials,
+      not the conductor's to override.</div>
+  </div>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3 style="margin-top:0">Attention decides <i>order</i>; budget decides <i>depth</i></h3>
+      <p>The same split the garbage-collector conductor uses (signal picks priority, budget picks how far to go). Attention spares
+        the still-used content <i>longest</i>; the budget invariant decides how deep the next epoch must reach.
+        Relevance never overrides the ceiling — it only orders who gets compressed first.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Anticipatory epochs, one instant safety epoch</h3>
+      <p>A planned epoch starts <b>early</b> (around eighty percent full), so its slow LLM work finishes before the ceiling. If a sudden
+        burst would breach budget before the planned epoch is ready, a <b>deterministic emergency epoch</b> applies instantly — one atomic,
+        mechanical compression, no LLM, no waiting — and the high-quality epoch still swaps in afterward. That instant fallback is the
+        <i>only</i> reactive move, and it is what keeps "never over budget" a guarantee rather than a hope.</p>
+    </div>
+  </div>
+
+  <div class="fig">
+    <div class="pipe">
+      <div class="stage"><div class="s-h"><span class="pill-kind" style="background:var(--cool)"></span>HOLD</div>
+        <div class="s-d">Steady, byte-stable applied state, re-sent unchanged each turn. Cache warm. No actions.</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="s-h"><span class="pill-kind" style="background:var(--warn)"></span>PREPARE · early</div>
+        <div class="s-d">Cross ~80%: compute the <b>whole</b> next target off to the side and fire <b>every</b> LLM summary in parallel. Visible state unchanged.</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="s-h"><span class="pill-kind" style="background:var(--ok)"></span>READY</div>
+        <div class="s-d">All summaries returned. The complete next state sits assembled in the back buffer.</div></div>
+      <div class="arrow">→</div>
+      <div class="stage" style="border-color:var(--accent-dim)"><div class="s-h"><span class="pill-kind" style="background:var(--accent)"></span>COMMIT · atomic</div>
+        <div class="s-d">Swap in all at once — one update, drop to low-water, one deliberate cache miss. → back to HOLD.</div></div>
+    </div>
+    <div class="cap"><b>Double-buffered.</b> The agent only ever sees a finished, stable state; the slow LLM work happens during PREPARE while the old state
+      holds — so an epoch is felt as a single clean transition, never a trickle. <b>EMERGENCY</b> (rare): if a burst outruns PREPARE, a deterministic
+      epoch commits instantly to hold the line, and the planned epoch still lands after.</div>
+  </div>
+
+  <!-- 02 PARENTS -->
+  <h2 id="parents"><span class="sec-num">02</span>The two parents</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h3 style="color:var(--k-tool_result); margin-top:0">attention-folder</h3>
+      <p style="margin-top:4px">A 0.5B probe scores <b>structural gravity</b> — how much the working tail attends back to each block — and folds the least-attended.</p>
+      <p><span class="badge good">▲</span> a learned signal of what the model actually needs; cache-warm epochs; reversible folds.</p>
+      <p><span class="badge bad">▼</span> only ever folds to a <b>shallow per-block digest</b>, only ever <i>grows</i> the fold set, never re-surfaces a block, and eventually runs out of reversible room.</p>
+    </div>
+    <div class="card">
+      <h3 style="color:var(--group-accent); margin-top:0">compaction-naive</h3>
+      <p style="margin-top:4px">At ~90% it summarizes the aged region into one LLM prose summary and collapses it into a <code>group</code>. User messages verbatim.</p>
+      <p><span class="badge good">▲</span> <b>real</b> token reduction; human intent preserved verbatim.</p>
+      <p><span class="badge bad">▼</span> <b>blind</b> (compacts by age), <b>irreversible</b> (no unfold), and <b>recursively amnesiac</b> (summarizes its own summary, compounding loss).</p>
+    </div>
+  </div>
+  <div class="callout amber">
+    <div class="lab">the synthesis, in one line</div>
+    <p style="margin:6px 0 0; color:#d8cbb6">Give the deep-compression engine an <b>attention admission test</b> and LLM-quality intermediate digests; stage every
+      irreversible step behind a reversible, recoverable probation; and bound the result so it can never outgrow the budget.</p>
+  </div>
+
+  <!-- 03 LADDER -->
+  <h2 id="ladder"><span class="sec-num">03</span>The fidelity ladder — LLM-quality, and recoverable</h2>
+  <p class="lede">Fix #1. Every unit sits at the highest fidelity its attention earns under the current budget pressure. The reversible
+    rungs now carry <b>LLM summaries</b>, not the mechanical stub — and they stay <b>unfold/recall-able</b>, which I verified needs
+    <i>no platform change</i>.</p>
+
+  <div class="ladder">
+    <div class="step">
+      <div class="lvl" style="color:var(--accent)">Full<small>L0 · live</small></div>
+      <div class="desc">Original text. The protected tail and any unit the probe still attends to.</div>
+      <div class="meta"><div class="row"><span class="dot" style="background:var(--accent)"></span> no command · full tokens</div></div>
+    </div>
+    <div class="step">
+      <div class="lvl" style="color:var(--cool)">Trim<small>L1 · reversible</small></div>
+      <div class="desc">Query-aware extractive excerpt — the salient <i>original</i> sentences (paths, decisions, errors, exact values kept unconditionally).
+        Deterministic, no LLM. Doubles as the instant placeholder and the no-model fallback.</div>
+      <div class="meta">
+        <div class="row"><span class="dot" style="background:var(--ok)"></span> agent unfold + recall</div>
+        <div class="row"><span class="dot" style="background:var(--faint)"></span> deterministic · ~25–40%</div></div>
+    </div>
+    <div class="step">
+      <div class="lvl" style="color:var(--k-text)">Digest<small>L2 · reversible</small></div>
+      <div class="desc"><b>A faithful 1–3 line LLM summary of the unit</b> via <code>host.complete</code> — content-hash cached. Written during an epoch's
+        PREPARE phase and committed with it; Trim stands in only for an emergency epoch. The fix: the most-populated layer is now LLM-quality, not a stub.</div>
+      <div class="meta">
+        <div class="row"><span class="dot" style="background:var(--ok)"></span> agent unfold + recall</div>
+        <div class="row"><span class="dot" style="background:var(--group-accent)"></span> LLM · cached forever</div></div>
+    </div>
+    <div class="step">
+      <div class="lvl" style="color:var(--group-accent)">Stratum<small>L3 · deep</small></div>
+      <div class="desc">A contiguous cold run summarized <b>holistically</b> into one group (shorter than the sum of its L2 digests — cross-unit dedup).
+        User messages verbatim. Double-gated before entry.</div>
+      <div class="meta">
+        <div class="row"><span class="dot" style="background:var(--warn)"></span> recall ✓ · no standing unfold</div>
+        <div class="row"><span class="dot" style="background:var(--group-accent)"></span> LLM · re-compressible</div></div>
+    </div>
+    <div class="step">
+      <div class="lvl" style="color:#c89">Merged<small>L4+ · ancient</small></div>
+      <div class="desc">When the deep zone hits its ceiling, the oldest strata fuse into a coarser super-stratum — graded forgetting — with drop-oldest as the floor.</div>
+      <div class="meta">
+        <div class="row"><span class="dot" style="background:var(--warn)"></span> recall ✓ (while it exists)</div>
+        <div class="row"><span class="dot" style="background:var(--danger)"></span> lossy · bounded</div></div>
+    </div>
+  </div>
+
+  <div class="callout">
+    <div class="lab">verified — recoverable LLM digests need no platform change</div>
+    <p style="margin:6px 0 0; color:#cdd5e3">The host passes a conductor's custom fold digest <b>verbatim</b>, and <code>resolveUnfold</code>/<code>resolveRecall</code>
+      match the agent's code against <code>foldCode(id)</code> — independent of the body text. So Thermocline prefixes each LLM digest with
+      <code>{#${'{'}foldCode(id){'}'} FOLDED}</code> (obtained from <code>host.digestOf(id)</code>) and the agent can unfold/recall it exactly as a normal fold.
+      And <code>recall</code> on a group returns members' <b>original</b> <code>.text</code> regardless of the group's summary — so strata are recall-able by construction.</p>
+  </div>
+
+  <!-- 04 DEEP -->
+  <h2 id="deep"><span class="sec-num">04</span>Bounded deep history — why nothing is immutable</h2>
+  <p class="lede">Fix #2. The deep-history zone (strata) lives under a <b>fixed token ceiling</b>. New strata push in at the warm end; when the
+    zone would overflow, the oldest, coldest strata <b>merge into coarser ones</b>, and <b>drop</b> off the cold end as the floor. The zone's
+    size is therefore <i>constant</i> no matter how long the session runs.</p>
+
+  <div class="fig">
+    <div class="deep">
+      <div class="io"><div class="a">new run<br>graduates →</div><div style="font-size:18px;color:var(--group-accent)">⇢</div></div>
+      <div class="ceil">
+        <div class="hd"><span>← warm / recent (sharp)</span><span>deep-history ceiling D ≈ 20% of budget</span><span>ancient (blurred) →</span></div>
+        <div class="strow">
+          <div class="st" style="height:70px; width:13%"><small>s9</small></div>
+          <div class="st" style="height:62px; width:12%"><small>s8</small></div>
+          <div class="st" style="height:54px; width:11%"><small>s7</small></div>
+          <div class="st" style="height:46px; width:10%"><small>s6</small></div>
+          <div class="st merged" style="height:40px; width:14%"><small>s4–5</small></div>
+          <div class="st merged" style="height:32px; width:16%"><small>s1–3</small></div>
+          <div class="st merged" style="height:24px; width:14%"><small>older</small></div>
+        </div>
+      </div>
+      <div class="io"><div style="font-size:18px;color:var(--danger)">⇢</div><div class="a">oldest<br>drops (floor)</div></div>
+    </div>
+    <div class="cap"><b>A multi-resolution memory.</b> Recent strata are fine-grained; ancient ones are merged coarse. Total tokens are capped at D; the
+      number of resolution levels grows only ~<b>log</b>(session length). Attention spares the still-used; the rest blurs with age.</div>
+  </div>
+
+  <div class="grid g2">
+    <div class="card">
+      <h3 style="margin-top:0">Forgetting is necessary — the design is its <i>shape</i></h3>
+      <p>Under a fixed budget and unbounded history, some information <b>must</b> be shed — that's information theory, not a flaw to engineer away.
+        Naive compaction sheds it as <i>uniform recursive blur over everything aged</i>. Thermocline sheds it as <b>recent-sharp, ancient-blurred,
+        attention-spared</b> — and bounded-log recursion confined to the coldest content, not linear recursion over all of it.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">vs v2's immutable strata</h3>
+      <p>v2 froze each stratum forever. Lovely for cache and amnesia — <b>fatal for budget</b>: N strata over a long session sum past the ceiling with
+        no reclaim. v3 trades a little cache stability (rare deep-merge flushes) and a little ancient fidelity (graded blur) for the thing that actually
+        matters: <b>the agent is never over budget.</b></p>
+    </div>
+  </div>
+
+  <!-- 05 GATE -->
+  <h2 id="gate"><span class="sec-num">05</span>Attention &amp; the double gate</h2>
+  <p class="lede">Attention sets the <i>order</i> at every rung — coldest compressed first, warmest spared longest. And it guards the one
+    irreversible-to-the-standing-view step (L2 → L3) with two independent cold votes, one of them behavioral.</p>
+  <div class="fig">
+    <div class="pipe">
+      <div class="stage"><div class="s-h"><span class="pill-kind" style="background:var(--accent)"></span>Full</div>
+        <div class="s-d">Attended-to, or in the protected tail.</div></div>
+      <div class="arrow">→</div>
+      <div class="stage"><div class="s-h"><span class="pill-kind" style="background:var(--k-text)"></span>Trim → Digest</div>
+        <div class="s-d">Attention dropped. Reversible, recoverable, LLM-quality. Dwell clock starts.</div></div>
+      <div class="arrow">→</div>
+      <div class="stage" style="border-color:var(--group-edge)"><div class="s-h"><span class="pill-kind" style="background:var(--group-accent)"></span>Stratum</div>
+        <div class="s-d">Deep, recall-able, re-compressible.</div>
+        <div class="gate"><div class="gh">BOTH, sustained ≥ K epochs:</div>
+          <ul><li>① probe temperature cold <i>(re-scored fresh this epoch)</i></li>
+            <li>② agent did <b>not</b> recall/unfold it while it sat folded</li></ul></div></div>
+    </div>
+    <div class="reset"><span style="font-size:15px">↩︎</span>
+      <span><b style="color:var(--text)">Any re-warm resets to Full:</b> the probe re-attends · the agent unfolds/recalls · ever-warm units need <b>2K</b>, not K.
+        Float-up is <b>epoch-granular</b>: each epoch re-plans folds from current temperatures, so a unit whose attention recovered is simply not re-folded — it returns to full at the next commit. No continuous re-surfacing (that would violate the epoch model).</span></div>
+    <div class="cap"><b>Why a behavioral second gate</b> — gate ① is a 0.5B proxy with known recency bias; betting an irreversible step on it alone is unsafe.
+      Gate ② is the agent's own conduct: it had the digest and the recovery tag in front of it and chose not to pull the content back.</div>
+  </div>
+  <p>Per-run sedimentation (tool-pairs atomic, whole-message snap, hot/pinned units as buoyant run boundaries) is unchanged from v2 — it keeps every
+    <code>group</code> command wire-valid and dissolves the "one hot block traps a cold region" failure by compacting each cold pocket independently.</p>
+
+  <!-- 06 ARCH -->
+  <h2 id="arch"><span class="sec-num">06</span>Architecture</h2>
+  <p class="lede">External WebSocket conductor (the attention probe needs a GPU process). The summaries run on the agent's <b>own</b> model — verified:
+    <code>cap/request{complete}</code> proxies to the same <code>host.complete</code> in-process conductors use (protocol v3).</p>
+  <div class="fig">
+    <div class="node"><div class="nh"><span class="pill-kind" style="background:var(--accent)"></span>Accordion app · RemoteRunner</div>
+      <div class="nd">Owns the engine, tokenizer, fold-tags, model link. Sends the <code>ConductorView</code>; applies <code>fold</code>/<code>group</code> commands; relays <code>complete</code>.</div></div>
+    <div class="conn">↕ <span class="wirelbl" style="display:inline">ws:// loopback · advertised in ~/.accordion/conductors/</span></div>
+    <div class="node" style="border-color:var(--group-edge)"><div class="nh"><span class="pill-kind" style="background:var(--group-accent)"></span>thermocline.mjs — the conductor (Node)</div>
+      <div class="nd">The budget-invariant loop, the fidelity ladder, dwell clocks + double gate, the bounded deep zone, the content-hash digest cache.
+        <b>Persists the (small, bounded) deep zone</b> to a session file so reconnect restores it with no new LLM call.</div>
+      <div class="tagrow"><span class="ntag">deterministic now</span><span class="ntag">LLM upgrade later</span><span class="ntag">drop-floor guarantee</span></div></div>
+    <div class="grid g2" style="margin-top:14px">
+      <div class="node"><div class="nh">⇢ probe.py (GPU)</div>
+        <div class="nd">Qwen2.5-0.5B last-token attention. Warm-water pre-warm; 180 s watchdog; OOM ladder. Reused from attention-folder.</div></div>
+      <div class="node"><div class="nh">⇢ host.complete (agent's model)</div>
+        <div class="nd">Per-unit L2 digests (cached) + per-run L3 summaries + rare L4 merges. All async, off the model-call path, fidelity-only.</div></div>
+    </div>
+    <div class="cap"><b>Bandwidth</b> — L2 digest calls are one-per-unit, content-hash-cached forever. An epoch commits only once <i>all</i> its summaries are back,
+      so the queue depth sets how long PREPARE takes — not whether the budget holds. A burst that outruns PREPARE is caught by the instant emergency epoch.</div>
+  </div>
+
+  <!-- 07 GOV -->
+  <h2 id="gov"><span class="sec-num">07</span>Governance</h2>
+  <table>
+    <thead><tr><th>control</th><th>state</th><th>why</th></tr></thead>
+    <tbody>
+      <tr><td><code>human-steering</code></td><td><span class="no">LOCKED</span></td>
+        <td>Strata + dwell bookkeeping need a single owner to stay wire-valid (same reason compaction-naive locks it). Consent gate on attach.</td></tr>
+      <tr><td><code>agent-unfold</code></td><td><span class="yes">OPEN — on purpose</span></td>
+        <td>The agent's <code>unfold</code> is gate ②, a real compaction veto. compaction-naive locks the agent out; Thermocline keeps it in the loop.</td></tr>
+      <tr><td><code>recall</code> · budget · observation · detach</td><td><span class="yes">NEVER LOCKABLE</span></td>
+        <td>ADR 0011 floor. <code>recall</code> exhumes a block's <i>original</i> text — even from a stratum. Detach freezes the current view, folds human-reversible.</td></tr>
+    </tbody>
+  </table>
+
+  <!-- 08 BEATS -->
+  <h2 id="beats"><span class="sec-num">08</span>How it stands against each parent</h2>
+  <table>
+    <thead><tr><th>property</th><th>attention-folder</th><th>compaction-naive</th><th>Thermocline v4</th></tr></thead>
+    <tbody>
+      <tr><td>stays under budget always</td><td class="mid">until folds exhaust</td><td class="yes">yes</td><td class="yes">yes — drop-floor guarantee</td></tr>
+      <tr><td>intermediate digest quality</td><td class="no">mechanical stub</td><td>—</td><td class="yes">LLM, cached, recoverable</td></tr>
+      <tr><td>deep token recovery</td><td class="no">shallow only</td><td class="yes">yes</td><td class="yes">yes (strata)</td></tr>
+      <tr><td>relevance signal</td><td class="yes">attention</td><td class="no">age only</td><td class="yes">attention + agent behavior</td></tr>
+      <tr><td>recursive amnesia</td><td class="yes">n/a</td><td class="no">linear, over everything</td><td class="mid">bounded-log, coldest only</td></tr>
+      <tr><td>agent can recover content</td><td class="yes">unfold</td><td class="no">no</td><td class="yes">unfold (L1/L2) · recall (any)</td></tr>
+      <tr><td>can re-surface a block</td><td class="no">no</td><td class="no">no</td><td class="yes">yes · epoch re-plan</td></tr>
+      <tr><td>survives reconnect</td><td class="no">raw</td><td class="no">raw</td><td class="yes">deep zone persisted</td></tr>
+      <tr><td>posture</td><td class="yes">collaborative</td><td class="no">locks agent out</td><td class="mid">exclusive, agent keeps veto</td></tr>
+    </tbody>
+  </table>
+
+  <!-- 09 EVO -->
+  <h2 id="evo"><span class="sec-num">09</span>Design evolution</h2>
+  <div class="evo">
+    <div class="row"><div class="from"><div class="lab">v3 · churn</div>Budget was enforced every pass, but LLM summaries landed one at a time — each a separate visible change. That's continuous action: a trickle of little cache misses, exactly the texture to avoid.</div>
+      <div class="mid">→</div><div class="to"><div class="lab">v4 · epochs</div><b>Double-buffered.</b> Prepare the entire next state (every summary) off to the side while holding steady, then commit atomically in one update. Anticipatory timing + one instant deterministic emergency epoch keep the budget guarantee hard.</div></div>
+    <div class="row"><div class="from"><div class="lab">v2 · broke</div>Probation layer folded to the engine's mechanical per-kind stub. Highly lossy, zero LLM, in the most-populated layer.</div>
+      <div class="mid">→</div><div class="to"><div class="lab">v3 · fixed</div><b>LLM digests at L2</b> (content-hash cached, async upgrade-in-place), Trim as the deterministic placeholder/fallback. Verified recoverable with the existing tag mechanic.</div></div>
+    <div class="row"><div class="from"><div class="lab">v2 · broke</div>Immutable append-only strata. Accumulate without bound → eventually exceed budget with no reclaim. A category error.</div>
+      <div class="mid">→</div><div class="to"><div class="lab">v3 · fixed</div><b>Bounded, re-compressible deep zone</b> (merge oldest → drop-oldest floor) + the synchronous-deterministic / async-LLM split. <b>Hard budget invariant.</b></div></div>
+    <div class="row"><div class="from"><div class="lab">v1 · broke</div>Single running front-summary rewritten each pass (full cache flush); blind, irreversible compaction; collaborative posture corrupted bookkeeping; one stale score gated deletion.</div>
+      <div class="mid">→</div><div class="to"><div class="lab">v1→v2</div>Per-run sedimentation, double-gate graduation, lock human-steering / keep agent-unfold, no-probe ⇒ no compaction, persisted state. <span class="tagv">(carried into v3)</span></div></div>
+  </div>
+
+  <!-- 10 RISKS -->
+  <h2 id="risks"><span class="sec-num">10</span>Honest residual risks</h2>
+  <div class="card">
+    <div class="risk"><div class="sev"><span class="badge bad">inherent</span></div><div class="body"><div class="t">Ancient detail is genuinely lost</div>
+      <div class="x">Bounded memory means graded forgetting is real, not reversible. <code>recall</code> only works while a stratum exists; once merged/dropped, that detail is gone.
+      This is the information-theoretic price of a hard budget — the design chooses the <i>shape</i> of the loss, it cannot abolish it.</div></div></div>
+    <div class="risk"><div class="sev"><span class="badge bad">serious</span></div><div class="body"><div class="t">Attention-biased forgetting</div>
+      <div class="x">The probe's recency/cross-window bias skews <i>which</i> cold content blurs first toward old, far-from-tail blocks. The double gate, ever-warm 2K, and recall reduce — not eliminate — this.</div></div></div>
+    <div class="risk"><div class="sev"><span class="badge warn">moderate</span></div><div class="body"><div class="t">LLM digest spend &amp; latency</div>
+      <div class="x">One cached call per folded unit plus per-stratum summaries. Off-path and budget-independent, but real cost and a quality lag (the deterministic form shows until the LLM lands).</div></div></div>
+    <div class="risk"><div class="sev"><span class="badge warn">moderate</span></div><div class="body"><div class="t">Each epoch commit is a cache miss</div>
+      <div class="x">A commit changes the context, so the prompt cache rebuilds from that point. Epochs are deliberately infrequent (one clean miss each) — far better than a per-turn trickle — but a burst that triggers the emergency epoch spends an extra one.</div></div></div>
+    <div class="risk"><div class="sev"><span class="badge good">minor</span></div><div class="body"><div class="t">Guarantee bottoms at the tail floor</div>
+      <div class="x">If the human sets budget below "protected tail + one minimal stratum," no conductor can comply — that's the budget/tail dials (human-owned, never lockable), not Thermocline.</div></div></div>
+  </div>
+
+  <!-- 11 SPEC -->
+  <h2 id="spec"><span class="sec-num">11</span>Spec appendix</h2>
+  <h3>conduct() — epoch-based, double-buffered</h3>
+  <pre><span class="c">// double buffer: what the agent sees now, and the next state being prepared off to the side</span>
+state = { applied, prepared: <span class="k">null</span>, preparing: <span class="k">false</span> }
+
+<span class="k">fun</span> <span class="f">onUpdate</span>(view):                       <span class="c">// called each turn — usually just re-sends</span>
+  cap  = min(view.budget, view.contextWindow)
+  fill = project(view, state.applied)        <span class="c">// tokens under the CURRENT applied state</span>
+
+  <span class="c">// 1 · ANTICIPATE — begin preparing the next epoch EARLY, off to the side</span>
+  <span class="k">if</span> fill &gt;= warmWater·cap &amp;&amp; !state.preparing &amp;&amp; needNewEpoch():
+     state.preparing = <span class="k">true</span>
+     target = planEpoch(view)                <span class="c">// run the §01 ladder to a target set (down to low-water)</span>
+     fireEverySummary(target)                <span class="c">// all LLM digests + stratum summaries, in parallel</span>
+        .allSettled().then(() =&gt; { state.prepared = assemble(target); requestRerun() })
+
+  <span class="c">// 2 · COMMIT — swap the WHOLE next state in atomically, once it is fully ready</span>
+  <span class="k">if</span> state.prepared:
+     state.applied = state.prepared; state.prepared = <span class="k">null</span>; state.preparing = <span class="k">false</span>
+     <span class="k">return</span> emit(state.applied)            <span class="hl">// ONE atomic swap → under budget, one cache miss</span>
+
+  <span class="c">// 3 · SAFETY — instant deterministic epoch if a burst would breach before prepared is ready</span>
+  <span class="k">if</span> fill &gt; cap:
+     state.applied = planEpoch(view).deterministic()   <span class="c">// mechanical, no LLM, atomic; LLM epoch still lands later</span>
+     <span class="k">return</span> emit(state.applied)
+
+  <span class="c">// 4 · HOLD — re-send the identical applied state (byte-stable, cache warm)</span>
+  <span class="k">return</span> emit(state.applied)</pre>
+  <p class="footnote"><code>project()</code> = <code>liveTokens − Σ folded(tokens−foldedTokens) − Σ strata(tokens−summaryShare)</code>, from explicit
+    <code>foldedIds</code>/<code>strata</code> sets (no view-flag inference). <code>tag(id)</code> = <code>{#${'{'}foldCode(id){'}'} FOLDED}</code>, so every
+    LLM digest stays unfold/recall-able. <code>assemble()</code> reconciles against reality at commit time — any unit the agent recalled, unfolded, or re-warmed during PREPARE is dropped from the epoch before it is swapped in.</p>
+
+  <div class="grid g2">
+    <div class="card"><h3 style="margin-top:0">Key state</h3>
+      <ul class="kv">
+        <li><code>foldedIds</code> / <code>strata[]</code> — explicit, separate</li>
+        <li><code>digestCache: hash → tagged LLM digest</code> — content-keyed, persisted</li>
+        <li><code>dwell</code> / <code>everWarm</code> — graduation clocks</li>
+        <li><code>deepZoneTokens</code> vs <code>ceilingD</code> — the merge/drop trigger</li>
+        <li><code>scores</code>, confirmed/pending/rev — from attention-folder</li>
+      </ul></div>
+    <div class="card"><h3 style="margin-top:0">Config</h3>
+      <ul class="kv">
+        <li><code>highWater .90 · lowWater .70 · warmWater .80</code></li>
+        <li><code>ceilingD ≈ .20·cap</code> — deep-zone token budget</li>
+        <li><code>K 3</code> dwell epochs (<code>2K</code> if ever-warm)</li>
+        <li><code>minRunUnits 3</code> · <code>digestConcurrency 2</code></li>
+        <li><code>trimRatio .30</code> · <code>maxSummaryTokens 8000</code></li>
+      </ul></div>
+  </div>
+
+  <div class="rule" style="margin-top:40px"></div>
+  <p class="footnote" style="margin-top:18px">Thermocline v4 · attention-gated LLM compression in deliberate epochs under a hard budget invariant · design proposal for the Accordion conductor
+    framework. Parents: <code>conductors/attention-folder</code> (ADR 0010) × <code>conductors/compaction-naive</code> (ADR 0014). Contract:
+    <code>conductors/contract</code> · ADR 0007/0011/0013. Recoverable-LLM-digest + recall-from-originals verified against the live engine; no platform change required. Not yet implemented.</p>
+</div>
+</body>
+</html>
