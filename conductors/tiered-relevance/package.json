@@ -1,0 +1,18 @@
+{
+  "name": "accordion-conductor-tiered-relevance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Relevance-driven level-of-detail conductor for Accordion — every block sits at the fidelity tier (Full/Trim/Digest/Group) its unified relevance earns; a 60–90% hysteresis band makes fold/unfold one stable re-tiering. Embeddings default to Ollama embeddinggemma; LLM digests use Ollama/Gemini/Anthropic with deterministic fallback.",
+  "main": "tiered-relevance.mjs",
+  "scripts": {
+    "start": "node tiered-relevance.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.8.1"
+  }
+}
