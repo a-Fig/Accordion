@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { faceFor, computeGeometry, tileRectCss, hitTest, buildSprites, resetSprites, type TileSpec } from "./tileDraw";
+import { faceFor, computeGeometry, tileRectCss, hitTest, desaturate, resetSprites, getSprites, type TileSpec } from "./tileDraw";
 
 // ---------------------------------------------------------------------------
 // faceFor
@@ -246,19 +246,50 @@ describe("TileSpec colorKind", () => {
 });
 
 // ---------------------------------------------------------------------------
-// resetSprites — cache invalidation
+// resetSprites / _spritesDpr — cache invalidation (Fix 3)
 // ---------------------------------------------------------------------------
 
 describe("resetSprites — clears sprite cache so DPR change forces rebuild", () => {
-  it("resetSprites() does not throw and allows buildSprites to rebuild", () => {
-    // We can't call buildSprites() in node (no HTMLCanvasElement), but we can
-    // verify resetSprites() runs without error — it signals to the next
-    // buildSprites() call that a rebuild at the new DPR is required.
-    expect(() => resetSprites()).not.toThrow();
+  it("getSprites() returns null after resetSprites()", () => {
+    // Start from a clean slate regardless of previous test order.
+    resetSprites();
+    expect(getSprites()).toBeNull();
   });
 
-  it("repeated resetSprites() calls are safe", () => {
+  it("getSprites() remains null after a second resetSprites()", () => {
     resetSprites();
-    expect(() => resetSprites()).not.toThrow();
+    resetSprites();
+    expect(getSprites()).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// desaturate — color utility
+// ---------------------------------------------------------------------------
+
+describe("desaturate", () => {
+  it("returns a valid rgb() string", () => {
+    const result = desaturate("#b483e0");
+    expect(result).toMatch(/^rgb\(/);
+  });
+
+  it("does not crash on dark colors", () => {
+    expect(() => desaturate("#6f4a32")).not.toThrow();
+  });
+
+  it("returns grey for fully saturated colors at factor=0", () => {
+    // factor=0 → fully desaturated; the r/g/b channels should equalize (grey)
+    const result = desaturate("#ff0000", 0);
+    // luminance of pure red = 0.299; grey value ~76
+    const match = result.match(/rgb\((\d+),(\d+),(\d+)\)/);
+    expect(match).not.toBeNull();
+    if (match) {
+      const r = Number(match[1]);
+      const g = Number(match[2]);
+      const b = Number(match[3]);
+      // all channels should be equal (grey)
+      expect(Math.abs(r - g)).toBeLessThan(2);
+      expect(Math.abs(g - b)).toBeLessThan(2);
+    }
   });
 });

@@ -156,7 +156,7 @@ function hslToRgb(h: number, s: number, l: number): [number, number, number] {
  * Approximate CSS `saturate(0.5)` by halving the HSL saturation.
  * Does NOT use ctx.filter (too slow in a per-tile loop).
  */
-function desaturate(hex: string, factor = 0.5): string {
+export function desaturate(hex: string, factor = 0.5): string {
   const [r, g, b] = parseHex(hex);
   const [h, s, l] = rgbToHsl(r, g, b);
   const [nr, ng, nb] = hslToRgb(h, s * factor, l);
@@ -257,7 +257,7 @@ export function resetSprites(): void {
   _spritesDpr = 0;
 }
 
-function getSprites(): Map<number, HTMLCanvasElement> | null {
+export function getSprites(): Map<number, HTMLCanvasElement> | null {
   return _sprites;
 }
 
