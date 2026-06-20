@@ -278,7 +278,7 @@ describe("group fold/unfold/delete lifecycle", () => {
 		// wire state (the override was a lie). It must now be refused outright.
 		s.pin("r:c1");
 		expect(s.get("r:c1")!.override).toBeNull();
-		expect(s.pinnedCount).toBe(0);
+		expect(s.blocks.filter((b) => b.override === "pinned" && !s.isFolded(b)).length).toBe(0);
 		// fold/unfold likewise no-op while the group owns the block.
 		s.fold("a:r1:p1");
 		s.unfold("a:r1:p0");
@@ -299,13 +299,15 @@ describe("group fold/unfold/delete lifecycle", () => {
 		expect(s.get("a:r1:p1")!.override).toBe("pinned");
 	});
 
-	it("pinnedCount does not count a member pinned before grouping (it reads collapsed)", () => {
+	it("a member pinned before grouping is not counted as pinned when collapsed (it reads folded)", () => {
 		const s = makeStore();
 		s.pin("a:r1:p1");
-		expect(s.pinnedCount).toBe(1);
+		// Before grouping: the pinned block is visible as pinned.
+		expect(s.blocks.filter((b) => b.override === "pinned" && !s.isFolded(b)).length).toBe(1);
 		s.createGroup("a:r1:p0", "r:c1"); // the pinned block is now collapsed inside the folder
 		expect(s.isFolded(s.get("a:r1:p1")!)).toBe(true);
-		expect(s.pinnedCount).toBe(0); // header must not contradict what the user sees
+		// After grouping: the block reads folded (collapsed in group), so it should not be counted as pinned.
+		expect(s.blocks.filter((b) => b.override === "pinned" && !s.isFolded(b)).length).toBe(0); // header must not contradict what the user sees
 	});
 
 	it("dissolves a group if the protected tail later grows over it (ADR 0006 watch item)", () => {

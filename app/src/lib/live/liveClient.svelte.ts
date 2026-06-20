@@ -440,5 +440,3 @@ export function disconnectLive(): void {
 	if (live.status !== "error") live.status = "idle";
 }
 
-/** The protocol version this client speaks; surfaced for the mismatch guard above. */
-export const CLIENT_PROTOCOL_VERSION = PROTOCOL_VERSION;

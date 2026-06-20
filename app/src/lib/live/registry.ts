@@ -79,11 +79,6 @@ export interface FocusRequest {
 	ts: number;
 }
 
-/** Relative path (under the home dir) of a session descriptor. */
-export function sessionEntryRelPath(sessionId: string): string {
-	return `${REGISTRY_DIR}/${SESSIONS_SUBDIR}/${sessionId}.json`;
-}
-
 /** True when an entry parses as a current-protocol, non-stale, dialable session. */
 export function isLiveEntry(e: unknown, now: number): e is SessionEntry {
 	if (!e || typeof e !== "object") return false;
@@ -128,6 +123,3 @@ export function isLiveConductor(e: unknown, now: number): e is ConductorEntry {
 	);
 }
 
-export function conductorEntryRelPath(id: string): string {
-	return `${REGISTRY_DIR}/${CONDUCTORS_SUBDIR}/${id}.json`;
-}

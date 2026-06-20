@@ -2,8 +2,8 @@
 	import { onMount } from "svelte";
 	import { session, isTauriEnv, loadSample, openFile, loadFilePath } from "$lib/session.svelte.ts";
 	import { connectLive, disconnectLive, live } from "$lib/live/liveClient.svelte";
-	import { discovery, startDiscovery, stopDiscovery, selectSession, DEMO_ID } from "$lib/live/discovery.svelte";
-	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery, selectClaude } from "$lib/live/claudeDiscovery.svelte";
+	import { discovery, startDiscovery, stopDiscovery, DEMO_ID } from "$lib/live/discovery.svelte";
+	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery } from "$lib/live/claudeDiscovery.svelte";
 	import { conductorState } from "$lib/live/conductor.svelte";
 	import { startConductorDiscovery, stopConductorDiscovery, allConductors, isLaunching } from "$lib/live/conductorDiscovery.svelte";
 	import { attachConductor, conductorRetry } from "$lib/live/conductorClient.svelte";
@@ -89,8 +89,8 @@
 	function selectAndConnect(s: SessionEntry): void {
 		if (discovery.selected === s.sessionId && live.status === "connected") return;
 		session.readOnly = false; // a live pi session is steerable, not read-only
-		selectClaude(null);
-		selectSession(s.sessionId);
+		claudeDiscovery.selected = null;
+		discovery.selected = s.sessionId;
 		connectLive(s.port);
 	}
 
@@ -98,8 +98,8 @@
 	// sample transcript instead of dialing a live pi over the socket.
 	function selectDemo(): void {
 		disconnectLive();
-		selectClaude(null);
-		selectSession(DEMO_ID);
+		claudeDiscovery.selected = null;
+		discovery.selected = DEMO_ID;
 		loadSample();
 	}
 
@@ -107,8 +107,8 @@
 	// no live socket to steer — folds here are a personal lens (see MapHeader badge).
 	function selectClaudeSession(s: ClaudeCodeSession): void {
 		disconnectLive();
-		selectSession(null);
-		selectClaude(s.sessionId);
+		discovery.selected = null;
+		claudeDiscovery.selected = s.sessionId;
 		loadFilePath(s.filePath);
 	}
 

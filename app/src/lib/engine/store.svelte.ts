@@ -14,7 +14,6 @@
 import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
 import { digest, digestTokens, groupDigest, groupDigestTokens, substTokens, wireFoldable } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
-import { messageKey } from "./ids";
 import type { Conductor, ConductorView, Command, ClampReport, ClampReason, LockName, ConductorHost, CompletionRequest, CompletionResult } from "$conductors/contract";
 import { hasLock } from "$conductors/contract";
 import { BuiltinConductor } from "$conductors";
@@ -38,7 +37,26 @@ interface GroupShape {
 /** Whole-block slack allowed above `protectTokens` before the next older block is left foldable. */
 const PROTECT_OVERFLOW_CAP = 1.25;
 
-export interface LogEntry {
+/**
+ * The "message key" of a block id — the id with its assistant-part suffix removed,
+ * so every part of one assistant message shares a key while scalar user/result/summary
+ * blocks remain their own key.
+ *
+ * Two id regimes share the app:
+ *  • LIVE wire (`live/mapping.ts`): assistant part = `a:<anchor>:p<j>` / `m<i>:p<j>`.
+ *  • LOADED transcripts (`engine/parse.ts`): assistant part = `<eid>:<j>` (bare numeric).
+ *
+ * Scalar durable ids like `u:<ts>` / `s:<ts>` / `r:<callId>` must NOT be stripped.
+ */
+function messageKey(id: string): string {
+	const live = id.match(/^(.*):p(?:\d+|\?)$/);
+	if (live) return live[1];
+	const parsed = id.match(/^(.+):\d+$/);
+	if (parsed && !/^[a-z]:\d+$/.test(id)) return parsed[1];
+	return id;
+}
+
+interface LogEntry {
 	by: Actor;
 	action: string;
 	detail: string;
@@ -372,7 +390,7 @@ export class AccordionStore {
 	 * (`user`, `tool_call`) whose individual `override:"folded"` would be an illegal wire state.
 	 *
 	 * The conductor's `subst` is PRESERVED, not cleared, so the kill switch freezes the EXACT
-	 * on-screen view. For a digest-folding conductor (built-in / autopilot) `subst` is already
+	 * on-screen view. For a digest-folding conductor (built-in) `subst` is already
 	 * `undefined`, so the block freezes to the engine digest exactly as before. For a
 	 * `replace`-based conductor (naive compaction) `subst` carries the generated summary —
 	 * preserving it means detach keeps the summary visible rather than reverting to a generic
@@ -562,15 +580,6 @@ export class AccordionStore {
 	foldedCount = $derived.by(() => {
 		let n = 0;
 		for (const b of this.blocks) if (this.isFolded(b)) n++;
-		return n;
-	});
-	pinnedCount = $derived.by(() => {
-		let n = 0;
-		// A block pinned BEFORE it was grouped keeps its "pinned" override (members keep their
-		// override, ADR §2), but a folded group collapses it on the wire — so it reads folded.
-		// Don't count it as pinned, or the header contradicts what the user sees (a collapsed
-		// tile reported as pinned).
-		for (const b of this.blocks) if (b.override === "pinned" && !this.groupWire.get(b.id)?.collapsed) n++;
 		return n;
 	});
 	overBudget = $derived.by(() => this.liveTokens > this.budget);

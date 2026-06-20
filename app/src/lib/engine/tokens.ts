@@ -6,7 +6,7 @@
  * everything downstream reads from estTokens so swapping it is a one-line change.
  */
 
-export const CHARS_PER_TOKEN = 4;
+const CHARS_PER_TOKEN = 4;
 /** Per-block structural overhead (role tags, delimiters). */
 export const BLOCK_OVERHEAD = 4;
 

@@ -89,10 +89,10 @@ export function buildDisplay(
 }
 
 /** A run of plain/collapsed tiles that lays out as ONE uniform CSS grid. */
-export type TilesSegment = { kind: "tiles"; rows: DisplayRow[] };
+type TilesSegment = { kind: "tiles"; rows: DisplayRow[] };
 /** One OPEN group, rendered as a full-width band of natural height between grids. */
-export type BandSegment = { kind: "band"; row: Extract<DisplayRow, { type: "groupOpen" }> };
-export type DisplaySegment = TilesSegment | BandSegment;
+type BandSegment = { kind: "band"; row: Extract<DisplayRow, { type: "groupOpen" }> };
+type DisplaySegment = TilesSegment | BandSegment;
 
 /**
  * Split a display-row list into stacked segments so an OPEN group (`groupOpen`) never lives
@@ -143,7 +143,7 @@ export function segmentDisplay(rows: DisplayRow[]): DisplaySegment[] {
  * Tiles-segment rows only contain `block` and `group` rows (open groups are `band`
  * segments, handled separately); `groupOpen` never reaches here.
  */
-export type LaneItem =
+type LaneItem =
 	| { kind: "tile"; block: Block }
 	| { kind: "fold"; block: Block }
 	| { kind: "group"; group: Group; members: Block[] };
