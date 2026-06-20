@@ -73,9 +73,8 @@ And folds nest: cold turns fold into **groups**, groups into bigger groups, so a
 
 Honest about what's **not** there yet: there is no autonomous Conductor on a live session,
 no agent-driven pinning, no nested/hierarchical groups, no LLM-generated summaries, no
-replay — that's the build ahead. There's also an
-older terminal-only POC (`src/accordion.ts`, `/expand` · `/collapse` · `/accordion`) that
-predates the app.
+replay — that's the build ahead. (An older terminal-only POC — `src/accordion.ts`,
+`/expand` · `/collapse` · `/accordion` — predated the app and has since been removed.)
 
 ### Try it
 
