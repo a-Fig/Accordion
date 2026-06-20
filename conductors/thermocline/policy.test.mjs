@@ -572,7 +572,8 @@ test("emitCommands: a non-dropped stratum group carries a recoverable tagged sum
 
 	const group = cmds.find((c) => c.kind === "group");
 	assert.ok(group, "a group exists for the graduated run");
-	assert.equal(group.digest, `${foldTag("g0")} holistic run summary`, "tag + holistic summary");
+	// FIX 1: the tag must encode the GROUP id ('g:'+firstMemberId) so foldCode(group.id) resolves.
+	assert.equal(group.digest, `${foldTag("g:g0")} holistic run summary`, "tag + holistic summary (group id)");
 });
 
 // ──────────────────────────────────────────────────────────────────────────────────────────
@@ -956,4 +957,417 @@ test("float-up: a unit cold one epoch and hot the next is folded then NOT re-fol
 	const folded2 = new Set(p2.folds.map((f) => f.unitId));
 	assert.ok(!folded2.has("b"), "epoch 2: re-warmed 'b' is NOT re-folded (float-up — re-derived from current scores)");
 	assert.ok(folded2.has("a"), "epoch 2: the still-cold 'a' is folded instead");
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// FIX 1 — stratum recovery tag must encode the GROUP id, not the bare first-member id.
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+test("FIX 1: stratum digest tag is foldTag('g:'+firstId), NOT foldTag(firstId)", () => {
+	_order = 0;
+	const N = 4;
+	const blocks = Array.from({ length: N }, (_, i) =>
+		blk({ id: `s${i}`, kind: "text", tokens: 9_000, foldedTokens: 50, order: i, folded: true }),
+	);
+	const v = view(blocks, { budget: 100_000, contextWindow: 100_000, protectedFromIndex: N });
+	const scores = new Map(blocks.map((b) => [b.id, 0.02]));
+	const st = state({ dwell: new Map(blocks.map((b) => [b.id, DEFAULT_CFG.K])) });
+	const graduated = updateGraduation(st, v, scores, DEFAULT_CFG).graduated;
+	const plan = planEpoch(v, scores, st, DEFAULT_CFG, { graduated });
+	const cmds = emitCommands(plan, new Map(), v);
+
+	const group = cmds.find((c) => c.kind === "group");
+	assert.ok(group, "a group command exists for the stratum");
+	const firstId = group.ids[0]; // the first member id of the stratum
+
+	// The tag MUST encode 'g:' + firstId (the host's group id format: store.svelte.ts ~1279).
+	const expectedTag = foldTag("g:" + firstId);
+	const wrongTag = foldTag(firstId);
+
+	assert.ok(group.digest.startsWith(expectedTag), `digest starts with foldTag('g:'+firstId) = '${expectedTag}'`);
+	assert.ok(!group.digest.startsWith(wrongTag), `digest does NOT start with the bare foldTag(firstId) = '${wrongTag}'`);
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// FIX 7 — mergeOverCeiling must NOT merge non-adjacent strata (with a buoy between them).
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+test("FIX 7: mergeOverCeiling does NOT merge two strata separated by a hot/held buoy", () => {
+	_order = 0;
+	// Build two cold runs separated by a hot buoy. Each run has exactly cfg.minRunUnits units.
+	// All three runs of 3 blocks each with a buoy block between the first two runs.
+	// Layout (orders): run-A (0,1,2), HOT-buoy (3), run-B (4,5,6), cold-block (7,8,9)
+	// We want: run-A and run-B graduate and sediment; buoy sits between them.
+	// Then raise ceilingFrac very low so the merge would fire — but should NOT merge A+B (non-adjacent).
+	const mkrun = (prefix, startOrder) =>
+		[0, 1, 2].map((i) =>
+			blk({ id: `${prefix}${i}`, kind: "text", tokens: 5_000, foldedTokens: 50, order: startOrder + i, folded: true }),
+		);
+	const buoy = blk({ id: "HOT", kind: "text", tokens: 100, order: 3, held: true, folded: false });
+	const runA = mkrun("A", 0);
+	const runB = mkrun("B", 4);
+	const blocks = [...runA, buoy, ...runB];
+
+	const v = view(blocks, {
+		budget: 100_000,
+		contextWindow: 100_000,
+		protectedFromIndex: blocks.length,
+	});
+	const scores = new Map(blocks.map((b) => [b.id, b.id === "HOT" ? 0.95 : 0.02]));
+	// Graduate run-A and run-B units; buoy (held) is not graduated.
+	const graduatedIds = new Set([...runA.map((b) => b.id), ...runB.map((b) => b.id)]);
+	const st = state({ dwell: new Map([...runA, ...runB].map((b) => [b.id, DEFAULT_CFG.K])) });
+
+	// Use a very low ceilingFrac so the merge would fire if adjacency wasn't checked.
+	const CFG = { ...DEFAULT_CFG, ceilingFrac: 0.001 };
+
+	const graduated = updateGraduation(st, v, scores, CFG).graduated;
+	const plan = planEpoch(v, scores, st, CFG, { graduated });
+
+	// There must be 2 separate strata (one for each run), NOT 1 merged spanning group.
+	const strataCmds = emitCommands(plan, new Map(), v).filter((c) => c.kind === "group");
+	assert.ok(strataCmds.length >= 2, `two strata from non-adjacent runs must remain separate (got ${strataCmds.length})`);
+
+	// Verify neither group command spans the HOT buoy.
+	for (const cmd of strataCmds) {
+		const [first, last] = cmd.ids;
+		const firstOrder = blocks.find((b) => b.id === first)?.order ?? -1;
+		const lastOrder = blocks.find((b) => b.id === last)?.order ?? -1;
+		const buoyOrder = buoy.order;
+		const spansBuiloy = firstOrder < buoyOrder && lastOrder > buoyOrder;
+		assert.ok(!spansBuiloy, `group [${first}..${last}] must NOT span the buoy at order ${buoyOrder}`);
+	}
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// FIX 8 — updateGraduation veto checks ANY member id, not just the unit's first-block id.
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+test("FIX 8: a recall/agentTouched on a non-first member id resets dwell and blocks graduation", () => {
+	_order = 0;
+	// Build a tool_call + tool_result pair unit. The unit's id is the call's id (first block).
+	// The server records the RESULT's id in recalledThisEpoch (the non-first member).
+	// The graduation veto must detect this and reset dwell to 0.
+	const blocks = [
+		blk({ id: "tcall", kind: "tool_call", callId: "cx", tokens: 200, foldedTokens: 30, order: 0, toolName: "grep", folded: true }),
+		blk({ id: "tres", kind: "tool_result", callId: "cx", tokens: 4_000, foldedTokens: 50, order: 1, folded: true }),
+	];
+	const v = view(blocks, { protectedFromIndex: blocks.length });
+	const scores = new Map([["tres", 0.02]]); // cold (pair scores on result id)
+
+	// Dwell already at K-1 for the unit (id = "tcall"). The server recalls the RESULT id ("tres").
+	const st = state({
+		dwell: new Map([["tcall", DEFAULT_CFG.K - 1]]),
+		recalledThisEpoch: new Set(["tres"]), // non-first member id
+	});
+
+	const g = updateGraduation(st, v, scores, DEFAULT_CFG);
+
+	// The unit's dwell must be reset to 0 (veto fired) — NOT graduated at K.
+	assert.equal(g.dwell.get("tcall"), 0, "non-first member recall resets the unit's dwell clock");
+	assert.ok(!g.graduated.has("tcall"), "the unit does NOT graduate when a non-first member was recalled");
+});
+
+test("FIX 8: agentTouched on a non-first member id also resets dwell", () => {
+	_order = 0;
+	const blocks = [
+		blk({ id: "call2", kind: "tool_call", callId: "cy", tokens: 300, foldedTokens: 30, order: 0, toolName: "read_file", folded: true }),
+		blk({ id: "res2", kind: "tool_result", callId: "cy", tokens: 5_000, foldedTokens: 50, order: 1, folded: true }),
+	];
+	const v = view(blocks, { protectedFromIndex: blocks.length });
+	const scores = new Map([["res2", 0.01]]); // cold
+
+	// agentTouched contains the result id (non-first member).
+	const st = state({
+		dwell: new Map([["call2", DEFAULT_CFG.K - 1]]),
+		agentTouched: new Set(["res2"]), // non-first member via agentTouched path
+	});
+
+	const g = updateGraduation(st, v, scores, DEFAULT_CFG);
+	assert.equal(g.dwell.get("call2"), 0, "agentTouched on non-first member resets the unit's dwell");
+	assert.ok(!g.graduated.has("call2"), "unit does not graduate when non-first member was agent-touched");
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// FIX 9 — dropStrataOldestFirst drops in CONVERSATION ORDER, not array-append order.
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+test("FIX 9: dropStrataOldestFirst drops the oldest stratum first even when a newer one is earlier in the array", () => {
+	_order = 0;
+	// Scenario: planEpoch appends strata in array order [runB (newer, graduated), runA (older,
+	// age-based)] because sedimentRuns (graduation) runs before Rung 3.5 (age-based last resort).
+	// Without FIX 9, dropStrataOldestFirst walks array order → drops runB (newer) first.
+	// With FIX 9, it sorts by conversation order → drops runA (older) first.
+	//
+	// We use tool_call+tool_result PAIRS (non-foldable) so per-block folds are not possible —
+	// forcing both runs to appear as strata (group commands). A held buoy between the runs ensures
+	// ageBasedRuns also treats it as a buoy (held breaks both sedimentRuns AND ageBasedRuns).
+	//
+	// Graduate only runB (the NEWER run): sedimentRuns => strata[0] = runB.
+	// runA (older) is not graduated; Rung 3.5 (age-based) => strata[1] = runA.
+	// Array order is thus [runB (newer, orders 7-12), runA (older, orders 0-5)].
+	//
+	// Budget: liveTokens = 3*(100+3000)*2 + 200 = 18_800.
+	// summaryTokens ~12% of 9_300 ~1_116 per run.
+	// With both strata summarized: 18800 - (9300-1116)*2 = 2_432 > target (1_750 = 0.7*2_500).
+	// After dropping runA only: 18800 - 9300 - (9300-1116) = 1_316 <= 1_750 — one drop suffices.
+	const mkPairRun = (prefix, startOrder) => {
+		const blks = [];
+		for (let i = 0; i < 3; i++) {
+			blks.push(blk({ id: `${prefix}call${i}`, kind: "tool_call", callId: `${prefix}c${i}`, tokens: 100, foldedTokens: 10, order: startOrder + i * 2, toolName: "fn", folded: true }));
+			blks.push(blk({ id: `${prefix}res${i}`, kind: "tool_result", callId: `${prefix}c${i}`, tokens: 3_000, foldedTokens: 50, order: startOrder + i * 2 + 1, folded: true }));
+		}
+		return blks;
+	};
+	const runA = mkPairRun("O", 0); // OLDER run (orders 0-5)
+	const heldBuoy = blk({ id: "BUOY", kind: "text", tokens: 200, order: 6, held: true, folded: false });
+	const runB = mkPairRun("N", 7); // NEWER run (orders 7-12)
+	const blocks = [...runA, heldBuoy, ...runB];
+
+	// Graduate ONLY runB units (unit id = first block of pair = the call id).
+	const runBUnitIds = ["Ncall0", "Ncall1", "Ncall2"];
+	const runAUnitIds = ["Ocall0", "Ocall1", "Ocall2"];
+
+	const v = view(blocks, { budget: 2_500, contextWindow: 2_500, protectedFromIndex: blocks.length });
+	// Score on the result ids (temperatureKey for pairs).
+	const scores = new Map([
+		["BUOY", 0.95],
+		...["Ores0", "Ores1", "Ores2", "Nres0", "Nres1", "Nres2"].map((id) => [id, 0.02]),
+	]);
+
+	const st = state({ dwell: new Map(runBUnitIds.map((id) => [id, DEFAULT_CFG.K])) });
+	const graduated = updateGraduation(st, v, scores, DEFAULT_CFG).graduated;
+
+	// Verify graduation: runB graduated, runA did not.
+	assert.ok(runBUnitIds.every((id) => graduated.has(id)), "runB (newer) units graduated");
+	assert.ok(runAUnitIds.every((id) => !graduated.has(id)), "runA (older) units did NOT graduate");
+
+	const plan = planEpoch(v, scores, st, DEFAULT_CFG, { graduated });
+
+	// Both runs must appear as strata (no per-block folds possible for non-foldable pairs).
+	assert.equal(plan.folds.length, 0, "no per-block folds for tool-pair runs");
+	assert.ok(plan.strata.length >= 2, "both runs appear as strata");
+
+	const strataA = plan.strata.find((s) => runAUnitIds.includes(s.unitIds[0]));
+	const strataB = plan.strata.find((s) => runBUnitIds.includes(s.unitIds[0]));
+	assert.ok(strataA, "a stratum exists for the OLDER run (runA, orders 0-5)");
+	assert.ok(strataB, "a stratum exists for the NEWER run (runB, orders 7-12)");
+
+	// With FIX 9: drop sorted by conversation order => runA (older, order 0) dropped first.
+	// Without FIX 9: array order [runB, runA] => runB (newer) would be dropped first — wrong.
+	assert.equal(strataA.digestKind, "drop", "the OLDER stratum (runA) is dropped first (conversation order wins)");
+	assert.notEqual(strataB.digestKind, "drop", "the NEWER stratum (runB) is NOT dropped (older one was sufficient)");
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// FUZZ / PROPERTY TEST — hard budget invariant across 8000 randomized inputs.
+//
+// Backs the PR claim "8000-trial fuzz of the budget invariant". Each trial generates a
+// random view (1–40 blocks, random kinds including tool_call+tool_result pairs, random
+// per-block tokens 10–40000, random budget/contextWindow, random protectedFromIndex, random
+// scores) and asserts that planEpoch's projected tokens ≤ cap, OR that the planner has
+// genuinely bottomed out at the irreducible floor (no eligible foldable/groupable/droppable
+// unit remains older than the protected tail). Both normal and deterministic modes are
+// tested on every trial.
+//
+// The PRNG is mulberry32 seeded from a fixed master seed — deterministic and reproducible.
+// If a trial ever fails without being at the irreducible floor, the test prints the
+// seed+trial index and fails so the case is immediately debuggable.
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+test("fuzz (8000 trials): planEpoch keeps project ≤ cap, or bottoms at the irreducible floor", () => {
+	// ── mulberry32 PRNG — deterministic, reproducible, no deps ───────────────────────────
+	/** mulberry32: seed → () → float in [0,1). */
+	function mulberry32(seed) {
+		return function () {
+			seed |= 0;
+			seed = (seed + 0x6d2b79f5) | 0;
+			let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+			t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+			return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+		};
+	}
+	function randInt(rng, lo, hi) {
+		return lo + Math.floor(rng() * (hi - lo + 1));
+	}
+	function randChoice(rng, arr) {
+		return arr[Math.floor(rng() * arr.length)];
+	}
+
+	// ── random view generator ──────────────────────────────────────────────────────────
+	const PLAIN_KINDS = ["user", "text", "thinking"];
+
+	function genView(rng) {
+		const blockCount = randInt(rng, 1, 40);
+		const blocks = [];
+		let order = 0;
+		let pairIdx = 0;
+
+		while (blocks.length < blockCount) {
+			// ~25% chance to emit a tool_call+tool_result pair (both or just one if near limit)
+			if (blocks.length < blockCount - 1 && rng() < 0.25) {
+				const cid = `fc${pairIdx++}`;
+				const callTok = randInt(rng, 10, 40000);
+				blocks.push({
+					id: `fb${blocks.length}`,
+					kind: "tool_call",
+					turn: 1,
+					order: order++,
+					tokens: callTok,
+					foldedTokens: Math.min(callTok, randInt(rng, 5, 50)),
+					callId: cid,
+					toolName: "fn",
+					held: false,
+					folded: rng() < 0.5,
+					protected: false,
+					grouped: false,
+					text: `tc${blocks.length}`,
+				});
+				if (blocks.length < blockCount) {
+					const resTok = randInt(rng, 10, 40000);
+					blocks.push({
+						id: `fb${blocks.length}`,
+						kind: "tool_result",
+						turn: 1,
+						order: order++,
+						tokens: resTok,
+						foldedTokens: Math.min(resTok, randInt(rng, 5, 50)),
+						callId: cid,
+						held: false,
+						folded: rng() < 0.5,
+						protected: false,
+						grouped: false,
+						text: `tr${blocks.length}`,
+					});
+				}
+			} else {
+				const kind = randChoice(rng, PLAIN_KINDS);
+				const tok = randInt(rng, 10, 40000);
+				blocks.push({
+					id: `fb${blocks.length}`,
+					kind,
+					turn: 1,
+					order: order++,
+					tokens: tok,
+					foldedTokens: Math.min(tok, randInt(rng, 5, 50)),
+					callId: undefined,
+					held: rng() < 0.05,
+					folded: rng() < 0.5,
+					protected: false,
+					grouped: false,
+					text: `t${blocks.length}`,
+				});
+			}
+		}
+
+		const liveTokens = blocks.reduce((s, b) => s + b.tokens, 0);
+		const budget = randInt(rng, 100, 200_000);
+		// ~30% chance of a separate contextWindow (sometimes tighter than budget)
+		const contextWindow = rng() < 0.3 ? randInt(rng, 100, 200_000) : null;
+		const protectedFromIndex = randInt(rng, 0, blocks.length);
+		return {
+			blocks,
+			liveTokens,
+			budget,
+			contextWindow,
+			protectedFromIndex,
+			protectTokens: 0,
+		};
+	}
+
+	function genScores(rng, units) {
+		const scores = new Map();
+		for (const u of units) {
+			if (rng() < 0.3) continue; // ~30% of units unscored
+			scores.set(u.temperatureKey, rng()); // temperature in [0,1)
+		}
+		return scores;
+	}
+
+	// ── irreducible-floor check ───────────────────────────────────────────────────────
+	// Returns true iff the plan is at the true irreducible floor: no eligible unit older
+	// than the protected tail remains uncompressed, and no non-dropped stratum could be
+	// further dropped to free space. The planner is allowed to stop here even over the cap.
+	function atIrreducibleFloor(v, plan, units) {
+		const pfi = Math.min(v.protectedFromIndex, v.blocks.length);
+		const protectedFrom = v.blocks[pfi]?.order ?? Infinity;
+
+		// Build set of unit ids already absorbed by a fold or stratum.
+		const foldedUnitIds = new Set(plan.folds.map((f) => f.unitId));
+		const strataUnitIds = new Set(plan.strata.flatMap((s) => s.unitIds));
+
+		// If any unit older than the tail is not yet absorbed and has remaining savings, not at floor.
+		for (const u of units) {
+			if (u.order >= protectedFrom) continue; // in protected tail — untouchable
+			if (u.held || u.protected || u.grouped) continue; // buoy — untouchable
+			if (foldedUnitIds.has(u.id) || strataUnitIds.has(u.id)) continue; // already absorbed
+			// This unit is older than the tail and not absorbed — any savings remaining?
+			const saving = u.tokens - u.foldedTokens;
+			if (saving > 0) return false; // still compressible → NOT at the floor
+		}
+
+		// If any stratum with summaryTokens > 0 exists and we are over the hard cap, the
+		// drop floor could still fire to free those summary tokens. Not at floor yet.
+		const overCap = project(v, {
+			foldedIds: new Set(plan.folds.flatMap((f) => f.ids)),
+			strata: plan.strata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens })),
+		}) > cap(v);
+		if (overCap) {
+			for (const s of plan.strata) {
+				if (s.digestKind !== "drop" && s.summaryTokens > 0) return false;
+			}
+		}
+
+		return true;
+	}
+
+	// ── run 8000 trials ──────────────────────────────────────────────────────────────
+	// Seeded so the run is reproducible across CI and local runs.
+	const MASTER_SEED = 0xdeadbeef;
+	const N_TRIALS = 8000; // ~1 s total; well under the 5 s cap
+	const masterRng = mulberry32(MASTER_SEED);
+
+	const emptyState = {
+		dwell: new Map(),
+		graduated: new Set(),
+		everWarm: new Set(),
+		agentTouched: new Set(),
+		recalledThisEpoch: new Set(),
+	};
+
+	const violations = [];
+
+	for (let trial = 0; trial < N_TRIALS; trial++) {
+		const trialSeed = (masterRng() * 0xffffffff) >>> 0;
+		const rng = mulberry32(trialSeed);
+
+		const v = genView(rng);
+		const units = buildUnits(v.blocks);
+		const scores = genScores(rng, units);
+		const hardCap = cap(v);
+
+		for (const deterministic of [false, true]) {
+			let plan;
+			// The plan must always terminate (no infinite loop). assert.doesNotThrow is too
+			// verbose inside a loop — just call it and let any throw propagate as a test failure.
+			plan = planEpoch(v, scores, emptyState, DEFAULT_CFG, { deterministic });
+
+			const applied = appliedOf(plan);
+			const proj = project(v, applied);
+
+			if (proj > hardCap && !atIrreducibleFloor(v, plan, units)) {
+				violations.push(
+					`trial ${trial} seed 0x${trialSeed.toString(16)} deterministic=${deterministic}: ` +
+						`projected=${proj} hardCap=${hardCap} blocks=${v.blocks.length} ` +
+						`pfi=${v.protectedFromIndex} budget=${v.budget} cw=${v.contextWindow}`,
+				);
+			}
+		}
+	}
+
+	assert.equal(
+		violations.length,
+		0,
+		`Hard budget invariant violated in ${violations.length} trial(s):\n${violations.slice(0, 5).join("\n")}`,
+	);
 });

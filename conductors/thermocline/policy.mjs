@@ -268,7 +268,10 @@ export function updateGraduation(state, view, scores, cfg = DEFAULT_CFG) {
 		const temp = scores.get(u.temperatureKey);
 		const cold = temp !== undefined && temp < cfg.coldThreshold;
 		const folded = isUnitFolded(u); // graduation only progresses while the unit is folded
-		const reWarm = !cold || touched.has(u.id) || u.held;
+		// FIX 8: check ANY member id, not just u.id (the first-block id). The server records raw
+		// block ids from msg.ids; a recall of a non-first member (e.g. the tool_result of a pair)
+		// would miss the veto if we only checked u.id.
+		const reWarm = !cold || u.ids.some((id) => touched.has(id)) || u.held;
 
 		if (reWarm || !folded || u.protected) {
 			// Any re-warm (or not-yet-folded / protected) resets the clock and clears graduation.
@@ -310,10 +313,11 @@ function isUnitFolded(u) {
  * @param {Map<string,number>} scores - temperatureKey → temperature.
  * @param {Set<string>} graduated - unit ids that cleared the double gate (from updateGraduation).
  * @param {object} cfg
+ * @param {Unit[]} [units] - pre-built units array (from buildUnits); if omitted, built internally.
  * @returns {{unitIds: string[], memberIds: string[], firstId: string, lastId: string}[]}
  */
-export function sedimentRuns(view, scores, graduated, cfg = DEFAULT_CFG) {
-	const units = buildUnits(view.blocks);
+export function sedimentRuns(view, scores, graduated, cfg = DEFAULT_CFG, units = null) {
+	if (!units) units = buildUnits(view.blocks);
 	const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
 	// COUPLING: `order` must track the block-array index — this tail boundary reads the .order of the
 	// block AT index pfi to split runs, so a unit's order field has to be monotone with its position
@@ -455,7 +459,7 @@ export function planEpoch(view, scores, state, cfg = DEFAULT_CFG, opts = {}) {
 	//    handed in via opts.graduated — planEpoch never advances dwell itself) into strata runs.
 	//    These claim their member tokens FIRST so the deepen loop never double-folds them.
 	const graduated = opts.graduated ?? new Set();
-	const runs = sedimentRuns(view, scores, graduated, cfg);
+	const runs = sedimentRuns(view, scores, graduated, cfg, units); // pass pre-built units (no second O(n) scan)
 
 	const strata = runs.map((r) => ({
 		ids: [r.firstId, r.lastId],
@@ -651,10 +655,22 @@ export function planEpoch(view, scores, state, cfg = DEFAULT_CFG, opts = {}) {
  * by Rung 4 (bound = soft target) and the hard-cap floor's branch (c) (bound = hard cap). Iterating
  * (not `break`-ing after the first) is the fix for the multi-stratum drop bug: every stratum that is
  * still needed to get under the bound is converted, not just the oldest one.
+ *
+ * FIX 9: iterate in CONVERSATION ORDER (oldest first) — sort by the first member's `order` in the
+ * view before dropping. Rungs 3.5 and 5 append age-based strata to the array in processing order,
+ * which may not match conversation order, so a naive array walk could drop a newer graduated stratum
+ * before an older age-stratum. Sorting by `firstId`'s block order guarantees correct drop order.
  */
 function dropStrataOldestFirst(strata, view, applied, bound) {
+	// Build a lookup for each stratum's first member's position in conversation order.
+	const orderOf = new Map(view.blocks.map((b) => [b.id, b.order]));
+	// Sort a COPY by conversation order (ascending) — we mutate the original strata array elements
+	// in place, so we only need a sorted reference list, not a sorted copy of the array.
+	const sorted = strata
+		.map((s, i) => ({ s, i, ord: orderOf.get(s.ids[0]) ?? Infinity }))
+		.sort((a, b) => a.ord - b.ord);
 	let droppedAny = false;
-	for (const s of strata) {
+	for (const { s } of sorted) {
 		if (project(view, applied()) <= bound) break;
 		if (s.digestKind !== "drop") {
 			s.digestKind = "drop";
@@ -741,12 +757,36 @@ function estimateStratumTokens(run, byUnit) {
  * Rung 3 — keep the deep zone bounded. If Σ stratum tokens exceeds ceilingFrac·cap, fuse the two
  * OLDEST strata (indices 0,1) into one coarser super-stratum and repeat until under the ceiling
  * (or only one stratum remains). Mutates `strata` in place (it is plan-local, freshly built).
+ *
+ * ADJACENCY GUARD: only fuse strata whose member ranges are CONTIGUOUS — i.e. stratum a's last
+ * member id is immediately followed by stratum b's first member id in conversation order. If a
+ * buoy (hot/held/protected/non-grouped block) sits between them, fusing would create a group
+ * spanning a gap: the host snaps the range outward and could swallow the buoy (grouping a
+ * hot/held block or getting the whole group refused → lost savings → budget invariant breaks).
+ * Non-adjacent strata are left as separate group commands; the drop-floor handles ceiling
+ * enforcement in that case.
  */
 function mergeOverCeiling(strata, cap, cfg, byUnit) {
 	const ceiling = cfg.ceilingFrac * cap;
 	const sumStrata = () => strata.reduce((s, x) => s + x.summaryTokens, 0);
 	while (sumStrata() > ceiling && strata.length > 1) {
 		const [a, b] = [strata[0], strata[1]];
+		// Check adjacency: a's last memberIds entry must immediately precede b's first memberIds entry
+		// in the byUnit map. Both must be units (present in byUnit); if either is absent, skip merge.
+		const aLastUnit = byUnit.get(a.unitIds[a.unitIds.length - 1]);
+		const bFirstUnit = byUnit.get(b.unitIds[0]);
+		const adjacent =
+			aLastUnit !== undefined &&
+			bFirstUnit !== undefined &&
+			// The two strata are contiguous iff a's last unit and b's first unit have consecutive orders.
+			// Because units are built in conversation order (each unit's .order = its first block's order),
+			// and strata member ranges are whole units, adjacency ⟺ no non-stratum unit sits between them.
+			// We check: the last memberIds of `a` is the block immediately before the first memberIds of `b`
+			// by looking at orders — if b.firstUnit.order === aLastUnit.order + aLastUnit.ids.length, they
+			// are contiguous in block-index space. Use the simpler unit-order check: adjacent if there is no
+			// gap in unit orders, i.e. bFirstUnit.order === aLastUnit.order + aLastUnit.ids.length.
+			bFirstUnit.order === aLastUnit.order + aLastUnit.ids.length;
+		if (!adjacent) break; // non-adjacent pair found — leave remaining strata as-is
 		const merged = {
 			ids: [a.ids[0], b.ids[1]],
 			unitIds: [...a.unitIds, ...b.unitIds],
@@ -775,8 +815,10 @@ function capOf(view) {
  *     the contract allows), its `ids` the unit's foldable member ids, its `digest` =
  *     foldTag(unit.id) + " " + (LLM digest for this unit, or the deterministic tier text).
  *   • Each stratum → a `group` command over [firstId, lastId].
- *       digestKind:"summary" → digest = foldTag(firstId) + " " + (LLM stratum summary OR
- *                              deterministicRecap) — recoverable, recall returns originals.
+ *       digestKind:"summary" → digest = foldTag('g:'+firstId) + " " + (LLM stratum summary OR
+ *                              deterministicRecap) — recoverable, recall returns originals. The
+ *                              'g:' prefix matches the host's group id format (store.svelte.ts
+ *                              ~1279: `id: \`g:\${memberIds[0]}\``), so foldCode(g.id) resolves.
  *       digestKind:"drop"    → digest = null (hard delete; the agent never sees those blocks).
  *
  * @param {Plan} plan - from planEpoch.
@@ -810,7 +852,12 @@ export function emitCommands(plan, digests, view) {
 		}
 		const stratumUnits = s.unitIds.map((id) => byUnit.get(id)).filter(Boolean);
 		const body = d.get(`stratum:${s.ids[0]}`) ?? deterministicRecap(stratumUnits);
-		cmds.push({ kind: "group", ids: [s.ids[0], s.ids[1]], digest: `${foldTag(s.ids[0])} ${body}` });
+		// COUPLING: the host creates the group with id `g:${memberIds[0]}` (store.svelte.ts ~1279).
+		// The agent resolves unfold/recall via foldCode(g.id), so the digest tag MUST encode the GROUP
+		// id (i.e. 'g:' + firstMemberId), not the bare first-member id. This is correct as long as
+		// the conductor's run boundary is already whole-message/tool-pair snapped so the host does not
+		// re-snap memberIds[0] away from s.ids[0].
+		cmds.push({ kind: "group", ids: [s.ids[0], s.ids[1]], digest: `${foldTag("g:" + s.ids[0])} ${body}` });
 	}
 
 	return cmds;
