@@ -177,6 +177,7 @@ test("budget invariant: planEpoch folds rendered down to ≤ lowWater·cap when 
 	const plan = planEpoch(v, scores, state(), DEFAULT_CFG);
 
 	assert.ok(plan.projected <= plan.targetTokens, `projected ${plan.projected} ≤ target ${plan.targetTokens}`);
+	assert.ok(plan.projected <= cap(v), `projected ${plan.projected} ≤ HARD cap ${cap(v)}`);
 	assert.equal(plan.targetTokens, 0.7 * cap(v));
 });
 
@@ -194,10 +195,12 @@ test("budget invariant: a tiny budget with a stratum present uses the drop-floor
 	const st = state({
 		dwell: new Map(blocks.map((b) => [b.id, DEFAULT_CFG.K])),
 	});
+	// The CALLER owns graduation now: advance dwell exactly once and feed the graduated set in.
+	const graduated = updateGraduation(st, v, scores, DEFAULT_CFG).graduated;
 
 	let plan;
 	assert.doesNotThrow(() => {
-		plan = planEpoch(v, scores, st, DEFAULT_CFG); // must not infinite-loop
+		plan = planEpoch(v, scores, st, DEFAULT_CFG, { graduated }); // must not infinite-loop
 	}, "planEpoch must terminate even when target is unreachable");
 
 	// A stratum exists and the floor must have dropped it (digest null on emit).
@@ -206,6 +209,13 @@ test("budget invariant: a tiny budget with a stratum present uses the drop-floor
 		plan.strata.some((s) => s.digestKind === "drop"),
 		"with the target unreachable, the oldest stratum is dropped (the floor that guarantees progress)",
 	);
+	// HARD-CAP INVARIANT: the plan must drive projected ≤ the HARD cap (here there is no protected
+	// tail, so the floor can fully close the gap).
+	const appliedFromPlan = {
+		foldedIds: new Set(plan.folds.flatMap((f) => f.ids)),
+		strata: plan.strata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens })),
+	};
+	assert.ok(project(v, appliedFromPlan) <= cap(v), `projected ${project(v, appliedFromPlan)} ≤ hard cap ${cap(v)}`);
 });
 
 test("budget invariant: drop-floor strictly reduces projected tokens vs keeping the summary", () => {
@@ -217,7 +227,8 @@ test("budget invariant: drop-floor strictly reduces projected tokens vs keeping 
 	const v = view(blocks, { budget: 3_000, contextWindow: 3_000, protectedFromIndex: N });
 	const scores = new Map(blocks.map((b) => [b.id, 0.02]));
 	const st = state({ dwell: new Map(blocks.map((b) => [b.id, DEFAULT_CFG.K])) });
-	const plan = planEpoch(v, scores, st, DEFAULT_CFG);
+	const graduated = updateGraduation(st, v, scores, DEFAULT_CFG).graduated;
+	const plan = planEpoch(v, scores, st, DEFAULT_CFG, { graduated });
 
 	// project with the dropped stratum (summaryTokens 0) must be below project with a summary cost.
 	const droppedProj = project(v, {
@@ -534,7 +545,8 @@ test("emitCommands: a stratum group spans [first,last] and a drop stratum carrie
 	const v = view(blocks, { budget: 2_000, contextWindow: 2_000, protectedFromIndex: N });
 	const scores = new Map(blocks.map((b) => [b.id, 0.02]));
 	const st = state({ dwell: new Map(blocks.map((b) => [b.id, DEFAULT_CFG.K])) });
-	const plan = planEpoch(v, scores, st, DEFAULT_CFG);
+	const graduated = updateGraduation(st, v, scores, DEFAULT_CFG).graduated;
+	const plan = planEpoch(v, scores, st, DEFAULT_CFG, { graduated });
 	const cmds = emitCommands(plan, new Map(), v);
 
 	const group = cmds.find((c) => c.kind === "group");
@@ -554,7 +566,8 @@ test("emitCommands: a non-dropped stratum group carries a recoverable tagged sum
 	const v = view(blocks, { budget: 100_000, contextWindow: 100_000, protectedFromIndex: N });
 	const scores = new Map(blocks.map((b) => [b.id, 0.02]));
 	const st = state({ dwell: new Map(blocks.map((b) => [b.id, DEFAULT_CFG.K])) });
-	const plan = planEpoch(v, scores, st, DEFAULT_CFG);
+	const graduated = updateGraduation(st, v, scores, DEFAULT_CFG).graduated;
+	const plan = planEpoch(v, scores, st, DEFAULT_CFG, { graduated });
 	const cmds = emitCommands(plan, new Map([[`stratum:g0`, "holistic run summary"]]), v);
 
 	const group = cmds.find((c) => c.kind === "group");
@@ -574,8 +587,10 @@ test("a graduated run becomes a stratum, not a set of per-block folds", () => {
 	const v = view(blocks, { budget: 40_000, contextWindow: 40_000, protectedFromIndex: N });
 	const scores = new Map(blocks.map((b) => [b.id, 0.02]));
 	const st = state({ dwell: new Map(blocks.map((b) => [b.id, DEFAULT_CFG.K])) });
-	const plan = planEpoch(v, scores, st, DEFAULT_CFG);
+	const graduated = updateGraduation(st, v, scores, DEFAULT_CFG).graduated;
+	const plan = planEpoch(v, scores, st, DEFAULT_CFG, { graduated });
 
+	assert.ok(plan.strata.length >= 1, "the graduated cold run sediments into at least one stratum");
 	const foldedUnitIds = new Set(plan.folds.map((f) => f.unitId));
 	const stratumUnitIds = new Set(plan.strata.flatMap((s) => s.unitIds));
 	for (const id of stratumUnitIds) {
@@ -626,6 +641,9 @@ test("empty-scores invariant: no probe, non-foldable pairs → age-based last re
 		project(v, applied) <= plan.targetTokens,
 		`projected ${project(v, applied)} must be ≤ targetTokens ${plan.targetTokens}`,
 	);
+	// HARD-CAP INVARIANT (the #1 requirement): never over the hard cap (no protected tail here, so
+	// the planner must fully close the gap).
+	assert.ok(project(v, applied) <= cap(v), `projected ${project(v, applied)} ≤ HARD cap ${cap(v)}`);
 });
 
 test("empty-scores invariant: no probe, already-at-fold-floor blocks → age-based last resort fires", () => {
@@ -660,6 +678,8 @@ test("empty-scores invariant: no probe, already-at-fold-floor blocks → age-bas
 		project(v, applied) <= plan.targetTokens,
 		`projected ${project(v, applied)} must be ≤ targetTokens ${plan.targetTokens}`,
 	);
+	// HARD-CAP INVARIANT: projected ≤ the hard cap (no protected tail ⇒ gap fully closed).
+	assert.ok(project(v, applied) <= cap(v), `projected ${project(v, applied)} ≤ HARD cap ${cap(v)}`);
 });
 
 test("deterministic/emergency invariant: opts.deterministic + non-foldable pairs still reaches budget", () => {
@@ -694,6 +714,8 @@ test("deterministic/emergency invariant: opts.deterministic + non-foldable pairs
 		project(v, applied) <= plan.targetTokens,
 		`emergency epoch projected ${project(v, applied)} must be ≤ targetTokens ${plan.targetTokens}`,
 	);
+	// HARD-CAP INVARIANT in the emergency (deterministic) path too.
+	assert.ok(project(v, applied) <= cap(v), `emergency projected ${project(v, applied)} ≤ HARD cap ${cap(v)}`);
 });
 
 test("deterministic/emergency invariant: deterministic folds use 'trim' tier inside age-based strata", () => {
@@ -737,8 +759,11 @@ test("last-resort dormancy: sufficient graduated strata means age-based path sta
 			...allBlocks.slice(6).map((b) => [b.id, 0]),
 		]),
 	});
+	// Caller-owned graduation: the first 6 (cold, folded, dwell=K) graduate; the last 4 (dwell=0) do not.
+	const graduated = updateGraduation(st, v, scores, DEFAULT_CFG).graduated;
+	assert.equal(graduated.size, 6, "exactly the first 6 graduate this tick");
 
-	const plan = planEpoch(v, scores, st, DEFAULT_CFG);
+	const plan = planEpoch(v, scores, st, DEFAULT_CFG, { graduated });
 
 	// The plan should be under target.
 	const applied = {
@@ -759,4 +784,176 @@ test("last-resort dormancy: sufficient graduated strata means age-based path sta
 			`un-graduated block ${id} must not be swallowed by a stratum (last resort must stay dormant)`,
 		);
 	}
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// HARD-CAP FLOOR — the #1 invariant: live tokens ≤ min(budget, contextWindow) at ALL times.
+// These cases are NOT reachable by the soft-target rungs (hot / sub-minRunUnits / multi-stratum),
+// so they exercise the dedicated hard-cap floor (Rung 5) that ignores the attention/minFold/minRun
+// gates once over the HARD cap.
+// ──────────────────────────────────────────────────────────────────────────────────────────
+
+/** Apply a plan to project() shape (folds → foldedIds, strata → {memberIds, summaryTokens}). */
+function appliedOf(plan) {
+	return {
+		foldedIds: new Set(plan.folds.flatMap((f) => f.ids)),
+		strata: plan.strata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens })),
+	};
+}
+
+test("hard-cap floor: all-HOT foldable blocks over cap with NO protected tail are force-folded (normal mode)", () => {
+	_order = 0;
+	// Two big HOT text blocks (run length 2 < minRunUnits, so neither sedimentRuns nor the age-based
+	// last resort can touch them) and no cold block to graduate. Rung 1 spares them (hot). Budget is
+	// far below their sum. ONLY the hard-cap floor (force-fold ignoring temperature) can save this.
+	const blocks = [
+		blk({ id: "h1", kind: "text", tokens: 50_000, foldedTokens: 40, order: 0 }),
+		blk({ id: "h2", kind: "text", tokens: 50_000, foldedTokens: 40, order: 1 }),
+	];
+	const v = view(blocks, { budget: 60_000, contextWindow: 60_000 }); // protectedFromIndex defaults to len ⇒ no tail
+	const scores = new Map([
+		["h1", 0.95], // hot
+		["h2", 0.95], // hot
+	]);
+	const plan = planEpoch(v, scores, state(), DEFAULT_CFG);
+
+	assert.ok(plan.folds.length >= 1, "the hard-cap floor force-folded at least one HOT block");
+	assert.ok(
+		project(v, appliedOf(plan)) <= cap(v),
+		`projected ${project(v, appliedOf(plan))} ≤ HARD cap ${cap(v)} (hot content force-compressed)`,
+	);
+});
+
+test("hard-cap floor: all-HOT foldable blocks over cap with NO protected tail are force-folded (deterministic mode)", () => {
+	_order = 0;
+	const blocks = [
+		blk({ id: "h1", kind: "text", tokens: 50_000, foldedTokens: 40, order: 0 }),
+		blk({ id: "h2", kind: "text", tokens: 50_000, foldedTokens: 40, order: 1 }),
+	];
+	const v = view(blocks, { budget: 60_000, contextWindow: 60_000 });
+	const scores = new Map([
+		["h1", 0.95],
+		["h2", 0.95],
+	]);
+	const plan = planEpoch(v, scores, state(), DEFAULT_CFG, { deterministic: true });
+
+	assert.ok(plan.folds.length >= 1, "the emergency hard-cap floor force-folded at least one HOT block");
+	for (const f of plan.folds) assert.equal(f.tier, "trim", "deterministic folds use the trim tier");
+	assert.ok(
+		project(v, appliedOf(plan)) <= cap(v),
+		`emergency projected ${project(v, appliedOf(plan))} ≤ HARD cap ${cap(v)}`,
+	);
+});
+
+test("hard-cap floor: 3 surviving strata, budget so small that MORE THAN ONE must drop (bug-b fix)", () => {
+	_order = 0;
+	// Three graduated cold runs separated by tiny PROTECTED hot buoys (uncompressible, but a small
+	// irreducible floor). ceilingFrac is raised so the merge never fuses the three strata. The budget
+	// is far below even three summarized strata, so ALL THREE must be dropped to get under the hard
+	// cap. The OLD Rung 4 dropped only strata[0] then `break`ed — this asserts >1 stratum drops.
+	const CFG = { ...DEFAULT_CFG, ceilingFrac: 100 }; // effectively disable the ceiling merge
+	const mkrun = (p, start) => [0, 1, 2].map((i) => blk({ id: `${p}${i}`, kind: "text", tokens: 2_000, foldedTokens: 50, order: start + i, folded: true }));
+	const blocks = [
+		...mkrun("A", 0),
+		blk({ id: "H1", kind: "text", tokens: 200, order: 3, folded: false, protected: true }),
+		...mkrun("B", 4),
+		blk({ id: "H2", kind: "text", tokens: 200, order: 7, folded: false, protected: true }),
+		...mkrun("C", 8),
+	];
+	const v = view(blocks, { budget: 1_000, contextWindow: 1_000, protectedFromIndex: blocks.length });
+	const scores = new Map(blocks.map((b) => [b.id, b.id.startsWith("H") ? 0.95 : 0.02]));
+	const st = state({ dwell: new Map(blocks.filter((b) => !b.id.startsWith("H")).map((b) => [b.id, CFG.K])) });
+	const graduated = updateGraduation(st, v, scores, CFG).graduated;
+	const plan = planEpoch(v, scores, st, CFG, { graduated });
+
+	assert.equal(plan.strata.length, 3, "the three graduated runs stay separate (ceiling merge disabled)");
+	const drops = plan.strata.filter((s) => s.digestKind === "drop").length;
+	assert.ok(drops > 1, `MORE THAN ONE stratum must drop (got ${drops}) — proves the Rung-4 break bug is fixed`);
+	assert.ok(
+		project(v, appliedOf(plan)) <= cap(v),
+		`projected ${project(v, appliedOf(plan))} ≤ HARD cap ${cap(v)}`,
+	);
+});
+
+test("hard-cap floor: force-GROUPs a sub-minRunUnits run of non-foldable tool pairs over the hard cap", () => {
+	_order = 0;
+	// TWO tool_call+tool_result pairs (each a non-foldable unit) — only 2 units, below minRunUnits (3),
+	// so the age-based last resort (which needs ≥ minRunUnits) cannot form a run. No per-block fold is
+	// possible (pairs aren't foldable). The hard-cap floor's force-group (minUnits=1) is the only path.
+	const blocks = [
+		blk({ id: "call0", kind: "tool_call", callId: "c0", tokens: 500, foldedTokens: 30, order: 0, toolName: "read_file" }),
+		blk({ id: "res0", kind: "tool_result", callId: "c0", tokens: 40_000, foldedTokens: 50, order: 1 }),
+		blk({ id: "call1", kind: "tool_call", callId: "c1", tokens: 500, foldedTokens: 30, order: 2, toolName: "grep" }),
+		blk({ id: "res1", kind: "tool_result", callId: "c1", tokens: 40_000, foldedTokens: 50, order: 3 }),
+	];
+	const v = view(blocks, { budget: 50_000, contextWindow: 50_000, protectedFromIndex: blocks.length });
+	const scores = new Map(); // empty probe
+
+	const plan = planEpoch(v, scores, state(), DEFAULT_CFG);
+	assert.equal(plan.folds.length, 0, "no per-block folds possible for non-foldable tool pairs");
+	assert.ok(plan.strata.length >= 1, "the hard-cap floor force-grouped a sub-minRunUnits run");
+	assert.ok(
+		project(v, appliedOf(plan)) <= cap(v),
+		`projected ${project(v, appliedOf(plan))} ≤ HARD cap ${cap(v)}`,
+	);
+});
+
+test("hard-cap floor: terminates at the protected-tail floor when the cap is unreachable (tail never touched)", () => {
+	_order = 0;
+	// A huge PROTECTED tail whose tokens ALONE exceed the hard cap. The floor can compress everything
+	// OLDER than the tail (here: a user head, which a group command can absorb) but the protected tail
+	// is host-absolute — the floor must terminate at it WITHOUT looping, even though the cap stays
+	// unreachable. This proves the irreducible floor = "only the protected tail remains".
+	const blocks = [
+		blk({ id: "usr", kind: "user", tokens: 6_000, foldedTokens: 40, order: 0 }), // older than the tail
+		blk({ id: "tail0", kind: "text", tokens: 40_000, foldedTokens: 40, order: 1, protected: true }),
+		blk({ id: "tail1", kind: "text", tokens: 40_000, foldedTokens: 40, order: 2, protected: true }),
+	];
+	const v = view(blocks, { budget: 50_000, contextWindow: 50_000, protectedFromIndex: 1 });
+	const scores = new Map([["usr", 0.02], ["tail0", 0.02], ["tail1", 0.02]]);
+
+	let plan;
+	assert.doesNotThrow(() => {
+		plan = planEpoch(v, scores, state(), DEFAULT_CFG); // must terminate (provable progress to fixed point)
+	}, "the hard-cap floor must terminate at the protected-tail floor, not loop");
+
+	// The protected tail blocks are NEVER folded or swept into a stratum (host-absolute floor).
+	const touched = new Set([...plan.folds.flatMap((f) => f.ids), ...plan.strata.flatMap((s) => s.memberIds)]);
+	assert.ok(!touched.has("tail0") && !touched.has("tail1"), "the protected tail is never compressed by the floor");
+	// The cap is genuinely unreachable (tail alone = 80k > 50k cap), so projected stays above cap —
+	// but the planner terminated rather than spinning. That is the irreducible-floor guarantee.
+	assert.ok(project(v, appliedOf(plan)) > cap(v), "cap unreachable: 80k protected tail exceeds the 50k cap");
+});
+
+// ──────────────────────────────────────────────────────────────────────────────────────────
+// FLOAT-UP — planEpoch re-derives reversible folds from the CURRENT scores each call: a unit whose
+// temperature recovered since last epoch is simply NOT re-folded (epoch-granularity float-up).
+// Strata (the deep zone) are monotonic/irreversible and not part of this.
+// ──────────────────────────────────────────────────────────────────────────────────────────
+test("float-up: a unit cold one epoch and hot the next is folded then NOT re-folded (re-derived from current scores)", () => {
+	_order = 0;
+	// Two units; only one needs folding to reach target. Epoch 1: 'b' is cold and gets folded.
+	// Epoch 2: 'b' has re-warmed (hot) — planEpoch re-derives candidates from the CURRENT scores and
+	// must NOT fold it again; it folds the other cold unit instead. No monotonic fold set is carried.
+	const a = blk({ id: "a", kind: "text", tokens: 30_000, foldedTokens: 50, order: 0 });
+	const b = blk({ id: "b", kind: "text", tokens: 30_000, foldedTokens: 50, order: 1 });
+	const v = view([a, b], { budget: 40_000, contextWindow: 40_000 }); // target 28k; folding one ⇒ ~30k? need one fold to pass
+	// live = 60k, target = 28k. Folding ONE unit ⇒ 60k - 29_950 = 30_050 > 28k ⇒ folds BOTH if both cold.
+	// Make it so folding the larger-saving one suffices: equal savings, so it folds in order until ≤ target.
+	// We only assert WHICH unit is folded under each score map, not the count.
+
+	// Epoch 1: both cold ⇒ biggest-cold-first folds 'a' then 'b' (equal saving, older first).
+	const cold = new Map([["a", 0.05], ["b", 0.05]]);
+	const p1 = planEpoch(v, cold, state(), DEFAULT_CFG);
+	const folded1 = new Set(p1.folds.map((f) => f.unitId));
+	assert.ok(folded1.has("b"), "epoch 1: 'b' is cold and folded");
+
+	// Epoch 2: 'b' re-warmed (hot), 'a' still cold. Re-derived from CURRENT scores ⇒ 'b' is spared by
+	// the attention-gated rungs; only 'a' is foldable. (We are NOT over the hard cap here — 'a' folded
+	// alone leaves 30_050, under the 40k cap — so the hard-cap floor stays dormant and 'b' floats up.)
+	const reWarm = new Map([["a", 0.05], ["b", 0.95]]);
+	const p2 = planEpoch(v, reWarm, state(), DEFAULT_CFG);
+	const folded2 = new Set(p2.folds.map((f) => f.unitId));
+	assert.ok(!folded2.has("b"), "epoch 2: re-warmed 'b' is NOT re-folded (float-up — re-derived from current scores)");
+	assert.ok(folded2.has("a"), "epoch 2: the still-cold 'a' is folded instead");
 });

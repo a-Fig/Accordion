@@ -14,7 +14,7 @@
  *     signal     — optional AbortSignal (drops the probe and rejects if aborted)
  *   Returns a Map<blockId, score> where higher score = more relevant = keep live longer.
  *
- * Also re-exports `tailTextFromView`, `resolvePython`, and `capHeadTail` from the same
+ * Also re-exports `tailTextFromView` and `resolvePython` from the same
  * source so thermocline's server code has one consistent import surface.
  */
 import { join, dirname } from "node:path";

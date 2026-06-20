@@ -315,6 +315,9 @@ function isUnitFolded(u) {
 export function sedimentRuns(view, scores, graduated, cfg = DEFAULT_CFG) {
 	const units = buildUnits(view.blocks);
 	const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
+	// COUPLING: `order` must track the block-array index — this tail boundary reads the .order of the
+	// block AT index pfi to split runs, so a unit's order field has to be monotone with its position
+	// in view.blocks (review §1). buildUnits preserves this (a unit's order = its first block's).
 	const protectedFrom = view.blocks[pfi]?.order ?? Infinity;
 
 	const runs = [];
@@ -363,16 +366,22 @@ export function sedimentRuns(view, scores, graduated, cfg = DEFAULT_CFG) {
  * @param {ConductorView} view
  * @param {Set<string>} claimed - unit ids already absorbed by prior strata or folds.
  * @param {object} cfg
+ * @param {number} [minUnits=cfg.minRunUnits] - minimum run length to keep. Rung 3.5 passes the
+ *        default (cfg.minRunUnits); the HARD-CAP FLOOR passes 1 so even a single uncompressed
+ *        tool-pair can be force-grouped once over the hard cap.
  * @returns {{unitIds: string[], memberIds: string[], firstId: string, lastId: string}[]}
  */
-function ageBasedRuns(units, view, claimed, cfg) {
+function ageBasedRuns(units, view, claimed, cfg, minUnits = cfg.minRunUnits) {
 	const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
+	// COUPLING: `order` must track the block-array index — this tail boundary reads the .order of the
+	// block AT index pfi to split runs, so a unit's order field has to be monotone with its position
+	// in view.blocks (review §1). buildUnits preserves this (a unit's order = its first block's).
 	const protectedFrom = view.blocks[pfi]?.order ?? Infinity;
 
 	const runs = [];
 	let cur = [];
 	const flush = () => {
-		if (cur.length >= cfg.minRunUnits) {
+		if (cur.length >= minUnits) {
 			const memberIds = cur.flatMap((u) => u.ids);
 			runs.push({
 				unitIds: cur.map((u) => u.id),
@@ -419,10 +428,18 @@ function ageBasedRuns(units, view, claimed, cfg) {
  *
  * @param {ConductorView} view
  * @param {Map<string,number>} scores - temperatureKey → temperature (0..1, higher = hotter).
- * @param {ThermoState} state - dwell/graduation/everWarm/touched (for sedimentRuns + graduation).
+ * @param {ThermoState} state - dwell/graduation/everWarm/touched (kept for signature stability; the
+ *        graduated SET is now taken from opts.graduated, NOT recomputed here — see below).
  * @param {object} cfg
- * @param {{deterministic?: boolean}} opts - deterministic:true ⇒ never rely on an LLM digest;
- *        every fold/stratum uses its deterministic tier (the emergency epoch).
+ * @param {{deterministic?: boolean, graduated?: Set<string>}} opts -
+ *        deterministic:true ⇒ never rely on an LLM digest; every fold/stratum uses its
+ *        deterministic tier (the emergency epoch).
+ *        graduated ⇒ the set of unit ids that have already graduated this tick. planEpoch does NOT
+ *        advance dwell — the CALLER owns graduation: it calls `updateGraduation` exactly once per
+ *        tick and threads the resulting `graduated` set in here. (Previously planEpoch re-ran
+ *        updateGraduation internally, double-incrementing dwell so a unit graduated in ~⌈K/2⌉ ticks
+ *        instead of K. Defaults to an empty set ⇒ no graduated-run strata, but folds + the
+ *        age-based last resort still work.)
  * @returns {Plan} { folds: [{unitId, ids, tier}], strata: [{ids:[first,last], unitIds, memberIds,
  *                   digestKind, summaryTokens}], targetTokens, cap, projected }.
  */
@@ -434,9 +451,10 @@ export function planEpoch(view, scores, state, cfg = DEFAULT_CFG, opts = {}) {
 	const units = buildUnits(view.blocks);
 	const byUnit = new Map(units.map((u) => [u.id, u]));
 
-	// 1. Recompute graduation freshly (pure) and sediment graduated-cold units into strata runs.
+	// 1. Sediment the already-graduated-cold units (graduation was advanced ONCE by the caller and
+	//    handed in via opts.graduated — planEpoch never advances dwell itself) into strata runs.
 	//    These claim their member tokens FIRST so the deepen loop never double-folds them.
-	const { graduated } = updateGraduation(state, view, scores, cfg);
+	const graduated = opts.graduated ?? new Set();
 	const runs = sedimentRuns(view, scores, graduated, cfg);
 
 	const strata = runs.map((r) => ({
@@ -523,18 +541,99 @@ export function planEpoch(view, scores, state, cfg = DEFAULT_CFG, opts = {}) {
 		mergeOverCeiling(strata, cap, cfg, byUnit);
 	}
 
-	// Rung 4: the DROP floor. While still over target and any stratum exists, drop the oldest
-	//   stratum (hard delete). This strictly reduces tokens every iteration, so the loop
-	//   terminates: it either reaches target or bottoms out at one minimal stratum + the tail.
-	while (project(view, applied()) > targetTokens && strata.length > 0) {
-		const oldest = strata[0];
-		if (oldest.digestKind === "drop") {
-			// Already a drop and still over target — nothing more this stratum can free; stop to
-			// avoid spinning (the remaining overflow is the protected tail / live floor).
-			break;
+	// Rung 4: the DROP floor toward the SOFT target. While still over target and any non-dropped
+	//   stratum exists, drop strata OLDEST-FIRST (hard delete). Each drop strictly reduces tokens,
+	//   so this terminates: it either reaches target or runs out of droppable strata. (Bug fix: this
+	//   must NOT `break` after dropping the oldest — it has to keep converting strata[1..] to drops
+	//   too, or a multi-stratum context stays over budget. See the iterate-oldest-first helper.)
+	dropStrataOldestFirst(strata, view, applied, targetTokens);
+
+	// Rung 5 — the HARD-CAP FLOOR. Everything above seeks the SOFT lowWater target while SPARING
+	// hot / short / un-graduated content (attention-gating). This last rung is the unconditional
+	// guarantee behind the #1 product invariant — live tokens ≤ the HARD cap = min(budget,
+	// contextWindow) — and it is GATED on being over that HARD cap, so it is fully DORMANT whenever
+	// the soft-target rungs already brought us under cap (the common case keeps attention-gating
+	// untouched). Once over the hard cap, budget beats attention-sparing: we reduce the single
+	// biggest reducible thing per step, ignoring the hot / minFoldTokens / minRunUnits gates:
+	//   • prefer force-FOLDING the biggest eligible-by-KIND foldable unit (text/thinking/tool_result)
+	//     not already folded — even if hot, even if its saving < minFoldTokens;
+	//   • else force-GROUP a contiguous foldable run as a stratum even if < minRunUnits (down to a
+	//     single unit) and even if not graduated — this is how non-foldable tool_call+tool_result
+	//     pairs get compressed when no per-block fold is possible;
+	//   • then DROP strata oldest-first.
+	// It runs in BOTH normal and deterministic (emergency) modes. It terminates at the TRUE
+	// irreducible floor — nothing foldable/groupable/droppable remains older than the protected tail
+	// (only the protected tail + the non-foldable head are left). Each branch STRICTLY reduces the
+	// projection (a fresh fold saves ≥1; a fresh group's members exceed its summary; a drop frees a
+	// summary), and every unit it touches is permanently marked folded/claimed, so no move repeats —
+	// the loop provably makes monotone progress to a fixed point.
+	if (project(view, applied()) > cap) {
+		// `claimed` tracks UNIT ids already absorbed by a per-block fold OR a stratum, so the floor
+		// never re-folds or re-groups the same unit — the property that guarantees monotone progress.
+		const claimed = new Set([...claimedByStratum, ...strata.flatMap((s) => s.unitIds)]);
+		for (const f of folds) claimed.add(f.unitId);
+
+		// Monotone-progress guard. Each branch STRICTLY reduces the projection (a fresh fold saves ≥1;
+		// a fresh group reduces by members−summary>0 or is born a DROP freeing members≥1; a drop frees
+		// a positive summary), and every unit it touches is marked claimed so no move repeats — the
+		// projection strictly decreases until a fixed point. This guard is the belt-and-suspenders
+		// stop: if a pass frees nothing, we are at the irreducible floor and must halt. The TRUE floor
+		// is: the protected tail + held/grouped buoys + the per-block-fold residue (Σ foldedTokens of
+		// the foldable units). Folds are PREFERRED (recoverable) over drops, so a context that is fully
+		// foldable bottoms out at that fold residue; the only way below it would be to drop recoverable
+		// content, which the floor declines unless the content is non-foldable (only groupable).
+		let prev = Infinity;
+		while (project(view, applied()) > cap) {
+			const before = project(view, applied());
+			if (before >= prev) break; // no progress last pass → irreducible floor reached
+			prev = before;
+
+			// (a) Force-fold the biggest eligible-by-KIND foldable unit not already folded. (Preferred:
+			//     a per-block fold is recoverable — the agent can unfold/recall it.)
+			const foldU = biggestForceFoldable(units, byUnit, foldedIds, claimed);
+			if (foldU) {
+				const tier = deterministic ? "trim" : "digest";
+				folds.push({
+					unitId: foldU.id,
+					ids: foldU.ids.filter((id) => isMemberFoldable(byUnit.get(foldU.id), id)),
+					tier,
+				});
+				for (const id of foldU.ids) {
+					if (isMemberFoldable(byUnit.get(foldU.id), id)) foldedIds.add(id);
+				}
+				claimed.add(foldU.id);
+				continue;
+			}
+
+			// (b) No per-block fold left — force-GROUP the biggest contiguous run of NOT-yet-claimed
+			//     units (≥1 unit, ungraduated OK). ageBasedRuns(minUnits=1) surfaces the non-foldable
+			//     tool-pairs / lone user|tool_call that only a group command can absorb. Picking by
+			//     position (oldest run first) keeps strata in conversation order and their ranges
+			//     non-overlapping, so the host's group snap stays a no-op.
+			const forceRuns = ageBasedRuns(units, view, claimed, cfg, 1);
+			if (forceRuns.length) {
+				const best = forceRuns[0]; // oldest eligible run → strata stay ordered & disjoint
+				const bestTok = runMemberTokens(best, byUnit);
+				const summaryTokens = estimateStratumTokens(best, byUnit);
+				// Recoverable summary preferred; but if a degenerate run's members are ≤ the summary
+				// floor, a summary would not reduce — born a DROP instead so the step still frees members.
+				const reduces = bestTok > summaryTokens;
+				strata.push({
+					ids: [best.firstId, best.lastId],
+					unitIds: best.unitIds,
+					memberIds: best.memberIds,
+					digestKind: reduces ? "summary" : "drop",
+					summaryTokens: reduces ? summaryTokens : 0,
+				});
+				for (const uid of best.unitIds) claimed.add(uid);
+				continue;
+			}
+
+			// (c) Nothing left to fold or newly group — DROP strata oldest-first down to the cap.
+			//     (If this frees nothing, the next pass's no-progress guard stops the loop.)
+			const droppedAny = dropStrataOldestFirst(strata, view, applied, cap);
+			if (!droppedAny) break; // only the protected tail + held buoys + fold residue remain — floor
 		}
-		oldest.digestKind = "drop";
-		oldest.summaryTokens = 0; // a dropped run contributes nothing to the wire
 	}
 
 	return {
@@ -544,6 +643,61 @@ export function planEpoch(view, scores, state, cfg = DEFAULT_CFG, opts = {}) {
 		cap,
 		projected: project(view, applied()),
 	};
+}
+
+/**
+ * Convert strata to drops OLDEST-FIRST until the projection is ≤ `bound` (or no non-dropped stratum
+ * remains). Mutates `strata` in place. Returns true iff it dropped at least one stratum. Used BOTH
+ * by Rung 4 (bound = soft target) and the hard-cap floor's branch (c) (bound = hard cap). Iterating
+ * (not `break`-ing after the first) is the fix for the multi-stratum drop bug: every stratum that is
+ * still needed to get under the bound is converted, not just the oldest one.
+ */
+function dropStrataOldestFirst(strata, view, applied, bound) {
+	let droppedAny = false;
+	for (const s of strata) {
+		if (project(view, applied()) <= bound) break;
+		if (s.digestKind !== "drop") {
+			s.digestKind = "drop";
+			s.summaryTokens = 0; // a dropped run contributes nothing to the wire
+			droppedAny = true;
+		}
+	}
+	return droppedAny;
+}
+
+/**
+ * The biggest (most member tokens) force-FOLDABLE unit for the hard-cap floor: a unit whose every
+ * member is a foldable kind (`u.foldable`), not held/protected/grouped, that would actually shrink
+ * (foldedTokens < tokens), and that is not already folded or already swept into a stratum. UNLIKE
+ * the attention-gated Rung 1, this IGNORES temperature (folds even hot units) and the minFoldTokens
+ * floor — once over the hard cap, budget wins. Returns null if none remains.
+ */
+function biggestForceFoldable(units, byUnit, foldedIds, inStratum) {
+	let best = null;
+	let bestSave = 0;
+	for (const u of units) {
+		if (!u.foldable) continue;
+		if (u.held || u.protected || u.grouped) continue;
+		if (u.foldedTokens >= u.tokens) continue;
+		if (inStratum.has(u.id)) continue;
+		if (u.ids.some((id) => foldedIds.has(id))) continue; // already folded this epoch
+		const save = savingOf(u);
+		if (save > bestSave) {
+			best = u;
+			bestSave = save;
+		}
+	}
+	return best;
+}
+
+/** Σ member tokens of a run (for picking the biggest force-group candidate). */
+function runMemberTokens(run, byUnit) {
+	let t = 0;
+	for (const uid of run.unitIds) {
+		const u = byUnit.get(uid);
+		if (u) t += u.tokens;
+	}
+	return t;
 }
 
 /** True iff a unit may be DEEPENED to a per-block fold this epoch. */

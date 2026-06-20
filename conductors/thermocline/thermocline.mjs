@@ -30,8 +30,6 @@ import {
 	emitCommands,
 	buildDigestPrompt,
 	buildStratumPrompt,
-	deterministicDigest,
-	deterministicRecap,
 } from "./policy.mjs";
 import { scoreCandidates, tailTextFromView } from "./scorer.mjs";
 
@@ -208,7 +206,7 @@ function freshState() {
 }
 
 // ── Status line ──
-function buildStatus(state, cap) {
+function buildStatus(state) {
 	const rawFill = Number.isFinite(state.lastFill) ? state.lastFill : 0;
 	const pct = Math.round(rawFill * 100);
 	const folded = state.confirmedApplied.size;
@@ -228,9 +226,9 @@ function buildStatus(state, cap) {
 	return { text, metrics };
 }
 
-function sendStatus(ws, state, cap) {
+function sendStatus(ws, state) {
 	if (ws.readyState !== 1 /* WebSocket.OPEN */) return;
-	const { text, metrics } = buildStatus(state, cap);
+	const { text, metrics } = buildStatus(state);
 	if (text === state.lastStatusText) return;
 	state.lastStatusText = text;
 	ws.send(JSON.stringify({ type: "conductor/status", text, metrics }));
@@ -306,7 +304,7 @@ function maybeScore(ws, state, view) {
 	const candidates = cands.map((u) => ({ id: u.temperatureKey, text: u.blocks.map((b) => b.text ?? "").join("\n") }));
 	const ids = candidates.map((c) => c.id);
 	log(`scoring ${candidates.length} units (fill ${(fill * 100).toFixed(0)}%)…`);
-	sendStatus(ws, state, cap);
+	sendStatus(ws, state);
 
 	scoreCandidates({ tailText, candidates, signal: state.abort.signal, log })
 		.then((scores) => {
@@ -315,12 +313,12 @@ function maybeScore(ws, state, view) {
 			state.rescoreNeeded = false;
 			state.scoringInFlight = false;
 			log(`scores ready: ${state.scores.size} cached`);
-			sendStatus(ws, state, cap);
+			sendStatus(ws, state);
 		})
 		.catch((err) => {
 			state.scoringInFlight = false;
 			log(`scoring failed: ${err.message}`);
-			sendStatus(ws, state, cap);
+			sendStatus(ws, state);
 		});
 }
 
@@ -385,29 +383,47 @@ function commit(ws, state, view, plan, digests) {
 		persistState(state.sessionKey, { strata: newStrata }, state.grad);
 	}
 
+	// Clear per-epoch touch sets: the epoch just committed so the "agent touched this epoch"
+	// signal has been consumed. Not clearing here would permanently veto graduation (#4, #5).
+	state.recalledThisEpoch = new Set();
+	state.agentTouched = new Set();
+
 	state.lastAction = "epoch";
 	state.rescoreNeeded = true; // tail moved; rescore before the next epoch
 	log(`COMMIT: ${plan.folds.length} folds · ${plan.strata.length} strata → projected ~${(plan.projected / Math.max(1, plan.cap) * 100).toFixed(0)}% full`);
 }
 
 // ── HOLD: re-derive commands from current applied plan, send only if changed ──
-function holdOrResend(ws, state, view, cap) {
+// Self-heal: if the last batch we sent is still UNCONFIRMED (its rev has not been acked by
+// host/commandResult) re-emit regardless of sig — the host may have dropped it as stale.
+// This mirrors attention-folder: we drive re-emission off confirmation, not off sig alone.
+function holdOrResend(ws, state, view) {
 	if (!state.applied.plan) return; // nothing committed yet — can't re-derive
 	const cmds = emitCommands(state.applied.plan, state.digestCache, view);
 	const sig = commandSig(cmds);
-	// HOLD gate: only send if the command set changed.
-	if (sig === state.applied.sig) return;
+
+	// Determine whether the last emitted batch is still pending (host hasn't acked it).
+	const pendingUnconfirmed =
+		state.pendingRev >= 0 &&
+		[...state.pendingSet].some((id) => !state.confirmedApplied.has(id));
+
+	// HOLD gate: skip only when the command set is unchanged AND the last batch is confirmed.
+	if (sig === state.applied.sig && !pendingUnconfirmed) return;
+
 	state.applied.sig = sig;
+	state.pendingRev = view.rev;
+	state.pendingSet = new Set(state.applied.foldedIds);
 	ws.send(JSON.stringify({ type: "conductor/commands", rev: view.rev, commands: cmds }));
-	log(`re-emit (view changed, same plan)`);
+	log(`re-emit (view changed or pending unconfirmed)`);
 }
 
 // ── PREPARE epoch in background: score + LLM summaries + commit ──
 // Runs entirely asynchronously. A stale token (prepareToken mismatch) causes early exit
 // so a superseded prepare (new human override, emergency, reconnect) is cleanly discarded.
 async function prepareEpoch(ws, state, view, token) {
-	// 1. Compute fresh plan (deterministic paths, no LLM yet).
-	const plan = planEpoch(view, state.scores, gradState(state), CFG);
+	// 1. Compute fresh plan (deterministic paths, no LLM yet). Graduation was advanced ONCE this tick
+	//    by the context/update handler — we thread that graduated set in; planEpoch never re-advances.
+	const plan = planEpoch(view, state.scores, gradState(state), CFG, { graduated: state.grad.graduated });
 
 	// 2. Fire cap/request completions for every digest/stratum that is not cached.
 	const jobs = [];
@@ -461,16 +477,14 @@ async function prepareEpoch(ws, state, view, token) {
 
 	// Re-plan on the LAST view (not the stale one we started with) so the commands are fresh.
 	const lv = state.lastView ?? view;
-	const freshPlan = planEpoch(lv, state.scores, gradState(state), CFG);
+	const freshPlan = planEpoch(lv, state.scores, gradState(state), CFG, { graduated: state.grad.graduated });
 
-	// COMMIT — atomic.
+	// COMMIT — atomic. commit() clears recalledThisEpoch + agentTouched at the single commit point.
 	if (ws.readyState === 1) {
 		commit(ws, state, lv, freshPlan, state.digestCache);
-		// Reset recalledThisEpoch now that the epoch committed.
-		state.recalledThisEpoch = new Set();
 	}
 	state.preparing = false;
-	sendStatus(ws, state, Math.min(lv.budget, lv.contextWindow ?? lv.budget));
+	sendStatus(ws, state);
 }
 
 // ── Main message handler ──
@@ -513,6 +527,27 @@ wss.on("connection", (ws) => {
 							state.digestCache.set(`stratum:${s.firstId}`, s.summary);
 						}
 					}
+					// Reconstruct a synthetic plan from the restored strata so holdOrResend can
+					// emit them on the first context/update (#6). No folds — those re-derive from
+					// scores. The plan shape emitCommands expects: folds[], strata[{ids,unitIds,
+					// memberIds,digestKind,summaryTokens}], projected, cap, targetTokens.
+					// We don't know projected/cap/targetTokens yet — use 0 as safe sentinels;
+					// they're only used for the COMMIT log, not by holdOrResend/emitCommands.
+					state.applied.plan = {
+						folds: [],
+						strata: state.applied.strata.map((s) => ({
+							ids: [s.firstId, s.lastId],
+							unitIds: s.unitIds ?? [],
+							memberIds: s.memberIds ?? [],
+							digestKind: "summary",
+							summaryTokens: s.summaryTokens ?? 0,
+						})),
+						projected: 0,
+						cap: 0,
+						targetTokens: 0,
+					};
+					// Mark that we need to validate strata ids on the first view (#6).
+					state._restoredPendingValidation = true;
 				}
 				if (Array.isArray(saved.dwell)) {
 					state.grad.dwell = new Map(saved.dwell);
@@ -554,11 +589,10 @@ wss.on("connection", (ws) => {
 					}
 				}
 			} else if (msg.event === "humanOverride") {
-				// Mark units touched so they don't graduate. The view's `held` flag already reflects
-				// them on the next tick, so this is belt-and-suspenders for the current epoch.
-				for (const id of ids) {
-					state.agentTouched.add(id);
-				}
+				// Do NOT add humanOverride ids to agentTouched: the view's per-block `held` flag
+				// already reflects them on the next tick and policy's graduation resets on `held`.
+				// Adding them here would permanently poison ids a human merely folded-then-unfolded
+				// (the exact anti-pattern warned about in attention-folder.mjs:214-221) — #5.
 			}
 			return;
 		}
@@ -582,7 +616,7 @@ wss.on("connection", (ws) => {
 			if (msg.rev === state.pendingRev) {
 				// The host confirmed our pending batch — it is now the live confirmed state.
 				state.confirmedApplied = new Set(state.pendingSet);
-				sendStatus(ws, state, 0);
+				sendStatus(ws, state);
 			}
 			// Log any clamps (unexpected — our commands should be provider-valid, but useful for debugging).
 			if (msg.reports?.length) {
@@ -607,6 +641,38 @@ wss.on("connection", (ws) => {
 		};
 		state.lastView = view;
 
+		// ── Validate restored strata on the first real view (#6) ──
+		// Drop any stratum whose firstId/lastId/memberIds no longer exist in the view (stale
+		// session — a group([firstId,lastId]) over vanished ids would be clamped as invalid-group).
+		if (state._restoredPendingValidation) {
+			state._restoredPendingValidation = false;
+			const liveIds = new Set(view.blocks.map((b) => b.id));
+			const validStrata = state.applied.strata.filter(
+				(s) => liveIds.has(s.firstId) && liveIds.has(s.lastId),
+			);
+			if (validStrata.length !== state.applied.strata.length) {
+				const dropped = state.applied.strata.length - validStrata.length;
+				log(`restore validation: dropped ${dropped} stale strata (ids vanished from view)`);
+				state.applied.strata = validStrata;
+				// Rebuild the plan stub from the surviving strata.
+				state.applied.plan = validStrata.length
+					? {
+						folds: [],
+						strata: validStrata.map((s) => ({
+							ids: [s.firstId, s.lastId],
+							unitIds: s.unitIds ?? [],
+							memberIds: s.memberIds ?? [],
+							digestKind: "summary",
+							summaryTokens: s.summaryTokens ?? 0,
+						})),
+						projected: 0,
+						cap: 0,
+						targetTokens: 0,
+					}
+					: null; // nothing left to emit
+			}
+		}
+
 		const cap = Math.min(view.budget, view.contextWindow ?? view.budget);
 		const fill = cap > 0 ? project(view, appliedForProject(state)) / cap : 0;
 		state.lastFill = fill;
@@ -626,14 +692,17 @@ wss.on("connection", (ws) => {
 		state.grad.graduated = gResult.graduated;
 
 		// ── SAFETY / EMERGENCY: if we are ALREADY over budget, act immediately ──
-		// deterministic:true → no LLM, instant. The PREPARE path (if any) may still
-		// commit later and supersede this with a richer plan.
+		// deterministic:true → no LLM, instant. Bump prepareToken FIRST so any in-flight
+		// prepare is discarded when it resolves — the emergency commit is the ground truth
+		// and a stale prepare must not layer on top of it (#3).
 		if (fill > 1.0) {
 			log(`EMERGENCY: fill ${(fill * 100).toFixed(0)}% > 100% — deterministic compaction`);
-			const plan = planEpoch(view, state.scores, gradState(state), CFG, { deterministic: true });
+			++state.prepareToken; // discard any in-flight prepare
+			state.preparing = false;
+			const plan = planEpoch(view, state.scores, gradState(state), CFG, { deterministic: true, graduated: state.grad.graduated });
 			commit(ws, state, view, plan, new Map()); // empty digest map → all deterministic fallbacks
 			state.lastAction = "emergency";
-			// Don't return — still run ANTICIPATE below in case a prepare isn't in flight.
+			// Don't return — still run ANTICIPATE below in case a new prepare is warranted.
 		}
 
 		// ── ANTICIPATE: if approaching warmWater and no prepare in flight, start one ──
@@ -651,12 +720,12 @@ wss.on("connection", (ws) => {
 		// ── HOLD: re-derive and re-emit if the command set changed ──
 		// This keeps the host in sync when blocks shift (tail moves, blocks added) without
 		// triggering a new LLM epoch. The hasNew gate mirrors attention-folder.
-		holdOrResend(ws, state, view, cap);
+		holdOrResend(ws, state, view);
 
 		// Background scoring: warm up scores for the next epoch.
 		maybeScore(ws, state, view);
 
-		sendStatus(ws, state, cap);
+		sendStatus(ws, state);
 	});
 
 	ws.on("close", () => {
