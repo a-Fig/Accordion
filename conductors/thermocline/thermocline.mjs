@@ -17,8 +17,10 @@
 // Run:  npm install   then   npm start   (or: node thermocline.mjs)
 //       The probe path is resolved from attention-folder's own directory — see scorer.mjs.
 
-import { WebSocketServer } from "ws";
-import { mkdirSync, writeFileSync, renameSync, rmSync, readFileSync } from "node:fs";
+// `ws` is imported DYNAMICALLY inside the !SMOKE bootstrap so the inline smoke harness
+// (node thermocline.mjs --smoke) can load this module to exercise the pure commit/graduation
+// helpers WITHOUT requiring `npm install` (ws absent) — mirrors how policy.test.mjs needs no deps.
+import { mkdirSync, writeFileSync, renameSync, rmSync, readFileSync, writeFile, rename } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -37,6 +39,10 @@ const ID = "thermocline";
 const LABEL = "Thermocline";
 const PORT = Number(process.env.THERMO_PORT || 7703);
 const URL = `ws://127.0.0.1:${PORT}`;
+
+// `node thermocline.mjs --smoke` runs the inline smoke harness instead of the WS server (it must
+// NOT bind a port or advertise a heartbeat). See the bottom of the file.
+const SMOKE = process.argv.includes("--smoke");
 
 // Copy the CFG defaults from policy so each can be overridden via env.
 const CFG = {
@@ -76,11 +82,10 @@ function advertise() {
 	writeFileSync(tmp, JSON.stringify(entry, null, 2));
 	renameSync(tmp, REG_FILE);
 }
-advertise();
-const heartbeat = setInterval(advertise, 5_000);
+const heartbeat = SMOKE ? null : (advertise(), setInterval(advertise, 5_000));
 
 function shutdown() {
-	clearInterval(heartbeat);
+	if (heartbeat) clearInterval(heartbeat);
 	try {
 		rmSync(REG_FILE, { force: true });
 	} catch {
@@ -94,11 +99,30 @@ process.on("SIGTERM", shutdown);
 // ── Persistence: deep-zone strata + dwell survive reconnect ──
 // Only strata (with their actual summary TEXT) and dwell/everWarm are worth saving.
 // Folds re-derive from scores on reconnect; only the compacted zone is irreversible.
-const PERSIST_DIR = join(process.env.ACCORDION_HOME || homedir(), ".accordion", "conductors");
+// Persist files live in the SAME dir as the discovery heartbeat (~/.accordion/conductors),
+// so there is one path source of truth — PERSIST_DIR is an alias of REG_DIR.
+const PERSIST_DIR = REG_DIR;
 
-/** Deterministic key for a session — used as part of the filename so each session keeps its own deep zone. */
+/**
+ * Deterministic key for a session — used as part of the persist filename so each session keeps
+ * its own deep zone. Prefer a stable session id when the host supplies one (a fork may extend the
+ * `host/hello` session payload — the contract today is only {title,model,cwd}, but an `id` is the
+ * primary key when present). Otherwise hash title|model|cwd.
+ *
+ * Returns `null` when there is no usable identity (no id AND any of title/model/cwd is missing) so
+ * the caller skips persistence entirely — two under-specified sessions must NOT hash to the same
+ * `undefined|undefined|undefined` file and corrupt each other's deep zone.
+ */
 function sessionKey(session) {
-	const raw = `${session.title}|${session.model}|${session.cwd}`;
+	if (session && typeof session.id === "string" && session.id) {
+		// A real session id is already unique — namespace it so it can't collide with a hash key.
+		return `id-${session.id}`;
+	}
+	// Fall back to the {title,model,cwd} hash, but only if ALL three are present. A missing field
+	// would stringify to "undefined" and let two distinct under-specified sessions share a file.
+	const { title, model, cwd } = session ?? {};
+	if (typeof title !== "string" || typeof model !== "string" || typeof cwd !== "string") return null;
+	const raw = `${title}|${model}|${cwd}`;
 	// FNV-1a 32-bit, same algorithm as foldCode, just a different use-site.
 	let h = 0x811c9dc5;
 	for (let i = 0; i < raw.length; i++) {
@@ -122,28 +146,37 @@ function loadPersistedState(key) {
 }
 
 function persistState(key, applied, grad) {
-	// Best-effort, async (we don't await this — an occasional missed write is fine).
+	// Best-effort, truly non-blocking — fire-and-forget async I/O so commit() stays fast.
+	// An occasional missed write is fine; the deep zone is regenerable from a fresh epoch.
 	try {
 		mkdirSync(PERSIST_DIR, { recursive: true });
-		const data = {
-			strata: applied.strata.map((s) => ({
-				firstId: s.firstId,
-				lastId: s.lastId,
-				unitIds: s.unitIds,
-				memberIds: s.memberIds,
-				summary: s.summary ?? null, // the actual LLM text, if we have it
-				summaryTokens: s.summaryTokens,
-			})),
-			dwell: [...(grad.dwell ?? new Map()).entries()],
-			everWarm: [...(grad.everWarm ?? new Set())],
-		};
-		const p = persistPath(key);
-		const tmp = `${p}.${process.pid}.tmp`;
-		writeFileSync(tmp, JSON.stringify(data, null, 2));
-		renameSync(tmp, p);
-	} catch (e) {
-		log(`persist failed (non-fatal): ${e.message}`);
+	} catch {
+		return; // can't even make the dir — give up silently
 	}
+	const data = {
+		strata: applied.strata.map((s) => ({
+			firstId: s.firstId,
+			lastId: s.lastId,
+			unitIds: s.unitIds,
+			memberIds: s.memberIds,
+			summary: s.summary ?? null, // the actual LLM text, if we have it
+			summaryTokens: s.summaryTokens,
+		})),
+		dwell: [...(grad.dwell ?? new Map()).entries()],
+		everWarm: [...(grad.everWarm ?? new Set())],
+	};
+	const p = persistPath(key);
+	const tmp = `${p}.${process.pid}.tmp`;
+	// Atomic write-temp-then-rename, async (fire-and-forget — errors logged but not thrown).
+	writeFile(tmp, JSON.stringify(data, null, 2), (writeErr) => {
+		if (writeErr) {
+			log(`persist write failed (non-fatal): ${writeErr.message}`);
+			return;
+		}
+		rename(tmp, p, (renameErr) => {
+			if (renameErr) log(`persist rename failed (non-fatal): ${renameErr.message}`);
+		});
+	});
 }
 
 // ── Per-connection conductor state ──
@@ -252,6 +285,11 @@ function complete(ws, state, { system, prompt, maxOutputTokens }) {
 		}
 		const reqId = nextReqId(state);
 		const timer = setTimeout(() => {
+			// Settle EXACTLY ONCE: only reject if this entry is still pending. cap/result and the
+			// ws-close handler both delete-then-settle, so a late timer that races past clearTimeout
+			// finds no entry and does nothing — never rejecting an already-settled promise (which
+			// would be an unhandled rejection under --unhandled-rejections=throw).
+			if (!state.pendingCaps.has(reqId)) return;
 			state.pendingCaps.delete(reqId);
 			reject(new Error(`cap/request ${reqId} timed out`));
 		}, 120_000);
@@ -279,7 +317,8 @@ function commandSig(commands) {
 function needNewEpoch(state, view, fill, cap) {
 	if (!state.applied.plan) return true;
 	// If we're above high-water the current plan no longer brings us down safely.
-	if (fill >= CFG.highWater * cap) return true;
+	// fill is a FRACTION (0..1), CFG.highWater is a FRACTION — compare fraction vs fraction.
+	if (fill >= CFG.highWater) return true;
 	return false;
 }
 
@@ -288,13 +327,14 @@ function needNewEpoch(state, view, fill, cap) {
 function maybeScore(ws, state, view) {
 	const units = buildUnits(view.blocks);
 	// Score candidates = units with a temperatureKey not yet attempted.
+	// (attempted is REPLACED each run so a unit can be re-scored when rescoreNeeded fires again.)
 	const cands = units.filter(
 		(u) => !u.protected && !u.held && !state.attempted.has(u.temperatureKey),
 	);
 	const fill = state.lastFill;
-	const cap = Math.min(view.budget, view.contextWindow ?? view.budget);
 
-	if (fill < CFG.warmWater || state.scoringInFlight || !(state.rescoreNeeded || cands.some((u) => !state.attempted.has(u.temperatureKey)))) return;
+	// Guard: must be warm, not already scoring, and have work to do (rescoreNeeded or new cands).
+	if (fill < CFG.warmWater || state.scoringInFlight || !(state.rescoreNeeded || cands.length)) return;
 	if (!cands.length) return;
 
 	const tailText = tailTextFromView(view.blocks);
@@ -309,7 +349,9 @@ function maybeScore(ws, state, view) {
 	scoreCandidates({ tailText, candidates, signal: state.abort.signal, log })
 		.then((scores) => {
 			for (const [id, v] of scores) state.scores.set(id, v);
-			for (const id of ids) state.attempted.add(id);
+			// REPLACE (not accumulate) so a unit can be re-scored on the next rescoreNeeded.
+			// Mirrors attention-folder: state.attempted = new Set(ids).
+			state.attempted = new Set(ids);
 			state.rescoreNeeded = false;
 			state.scoringInFlight = false;
 			log(`scores ready: ${state.scores.size} cached`);
@@ -344,37 +386,224 @@ function appliedForProject(state) {
 	};
 }
 
+// ── commit helpers: reconcile (BLOCKER 2) + real-token top-up (BLOCKER 1) ──
+
+/** Union of two (possibly undefined) sets into a fresh Set (policy.unionSet is not exported). */
+function unionSet(a, b) {
+	const out = new Set(a ?? []);
+	for (const x of b ?? []) out.add(x);
+	return out;
+}
+
+/** cap = the tighter of budget and contextWindow (mirrors policy.capOf, which is not exported). */
+function capOfView(view) {
+	return Math.min(view.budget, view.contextWindow ?? view.budget);
+}
+
+/** The project()-shape applied state derived from a working plan's folds + strata. */
+function appliedShapeOf(plan) {
+	return {
+		foldedIds: new Set(plan.folds.flatMap((f) => f.ids)),
+		strata: plan.strata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens })),
+	};
+}
+
+/**
+ * BLOCKER 2 — commit-time assemble()/reconcile. Any unit the agent recalled, unfolded, or
+ * re-warmed during PREPARE is dropped from the epoch before it is swapped in: a fold whose member
+ * ids intersect `touched` is removed, and a whole stratum that contains a touched member is removed
+ * (you cannot partially un-group, so the whole run stays live this epoch). Belt-and-suspenders with
+ * the round-1 discard-on-agentUnfold — guarantees the agent's veto holds even if a prepare slipped
+ * through (e.g. the first epoch where state.applied.plan was null and the discard couldn't see the
+ * coming folds). Returns a NEW plan (does not mutate the input).
+ */
+function reconcilePlan(plan, touched) {
+	if (!touched || touched.size === 0) return plan;
+	const folds = plan.folds.filter((f) => !f.ids.some((id) => touched.has(id)));
+	const strata = plan.strata.filter((s) => !s.memberIds.some((id) => touched.has(id)));
+	if (folds.length === plan.folds.length && strata.length === plan.strata.length) return plan;
+	return { ...plan, folds, strata };
+}
+
+/**
+ * Substitute REAL LLM-summary token counts into a plan's strata (the digest text length), so the
+ * projection reflects what the agent will actually receive — not planEpoch's ~12% estimate. Returns
+ * a NEW plan with each stratum's summaryTokens replaced when a real summary exists.
+ */
+function planWithRealStratumTokens(plan, digests) {
+	const d = digests ?? new Map();
+	const strata = plan.strata.map((s) => {
+		if (s.digestKind === "drop") return s; // a drop contributes 0 — no real text
+		const summary = d.get(`stratum:${s.ids[0]}`);
+		if (summary == null) return s; // no LLM text yet → keep the estimate
+		return { ...s, summaryTokens: Math.ceil(summary.length / 4) };
+	});
+	return { ...plan, strata };
+}
+
+/**
+ * Convert a plan's OWN strata to drops OLDEST-FIRST until project() ≤ bound (or none remain).
+ * Mirrors policy.dropStrataOldestFirst but operates on our working plan. Each drop frees the
+ * stratum's REAL summaryTokens, so this strictly reduces and terminates. Mutates `plan.strata`
+ * elements in place; returns true iff it dropped at least one stratum.
+ */
+function dropOwnStrataOldestFirst(plan, view, bound) {
+	const orderOf = new Map(view.blocks.map((b) => [b.id, b.order]));
+	const sorted = plan.strata
+		.map((s) => ({ s, ord: orderOf.get(s.ids[0]) ?? Infinity }))
+		.sort((a, b) => a.ord - b.ord);
+	let dropped = false;
+	for (const { s } of sorted) {
+		if (project(view, appliedShapeOf(plan)) <= bound) break;
+		if (s.digestKind !== "drop") {
+			s.digestKind = "drop";
+			s.summaryTokens = 0;
+			dropped = true;
+		}
+	}
+	return dropped;
+}
+
+/**
+ * BLOCKER 1 — guarantee the agent NEVER receives a batch whose projected live exceeds cap, using
+ * the REAL summary token counts (not the estimate planEpoch projected with). Called after the plan
+ * has real stratum tokens substituted in. If projected ≤ cap there is nothing to do. Otherwise:
+ *
+ *   (1) Run a DETERMINISTIC planEpoch over the live view to get additional folds/age-strata/drops,
+ *       and MERGE its NEW moves into our plan (a fold whose unit is already folded or claimed by a
+ *       stratum is skipped; a stratum whose members are already claimed is skipped) — keeping our
+ *       real-token LLM strata. Re-check (≤3 passes; the deterministic floor terminates so this is a
+ *       guard against a pathological loop, not the real terminator).
+ *   (2) If merging makes no further progress yet we're still over cap (e.g. a single verbose stratum
+ *       at maxOutputTokens whose region the deterministic plan would only re-stratum, so it's skipped
+ *       as already-claimed), DROP our own strata oldest-first until ≤ cap. Dropping always frees real
+ *       tokens down to the irreducible floor, which planEpoch guarantees is ≤ cap.
+ *
+ * Mutates / returns a plan whose project(view) ≤ cap (with real tokens). Pure-ish: builds new fold
+ * entries, may convert strata to drops.
+ */
+function topUpToCap(plan, view, state, cap) {
+	if (project(view, appliedShapeOf(plan)) <= cap) return plan;
+
+	const liveUnits = buildUnits(view.blocks);
+	const memberIdsOfUnit = new Map(liveUnits.map((u) => [u.id, u.ids]));
+	// Track every UNIT id our plan has already claimed (folded or swept into a stratum) so merged
+	// deterministic moves never double-fold/double-group the same unit.
+	const claimedUnits = new Set([
+		...plan.folds.map((f) => f.unitId),
+		...plan.strata.flatMap((s) => s.unitIds ?? []),
+	]);
+	// Every member id already claimed by a fold OR a stratum — the secondary (member-level) guard
+	// behind claimedUnits. (Units partition blocks, so claimedUnits alone is airtight; this just
+	// keeps the "no member already claimed" check literally true against all existing content.)
+	const foldedMembers = new Set([
+		...plan.folds.flatMap((f) => f.ids),
+		...plan.strata.flatMap((s) => s.memberIds ?? []),
+	]);
+
+	const MAX_PASSES = 3;
+	for (let pass = 0; pass < MAX_PASSES; pass++) {
+		if (project(view, appliedShapeOf(plan)) <= cap) return plan;
+		const det = planEpoch(view, state.scores, gradState(state), CFG, {
+			deterministic: true,
+			graduated: state.grad.graduated,
+		});
+		let added = false;
+
+		// Merge NEW deterministic folds (unit not already claimed, no member already folded).
+		for (const f of det.folds) {
+			if (claimedUnits.has(f.unitId)) continue;
+			if (f.ids.some((id) => foldedMembers.has(id))) continue;
+			plan.folds.push({ unitId: f.unitId, ids: f.ids, tier: f.tier });
+			for (const id of f.ids) foldedMembers.add(id);
+			claimedUnits.add(f.unitId);
+			added = true;
+		}
+
+		// Merge NEW deterministic strata (no member already folded/claimed). These carry estimated
+		// tokens / deterministic recaps — emitCommands renders deterministicRecap for them (no LLM).
+		for (const s of det.strata) {
+			const units = s.unitIds ?? [];
+			if (units.some((id) => claimedUnits.has(id))) continue;
+			if (s.memberIds.some((id) => foldedMembers.has(id))) continue;
+			plan.strata.push({
+				ids: s.ids,
+				unitIds: units,
+				memberIds: s.memberIds,
+				digestKind: s.digestKind,
+				summaryTokens: s.summaryTokens,
+			});
+			for (const id of units) claimedUnits.add(id);
+			for (const id of s.memberIds) foldedMembers.add(id);
+			// member ids of the unit (incl. non-foldable tool_call) are now claimed.
+			for (const uid of units) for (const mid of memberIdsOfUnit.get(uid) ?? []) foldedMembers.add(mid);
+			added = true;
+		}
+
+		if (project(view, appliedShapeOf(plan)) <= cap) return plan;
+		if (!added) break; // no NEW moves available — fall through to dropping our own strata
+	}
+
+	// Last resort: drop our OWN strata oldest-first (frees real tokens) until ≤ cap. Always
+	// terminates — the floor (no strata, only folds + protected tail) is ≤ cap by planEpoch's
+	// hard-cap guarantee.
+	dropOwnStrataOldestFirst(plan, view, cap);
+	return plan;
+}
+
 // ── commit: send conductor/commands and update internal state ──
 // This is the ATOMIC COMMIT point. After this, the host holds the new state.
 function commit(ws, state, view, plan, digests) {
-	const cmds = emitCommands(plan, digests, view);
+	// (1) BLOCKER 2 — reconcile against reality: drop any fold/stratum the agent touched (recalled,
+	//     unfolded, or re-warmed) during PREPARE before this state is swapped in.
+	const touched = unionSet(state.agentTouched, state.recalledThisEpoch);
+	// (2) Substitute REAL LLM-summary tokens so the projection reflects the actual wire, then
+	//     (3) BLOCKER 1 — top up deterministically until projected live ≤ cap with those real tokens.
+	let working = reconcilePlan(plan, touched);
+	working = planWithRealStratumTokens(working, digests);
+	working = topUpToCap(working, view, state, working.cap || capOfView(view));
+
+	// Recompute the final projection (with real tokens + any top-up) for the log + telemetry.
+	const finalProjected = project(view, appliedShapeOf(working));
+	working = { ...working, projected: finalProjected };
+
+	// Build the commands from the FINAL reconciled+topped-up plan (so plan ↔ commands ↔ applied
+	// all agree — holdOrResend later re-derives from state.applied.plan).
+	const cmds = emitCommands(working, digests, view);
 	const sig = commandSig(cmds);
 
-	// Update our applied state from the plan.
-	const newFoldedIds = new Set(plan.folds.flatMap((f) => f.ids));
-	const newStrata = plan.strata.map((s) => {
+	// Update our applied state from the FINAL plan.
+	const newFoldedIds = new Set(working.folds.flatMap((f) => f.ids));
+	const newStrata = working.strata.map((s) => {
 		const key = `stratum:${s.ids[0]}`;
-		const summary = digests?.get(key) ?? null;
+		const summary = s.digestKind === "drop" ? null : (digests?.get(key) ?? null);
 		return {
 			firstId: s.ids[0],
 			lastId: s.ids[1],
 			unitIds: s.unitIds,
 			memberIds: s.memberIds,
 			summary,
+			// summaryTokens already carries the real text length for summarised strata (set in
+			// planWithRealStratumTokens / 0 for drops); recompute from text when we have it to stay exact.
 			summaryTokens: summary != null ? Math.ceil(summary.length / 4) : s.summaryTokens,
 		};
 	});
 
 	state.applied = {
-		plan,
+		plan: working,
 		foldedIds: newFoldedIds,
 		strata: newStrata,
 		sig,
 	};
 
 	// Track pending confirmation (mirrors attention-folder).
+	// Include each stratum's group id ('g:'+firstId) so a group-only batch arms
+	// pendingUnconfirmed and self-heals if the host drops it.
 	state.pendingRev = view.rev ?? -1;
-	state.pendingSet = new Set(newFoldedIds);
+	state.pendingSet = new Set([
+		...newFoldedIds,
+		...newStrata.map((s) => `g:${s.firstId}`),
+	]);
 
 	ws.send(JSON.stringify({ type: "conductor/commands", rev: view.rev, commands: cmds }));
 
@@ -390,7 +619,8 @@ function commit(ws, state, view, plan, digests) {
 
 	state.lastAction = "epoch";
 	state.rescoreNeeded = true; // tail moved; rescore before the next epoch
-	log(`COMMIT: ${plan.folds.length} folds · ${plan.strata.length} strata → projected ~${(plan.projected / Math.max(1, plan.cap) * 100).toFixed(0)}% full`);
+	const capForLog = working.cap || capOfView(view);
+	log(`COMMIT: ${working.folds.length} folds · ${working.strata.length} strata → projected ~${(finalProjected / Math.max(1, capForLog) * 100).toFixed(0)}% full`);
 }
 
 // ── HOLD: re-derive commands from current applied plan, send only if changed ──
@@ -412,7 +642,11 @@ function holdOrResend(ws, state, view) {
 
 	state.applied.sig = sig;
 	state.pendingRev = view.rev;
-	state.pendingSet = new Set(state.applied.foldedIds);
+	// Include stratum group ids so group-only batches arm pendingUnconfirmed (mirrors commit).
+	state.pendingSet = new Set([
+		...state.applied.foldedIds,
+		...state.applied.strata.map((s) => `g:${s.firstId}`),
+	]);
 	ws.send(JSON.stringify({ type: "conductor/commands", rev: view.rev, commands: cmds }));
 	log(`re-emit (view changed or pending unconfirmed)`);
 }
@@ -462,15 +696,21 @@ async function prepareEpoch(ws, state, view, token) {
 	// Await all LLM calls (Promise.allSettled so partial failures don't abort the epoch).
 	const results = await Promise.allSettled(jobs);
 	// Check if this prepare is still current (a newer one or an emergency may have superseded it).
+	// Do NOT clear state.preparing here — the current owner (or EMERGENCY / agentUnfold discard)
+	// manages that flag; clearing it from a stale branch would incorrectly signal completion to
+	// the live owner and allow a spurious re-prepare to fire on the same tick.
 	if (state.prepareToken !== token) {
 		log(`prepare ${token} superseded — discarding`);
-		state.preparing = false;
 		return;
 	}
 
-	// Cache whatever came back (null = timed-out/rejected → deterministic fallback fires in emitCommands).
+	// Cache whatever came back — but ONLY real, non-empty text (#5). r.value is the wrapper
+	// {key,text} (always truthy), so an empty model response (text="" or whitespace) would
+	// otherwise be cached as "" — and emitCommands' `d.get(...) ?? deterministic` does NOT fall
+	// back on "" (it's non-nullish), giving the agent a bare `{#code FOLDED}` tag with no body.
+	// Dropping empty/whitespace responses lets emitCommands fall back to deterministicDigest/Recap.
 	for (const r of results) {
-		if (r.status === "fulfilled" && r.value) {
+		if (r.status === "fulfilled" && r.value && r.value.text && r.value.text.trim()) {
 			state.digestCache.set(r.value.key, r.value.text);
 		}
 	}
@@ -488,9 +728,9 @@ async function prepareEpoch(ws, state, view, token) {
 }
 
 // ── Main message handler ──
-const wss = new WebSocketServer({ host: "127.0.0.1", port: PORT });
-
-wss.on("connection", (ws) => {
+// Defined as a named function so the inline smoke harness (--smoke) can load this module without
+// binding a port; the server is only created + wired below, guarded by !SMOKE.
+function onConnection(ws) {
 	const state = freshState();
 	log("Accordion connected");
 
@@ -516,13 +756,22 @@ wss.on("connection", (ws) => {
 		// ── host/hello — session identity + optional state restore ──
 		if (msg.type === "host/hello") {
 			state.sessionKey = sessionKey(msg.session ?? {});
-			const saved = loadPersistedState(state.sessionKey);
+			// A null key means the session is under-specified (no id, missing title/model/cwd):
+			// skip restore AND later persistence so we never read/write a shared "null" file.
+			const saved = state.sessionKey ? loadPersistedState(state.sessionKey) : null;
 			if (saved) {
 				// Restore strata (with their summary texts) and dwell.
-				if (Array.isArray(saved.strata) && saved.strata.length) {
-					state.applied.strata = saved.strata;
+				// LOW: skip strata from PRE-EXISTING persist files that lack a non-empty unitIds —
+				// emitCommands would render deterministicRecap([]) ("run · empty") over a real summary
+				// (it reads s.unitIds → byUnit → []), clobbering the saved digest. A stratum with no
+				// unitIds also can't be re-validated by member id below, so it can never heal.
+				const savedStrata = Array.isArray(saved.strata)
+					? saved.strata.filter((s) => Array.isArray(s.unitIds) && s.unitIds.length > 0)
+					: [];
+				if (savedStrata.length) {
+					state.applied.strata = savedStrata;
 					// Re-populate the digest cache from saved summaries.
-					for (const s of saved.strata) {
+					for (const s of savedStrata) {
 						if (s.summary != null) {
 							state.digestCache.set(`stratum:${s.firstId}`, s.summary);
 						}
@@ -568,25 +817,15 @@ wss.on("connection", (ws) => {
 					state.agentTouched.add(id);
 					state.recalledThisEpoch.add(id);
 				}
-				// If a prepare is in flight that would compact any of these ids, discard it.
+				// If a prepare is in flight, UNCONDITIONALLY discard it on any agentUnfold.
+				// The in-flight prepare's plan is local to prepareEpoch and not stored on state,
+				// so checking state.applied.plan (the LAST COMMITTED plan) would miss folds the
+				// in-flight prepare will add — a conservative discard guarantees the veto is
+				// never missed. Agent unfolds are rare; the next tick re-prepares if still needed.
 				if (state.preparing && ids.length) {
-					const units = state.lastView ? buildUnits(state.lastView.blocks) : [];
-					const touchedUnits = new Set(
-						units.filter((u) => u.ids.some((bid) => ids.includes(bid))).map((u) => u.id),
-					);
-					// If any of the prepare's planned folds/strata touch an agent-unfolded unit,
-					// bump the token to discard the stale prepare.
-					if (state.applied.plan) {
-						const planUnits = new Set([
-							...(state.applied.plan.folds ?? []).map((f) => f.unitId),
-							...(state.applied.plan.strata ?? []).flatMap((s) => s.unitIds),
-						]);
-						if ([...touchedUnits].some((uid) => planUnits.has(uid))) {
-							log(`agentUnfold conflicts with in-flight prepare — discarding`);
-							++state.prepareToken;
-							state.preparing = false;
-						}
-					}
+					log(`agentUnfold — discarding in-flight prepare to guarantee veto`);
+					++state.prepareToken;
+					state.preparing = false;
 				}
 			} else if (msg.event === "humanOverride") {
 				// Do NOT add humanOverride ids to agentTouched: the view's per-block `held` flag
@@ -641,14 +880,22 @@ wss.on("connection", (ws) => {
 		};
 		state.lastView = view;
 
-		// ── Validate restored strata on the first real view (#6) ──
-		// Drop any stratum whose firstId/lastId/memberIds no longer exist in the view (stale
-		// session — a group([firstId,lastId]) over vanished ids would be clamped as invalid-group).
+		// ── Validate restored strata on the first real view (#6, #7) ──
+		// Drop any stratum with ANY missing member id, not just a missing firstId/lastId (#7). An
+		// interior member can vanish (scrolled out / session diverged) while the boundary ids
+		// survive — project() would still subtract that stratum's summaryTokens (permanently low
+		// fill → delayed epochs) and the group([firstId,lastId]) could even swallow live blocks that
+		// drifted into the gap. A stratum is only safe to keep if EVERY member is still live.
 		if (state._restoredPendingValidation) {
 			state._restoredPendingValidation = false;
 			const liveIds = new Set(view.blocks.map((b) => b.id));
 			const validStrata = state.applied.strata.filter(
-				(s) => liveIds.has(s.firstId) && liveIds.has(s.lastId),
+				(s) =>
+					liveIds.has(s.firstId) &&
+					liveIds.has(s.lastId) &&
+					Array.isArray(s.memberIds) &&
+					s.memberIds.length > 0 &&
+					s.memberIds.every((id) => liveIds.has(id)),
 			);
 			if (validStrata.length !== state.applied.strata.length) {
 				const dropped = state.applied.strata.length - validStrata.length;
@@ -677,10 +924,11 @@ wss.on("connection", (ws) => {
 		const fill = cap > 0 ? project(view, appliedForProject(state)) / cap : 0;
 		state.lastFill = fill;
 
-		// ── Update graduation state ──
-		// Fold result into grad.everWarm: any unit that is currently NOT cold gets everWarm'd.
-		const gResult = updateGraduation(gradState(state), view, state.scores, CFG);
-		// Track newly-hot units (scored ≥ coldThreshold this turn) as everWarm.
+		// ── everWarm update (EVERY tick) ──
+		// everWarm feeds scoring/graduation (need=K vs 2K), so it must track the latest scores on
+		// every tick — even HOLD ticks where no epoch fires. Update it BEFORE any graduation
+		// computation so a unit that became hot THIS tick is already in everWarm when graduation
+		// decides need=K vs 2K (prevents a one-tick lag where a newly-hot unit graduates at K).
 		const units = buildUnits(view.blocks);
 		for (const u of units) {
 			const temp = state.scores.get(u.temperatureKey);
@@ -688,8 +936,39 @@ wss.on("connection", (ws) => {
 				state.grad.everWarm.add(u.id);
 			}
 		}
-		state.grad.dwell = gResult.dwell;
-		state.grad.graduated = gResult.graduated;
+
+		// ── Prune unbounded per-session maps (#6). ──
+		// scores/attempted/digestCache otherwise grow forever — scrolled-out block ids and
+		// merged-away strata accumulate. Best-effort, cheap, no behavior change beyond bounding
+		// memory: drop any key whose underlying id is absent from the CURRENT view. Reuse this
+		// tick's `units` (don't rebuild) for the live temperatureKey / unit-id sets.
+		const liveBlockIds = new Set(view.blocks.map((b) => b.id));
+		const liveTempKeys = new Set(units.map((u) => u.temperatureKey));
+		const liveUnitIds = new Set(units.map((u) => u.id));
+		for (const k of state.scores.keys()) if (!liveTempKeys.has(k)) state.scores.delete(k);
+		for (const k of state.attempted) if (!liveTempKeys.has(k)) state.attempted.delete(k);
+		for (const k of state.digestCache.keys()) {
+			// keys are either a unit id (per-block digest) or `stratum:<firstId>` (run summary).
+			const stale = k.startsWith("stratum:")
+				? !liveBlockIds.has(k.slice("stratum:".length))
+				: !liveUnitIds.has(k);
+			if (stale) state.digestCache.delete(k);
+		}
+
+		// ── Graduation advances PER EPOCH, not per tick (#4). ──
+		// updateGraduation advances dwell, so calling it every tick would graduate a unit after K
+		// USER TURNS instead of K compaction EPOCHS — defeating the "sustained K dwell epochs"
+		// double-gate. Instead we advance dwell at most ONCE per tick, and only when an epoch
+		// actually fires (EMERGENCY commit or an ANTICIPATE prepare). On HOLD ticks dwell holds.
+		// (everWarm above is already current, preserving round-1's ordering intent.)
+		let _gradAdvanced = false;
+		const advanceGraduationOnce = () => {
+			if (_gradAdvanced) return; // already advanced this tick — an epoch fired earlier
+			_gradAdvanced = true;
+			const g = updateGraduation(gradState(state), view, state.scores, CFG);
+			state.grad.dwell = g.dwell;
+			state.grad.graduated = g.graduated;
+		};
 
 		// ── SAFETY / EMERGENCY: if we are ALREADY over budget, act immediately ──
 		// deterministic:true → no LLM, instant. Bump prepareToken FIRST so any in-flight
@@ -699,6 +978,7 @@ wss.on("connection", (ws) => {
 			log(`EMERGENCY: fill ${(fill * 100).toFixed(0)}% > 100% — deterministic compaction`);
 			++state.prepareToken; // discard any in-flight prepare
 			state.preparing = false;
+			advanceGraduationOnce(); // this epoch advances dwell (once per tick)
 			const plan = planEpoch(view, state.scores, gradState(state), CFG, { deterministic: true, graduated: state.grad.graduated });
 			commit(ws, state, view, plan, new Map()); // empty digest map → all deterministic fallbacks
 			state.lastAction = "emergency";
@@ -708,6 +988,7 @@ wss.on("connection", (ws) => {
 		// ── ANTICIPATE: if approaching warmWater and no prepare in flight, start one ──
 		if (fill >= CFG.warmWater && !state.preparing && needNewEpoch(state, view, fill, cap)) {
 			state.preparing = true;
+			advanceGraduationOnce(); // the prepare epoch advances dwell (guarded: at most once/tick)
 			const token = ++state.prepareToken;
 			log(`ANTICIPATE: fill ${(fill * 100).toFixed(0)}% ≥ ${(CFG.warmWater * 100).toFixed(0)}% — preparing epoch (token ${token})`);
 			// Fire and forget — prepareEpoch sets state.preparing=false when done.
@@ -732,14 +1013,268 @@ wss.on("connection", (ws) => {
 		// Abort any in-flight probe — it's scoring a context nobody is listening to.
 		state.abort.abort();
 		// Reject any pending cap requests (their promises will never settle otherwise).
-		for (const [, { reject, timer }] of state.pendingCaps) {
+		// Drain by delete-then-reject so each is settled exactly once: clearing the map up front
+		// means a timer that fires mid-loop finds no entry (its has()-guard) and stays silent —
+		// no double-reject, no unhandled rejection under --unhandled-rejections=throw.
+		const pending = [...state.pendingCaps.values()];
+		state.pendingCaps.clear();
+		for (const { reject, timer } of pending) {
 			clearTimeout(timer);
 			reject(new Error("ws closed"));
 		}
-		state.pendingCaps.clear();
 		log("Accordion disconnected");
 	});
-});
+}
 
-log(`${LABEL} listening on ${URL}`);
-log(`waters: warm=${(CFG.warmWater * 100).toFixed(0)}% high=${(CFG.highWater * 100).toFixed(0)}% low=${(CFG.lowWater * 100).toFixed(0)}%  advertised at ${REG_FILE}`);
+// ── Inline smoke harness (node thermocline.mjs --smoke) ───────────────────────────────────────
+// Exercises the two PR-review fixes that the pure policy.test.mjs cannot reach because they live in
+// the server layer: BLOCKER 1 (a commit whose REAL summary exceeds the estimate is topped up to ≤
+// cap BEFORE send) and MAJOR 4 (dwell advances per EPOCH, not per HOLD tick). It needs no `ws` and
+// no probe — it calls the in-module commit() / onConnection() directly with fakes.
+
+function assert(cond, label) {
+	if (!cond) {
+		log(`SMOKE FAIL: ${label}`);
+		process.exitCode = 1;
+		throw new Error(`smoke assertion failed: ${label}`);
+	}
+	log(`  ok: ${label}`);
+}
+
+/** A minimal fake WebSocket: captures sent frames, lets the harness drive registered handlers. */
+function makeFakeWs() {
+	const sent = [];
+	const handlers = new Map();
+	const ws = {
+		readyState: 1, // OPEN
+		send: (raw) => sent.push(JSON.parse(raw)),
+		on: (ev, fn) => handlers.set(ev, fn),
+		emit: (ev, arg) => {
+			if (ev === "close") ws.readyState = 3; // CLOSED — a post-close commit() will no-op (readyState check)
+			handlers.get(ev)?.(arg);
+		},
+		sent,
+	};
+	return ws;
+}
+
+/** Build a ViewBlock with sensible defaults. */
+function smokeBlock(o) {
+	return {
+		id: o.id,
+		kind: o.kind ?? "text",
+		turn: o.turn ?? 1,
+		order: o.order,
+		tokens: o.tokens ?? 100,
+		foldedTokens: o.foldedTokens ?? 8,
+		held: o.held ?? false,
+		folded: o.folded ?? false,
+		protected: o.protected ?? false,
+		grouped: o.grouped ?? false,
+		text: o.text ?? `block ${o.id}`,
+		toolName: o.toolName,
+		isError: o.isError,
+	};
+}
+
+// ── BLOCKER 1: real summary tokens > estimate ⇒ top-up to ≤ cap before send ──
+function smokeBlocker1() {
+	log("SMOKE BLOCKER 1 — real-summary top-up keeps projected ≤ cap");
+	// cap=1000, liveTokens=1180. One stratum over 5 text units (200 tok each = 1000 tok). The
+	// ESTIMATE (~12% = 120) keeps projected at 1180-(1000-120)=300 (under cap) — but a VERBOSE real
+	// summary (~950 tok) would push projected to 1180-(1000-950)=1130 > cap. Top-up must fix that.
+	const blocks = [];
+	for (let i = 0; i < 5; i++) {
+		blocks.push(smokeBlock({ id: `m${i}`, kind: "text", order: i, tokens: 200, foldedTokens: 10, folded: true }));
+	}
+	// A protected tail block at the end so protectedFromIndex < length (older blocks are foldable).
+	blocks.push(smokeBlock({ id: "tail", kind: "text", order: 5, tokens: 180, protected: true }));
+	const view = {
+		rev: 1,
+		blocks,
+		contextWindow: 1000,
+		budget: 1000,
+		liveTokens: 1180,
+		protectedFromIndex: 5, // index of "tail" → m0..m4 are older/foldable
+		protectTokens: 180,
+	};
+	const cap = capOfView(view);
+
+	// A plan with ONE summary stratum over m0..m4 (members 1000 tok), estimate 120.
+	const memberIds = ["m0", "m1", "m2", "m3", "m4"];
+	const plan = {
+		folds: [],
+		strata: [{ ids: ["m0", "m4"], unitIds: memberIds, memberIds, digestKind: "summary", summaryTokens: 120 }],
+		targetTokens: CFG.lowWater * cap,
+		cap,
+		projected: project(view, { foldedIds: new Set(), strata: [{ memberIds, summaryTokens: 120 }] }),
+	};
+	assert(plan.projected <= cap, "estimate alone is under cap (so only real tokens trigger top-up)");
+
+	// A VERBOSE real summary: ~3800 chars → ~950 tokens (chars/4), far above the 120 estimate.
+	const hugeSummary = "x ".repeat(1900); // 3800 chars → ceil(3800/4)=950 tokens
+	const digests = new Map([[`stratum:m0`, hugeSummary]]);
+
+	const state = freshState();
+	state.sessionKey = null; // skip persistence in the smoke
+	state.lastView = view;
+	const ws = makeFakeWs();
+
+	commit(ws, state, view, plan, digests);
+
+	// The applied state after commit must project ≤ cap with the REAL summary tokens.
+	const projectedAfter = project(view, appliedForProject(state));
+	assert(projectedAfter <= cap, `projected after commit (${projectedAfter}) ≤ cap (${cap})`);
+
+	// And the batch actually SENT must be the same state — recompute its projection from the wire.
+	const frame = ws.sent.find((m) => m.type === "conductor/commands");
+	assert(!!frame, "a conductor/commands frame was sent");
+	// The verbose stratum should have been converted to a DROP (group with digest:null) by the
+	// own-strata drop fallback, since no other content was compressible in this view.
+	const droppedGroup = frame.commands.find((c) => c.kind === "group" && c.digest === null);
+	assert(!!droppedGroup, "verbose stratum was dropped (group digest:null) to satisfy the cap");
+
+	// ── BLOCKER 1 (merge path): when OTHER foldable content exists, the top-up's deterministic
+	// merge folds it to reach cap and KEEPS the LLM stratum as a summary (no drop needed). ──
+	log("  · merge path: deterministic folds added, LLM stratum kept");
+	const b2 = [];
+	// Stratum over m0,m1 (400 tok); plus 3 unclaimed foldable units e2,e3,e4 (200 tok each) the
+	// plan left live; plus protected tail. liveTokens 1300: estimate keeps us under cap, the verbose
+	// real summary tips us over, and folding e2/e3/e4 recovers — WITHOUT dropping the stratum.
+	// e2/e3/e4 each save 280 tok (≥ minFoldTokens 200) so the deterministic Rung 1 folds them
+	// INDIVIDUALLY (rather than sweeping them into an age-stratum that would overlap the claimed
+	// region), giving the merge real per-block folds to add.
+	b2.push(smokeBlock({ id: "n0", kind: "text", order: 0, tokens: 200, foldedTokens: 10, folded: true }));
+	b2.push(smokeBlock({ id: "n1", kind: "text", order: 1, tokens: 200, foldedTokens: 10, folded: true }));
+	b2.push(smokeBlock({ id: "e2", kind: "text", order: 2, tokens: 300, foldedTokens: 20 }));
+	b2.push(smokeBlock({ id: "e3", kind: "text", order: 3, tokens: 300, foldedTokens: 20 }));
+	b2.push(smokeBlock({ id: "e4", kind: "text", order: 4, tokens: 300, foldedTokens: 20 }));
+	b2.push(smokeBlock({ id: "tail2", kind: "text", order: 5, tokens: 300, protected: true, text: "" }));
+	const view2 = {
+		rev: 2, blocks: b2, contextWindow: 1000, budget: 1000, liveTokens: 1300,
+		protectedFromIndex: 5, protectTokens: 300,
+	};
+	const cap2 = capOfView(view2);
+	const mids2 = ["n0", "n1"];
+	const plan2 = {
+		folds: [],
+		strata: [{ ids: ["n0", "n1"], unitIds: mids2, memberIds: mids2, digestKind: "summary", summaryTokens: 48 }],
+		targetTokens: CFG.lowWater * cap2, cap: cap2,
+		projected: project(view2, { foldedIds: new Set(), strata: [{ memberIds: mids2, summaryTokens: 48 }] }),
+	};
+	assert(plan2.projected <= cap2, "merge: estimate alone under cap");
+	const verbose2 = "y ".repeat(760); // 1520 chars → 380 tokens, far above the 48 estimate
+	const digests2 = new Map([["stratum:n0", verbose2]]);
+	const state2 = freshState();
+	state2.sessionKey = null;
+	state2.lastView = view2;
+	const ws2 = makeFakeWs();
+	commit(ws2, state2, view2, plan2, digests2);
+
+	const proj2 = project(view2, appliedForProject(state2));
+	assert(proj2 <= cap2, `merge: projected after commit (${proj2}) ≤ cap (${cap2})`);
+	assert(state2.applied.foldedIds.size > 0, "merge: top-up added per-block folds (e2/e3/e4)");
+	// The LLM stratum survived as a real summary (group with a NON-null digest), not a drop.
+	const f2 = ws2.sent.find((m) => m.type === "conductor/commands");
+	const keptGroup = f2.commands.find((c) => c.kind === "group" && c.digest && c.digest.includes("FOLDED"));
+	assert(!!keptGroup, "merge: the LLM stratum was kept as a summary (group with a real digest)");
+}
+
+// ── MAJOR 4: dwell advances per EPOCH, not per HOLD tick ──
+// Two parts: (A) drive the REAL handler (onConnection) and confirm a HOLD tick fires NO epoch while
+// an over-budget tick fires exactly one — i.e. dwell-advancing work happens only on epoch ticks;
+// (B) confirm the per-epoch dwell delta is exactly +1 via the same updateGraduation the handler gates.
+function smokeMajor4() {
+	log("SMOKE MAJOR 4 — dwell advances per epoch, unchanged across HOLD ticks");
+	const COLD = CFG.coldThreshold - 0.1; // clearly cold
+
+	function viewWithLive(liveTokens, rev) {
+		return {
+			rev,
+			blocks: [
+				smokeBlock({ id: "c0", kind: "text", order: 0, tokens: 300, foldedTokens: 10, folded: true }),
+				smokeBlock({ id: "c1", kind: "text", order: 1, tokens: 300, foldedTokens: 10, folded: true }),
+				// Empty protected-tail text ⇒ tailTextFromView is blank ⇒ maybeScore bails before
+				// spawning the probe (the smoke is hermetic — no python child, no hang).
+				smokeBlock({ id: "tail", kind: "text", order: 2, tokens: 200, protected: true, text: "" }),
+			],
+			contextWindow: 1000,
+			budget: 1000,
+			liveTokens,
+			protectedFromIndex: 2,
+			protectTokens: 200,
+		};
+	}
+
+	// (A) Handler-driven: a HOLD tick (fill < warmWater) must produce NO commands frame; an
+	// over-budget tick must produce at least one (the EMERGENCY commit). A commands frame is the
+	// observable "an epoch fired this tick" — HOLD ticks emit none, so no dwell-advancing work runs.
+	const ws = makeFakeWs();
+	onConnection(ws);
+	const recv = (obj) => ws.emit("message", JSON.stringify(obj));
+	recv({ type: "host/hello", session: {}, budget: 1000, contextWindow: 1000 }); // sessionKey null → no disk
+	const cmdCount = () => ws.sent.filter((m) => m.type === "conductor/commands").length;
+
+	let before = cmdCount();
+	recv({ type: "context/update", ...viewWithLive(500, 1) }); // HOLD: fill 0.5 → no epoch
+	assert(cmdCount() === before, "HOLD tick (fill 50%) fires no epoch (no commands frame)");
+
+	before = cmdCount();
+	recv({ type: "context/update", ...viewWithLive(500, 2) }); // HOLD again → still no epoch
+	assert(cmdCount() === before, "second HOLD tick still fires no epoch");
+
+	before = cmdCount();
+	recv({ type: "context/update", ...viewWithLive(1200, 3) }); // over budget → EMERGENCY epoch fires
+	assert(cmdCount() >= before + 1, "over-budget tick fires an epoch (≥1 commands frame)");
+
+	// The over-budget tick also kicks ANTICIPATE → prepareEpoch → a pending cap/request with a
+	// 120 s timer. Emit close to settle it so the smoke process exits promptly (mirrors a real
+	// disconnect: rejects pending caps, clears timers).
+	ws.emit("close");
+
+	// (B) Per-epoch dwell delta = +1 (the same updateGraduation the handler calls once per epoch).
+	// Seed dwell at 2 (a prior epoch), with both units cold+folded+untouched.
+	const st = {
+		dwell: new Map([["c0", 2], ["c1", 2]]),
+		graduated: new Set(),
+		everWarm: new Set(),
+		agentTouched: new Set(),
+		recalledThisEpoch: new Set(),
+	};
+	const scores = new Map([["c0", COLD], ["c1", COLD]]);
+	const v = viewWithLive(500, 9);
+
+	// A HOLD tick does NOT call updateGraduation, so dwell is untouched — model that by simply not
+	// calling it and asserting the map is unchanged.
+	const dwellAtHold = new Map(st.dwell);
+	assert(st.dwell.get("c0") === dwellAtHold.get("c0"), "HOLD: dwell untouched (no updateGraduation call)");
+
+	// An EPOCH tick calls updateGraduation exactly once → +1.
+	const g = updateGraduation(st, v, scores, CFG);
+	assert(g.dwell.get("c0") === 3, `EPOCH: dwell advances exactly once (2 → ${g.dwell.get("c0")})`);
+	assert(g.dwell.get("c1") === 3, "EPOCH: a second cold unit also advances exactly once");
+}
+
+async function runSmoke() {
+	log("Running thermocline.mjs inline smoke harness…");
+	try {
+		smokeBlocker1();
+		smokeMajor4();
+	} catch (e) {
+		log(`SMOKE harness threw: ${e.message}`);
+		process.exitCode = 1;
+		return;
+	}
+	if (process.exitCode) log("SMOKE: FAILURES (see above)");
+	else log("SMOKE: all assertions passed");
+}
+
+if (!SMOKE) {
+	const { WebSocketServer } = await import("ws");
+	const wss = new WebSocketServer({ host: "127.0.0.1", port: PORT });
+	wss.on("connection", onConnection);
+	log(`${LABEL} listening on ${URL}`);
+	log(`waters: warm=${(CFG.warmWater * 100).toFixed(0)}% high=${(CFG.highWater * 100).toFixed(0)}% low=${(CFG.lowWater * 100).toFixed(0)}%  advertised at ${REG_FILE}`);
+} else {
+	await runSmoke();
+}

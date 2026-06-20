@@ -243,6 +243,21 @@ The engine, the wire protocol, and all in-process conductors are untouched.
   and the wire lifecycle are testable without hardware. The full PREPARE→COMMIT path with
   a real probe and a real `cap/request complete` round-trip requires a running Accordion
   desktop instance with a live pi session and an NVIDIA GPU.
+- **Stratum recoverability couples to the host's group-id format.** A stratum's recovery
+  tag is `foldTag('g:' + firstMemberId)` to match the host's `g:${memberIds[0]}` group id
+  (`store.svelte.ts`), so `unfold`/`recall` resolve. This holds because the conductor's runs
+  are already whole-message / tool-pair snapped, so the host's outward snap does not move
+  `memberIds[0]` off `firstId`. A host-side change to prepend the recovery tag to ANY
+  conductor-supplied group digest would make this unconditional and is the cleaner fix (a
+  small engine change, deferred to keep this PR conductor-only).
+- **Dwell counts compaction epochs, not user turns.** Graduation advances at most once per
+  tick and only when an epoch actually fires (EMERGENCY or ANTICIPATE), so the K-epoch
+  probation is measured in compaction events, not raw `context/update` ticks.
+- **The budget invariant outranks the recall veto under EMERGENCY.** On the PREPARE→commit
+  path the agent's recall/unfold veto is honored at commit time (`reconcilePlan`). But when
+  the context is already over the hard cap, the emergency deterministic top-up may re-fold a
+  unit the agent just touched — staying ≤ cap wins, consistent with the ladder's floor-lift.
+  In the common (empty-`touched`) case this never triggers.
 
 ## Out of scope (this cut)
 

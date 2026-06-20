@@ -114,7 +114,7 @@ The port and all tuning knobs can be overridden via environment variables. Defau
 
 ## Files
 
-- `thermocline.mjs` — WS server: epoch machine, HOLD/PREPARE/COMMIT/EMERGENCY, cap/request bridge, persistence, heartbeat.
+- `thermocline.mjs` — WS server: epoch machine, HOLD/PREPARE/COMMIT/EMERGENCY, cap/request bridge, persistence, heartbeat. `node thermocline.mjs --smoke` runs an inline, dependency-free smoke harness (no `ws`, no probe) covering the budget-at-commit top-up and per-epoch dwell.
 - `policy.mjs` — pure policy core: `planEpoch`, `updateGraduation`, `sedimentRuns`, `emitCommands`, prompt builders, deterministic fallbacks. No I/O, no `Date.now()`, fully unit-testable.
 - `scorer.mjs` — thin re-export shim: delegates to `../attention-folder/scorer.mjs` so the probe path is always correct regardless of invocation cwd.
 - `policy.test.mjs` — unit tests for the pure policy (`node --test`, no GPU, no Python, no WS).
