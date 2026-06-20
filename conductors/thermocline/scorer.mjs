@@ -18,7 +18,7 @@
  * source so thermocline's server code has one consistent import surface.
  */
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Resolve the absolute path to attention-folder/scorer.mjs so this import is
 // cwd-independent and survives being invoked from any working directory.
@@ -35,6 +35,6 @@ const {
 	scoreCandidates,
 	tailTextFromView,
 	resolvePython,
-} = await import(ATTN_SCORER);
+} = await import(pathToFileURL(ATTN_SCORER).href);
 
 export { scoreCandidates, tailTextFromView, resolvePython };
