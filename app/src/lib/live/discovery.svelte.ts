@@ -123,10 +123,6 @@ export function stopDiscovery(): void {
 	_onFocus = null;
 }
 
-export function selectSession(sessionId: string | null): void {
-	discovery.selected = sessionId;
-}
-
 /**
  * True when two session lists are identical in every field the sidebar renders or connects
  * with. Compared positionally — both lists are sorted by `startedAt`, and the sidebar renders

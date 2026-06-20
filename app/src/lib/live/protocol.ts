@@ -230,12 +230,6 @@ export interface PlanMessage {
 	groups?: GroupOp[];
 }
 
-/** Optional: the GUI announcing itself (reserved; unused in M1). */
-export interface AttachMessage {
-	type: "attach";
-	protocolVersion: number;
-}
-
 /**
  * GUI → extension: ask the extension to run an out-of-band model completion (protocol v5).
  *
@@ -319,7 +313,7 @@ export interface RecallResultMessage {
 	missing: string[];
 }
 
-export type ClientMessage = PlanMessage | AttachMessage | UnfoldResultMessage | RecallResultMessage | CompleteRequestMessage;
+export type ClientMessage = PlanMessage | UnfoldResultMessage | RecallResultMessage | CompleteRequestMessage;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -329,8 +323,3 @@ export function isServerMessage(v: unknown): v is ServerMessage {
 	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult";
 }
 
-export function isClientMessage(v: unknown): v is ClientMessage {
-	if (!v || typeof v !== "object" || !("type" in v)) return false;
-	const t = (v as any).type;
-	return t === "plan" || t === "attach" || t === "unfoldResult" || t === "recallResult" || t === "completeRequest";
-}
