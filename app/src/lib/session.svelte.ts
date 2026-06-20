@@ -44,6 +44,7 @@ export async function loadSample() {
 		if (!res.ok) throw new Error(`fetch failed (${res.status})`);
 		const text = await res.text();
 		if (token !== _loadToken) return; // a newer selection superseded this sample load — drop it
+		session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 		session.store = new AccordionStore(parse(text));
 		session.filePath = null;
 		session.readOnly = false;
@@ -130,6 +131,7 @@ async function _load(path: string, readFn: (p: string) => Promise<string>, token
 	if (token !== _loadToken) return; // a newer selection superseded this load — drop it
 	const prevBudget = session.store?.budget;
 	const prevProtect = session.store?.protectTokens;
+	session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 	session.store = new AccordionStore(parse(text));
 	if (prevBudget !== undefined) session.store.setBudget(prevBudget);
 	if (prevProtect !== undefined) session.store.setProtect(prevProtect);

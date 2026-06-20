@@ -270,6 +270,26 @@ export class AccordionStore {
 	}
 
 	/**
+	 * Retire this store before its `session.store` slot is reassigned to a fresh
+	 * `AccordionStore` (session swap, file reload, live hello / full-sync reset). Runs the
+	 * attached conductor's `detach()` lifecycle hook so an in-flight `host.complete()` call is
+	 * aborted — otherwise a discarded store's conductor (e.g. naive-compaction mid-summary)
+	 * leaves an uncancelled, billable model call running against an orphaned store, which then
+	 * fires its completion callbacks into the void (harmless thanks to the host identity guard,
+	 * but wasted spend and a lifecycle leak).
+	 *
+	 * Deliberately NOT `detach()`: the kill switch freezes the conductor-folded view into
+	 * human-owned folds and refolds so the human keeps steering AFTER the conductor leaves. A
+	 * store that is about to be thrown away has no view to preserve and no one left to steer it,
+	 * so `dispose()` skips the freeze/refold and only tears down the conductor lifecycle.
+	 * Idempotent: a second call detaches a null conductor (a no-op).
+	 */
+	dispose(): void {
+		this.detachConductorHost(this.conductor);
+		this.conductor = null;
+	}
+
+	/**
 	 * ADR 0011 consent → baseline. Clear standing human/agent overrides in the domains the
 	 * attaching conductor locks: under `human-steering` every HUMAN override (pin / manual
 	 * fold / manual unfold) AND every human-owned GROUP is released; under `agent-unfold` every

@@ -230,6 +230,7 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			// Structural reset: clear all ghosts — no ghost survives a session reconnect.
 			ghostClearAll();
 			budgetLive = false;
+			session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 			session.store = new AccordionStore({
 				meta: { format: "pi", title: msg.meta.title || "live pi session", cwd: msg.meta.cwd || "", model: msg.meta.model || "" },
 				blocks: [],
@@ -253,6 +254,7 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				const prevContextWindow = session.store.contextWindow;
 				const prevBudget = session.store.budget;
 				const prevProtect = session.store.protectTokens;
+				session.store.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 				session.store = new AccordionStore({
 					meta: session.store.meta,
 					blocks: [],

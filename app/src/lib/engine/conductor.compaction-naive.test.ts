@@ -1556,3 +1556,60 @@ describe("NaiveCompactionConductor — AccordionStore integration", () => {
 		expect(g2.memberIds).toContain("m3:p0");
 	});
 });
+
+// ── 18. AccordionStore.dispose() — outgoing-store cleanup ─────────────────────
+//
+// Regression: when `session.store` is reassigned to a fresh AccordionStore (session swap,
+// file reload, live hello / full-sync reset), the OUTGOING store must `dispose()` so its
+// conductor's `detach()` runs and aborts any in-flight `host.complete()`. Without it, a
+// naive-compaction summary call caught mid-flight runs to completion against an orphaned
+// store — uncancelled, billable, and a lifecycle leak.
+
+describe("AccordionStore.dispose() — outgoing-store cleanup", () => {
+	it("aborts an in-flight naive-compaction completion when the store is disposed", async () => {
+		// Aged region over the 90% threshold so the conductor launches a summary completion
+		// (mirrors the integration harness above).
+		const blocks = [
+			blk(0, "text", 2000, { text: "first aged block" }),
+			blk(1, "text", 2000, { text: "second aged block" }),
+			blk(2, "text", 200, { text: "tail" }),
+		];
+		const s = makeStore(blocks);
+		s.setProtect(200);
+		s.setBudget(4_000);
+
+		// A completer that captures the request's AbortSignal and NEVER settles — the call
+		// stays in-flight, exactly like a slow model round-trip caught mid-session-swap.
+		let captured: AbortSignal | undefined;
+		s.completer = (req: CompletionRequest) => {
+			captured = req.signal;
+			return new Promise<CompletionResult>(() => {}); // never settles
+		};
+
+		s.attach(new NaiveCompactionConductor());
+		await flushMicrotasks();
+
+		// The completion launched and is still in flight (not yet aborted).
+		expect(captured).toBeInstanceOf(AbortSignal);
+		expect(captured!.aborted).toBe(false);
+
+		// Retire the store — the exact action the four `session.store = new AccordionStore(...)`
+		// sites now perform on the outgoing store before discarding it.
+		s.dispose();
+
+		// The in-flight model call was cancelled instead of running on against the orphan.
+		expect(captured!.aborted).toBe(true);
+		// A disposed store carries no conductor.
+		expect(s.conductor).toBeNull();
+	});
+
+	it("is a harmless no-op for a store on the default (pure) conductor, and is idempotent", () => {
+		const s = makeStore([blk(0, "text", 100), blk(1, "text", 100)]);
+		// The default conductor is the pure built-in (no `detach` hook) — dispose must not throw.
+		expect(() => s.dispose()).not.toThrow();
+		expect(s.conductor).toBeNull();
+		// Second dispose detaches a null conductor — still a no-op.
+		expect(() => s.dispose()).not.toThrow();
+		expect(s.conductor).toBeNull();
+	});
+});
