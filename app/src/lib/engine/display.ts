@@ -89,10 +89,10 @@ export function buildDisplay(
 }
 
 /** A run of plain/collapsed tiles that lays out as ONE uniform CSS grid. */
-export type TilesSegment = { kind: "tiles"; rows: DisplayRow[] };
+type TilesSegment = { kind: "tiles"; rows: DisplayRow[] };
 /** One OPEN group, rendered as a full-width band of natural height between grids. */
-export type BandSegment = { kind: "band"; row: Extract<DisplayRow, { type: "groupOpen" }> };
-export type DisplaySegment = TilesSegment | BandSegment;
+type BandSegment = { kind: "band"; row: Extract<DisplayRow, { type: "groupOpen" }> };
+type DisplaySegment = TilesSegment | BandSegment;
 
 /**
  * Split a display-row list into stacked segments so an OPEN group (`groupOpen`) never lives
@@ -122,4 +122,44 @@ export function segmentDisplay(rows: DisplayRow[]): DisplaySegment[] {
 	}
 	if (cur) segs.push({ kind: "tiles", rows: cur });
 	return segs;
+}
+
+// ---------------------------------------------------------------------------
+// buildLane — sliver-mode lane grouping helper (pure, no store import)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single item in the sliver-mode lane for a `tiles` segment.
+ *
+ * - `tile`  — a live (non-folded) block → a full square cell.
+ * - `fold`  — ONE ungrouped folded block. Folding substitutes the block's content for a
+ *             digest, which is a real synthetic "cocoa" block now in the context; the lane
+ *             shows that cocoa block plus the original as a thin sliver. Adjacent ungrouped
+ *             folds are NEVER merged — each folded block is its own `fold` item (1 cocoa +
+ *             1 sliver). Adjacency is not grouping.
+ * - `group` — a collapsed ADR-0006 group → ONE shared cocoa summary block + its N member
+ *             slivers. A shared summary only ever comes from an explicit group.
+ *
+ * Tiles-segment rows only contain `block` and `group` rows (open groups are `band`
+ * segments, handled separately); `groupOpen` never reaches here.
+ */
+type LaneItem =
+	| { kind: "tile"; block: Block }
+	| { kind: "fold"; block: Block }
+	| { kind: "group"; group: Group; members: Block[] };
+
+export function buildLane(
+	rows: DisplayRow[],
+	isFolded: (b: Block) => boolean,
+): LaneItem[] {
+	const items: LaneItem[] = [];
+	for (const row of rows) {
+		if (row.type === "group") {
+			items.push({ kind: "group", group: row.group, members: row.members });
+		} else if (row.type === "block") {
+			const b = row.block;
+			items.push(isFolded(b) ? { kind: "fold", block: b } : { kind: "tile", block: b });
+		}
+	}
+	return items;
 }

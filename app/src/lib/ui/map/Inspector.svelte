@@ -3,7 +3,6 @@
 	import { cubicOut } from "svelte/easing";
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block, Group } from "../../engine/types";
-	import { groupDigest } from "$lib/engine/digest";
 	import Icon from "$lib/ui/Icon.svelte";
 
 	let {
@@ -37,12 +36,29 @@
 	// disabled here so the guarantee is visible, not just enforced silently.
 	const protect = $derived(block ? store.isProtected(block) : false);
 
+	// Involvement locks (ADR 0011): under `human-steering` the human's fold / unfold / pin /
+	// group / reset controls are the conductor's, so they show disabled — the honest mirror of
+	// the engine's no-op. Observation (this whole panel's content, the digest, the partner
+	// preview) is NEVER gated; only the mutating buttons are. Drive purely off `store.isLocked`
+	// so it's correct in preview/demo/read-only too.
+	const steerLocked = $derived(store.isLocked("human-steering"));
+	const lockTip = $derived(
+		`Locked by ${store.lockingConductorLabel ?? "the active conductor"} — detach to take back control`,
+	);
+
 	// the call/result partner — they're separate blocks sharing a callId
 	const partner = $derived.by<Block | null>(() => {
 		if (!block?.callId) return null;
 		return store.blocks.find((x) => x.id !== block.id && x.callId === block.callId) ?? null;
 	});
 	const partnerProtected = $derived(partner ? store.isProtected(partner) : false);
+
+	// Can the human fold this block / its partner right now? The single engine predicate the
+	// fold controls consult, so the Inspector never offers a fold the wire would refuse (a live
+	// user/tool_call) — matching ContextMap. Unfold of an already-folded block always stays.
+	const canFoldBlock = $derived(block ? store.canFold(block) : false);
+	const canFoldPartner = $derived(partner ? store.canFold(partner) : false);
+	const partnerFolded = $derived(partner ? store.isFolded(partner) : false);
 
 	function body(b: Block): { text: string; clipped: number } {
 		const t = b.text ?? "";
@@ -62,7 +78,13 @@
 	const gLiveTok = $derived(group ? store.groupLiveTokens(group) : 0);
 	const gSavedTok = $derived(group ? store.groupSavedTokens(group) : 0);
 	const gStrag = $derived(group ? store.groupStragglerCount(group) : 0);
-	const gDigest = $derived(group ? groupDigest(group, store.groupMembers(group)) : "");
+	const gIsDropGroup = $derived(group ? store.isDropGroup(group) : false);
+	// The EXACT summary the agent receives for this group: the conductor's custom digest
+	// (e.g. naive compaction's LLM summary) when present, else the deterministic structural
+	// recap. Mirrors the wire (`plan.ts` → `store.groupSummary`) so this "shown to agent"
+	// panel never diverges from what the agent actually sees. (Drop groups return ""; this
+	// derived is only rendered in the non-drop branch.)
+	const gDigest = $derived(group ? store.groupSummary(group) : "");
 	const gTurnFirst = $derived(gMembers.length > 0 ? gMembers[0].turn : 0);
 	const gTurnLast = $derived(gMembers.length > 0 ? gMembers[gMembers.length - 1].turn : 0);
 
@@ -119,16 +141,22 @@
 				{#if group.folded}
 					<button
 						class="action-btn action-primary-group"
+						class:action-disabled={steerLocked}
+						disabled={steerLocked}
+						aria-disabled={steerLocked}
 						onclick={() => store.unfoldGroup(group!.id)}
-						title="Unfold group to context"
+						title={steerLocked ? lockTip : "Unfold group to context"}
 					>
 						<Icon name="chevrons-up-down" size={14} />
 						Unfold to context
 					</button>
 					<button
 						class="action-btn action-danger"
+						class:action-disabled={steerLocked}
+						disabled={steerLocked}
+						aria-disabled={steerLocked}
 						onclick={() => { store.deleteGroup(group!.id); onclose(); }}
-						title="Delete group"
+						title={steerLocked ? lockTip : "Delete group"}
 					>
 						<Icon name="trash-2" size={14} />
 						Delete
@@ -136,16 +164,22 @@
 				{:else}
 					<button
 						class="action-btn"
+						class:action-disabled={steerLocked}
+						disabled={steerLocked}
+						aria-disabled={steerLocked}
 						onclick={() => store.foldGroup(group!.id)}
-						title="Re-fold group"
+						title={steerLocked ? lockTip : "Re-fold group"}
 					>
 						<Icon name="chevrons-down-up" size={14} />
 						Re-fold
 					</button>
 					<button
 						class="action-btn action-danger"
+						class:action-disabled={steerLocked}
+						disabled={steerLocked}
+						aria-disabled={steerLocked}
 						onclick={() => { store.deleteGroup(group!.id); onclose(); }}
-						title="Delete group"
+						title={steerLocked ? lockTip : "Delete group"}
 					>
 						<Icon name="trash-2" size={14} />
 						Delete
@@ -156,13 +190,23 @@
 
 		<!-- ── Body: group digest ─────────────────────────────────── -->
 		<div class="body-wrap">
-			<div class="digest-callout">
-				<div class="digest-label">
-					<Icon name="chevrons-down-up" size={12} stroke={2} />
-					Group digest — shown to agent when folded
+			{#if gIsDropGroup}
+				<div class="digest-callout digest-callout-drop">
+					<div class="digest-label digest-label-drop">
+						<Icon name="chevrons-down-up" size={12} stroke={2} />
+						Drop group — removed from wire
+					</div>
+					<p class="drop-note">The agent does not see this block</p>
 				</div>
-				<pre class="digest-text mono">{gDigest}</pre>
-			</div>
+			{:else}
+				<div class="digest-callout">
+					<div class="digest-label">
+						<Icon name="chevrons-down-up" size={12} stroke={2} />
+						Group digest — shown to agent when folded
+					</div>
+					<pre class="digest-text mono">{gDigest}</pre>
+				</div>
+			{/if}
 		</div>
 	</aside>
 {:else if block}
@@ -220,9 +264,20 @@
 			<div class="meta-actions">
 				<button
 					class="action-btn"
-					class:action-disabled={protect}
-					disabled={protect}
-					title={protect ? "Protected working tail — never folded" : folded ? "Unfold block" : "Fold block"}
+					class:action-disabled={steerLocked || (!folded && !canFoldBlock)}
+					disabled={steerLocked || (!folded && !canFoldBlock)}
+					aria-disabled={steerLocked}
+					title={steerLocked
+						? lockTip
+						: folded
+							? "Unfold block"
+							: canFoldBlock
+								? "Fold block"
+								: protect
+									? "Protected working tail — never folded"
+									: pinned
+										? "Pinned — unpin to fold"
+										: "Only text, thinking & tool results can fold"}
 					onclick={() => store.toggle(block!.id)}
 				>
 					<Icon name={folded ? "chevrons-up-down" : "chevrons-down-up"} size={14} />
@@ -231,8 +286,11 @@
 				<button
 					class="action-btn"
 					class:action-active={pinned}
+					class:action-disabled={steerLocked}
+					disabled={steerLocked}
+					aria-disabled={steerLocked}
 					onclick={() => (pinned ? store.unpin(block!.id) : store.pin(block!.id))}
-					title={pinned ? "Unpin block" : "Pin block (keeps it live)"}
+					title={steerLocked ? lockTip : pinned ? "Unpin block" : "Pin block (keeps it live)"}
 				>
 					<Icon name={pinned ? "pin-off" : "pin"} size={14} />
 					{pinned ? "Unpin" : "Pin"}
@@ -275,19 +333,30 @@
 						{partner.kind === "tool_result" ? "Result it produced" : "Call that produced this"}
 					</span>
 					<span class="partner-meta tnum">
-						{store.isFolded(partner) ? "folded" : "live"} · {fmt(store.effTokens(partner))} tok
+						{partnerFolded ? "folded" : "live"} · {fmt(store.effTokens(partner))} tok
 					</span>
 				</div>
 
 				<button
 					class="action-btn partner-toggle"
-					class:action-disabled={partnerProtected}
-					disabled={partnerProtected}
-					title={partnerProtected ? "Protected — never folded" : store.isFolded(partner) ? "Unfold partner" : "Fold partner"}
+					class:action-disabled={steerLocked || (!partnerFolded && !canFoldPartner)}
+					disabled={steerLocked || (!partnerFolded && !canFoldPartner)}
+					aria-disabled={steerLocked}
+					title={steerLocked
+						? lockTip
+						: partnerFolded
+							? "Unfold partner"
+							: canFoldPartner
+								? "Fold partner"
+								: partnerProtected
+									? "Protected — never folded"
+									: partner?.override === "pinned"
+										? "Pinned — unpin to fold"
+										: "Only text, thinking & tool results can fold"}
 					onclick={() => store.toggle(partner!.id)}
 				>
 					<Icon name="corner-down-right" size={14} />
-					{partnerProtected ? "Protected" : store.isFolded(partner) ? "Unfold" : "Fold"} partner
+					{partnerFolded ? "Unfold" : canFoldPartner ? "Fold" : partnerProtected ? "Protected" : "Fold"} partner
 				</button>
 
 				<pre class="partner-preview mono">{body(partner).text}</pre>
@@ -532,6 +601,12 @@
 		gap: var(--sp-2);
 	}
 
+	/* Drop group variant: muted/faint palette — content is gone, not just summarised. */
+	.digest-callout-drop {
+		border-left-color: var(--faint);
+		opacity: 0.75;
+	}
+
 	.digest-label {
 		display: flex;
 		align-items: center;
@@ -543,12 +618,25 @@
 		letter-spacing: .05em;
 	}
 
+	.digest-label-drop {
+		color: var(--faint);
+	}
+
 	.digest-text {
 		margin: 0;
 		font-size: var(--fs-sm);
 		color: var(--muted);
 		white-space: pre-wrap;
 		word-break: break-word;
+		line-height: 1.5;
+	}
+
+	/* Muted note shown instead of a digest for drop groups. */
+	.drop-note {
+		margin: 0;
+		font-size: var(--fs-sm);
+		font-style: italic;
+		color: var(--faint);
 		line-height: 1.5;
 	}
 

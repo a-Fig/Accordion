@@ -1,0 +1,6 @@
+{
+  "id": "tiered-relevance",
+  "label": "Tiered relevance",
+  "command": "node",
+  "args": ["tiered-relevance.mjs"]
+}

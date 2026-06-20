@@ -13,16 +13,41 @@
 import { session, cancelPendingLoad } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import { wireToBlock } from "./mapping";
-import { computeFoldOps, computeGroupOps, resolveUnfold } from "./plan";
+import { computeFoldOps, computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
 import { folding } from "./folding.svelte";
-import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage } from "./protocol";
+import { activeRemoteRunner } from "./conductorClient.svelte";
+import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
+import type { CompletionRequest, CompletionResult } from "$conductors/contract";
 
 let socket: WebSocket | null = null;
 let manualClose = false;
 // True once budget has been set from pi's contextWindow for the current connection.
 // Prevents subsequent syncs from overriding a user's manual budget adjustment.
 let budgetLive = false;
+
+/**
+ * Safety backstop: if the extension (or the model it calls) never replies to a
+ * completion request, the pending promise would hang forever. Two minutes is generous
+ * enough for any real LLM completion while still bounding the worst-case hang window.
+ * On fire, the promise rejects and the map entry is cleared so a late `completeResult`
+ * for the same reqId is ignored.
+ */
+const COMPLETION_TIMEOUT_MS = 120_000;
+
+/**
+ * Pending out-of-band completion requests keyed by `reqId`. A conductor calls
+ * `host.complete(req)`, which routes here; the promise resolves/rejects when the
+ * extension sends back a matching `completeResult`. Module-scoped and parallel to
+ * `socket` so it survives across the connect/message lifecycle without threading
+ * through a closure per connection.
+ *
+ * Each entry also holds a `timer` handle that is cleared on every settle path
+ * (success, abort, disconnect drain) so no timer leaks.
+ */
+const pendingCompletions = new Map<number, { resolve: (r: CompletionResult) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+/** Monotonic counter for `completeRequest` reqIds. Starts at 1 to distinguish from unset/zero. */
+let completionReqId = 0;
 
 /** Live connection status, for the UI. */
 export const live = $state<{ status: "idle" | "connecting" | "connected" | "error"; detail: string }>({
@@ -46,6 +71,111 @@ export const live = $state<{ status: "idle" | "connecting" | "connected" | "erro
 function computePlan(): { ops: FoldOp[]; groups: GroupOp[] } {
 	if (!folding.enabled || !session.store) return { ops: [], groups: [] };
 	return { ops: computeFoldOps(session.store), groups: computeGroupOps(session.store) };
+}
+
+/**
+ * Reject all pending completion promises and clear the registry. Called on any
+ * disconnect path so no request can silently hang across a session boundary.
+ * Also clears the per-entry timeout timer so no timer leaks survive a disconnect.
+ */
+function drainPendingCompletions(reason: string): void {
+	for (const { reject, timer } of pendingCompletions.values()) {
+		clearTimeout(timer);
+		reject(new Error(reason));
+	}
+	pendingCompletions.clear();
+}
+
+/**
+ * Fire an out-of-band completion request to the pi extension over the live socket.
+ *
+ * This is the implementation behind `store.completer` — the live client injects it
+ * when the socket opens and clears it when the socket closes. Conductors reach it
+ * through `host.complete(req)` (never called directly).
+ *
+ * Hard invariants:
+ *  - NEVER blocks or alters the agent's own model call; the extension fulfils it on a
+ *    side channel completely outside the sync→plan→apply loop.
+ *  - If `req.signal` is already aborted before this call, the promise rejects
+ *    immediately so no wire message is sent.
+ *  - If `req.signal` fires while the call is in flight, the pending entry is removed
+ *    and the promise rejects with the abort reason; a late `completeResult` for the
+ *    same `reqId` is then silently ignored (no pending entry found).
+ */
+async function sendCompletion(req: CompletionRequest): Promise<CompletionResult> {
+	const ws = socket;
+	if (!ws || ws.readyState !== WebSocket.OPEN) {
+		throw new Error("not connected");
+	}
+
+	// Abort immediately if the signal is already fired before we even send.
+	if (req.signal?.aborted) {
+		throw new DOMException("aborted", "AbortError");
+	}
+
+	const reqId = ++completionReqId;
+	const msg: CompleteRequestMessage = {
+		type: "completeRequest",
+		reqId,
+		system: req.system,
+		prompt: req.prompt,
+		maxOutputTokens: req.maxOutputTokens,
+	};
+
+	return new Promise<CompletionResult>((resolve, reject) => {
+		// Register BEFORE sending so there is no window where a synchronous response
+		// could arrive before we have stored the handlers (impossible over WS in practice,
+		// but defensive correctness costs nothing here).
+		let abortListener: (() => void) | null = null;
+
+		// Placeholder timer handle; replaced with the real timer immediately after the
+		// entry is inserted into the map (before the WS send), so the settle wrapper
+		// always has a valid handle to clear.
+		let timeoutHandle: ReturnType<typeof setTimeout>;
+
+		const settle = (fn: () => void): void => {
+			// Clear the safety-backstop timer exactly once regardless of settle path
+			// (success via completeResult, abort signal, or drain on disconnect).
+			clearTimeout(timeoutHandle);
+			// Clean up the abort listener exactly once regardless of settle path.
+			if (abortListener && req.signal) {
+				req.signal.removeEventListener("abort", abortListener);
+				abortListener = null;
+			}
+			pendingCompletions.delete(reqId);
+			fn();
+		};
+
+		// Start the safety backstop timer. On fire, reject the promise and remove the
+		// entry so any late `completeResult` for this reqId is silently ignored.
+		timeoutHandle = setTimeout(() => {
+			if (pendingCompletions.has(reqId)) {
+				settle(() => reject(new Error("completion timed out")));
+			}
+		}, COMPLETION_TIMEOUT_MS);
+
+		pendingCompletions.set(reqId, {
+			resolve: (r) => settle(() => resolve(r)),
+			reject: (e) => settle(() => reject(e)),
+			timer: timeoutHandle,
+		});
+
+		// Wire the abort signal AFTER the entry is in the map so the listener can safely
+		// delete it and any late result for this reqId is ignored. Route through settle()
+		// so the timeout timer is cleared and the abort listener is removed exactly once.
+		if (req.signal) {
+			abortListener = () => {
+				settle(() => reject(new DOMException("aborted", "AbortError")));
+			};
+			req.signal.addEventListener("abort", abortListener, { once: true });
+		}
+
+		try {
+			ws.send(JSON.stringify(msg));
+		} catch (e) {
+			settle(() => reject(new Error(e instanceof Error ? e.message : "send failed")));
+		}
+	});
 }
 
 export function connectLive(port: number = DEFAULT_PORT): void {
@@ -88,7 +218,6 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				}
 			live.status = "connected";
 			session.error = "";
-			session.live = true;
 			session.filePath = null;
 			// A live pi session is steerable, never a read-only recording. Reset here —
 			// alongside the authoritative store rebuild — so the READ-ONLY badge can never
@@ -101,12 +230,17 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			// Structural reset: clear all ghosts — no ghost survives a session reconnect.
 			ghostClearAll();
 			budgetLive = false;
+			session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 			session.store = new AccordionStore({
 				meta: { format: "pi", title: msg.meta.title || "live pi session", cwd: msg.meta.cwd || "", model: msg.meta.model || "" },
 				blocks: [],
 				lineCount: 0,
 				skipped: 0,
 			});
+			// Expose the completion backend to conductors while this socket is live.
+			// Cleared on disconnect/close so `host.can("complete")` returns false when
+			// there is no active model link.
+			session.store.completer = sendCompletion;
 			if (typeof msg.meta.contextWindow === "number" && msg.meta.contextWindow > 0) {
 				session.store.setContextWindow(msg.meta.contextWindow);
 				session.store.setBudget(msg.meta.contextWindow);
@@ -120,6 +254,7 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				const prevContextWindow = session.store.contextWindow;
 				const prevBudget = session.store.budget;
 				const prevProtect = session.store.protectTokens;
+				session.store.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 				session.store = new AccordionStore({
 					meta: session.store.meta,
 					blocks: [],
@@ -130,6 +265,9 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				if (prevContextWindow !== null) session.store.setContextWindow(prevContextWindow);
 				session.store.setBudget(prevBudget);
 				session.store.setProtect(prevProtect);
+				// Re-attach the completer: a structural reset builds a brand-new store object,
+				// so the reference from the hello path is gone. The socket is still live.
+				session.store.completer = sendCompletion;
 			}
 			// Update contextWindow from the sync (refreshed each context hook, and pushed
 			// immediately on a `/model` swap). Snap the budget to the window the FIRST time
@@ -168,11 +306,41 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			// override then would silently leak a block from the budget on the next arm.
 			const { restored, missing } =
 				folding.enabled && session.store ? resolveUnfold(session.store, codes) : { restored: [], missing: codes };
+			// Tell an attached remote conductor that the agent pulled blocks back to full — it
+			// didn't initiate this, and may want to adapt (ADR 0007 host/event). Fire-and-forget.
+			// We send block ids (not fold codes) so the conductor can correlate against the
+			// ViewBlocks it received. A code may map to >1 block on a hash collision — include all.
+			if (restored.length) {
+				// `r.ids` carries the exact ids the resolver touched (group memberIds or
+				// per-block id, including all hash-collision matches). Dedupe across entries.
+				const ids = [...new Set(restored.flatMap((r) => r.ids))];
+				activeRemoteRunner()?.notifyEvent(
+					"agentUnfold",
+					ids,
+					`agent unfolded ${restored.length} block(s)`,
+				);
+			}
 			const reply: UnfoldResultMessage = { type: "unfoldResult", reqId: msg.reqId, restored, missing };
 			try {
 				ws.send(JSON.stringify(reply));
 			} catch {
 				/* socket gone — the tool will time out and tell the agent to retry */
+			}
+		} else if (msg.type === "recallRequest") {
+			// The live agent asked (via the `recall` tool, ADR 0011) for the ORIGINAL full
+			// content of folded blocks it saw tagged `{#<code> FOLDED}`. recall is an
+			// UNBLOCKABLE READ - the counterpart to the human's peek: it returns the content
+			// THIS turn and does NOT change fold state (no override, the block stays folded).
+			// Because it is a pure read, it is NOT gated by the armed/disarmed steering toggle:
+			// we resolve against the current store either way (resolveRecall never mutates, so
+			// disarmed there is simply nothing folded to recall, all codes report missing).
+			const codes = Array.isArray(msg.codes) ? msg.codes : [];
+			const { restored, missing } = session.store ? resolveRecall(session.store, codes) : { restored: [], missing: codes };
+			const reply: RecallResultMessage = { type: "recallResult", reqId: msg.reqId, restored, missing };
+			try {
+				ws.send(JSON.stringify(reply));
+			} catch {
+				/* socket gone - the tool will time out and tell the agent to retry */
 			}
 		} else if (msg.type === "stream") {
 			// Ghost lifecycle — presentation only; ghosts NEVER enter session.store.blocks.
@@ -198,6 +366,25 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 					ghostEnd(msg.contentIndex);
 				}
 			}
+		} else if (msg.type === "completeResult") {
+			if (typeof msg.reqId !== "number") return;
+			// Out-of-band completion response from the extension (protocol v5). Look up the
+			// pending promise by reqId; if the entry is gone (aborted or stale), ignore silently.
+			const pending = pendingCompletions.get(msg.reqId);
+			if (pending) {
+				if (msg.ok) {
+					pending.resolve({
+						text: msg.text ?? "",
+						model: msg.model ?? "",
+						inputTokens: msg.inputTokens,
+						outputTokens: msg.outputTokens,
+					});
+				} else {
+					pending.reject(new Error(msg.error ?? "completion failed"));
+				}
+				// `pending.resolve/reject` already delete the entry via the `settle` wrapper
+				// in `sendCompletion`, so no explicit `pendingCompletions.delete` here.
+			}
 		}
 	};
 
@@ -207,7 +394,6 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 	};
 
 	ws.onclose = () => {
-		session.live = false;
 		// Guaranteed teardown (invariant #2): on disconnect, all ghosts vanish with the
 		// GUI state. A ghost cannot outlive the WS connection that spawned it.
 		ghostClearAll();
@@ -217,6 +403,11 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			// new socket's connecting/connected state back to idle.
 			if (socket === ws) {
 				socket = null;
+				// Clear the completion backend so `host.can("complete")` returns false while
+				// disconnected. Drain any pending completion promises with a disconnection error
+				// so they do not hang indefinitely.
+				if (session.store) session.store.completer = null;
+				drainPendingCompletions("disconnected");
 				if (!manualClose && live.status !== "error") {
 					live.status = "idle";
 					live.detail = "disconnected";
@@ -228,10 +419,16 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 export function disconnectLive(): void {
 	manualClose = true;
 	budgetLive = false;
-	session.live = false;
 	// Guaranteed teardown (invariant #2): explicit disconnect clears all ghosts
 	// immediately, before the socket close fires.
 	ghostClearAll();
+	// Clear the completion backend and drain any in-flight completion promises before
+	// closing the socket, so conductors that await host.complete() get an immediate error
+	// rather than a dangling promise. The onclose handler also runs this path but may
+	// fire asynchronously; running it here ensures the completer is unavailable the
+	// moment the caller's disconnectLive() returns.
+	if (session.store) session.store.completer = null;
+	drainPendingCompletions("disconnected");
 	if (socket) {
 		try {
 			socket.close();
@@ -243,5 +440,3 @@ export function disconnectLive(): void {
 	if (live.status !== "error") live.status = "idle";
 }
 
-/** The protocol version this client speaks; surfaced for the mismatch guard above. */
-export const CLIENT_PROTOCOL_VERSION = PROTOCOL_VERSION;

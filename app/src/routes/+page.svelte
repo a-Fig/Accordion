@@ -2,8 +2,13 @@
 	import { onMount } from "svelte";
 	import { session, isTauriEnv, loadSample, openFile, loadFilePath } from "$lib/session.svelte.ts";
 	import { connectLive, disconnectLive, live } from "$lib/live/liveClient.svelte";
-	import { discovery, startDiscovery, stopDiscovery, selectSession, DEMO_ID } from "$lib/live/discovery.svelte";
-	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery, selectClaude } from "$lib/live/claudeDiscovery.svelte";
+	import { discovery, startDiscovery, stopDiscovery, DEMO_ID } from "$lib/live/discovery.svelte";
+	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery } from "$lib/live/claudeDiscovery.svelte";
+	import { conductorState } from "$lib/live/conductor.svelte";
+	import { startConductorDiscovery, stopConductorDiscovery, allConductors, isLaunching } from "$lib/live/conductorDiscovery.svelte";
+	import { attachConductor, conductorRetry } from "$lib/live/conductorClient.svelte";
+	import { folding } from "$lib/live/folding.svelte";
+	import { foldAlarm, runFoldCheck } from "$lib/live/foldAlarm.svelte";
 	import { DEFAULT_PORT } from "$lib/live/protocol";
 	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
@@ -29,6 +34,33 @@
 	$effect(() => {
 		if (isTauriEnv && source === "claude") startClaudeDiscovery();
 		else stopClaudeDiscovery();
+	});
+
+	// ── Conductors (ADR 0007) ──────────────────────────────────────────────
+	// External conductors to offer in the switcher (discovered + configured). The built-in
+	// and "Raw" entries are added by the sidebar itself. Reactive so newly-found conductors
+	// appear without a reload.
+	const conductors = $derived(allConductors());
+
+	// Attach the selected conductor to the active session's store. Tracks the store, the
+	// selection, AND the available list — so a conductor selected before discovery found it
+	// (e.g. a remote id restored from localStorage on launch) gets attached once it appears.
+	// `attachConductor` is idempotent, so a poll refreshing the list when we're already
+	// correctly attached is a no-op (no reconnect churn).
+	//
+	// Flash suppression: if the active id is a launchable that is still launching (started
+	// but not yet discovered), hold — do NOT fall back to built-in while the process is
+	// booting. Once discovery sees the heartbeat, isLaunching clears, conductors changes,
+	// and this effect re-runs to attach the real RemoteRunner.
+	$effect(() => {
+		void conductorRetry.tick; // re-fire on a remote-drop retry tick (recover a same-process socket drop)
+		const store = session.store;
+		const activeId = conductorState.activeId;
+		const list = conductors;
+		if (!store) return;
+		// Suppress the built-in fallback while the process is still starting up.
+		if (isLaunching(activeId) && !list.some((c) => c.id === activeId)) return;
+		attachConductor(store, activeId, list);
 	});
 
 	const selectedBlock = $derived(
@@ -57,8 +89,8 @@
 	function selectAndConnect(s: SessionEntry): void {
 		if (discovery.selected === s.sessionId && live.status === "connected") return;
 		session.readOnly = false; // a live pi session is steerable, not read-only
-		selectClaude(null);
-		selectSession(s.sessionId);
+		claudeDiscovery.selected = null;
+		discovery.selected = s.sessionId;
 		connectLive(s.port);
 	}
 
@@ -66,8 +98,8 @@
 	// sample transcript instead of dialing a live pi over the socket.
 	function selectDemo(): void {
 		disconnectLive();
-		selectClaude(null);
-		selectSession(DEMO_ID);
+		claudeDiscovery.selected = null;
+		discovery.selected = DEMO_ID;
 		loadSample();
 	}
 
@@ -75,8 +107,8 @@
 	// no live socket to steer — folds here are a personal lens (see MapHeader badge).
 	function selectClaudeSession(s: ClaudeCodeSession): void {
 		disconnectLive();
-		selectSession(null);
-		selectClaude(s.sessionId);
+		discovery.selected = null;
+		claudeDiscovery.selected = s.sessionId;
 		loadFilePath(s.filePath);
 	}
 
@@ -87,18 +119,31 @@
 
 	onMount(() => {
 		startDiscovery(onFocusRequest);
+		startConductorDiscovery();
 		return () => {
 			stopDiscovery();
 			stopClaudeDiscovery();
+			stopConductorDiscovery();
 			disconnectLive();
 		};
 	});
 
-	// Two distinct states — keep them separate (they contradict otherwise):
-	//  • LIVE     = connected to a pi session over the socket; folds steer the agent.
-	//  • WATCHING = tailing a read-only Claude Code transcript; folds are a local lens.
 	const isLive = $derived(live.status === "connected");
-	const isWatching = $derived(session.live && session.readOnly && live.status !== "connected");
+	const isWatching = $derived(session.readOnly && !isLive);
+
+	// View↔wire fold alarm (indicator-only): re-run the divergence check on every settled
+	// store change. `st.version` is the settled-change signal (manual fold, conductor pass,
+	// budget/protect change, append — all route through refold()→runConductor()→version++).
+	$effect(() => {
+		const st = session.store;
+		if (!st) {
+			foldAlarm.active = false;
+			foldAlarm.detail = "";
+			return;
+		}
+		st.version; // track the settled-change signal
+		runFoldCheck(st, live.status === "connected");
+	});
 </script>
 
 <svelte:head><title>Accordion</title></svelte:head>
@@ -130,20 +175,23 @@
 							<Icon name="accordion" size={20} stroke={1.75} />
 						</span>
 						<span class="wordmark">Accordion</span>
+						{#if foldAlarm.active}
+							<span class="alarm-dot" title={foldAlarm.detail || "View ↔ wire fold mismatch — the screen disagrees with what the agent would receive"}></span>
+						{/if}
 						<div class="divider"></div>
 						<div class="session-meta">
 							<span class="meta-title tnum">
 								{session.filePath ? baseName(session.filePath) : s.meta.title}
 							</span>
 							{#if isLive}
-								<span class="live-chip">
-									<span class="live-dot" title="Live — connected to pi; folds steer the agent"></span>
-									<span class="live-label">LIVE</span>
+								<span class="live-chip" class:steering={folding.enabled}>
+									<span class="live-dot" title={folding.enabled ? "Connected to pi; actively steering the agent's context" : "Connected to pi; passively watching the session"}></span>
+									<span class="live-label">{folding.enabled ? "listening & steering" : "listening"}</span>
 								</span>
 							{:else if isWatching}
-								<span class="live-chip watching">
-									<span class="live-dot" title="Watching — tailing a read-only Claude Code transcript; folds are a local lens"></span>
-									<span class="live-label">WATCHING</span>
+								<span class="live-chip">
+									<span class="live-dot" title="Tailing a read-only transcript; folds are a local lens"></span>
+									<span class="live-label">watching</span>
 								</span>
 							{/if}
 						</div>
@@ -320,16 +368,17 @@
 		max-width: 38vw;
 	}
 
-	/* Live / Watching chip — colour driven by --chip so both states share one rule */
+	/* Live / Watching chip — colour driven by --chip so both states share one rule.
+	   Preview (default) and Watching = blue; Steering (folding armed) = green. */
 	.live-chip {
-		--chip: var(--ok);
+		--chip: var(--accent);
 		display: inline-flex;
 		align-items: center;
 		gap: 4px;
 		flex: 0 0 auto;
 	}
-	.live-chip.watching {
-		--chip: var(--accent);
+	.live-chip.steering {
+		--chip: var(--ok);
 	}
 	/* compositor-only pulse (transform + opacity) — no per-frame repaint */
 	@keyframes livepulse {
@@ -360,6 +409,32 @@
 		color: var(--chip);
 		letter-spacing: 0.06em;
 		line-height: 1;
+	}
+
+	/* View↔wire fold-mismatch alarm — a single header dot, exempt from the grid
+	   perf rule (that's about the 982-tile grid, not a lone indicator). Kept
+	   compositor-only (transform + opacity) like .live-dot; slower 3s pulse. */
+	@keyframes alarmpulse {
+		0% { transform: scale(1); opacity: 0.5; }
+		70%, 100% { transform: scale(2.6); opacity: 0; }
+	}
+	.alarm-dot {
+		position: relative;
+		display: inline-block;
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--danger);
+		flex: 0 0 auto;
+	}
+	.alarm-dot::after {
+		content: "";
+		position: absolute;
+		inset: 0;
+		border-radius: 50%;
+		background: var(--danger);
+		animation: alarmpulse 3s ease-in-out infinite;
+		pointer-events: none;
 	}
 
 	/* Meta chips row (model · cwd · blocks) */

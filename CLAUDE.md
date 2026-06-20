@@ -25,9 +25,7 @@ The old **Classic** view (summary/timeline of `BlockCard`s) and the earlier 3-wa
 (`ContextSummary` / `ContextTimeline` / `Timeline` / `BlockCard`) and `chains.ts` are gone.
 
 The current pi extension is **`extension/accordion.ts`** (the live link — see below).
-`src/` (repo root) and `visualizer/` are the *older* pi-extension POC and the
-standalone HTML visualizer — not the focus; touch only if asked. Don't confuse
-`src/accordion.ts` (old POC) with `extension/accordion.ts` (current).
+The old root `src/` POC and `visualizer/` have been removed from the repo.
 
 ## The engine is the source of truth — use it, don't change it
 
@@ -56,7 +54,12 @@ standalone HTML visualizer — not the focus; touch only if asked. Don't confuse
     protected heals back to live; `pin()` remains allowed because it keeps content open.
     `setProtect(n)` resizes the tail and re-folds — wired to an on-bar draggable handle
     on the composition strip (0–60k, step 2k; the real refold is deferred to pointer-release
-    so dragging doesn't re-fold continuously).
+    so dragging doesn't re-fold continuously). **ADR 0011 `tail-size` lock:** under an exclusive
+    conductor holding the `tail-size` lock the host floor described above is lifted (`protectedFromIndex`
+    returns `blocks.length`, collapsing the grid to one box) and `setProtect` is a no-op
+    — the conductor may fold any block, including recent reasoning. Absent the lock the tail is
+    host-absolute exactly as described. See `protectedFromIndex` / `setProtect` in `store.svelte.ts` and
+    [ADR 0011](docs/adr/0011-conductor-involvement-locks.md).
 - `tokens.ts` (chars/4 estimate) · `digest.ts` (what a kind collapses to when folded).
 
 Folding is **content substitution, never removal** — provider-safe and fully reversible.
@@ -76,7 +79,7 @@ plan the app returns. Decisions live in ADRs: [0001](docs/adr/0001-pi-live-integ
     `PROTOCOL_VERSION`. Block ids encode message location (`m<i>:p<j>`, `m<i>:r`, …).
   - `mapping.ts` — `linearize(messages)` (mirrors `engine/parse`) and the **pure,
     kind-checked** `applyPlan(messages, ops)` (a `tool_call` is never folded → never
-    orphans its result; recent messages are backstopped).
+    orphans its result; the engine is the single foldability gate so no wire-side position backstop is needed — the engine never folds a protected block).
   - `registry.ts` — the **discovery** contract: `SessionEntry`, `FocusRequest`,
     `isLiveEntry`, and the `~/.accordion/` layout. The Tauri Rust layer mirrors these
     constants — change them in lockstep.
@@ -106,6 +109,21 @@ appended* CC session re-runs `_load` on each tail tick, which rebuilds the store
 drops manual folds; static transcripts (the common case) never re-load. The durable fix
 is an incremental `appendBlocks` tail like the WS path.
 
+**RULE — preview/read-only is NOT a more permissive mode.** Preview, demo, and read-only
+Claude Code sessions obey EVERY rule the steering path does — the same foldability
+predicate, the same UI affordances, the same token accounting, the same group/conductor
+constraints. The *only* difference between preview and steering is that no plan is ever
+written to the agent's wire; the agent's context is never altered. Everything else is
+byte-identical. The UI must NEVER render a fold, group, or state that the steering path
+could not itself produce — if the wire would refuse it, the UI must refuse it too, in
+every mode. "There's no agent on the other end, so anything goes" is a forbidden line of
+reasoning: the app is a source of truth, and a source of truth does not relax its rules
+when no one is watching. The foldability gate lives in ONE place (the engine) and is the
+single predicate shared by `fold()`/`isFolded`/`computeFoldOps` — never a stricter rule on
+the wire than in the view. Involvement locks ([ADR 0011](docs/adr/0011-conductor-involvement-locks.md))
+obey the same rule: a locked control is locked in every mode — preview and read-only are not
+exemptions.
+
 **Invariants (don't break):** discovery I/O is best-effort and **never blocks or alters
 a model call**; no GUI / reply timeout / empty plan ⇒ messages pass through untouched;
 no disk I/O on the `context` (pre-model-call) hook. **The engine is now on (M2, ADR
@@ -114,6 +132,13 @@ header toggle). Disarmed, the GUI still replies with an empty plan — M1 behavi
 model call altered. Armed, `computePlan` mirrors the engine's fold decisions into ops
 via `computeFoldOps` (`plan.ts`), guarded so only **durable-id** `text`/`thinking`/
 `tool_result` blocks are ever folded (`isDurableId`; `applyPlan` enforces the same).
+The out-of-band **completion relay** (`completeRequest` / `completeResult`, pi wire v5)
+is a separate channel: the GUI sends it when a conductor calls `host.complete()`, the
+extension runs the model call and returns the raw result, and the GUI passes it back to
+the conductor. This is **never on the `context` hook path** — it runs on a side channel
+completely outside the `sync→plan→apply` loop and must never block or alter the agent's
+own model call. The extension stays thin: it runs exactly the completion it is handed and
+decides nothing (strategy lives in the conductor, in the GUI).
 
 **M3 — agent self-unfold ([ADR 0005](docs/adr/0005-agent-unfold.md)):** the engine's
 `digest()` now prefixes every folded block's digest with `{#<code> FOLDED}`, where
@@ -128,12 +153,128 @@ them unfolded (sticky, provenance `"agent"`), and the full content returns on th
 **next turn** (state-change-only; no content echo this cut). The agent can only unfold a
 block that is actually folded — it can't downgrade a human pin. Agent unfolds show in the
 activity log; the human can re-fold them. The skill `accordion-context-folding` is
-auto-exposed via `resources_discover` — no manual loading.
+auto-exposed via `resources_discover` — no manual loading. **ADR 0011 ships a sibling agent tool `recall`** — an unblockable read that returns a folded
+block's full content as a tool result (like `read_file`) without mutating the standing view:
+no override is created, the block stays folded in context (vs `unfold`, which forces the block
+standing-open and is lockable under `agent-unfold`). Symmetry: **Peek : Human :: Recall : Agent.**
+The conductor then manages the resulting tool-result block like any other. `recall` sits beside
+`unfold` in `extension/accordion.ts` (see `resolveRecall` in `app/src/lib/live/plan.ts`) and is
+**never lockable**. Both tools are kept for now; `unfold` is potentially transitional.
 
 **Known characteristic:** the view syncs on pi's `context` hook, which fires *before*
 each model call — so an assistant reply is only seen at the *next* model call (i.e. the
 next user turn for a plain reply; immediately for tool-using turns). Closing that gap
 (a post-turn view sync) is a planned follow-up.
+
+## Conductors — pluggable context strategy ([ADR 0007](docs/adr/0007-conductor-protocol.md), [0008](docs/adr/0008-conductor-first-party-one-view.md), [0011](docs/adr/0011-conductor-involvement-locks.md))
+
+*Which* blocks to fold / replace / group / restore / pin is owned by a **conductor**, an
+interchangeable strategy behind one contract: `conduct(view) → Command[] | null` (`Command[]`
+= complete desired state, `[]` = clear to raw, `null` = hold last state). Accordion imposes
+no strategy of its own — no conductor attached ⇒ raw context. Conductors are **first-party**
+(every one ships in this repo or a fork — no sandbox, no trust boundary); the interface
+exists to make them cheap to write, with the built-in as the worked example. The contract
+lives in the top-level **`conductors/contract/`** (both halves dependency-free / Node-safe,
+re-exported by `conductors/contract/index.ts`, imported via the `$conductors` alias):
+`conductor.ts` (the in-process shape — `ConductorView`, `ViewBlock`, the `Command` union
+`fold·replace·group·restore·pin`, `ClampReport`, the `Conductor` interface, plus
+`ConductorHost` / `CompletionRequest` / `CompletionResult` / `HostCapabilityId`) and `protocol.ts`
+(the WebSocket messages, `CONDUCTOR_PROTOCOL_VERSION = 3`, which *import* the `Command` /
+`ViewBlock` types so there is one definition). The host enforces one unconditional floor —
+**provider-validity** (the message stays sendable); **human overrides win for every control
+the conductor did NOT lock** (see involvement locks below); an unsafe command is clamped to
+nearest-safe and **reported**, never silently dropped (bug/UX rails, not protection against
+the conductor).
+
+- **Involvement locks ([ADR 0011](docs/adr/0011-conductor-involvement-locks.md)).** The
+  founding "human overrides always win" is now **conditional**: a conductor may declare a
+  **lock-set** claiming exclusive control of up to three steering controls — **`human-steering`**
+  (hand fold/unfold/pin/group/reset), **`agent-unfold`** (the agent's `unfold` tool), and
+  **`tail-size`** (the `setProtect` dial + the tail's no-fold floor). A conductor that locks
+  nothing is **collaborative** (default, today's behavior); one that declares a non-empty
+  lock-set is **exclusive**. Attaching an exclusive conductor requires a one-time consent gate
+  showing the lock table. Under a lock the human's recourse is **detach** (the kill switch) —
+  trust moves from *override* to *revocability*. The kill switch is host-enforced and
+  unconditional: detach **freezes the current folded view in place and unlocks all controls**
+  (not reset-to-raw; individual folds remain human-reversible after detach).
+  **Four things are never lockable in any conductor:** observation (peek, the live map, the
+  activity log, the budget readout); the **budget** dial; the agent's **`recall`** tool; and
+  **detach** itself. Under an exclusive conductor holding the `tail-size` lock the host's tail
+  floor is lifted — the conductor may fold any block, including recent reasoning, even to zero;
+  provider-validity remains the only unconditional host floor. Ships **additively**: the
+  `Conductor` interface gains an additive lock declaration (defaulting to locks-nothing); the
+  wire bumps `CONDUCTOR_PROTOCOL_VERSION` 2 → 3 carrying the declaration in the `conductor/hello`
+  handshake. Every existing conductor stays collaborative and the built-in golden test is
+  untouched. Host enforcement, the consent gate, and the freeze-on-detach kill switch all
+  ship in this PR (ADR 0011). Known gap: remote conductors see the consent gate
+  post-handshake, after the first plan may have already applied — cancel triggers `detach()`
+  which cleanly freezes that state.
+
+- **One public view.** Every conductor — built-in included — receives the same pure-data
+  `ConductorView`: top-level `budget`, `contextWindow`, `liveTokens`, `protectedFromIndex`,
+  `protectTokens`, and `blocks: ViewBlock[]` (`id, kind, turn, order, tokens, foldedTokens,
+  toolName?, callId?, isError?, held, folded, protected, grouped, text?, preview?`). The
+  store builds it in `buildView`/`runConductor` (`store.svelte.ts`); there is no privileged
+  richer in-process snapshot.
+- **In-process is the main way.** Drop a TS class implementing `conduct(view)` in
+  `conductors/<name>/` and register one line in `conductors/index.ts`
+  (`IN_PROCESS_CONDUCTORS`: `{ id, label, create: () => new MyConductor() }`) — it appears in
+  the header switcher automatically. The **built-in** folder is the worked reference —
+  `conductors/builtin/builtin.ts` (`BuiltinConductor`, a ~15-line `conduct`), attached by
+  `AccordionStore` on construction; `store.attach(c)` / `store.detach()` swap it. Folds from
+  every conductor are attributed uniformly (`by:"auto"`; no `id === "builtin"` special-case).
+  Its byte-identical output is pinned by a golden test (`conductor.builtin.test.ts`) — don't
+  break it.
+- **Host capabilities are first-class on the `Conductor` interface.** An optional
+  `attach(host: ConductorHost)` lifecycle hook (called once before the first `conduct()`) injects
+  a `ConductorHost` handle with six methods: `can`, `complete`, `countTokens`, `digestOf`,
+  `setStatus`, `requestRerun`. `"complete"` is the first real capability — how LLM summarisation calls come to
+  Accordion: the conductor fires `host.complete(req)` off-path, holds with `null`, stashes the
+  result in instance state, then calls `host.requestRerun()` to re-run `conduct()` and emit
+  commands. `conduct()` stays synchronous throughout. `detach()` (optional) lets the conductor
+  cancel in-flight calls. A pure conductor (the built-in) omits `attach` and is unaffected. The
+  live pi extension relays `completeRequest` / `completeResult` out-of-band, outside the
+  `sync→plan→apply` model-call path. Full reference: Part 3 of `docs/conductor-protocol.md`.
+- **WebSocket is a demoted escape hatch** for a separate process / another language. The
+  conductor hosts a WS endpoint; Accordion **dials as a client** (the webview can't host a
+  server). `context/update` carries the full `ConductorView`. App side:
+  `live/conductorClient.svelte.ts` (`RemoteRunner` bridges the async WS ↔ the synchronous
+  `conduct()`), `live/conductorDiscovery.svelte.ts` (polls Rust `list_conductors` +
+  hand-configured URLs), switched via the header `ui/map/ConductorMenu.svelte` dropdown.
+  Local discovery files live at `~/.accordion/conductors/<id>.json` (5 s heartbeat; 15 s stale/reap window).
+- **Writing one:** [conductors/README.md](conductors/README.md) leads with the in-process
+  path + a minimal example; [docs/conductor-protocol.md](docs/conductor-protocol.md) is the
+  full developer reference (the `ConductorView`/`ViewBlock`/`Command` tables first, then the
+  WS lifecycle + message shapes as the escape-hatch half). External (WS) implementations live
+  in `conductors/<name>/`, any language; `conductors/recency-folder/` is the runnable wire
+  starter.
+- **All conductors live in `conductors/`** — always check that directory for the full set;
+  this doc may not name every one. Current conductors:
+  - `builtin/` — the default, in-process. Deterministic oldest-first, lowest-value-first fold.
+  - `cold-score/` — in-process. ACT-R power-law scoring + lexical pre-unfold + hysteresis.
+    See [ADR 0009](docs/adr/0009-cold-score-conductor.md).
+  - `cold-epoch/` — in-process. Cold-score's ACT-R ranking + an **epoch model**: holds a
+    byte-stable fold set inside a hysteresis band and changes it only at deliberate epochs
+    (when projected live tokens cross the high-water mark), so the folded prefix stays
+    cache-warm between epochs.
+  - `sliding-window/` — in-process. When live tokens exceed ~90% of budget, issues `group`
+    commands with `digest: null` (DROP) to hard-delete the oldest non-`user` blocks down to
+    ~70%; skips user messages. Locks `human-steering` + `agent-unfold`.
+  - `attention-folder/` — external (WS). A small LM (Qwen2.5-0.5B probe) scores attention
+    relevance; periodic hysteresis-band epochs fold the least-attended blocks. See
+    [ADR 0010](docs/adr/0010-attention-conductor.md).
+  - `garbage-collector/` — in-process. Reachability-based: mark-and-sweep from roots (protected tail + held + first `user` message) over entity/causal/message edges; folds unreachable blocks first, reachable ones only as a budget fallback. Collaborative, no instance state. See [ADR 0012](docs/adr/0012-garbage-collector-conductor.md).
+  - `recency-folder/` — external (WS). Minimal wire-protocol starter example.
+  - `compaction-naive/` — in-process. Naive compaction baseline: when the visible window
+    crosses 90% of budget it calls `host.complete` to summarize the aged region into one prose
+    summary and collapses the whole region into a single `group(digest: summary)` — the same
+    shape sliding-window uses, but with an LLM summary digest instead of `null` (drop). Lossy
+    + recursive amnesia (each pass only reads the prior summary + newly-aged blocks; originals
+    already compressed are never re-read). No fold tags — the agent cannot self-unfold. The
+    intentional foil to reversible folding. All block kinds (incl. `user` and `tool_call`) are
+    swallowed by the group; the host's whole-message snap + pair-balance keeps the result
+    wire-valid. User messages are baked VERBATIM into the summary (Claude-Code `/compact`
+    style) so human intent survives compaction; only assistant reasoning degrades. See [ADR 0013](docs/adr/0013-conductor-host-capabilities.md) / [ADR 0014](docs/adr/0014-naive-compaction-conductor.md).
 
 ## Visual grammar (consistent across ALL views)
 
@@ -198,6 +339,10 @@ Environment gotchas (Windows, this repo's usual setup):
   page is healthy); verify via `preview_eval` / `preview_inspect` and `svelte-check`.
 - Always `npx svelte-check --tsconfig ./tsconfig.json` before declaring done.
 
+## Post-merge routine
+
+After a PR lands on `main`, close any open Accordion window (the running `app.exe` locks the file), then pull main on the registered checkout (the one in `~/.pi/agent/settings.json → extensions`), run `npm install` inside `app/` in case deps changed, and rebuild the binary with `npm run tauri build -- --no-bundle` (cargo must be on PATH). The next `/accordion` call picks up the new binary automatically. If the extension code changed, restart pi so it reloads `accordion.ts`.
+
 ## Data & security
 
 - Dev sample: `app/static/sample-session.jsonl` — a real ~130k-token / ~982-block pi
@@ -209,5 +354,4 @@ Environment gotchas (Windows, this repo's usual setup):
 ## Working style
 
 Be candid — no undue praise, no overselling. The owner reviews by screenshot and
-makes the design calls; surface tradeoffs plainly and let them decide. Only commit /
-push when explicitly asked.
+makes the design calls; surface tradeoffs plainly and let them decide.

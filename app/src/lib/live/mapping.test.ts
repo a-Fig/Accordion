@@ -129,7 +129,7 @@ describe("blockId — position-independence (the durable id invariant)", () => {
 			timestamp: 2001,
 		};
 		const X: PiMessage = { role: "user", content: "prepended X", timestamp: 1500 };
-		// Padding keeps B out of the PROTECT_RECENT_MSGS=2 tail so it stays foldable.
+		// Padding ensures we exercise the durable-id path with non-trivial array positions.
 		const P: PiMessage = { role: "user", content: "pad P", timestamp: 3000 };
 		const Q: PiMessage = { role: "user", content: "pad Q", timestamp: 3001 };
 
@@ -170,7 +170,6 @@ describe("applyPlan", () => {
 	});
 
 	it("folds a tool_result's content but keeps its pairing fields", () => {
-		// add filler messages so the result is outside the recent-message backstop
 		const msgs: PiMessage[] = [
 			...sample(),
 			{ role: "user", content: "next", timestamp: 2000 },
@@ -183,7 +182,7 @@ describe("applyPlan", () => {
 		expect(tr.toolName).toBe("read");
 	});
 
-	it("replaces thinking/text and never folds a tool_call", () => {
+	it("replaces thinking/text in-place and never folds a tool_call regardless of position", () => {
 		const msgs: PiMessage[] = [
 			...sample(),
 			{ role: "user", content: "next", timestamp: 2000 },
@@ -215,16 +214,25 @@ describe("applyPlan", () => {
 		expect(out).toBe(msgs); // nothing applied → original array returned
 	});
 
-	it("backstop: refuses to fold the most-recent messages", () => {
-		// here the tool_result is within the last PROTECT_RECENT_MSGS, so the op is ignored
-		const msgs = sample();
+	it("engine-trusting: folds the newest message when the plan names it (no wire-side position backstop)", () => {
+		// The wire now trusts the engine's plan. When a durable fold op targets a block in
+		// the newest message, applyPlan applies it. Previously the position-based backstop
+		// would have suppressed this, creating a view↔wire divergence.
+		const msgs = sample(); // 3 messages; tool_result is the last one
 		const out = applyPlan(msgs, [{ id: "r:call_1", digestText: "folded!" }]);
-		expect(out).toBe(msgs); // no change → identity
-		expect(msgs[2].content).toBe("line1\nline2\nline3"); // untouched
+		expect(out).not.toBe(msgs); // change applied → new array
+		expect(out[2].content).toEqual([{ type: "text", text: "folded!" }]); // newest message folded
+		// tool pair fields preserved
+		expect((out[2] as any).toolCallId).toBe("call_1");
+		expect((out[2] as any).toolName).toBe("read");
 	});
 
-	it("folds correctly using durable ids — same as positional for a stable message array", () => {
-		// Simulate a more complex session to exercise the durable path end-to-end
+	it("folds correctly using durable ids — all targeted blocks fold including the NEWEST message", () => {
+		// Exercise the durable path end-to-end AND prove the wire folds a RECENT block: the newest
+		// assistant message (index 4 of 5 — inside the old PROTECT_RECENT_MSGS=2 backstop region,
+		// protectFrom would have been 3) is targeted and must now fold, because the wire trusts the
+		// engine's plan regardless of position. This is the test's teeth: re-adding the position
+		// backstop keeps out[4] whole and fails the newest-message assertion below.
 		const sessionMsgs: PiMessage[] = [
 			{ role: "user", content: "hello", timestamp: 100 },
 			{
@@ -241,24 +249,23 @@ describe("applyPlan", () => {
 			{ role: "assistant", content: [{ type: "text", text: "newest reply" }], responseId: "resp_2", timestamp: 201 },
 		];
 
-		// Fold the thinking and text parts of the first assistant turn.
-		// The tool_result and the newest messages (protected) should be untouched.
+		// Fold the first assistant turn, the tool result, AND the newest assistant message.
 		const ops: FoldOp[] = [
 			{ id: "a:resp_1:p0", digestText: "compressed thought" },
 			{ id: "a:resp_1:p1", digestText: "compressed text" },
-			{ id: "r:call_99", digestText: "compressed result" }, // outside backstop — should fold
+			{ id: "r:call_99", digestText: "compressed result" },
+			{ id: "a:resp_2:p0", digestText: "compressed newest" }, // index 4 — the old backstop suppressed this
 		];
 		const out = applyPlan(sessionMsgs, ops);
 
 		const assistantParts = out[1].content as any[];
 		expect(assistantParts[0].thinking).toBe("compressed thought");
 		expect(assistantParts[1].text).toBe("compressed text");
-
 		expect(out[2].content).toEqual([{ type: "text", text: "compressed result" }]);
-
-		// Protected tail: the last 2 messages are never folded
+		// The NEWEST message folds too — the teeth: a position backstop would keep it whole.
+		expect((out[4].content as any[])[0].text).toBe("compressed newest");
+		// The untargeted user message passes through (user kind is never folded anyway).
 		expect((out[3].content as string)).toBe("continue");
-		expect((out[4].content as any[])[0].text).toBe("newest reply");
 	});
 });
 
@@ -320,8 +327,9 @@ describe("positional ids — instability + the applyPlan durable-id guard", () =
 	});
 
 	it("applyPlan REFUSES a positional-id op but APPLIES the same fold under the durable id", () => {
-		// An anchor-less assistant message whose text part WOULD be foldable by
-		// position. Pad after it so it sits outside the PROTECT_RECENT_MSGS=2 tail.
+		// An anchor-less assistant message whose text part WOULD be foldable by content.
+		// The durable-id guard refuses the fold regardless of position — the test message
+		// sits at index 0 (the oldest possible position) and the guard still applies.
 		const target: PiMessage = { role: "assistant", content: [{ type: "text", text: "ORIGINAL" }] };
 		const msgs: PiMessage[] = [
 			target, // index 0 → positional id m0:p0 (no responseId/timestamp)

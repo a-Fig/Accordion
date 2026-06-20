@@ -1,0 +1,14 @@
+{
+  "name": "accordion-conductor-recency-folder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reference conductor for Accordion — folds the oldest non-protected tool_results until the context is under budget.",
+  "main": "recency-folder.js",
+  "scripts": {
+    "start": "node recency-folder.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

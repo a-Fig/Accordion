@@ -51,6 +51,3 @@ export function stopClaudeDiscovery(): void {
 	// Intentionally do NOT clear sessions — avoids a flash-to-empty when re-entering the tab.
 }
 
-export function selectClaude(sessionId: string | null): void {
-	claudeDiscovery.selected = sessionId;
-}

@@ -1,0 +1,6 @@
+{
+  "id": "recency-folder",
+  "label": "Recency folder",
+  "command": "node",
+  "args": ["recency-folder.js"]
+}

@@ -7,11 +7,12 @@ import type { GroupOp, FoldOp } from "./protocol";
 //
 // A group removes a contiguous run of WHOLE messages and inserts ONE synthetic
 // summary message. These tests lock the invariants that keep the model array valid:
-// balanced tool pairs, the recent backstop, durability, purity — and that the output
-// never orphans a tool call/result no matter what range is requested.
+// balanced tool pairs, durability, purity — and that the output never orphans a
+// tool call/result no matter what range is requested. The wire trusts the engine's
+// plan (the engine is the single gate that prevents folding protected blocks).
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 8 messages; PROTECT_RECENT_MSGS = 2 ⇒ m6,m7 are the protected backstop.
+// 8 messages; m6,m7 are the newest (the engine's token-based protected tail would cover them).
 function msgs(): PiMessage[] {
 	return [
 		{ role: "user", content: "fix the bug", timestamp: 1000 }, // m0  u:1000
@@ -86,11 +87,18 @@ describe("applyPlan — group collapse", () => {
 		expect(toolBalance(out).balanced).toBe(true); // call_1 + its result both still present
 	});
 
-	it("NEVER removes a message in the recent backstop", () => {
-		// m6,m7 are protected; a group over them must not collapse them → identity passthrough.
+	it("collapses the newest messages when the plan names them (wire trusts the engine)", () => {
+		// The wire no longer has a position-based backstop. When the plan names m6,m7 (the
+		// newest messages) via durable ids, the group collapses them — just as it would any
+		// earlier messages. The engine is the single gate that prevents folding protected blocks;
+		// applyPlan trusts that the plan is already safe (as computeGroupOps ensures).
 		const src = msgs();
-		const out = applyPlan(src, [], [G(["u:3000", "a:resp_c:p0"], "{#g4 FOLDED} nope")]);
-		expect(out).toBe(src); // unchanged, same reference
+		const out = applyPlan(src, [], [G(["u:3000", "a:resp_c:p0"], "{#g4 FOLDED} newest folded")]);
+		// m6+m7 collapsed into one summary entry; 8 → 7 messages
+		expect(out.length).toBe(7);
+		expect(out.some((m) => (m.content as any)?.[0]?.text === "{#g4 FOLDED} newest folded")).toBe(true);
+		// Tool pairs from earlier turns remain balanced
+		expect(toolBalance(out).balanced).toBe(true);
 	});
 
 	it("never removes a message with a non-durable (positional) id", () => {
@@ -151,7 +159,7 @@ describe("applyPlan — group collapse", () => {
 		expect(out.every((m) => validRole(m.role))).toBe(true);
 		expect(out.every(nonEmpty)).toBe(true);
 		expect(toolBalance(out).balanced).toBe(true);
-		// EVERY non-protected message (m0..m5) collapses into one entry; the backstop survives.
+		// EVERY message in the group (m0..m5) collapses into one entry; m6,m7 pass through (not in group).
 		out = applyPlan(
 			msgs(),
 			[],
@@ -160,13 +168,13 @@ describe("applyPlan — group collapse", () => {
 		expect(out.every((m) => validRole(m.role))).toBe(true);
 		expect(out.every(nonEmpty)).toBe(true);
 		expect(toolBalance(out).balanced).toBe(true);
-		expect(hasText(out, "thanks")).toBe(true); // m6 (protected) untouched
-		// NOTE: role rhythm (same-role adjacency, e.g. summary-user next to protected-user m6) is
+		expect(hasText(out, "thanks")).toBe(true); // m6 not a group member → untouched
+		// NOTE: role rhythm (same-role adjacency, e.g. summary-user next to non-member m6) is
 		// structurally valid here but its provider acceptance is ADR 0006 watch item #1 (verify live).
 	});
 
 	it("balanced-in ⇒ balanced-out, no emptied message, for EVERY contiguous range (provider-safety property)", () => {
-		// Brute-force every contiguous message range over the non-protected region (m0..m5).
+		// Brute-force every contiguous message range over m0..m5 (m6,m7 are outside this range).
 		// The output must NEVER orphan a tool pair or emit an empty message, whatever is grouped.
 		const idsByMsg = [
 			["u:1000"], // m0
@@ -175,7 +183,7 @@ describe("applyPlan — group collapse", () => {
 			["u:2000"], // m3
 			["a:resp_b:p0", "a:resp_b:p1"], // m4 (carries call_2)
 			["r:call_2"], // m5
-		]; // m6,m7 are the protected backstop
+		]; // m6,m7 are outside this brute-force range; the engine would protect them, not applyPlan
 		for (let lo = 0; lo < idsByMsg.length; lo++) {
 			for (let hi = lo; hi < idsByMsg.length; hi++) {
 				const memberIds = idsByMsg.slice(lo, hi + 1).flat();

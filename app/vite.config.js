@@ -1,11 +1,24 @@
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [sveltekit()],
+
+  // The top-level `conductors/` dir lives OUTSIDE this SvelteKit root (`app/`). The kit
+  // alias in svelte.config.js feeds svelte-check + the SvelteKit build, but vitest reads
+  // THIS config directly and may skip kit's alias injection — so mirror `$conductors` here
+  // and allow the dev/build server to read the parent dir.
+  resolve: {
+    alias: {
+      $conductors: path.resolve(__dirname, "../conductors"),
+    },
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
@@ -16,6 +29,10 @@ export default defineConfig(async () => ({
     port: 1420,
     strictPort: true,
     host: host || false,
+    // Let the dev/build server read `../conductors` (one level above the SvelteKit root).
+    fs: {
+      allow: [".."],
+    },
     hmr: host
       ? {
           protocol: "ws",

@@ -24,9 +24,9 @@
  */
 import type { AccordionStore } from "../engine/store.svelte";
 import type { Block } from "../engine/types";
-import type { FoldOp, GroupOp, UnfoldRestored } from "./protocol";
+import type { FoldOp, GroupOp, UnfoldRestored, RecallContent } from "./protocol";
 import { isDurableId } from "./mapping";
-import { foldCode, FOLDABLE_KINDS } from "../engine/digest";
+import { foldCode, wireFoldable } from "../engine/digest";
 
 /**
  * Compute the fold plan for the current store state: one `FoldOp` per block that
@@ -42,7 +42,7 @@ export function computeFoldOps(store: AccordionStore): FoldOp[] {
 		// wire (applyPlan removes the message before any in-place fold runs) AND a trap — the op
 		// would carry the block's own digest, divergent from the group summary. Skip them.
 		if (store.groupOf(b)?.folded) continue;
-		if (!FOLDABLE_KINDS.has(b.kind)) continue; // never user / tool_call
+		if (!wireFoldable(b)) continue; // never user / tool_call — the ONE shared foldability gate
 		if (!isDurableId(b.id)) continue; // durable-id safety guard
 		const digestText = store.digestOf(b);
 		if (!digestText) continue; // never empty a content part
@@ -54,11 +54,11 @@ export function computeFoldOps(store: AccordionStore): FoldOp[] {
 /**
  * Compute the group-collapse ops for the current store state (ADR 0006): one `GroupOp` per
  * FOLDED group. `memberIds` is the group's durable member ids — the GUI's *intent*; the
- * extension's `applyPlan` independently re-derives which whole, balanced, non-backstop
- * messages it may actually remove (a non-durable member is dropped here too, since a
- * positional id is not stable across array shifts). `summaryText` is the engine's
- * single-source-of-truth recap, carrying the one `{#code FOLDED}` tag for the whole range.
- * Pure read; the store is never mutated.
+ * extension's `applyPlan` independently re-derives which whole, balanced messages it may
+ * actually remove (a non-durable member is dropped here too, since a positional id is not
+ * stable across array shifts). `summaryText` is the engine's single-source-of-truth recap
+ * (carrying the one `{#code FOLDED}` tag for default-recap groups), or `null` for a drop
+ * group (the wire removes the run and inserts nothing). Pure read; the store is never mutated.
  */
 export function computeGroupOps(store: AccordionStore): GroupOp[] {
 	const out: GroupOp[] = [];
@@ -66,8 +66,11 @@ export function computeGroupOps(store: AccordionStore): GroupOp[] {
 		if (!g.folded) continue;
 		const memberIds = g.memberIds.filter(isDurableId);
 		if (!memberIds.length) continue; // nothing durably removable
-		const summaryText = store.groupSummary(g);
-		if (!summaryText) continue;
+		const isDropGroup = store.isDropGroup(g);
+		const summaryText: string | null = isDropGroup ? null : store.groupSummary(g);
+		// Drop group (summaryText === null) is VALID — do not skip it.
+		// Only skip a non-drop group whose summary is empty/whitespace (defensive; shouldn't happen).
+		if (summaryText !== null && !summaryText.trim()) continue;
 		out.push({ id: g.id, memberIds, summaryText });
 	}
 	return out;
@@ -110,15 +113,20 @@ export function resolveUnfold(store: AccordionStore, codes: string[]): { restore
 		for (const g of store.groups) {
 			if (g.folded && foldCode(g.id) === code) {
 				store.unfoldGroup(g.id, "agent");
-				restored.push({ code, kind: "text", label: `group · ${g.memberIds.length} blocks` });
-				hit = true;
+				// VERIFY it took (FIX 3): under the `agent-unfold` lock `unfoldGroup(…, "agent")`
+				// is a no-op, so the group stays folded. Only count a restore that actually
+				// happened — a refused one falls through to `missing`, never a false "restored".
+				if (!store.groupById(g.id)?.folded) {
+					restored.push({ code, kind: "text", label: `group · ${g.memberIds.length} blocks`, ids: g.memberIds });
+					hit = true;
+				}
 			}
 		}
 		// Mirror EXACTLY the set `computeFoldOps` sends: folded, a foldable kind, and a
 		// durable id. So the agent can only ever restore something it was actually shown a
 		// `{#code FOLDED}` tag for — never a human pin, a locally-folded user/tool_call, or
 		// a positional-id block that was never on the wire.
-		const matches = store.blocks.filter((b) => store.isFolded(b) && FOLDABLE_KINDS.has(b.kind) && isDurableId(b.id) && foldCode(b.id) === code);
+		const matches = store.blocks.filter((b) => store.isFolded(b) && wireFoldable(b) && isDurableId(b.id) && foldCode(b.id) === code);
 		for (const b of matches) {
 			// A member of a FOLDED group is controlled by the group, not per-block overrides —
 			// `store.unfold` would no-op there (ADR 0006 §2). Route it through `unfoldGroup` so
@@ -126,9 +134,75 @@ export function resolveUnfold(store: AccordionStore, codes: string[]): { restore
 			// from the wire, so the agent only ever holds the group code — but keep the honesty
 			// guarantee LOCAL to this resolver rather than relying on that.)
 			const grp = store.groupOf(b);
-			if (grp?.folded) store.unfoldGroup(grp.id, "agent");
+			const grpFolded = grp?.folded ?? false;
+			if (grpFolded) store.unfoldGroup(grp!.id, "agent");
 			else store.unfold(b.id, "agent");
-			restored.push({ code, kind: b.kind, label: blockLabel(b) });
+			// VERIFY the unfold actually took effect (FIX 3): under the `agent-unfold` lock both
+			// `store.unfold` and `store.unfoldGroup` are no-ops, so the block stays folded. Only
+			// report a restore that really happened; a refused one is dropped here and, if every
+			// match for this code is refused, the code falls through to `missing`.
+			const stillFolded = grpFolded ? (grp!.folded ?? false) : store.isFolded(b);
+			if (stillFolded) continue;
+			// ids reflects the ACTUAL restore set: if routed through unfoldGroup the whole group
+			// is restored, not just the single member block (honesty guarantee). Captured before
+			// the unfold call so the pre-unfold folded state is used for the branch decision.
+			restored.push({ code, kind: b.kind, label: blockLabel(b), ids: grpFolded ? grp!.memberIds : [b.id] });
+			hit = true;
+		}
+		if (!hit) missing.push(code);
+	}
+	return { restored, missing };
+}
+
+/**
+ * Resolve an agent `recall` request against the live store (protocol v4, ADR 0011).
+ * `recall` is the agent's counterpart to the human's "peek": an UNBLOCKABLE read that
+ * returns a folded block's ORIGINAL full content so the agent can use it THIS turn —
+ * WITHOUT changing what is standing in its context. The block stays folded.
+ *
+ * Critical differences from `resolveUnfold`:
+ *   • READ-ONLY — this NEVER calls `store.unfold`/`unfoldGroup`/any mutator. No override
+ *     is created; the matched block remains folded exactly as it was. (This is why recall
+ *     is never lockable: it can't alter the standing view, so it is the safe-by-construction
+ *     read that keeps a locked `unfold` from blinding the agent.)
+ *   • ORIGINAL content — for a matched block we return `store.get(id)?.text` (the full,
+ *     un-folded content), NOT `store.digestOf(b)` (the lossy folded substitution). Returning
+ *     the digest would defeat recall's whole purpose: the agent already SEES the digest.
+ *
+ * Same match set as `resolveUnfold` / `computeFoldOps`: folded + a `FOLDABLE_KIND` + a
+ * durable id + `foldCode(b.id) === code` for per-block matches; also folded groups via
+ * `foldCode(g.id) === code` (a group returns its members' full original text joined). A
+ * code matching nothing → `missing`. Pure of the wire — the caller sends the result.
+ */
+export function resolveRecall(store: AccordionStore, codes: string[]): { restored: RecallContent[]; missing: string[] } {
+	const restored: RecallContent[] = [];
+	const missing: string[] = [];
+	for (const code of codes) {
+		let hit = false;
+		// A GROUP code (= foldCode(group.id)) recalls the WHOLE range: return the full original
+		// text of every member, joined in conversation order. Checked first; a code can in
+		// principle match both a group and a block (rare collision) → return both.
+		for (const g of store.groups) {
+			if (g.folded && foldCode(g.id) === code) {
+				const text = g.memberIds
+					.map((id) => store.get(id)?.text ?? "")
+					.filter((t) => t.length > 0)
+					.join("\n\n");
+				restored.push({ code, label: `group · ${g.memberIds.length} blocks`, text, ids: g.memberIds });
+				hit = true;
+			}
+		}
+		// Mirror EXACTLY the set `computeFoldOps`/`resolveUnfold` use: folded, a foldable kind,
+		// and a durable id — so the agent can only ever recall something it was actually shown a
+		// `{#code FOLDED}` tag for.
+		const matches = store.blocks.filter((b) => store.isFolded(b) && wireFoldable(b) && isDurableId(b.id) && foldCode(b.id) === code);
+		for (const b of matches) {
+			// A member of a FOLDED group is represented by its group on the wire (the agent only
+			// holds the group code); skip per-block recall here so we don't double-report — the
+			// group branch above already returns the full range.
+			if (store.groupOf(b)?.folded) continue;
+			// READ-ONLY: return the block's ORIGINAL full text, never the digest, and never mutate.
+			restored.push({ code, label: blockLabel(b), text: store.get(b.id)?.text ?? b.text, ids: [b.id] });
 			hit = true;
 		}
 		if (!hit) missing.push(code);

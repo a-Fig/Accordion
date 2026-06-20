@@ -8,19 +8,17 @@ import { AccordionStore } from "./engine/store.svelte";
  * (`state_invalid_export`) — `export let store = $state(null); store = …` throws
  * at compile time. The supported cross-module pattern is to export a single
  * `$state` *object* and mutate its properties; property mutation stays reactive
- * for every consumer that reads `session.store`, `session.live`, etc.
+ * for every consumer that reads `session.store`, `session.readOnly`, etc.
  */
 export const session = $state<{
 	store: AccordionStore | null;
 	filePath: string | null;
 	error: string;
-	live: boolean;
 	readOnly: boolean;
 }>({
 	store: null,
 	filePath: null,
 	error: "",
-	live: false,
 	readOnly: false,
 });
 
@@ -46,6 +44,7 @@ export async function loadSample() {
 		if (!res.ok) throw new Error(`fetch failed (${res.status})`);
 		const text = await res.text();
 		if (token !== _loadToken) return; // a newer selection superseded this sample load — drop it
+		session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 		session.store = new AccordionStore(parse(text));
 		session.filePath = null;
 		session.readOnly = false;
@@ -132,6 +131,7 @@ async function _load(path: string, readFn: (p: string) => Promise<string>, token
 	if (token !== _loadToken) return; // a newer selection superseded this load — drop it
 	const prevBudget = session.store?.budget;
 	const prevProtect = session.store?.protectTokens;
+	session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 	session.store = new AccordionStore(parse(text));
 	if (prevBudget !== undefined) session.store.setBudget(prevBudget);
 	if (prevProtect !== undefined) session.store.setProtect(prevProtect);
@@ -158,7 +158,6 @@ async function _openWithReader(path: string, readFn: (p: string) => Promise<stri
 
 function _startPolling(path: string, readFn: (p: string) => Promise<string>, token: number) {
 	_stopPolling();
-	session.live = true;
 	_pollInterval = setInterval(async () => {
 		try {
 			const text = await readFn(path);
@@ -177,7 +176,6 @@ function _stopPolling() {
 		clearInterval(_pollInterval);
 		_pollInterval = null;
 	}
-	session.live = false;
 }
 
 function _expose() {

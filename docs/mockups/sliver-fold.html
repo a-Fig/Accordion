@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Accordion — sliver-fold mockup</title>
+<style>
+  /* ---- real Accordion theme vars (app/src/app.css) ---- */
+  :root {
+    --bg: #0b0d12;
+    --panel: #14171f;
+    --panel-2: #1a1e28;
+    --panel-3: #232834;
+    --panel-4: #2c3340;
+    --line: #2c3342;
+    --line-soft: #20252f;
+    --text: #eef1f6;
+    --muted: #9aa3b4;
+    --faint: #828b9e;
+    --accent: #6ea8fe;
+    --accent-dim: #2d4a7a;
+    --group: #6f4a32;
+    --group-edge: #9c6b43;
+    --group-accent: #d39455;
+
+    /* kind = color (real values) */
+    --k-user: #6ea8fe;
+    --k-text: #aab2c2;
+    --k-thinking: #b483e0;
+    --k-tool_call: #34d3c2;
+    --k-tool_result: #f0a35e;
+
+    /* NEW — proposed: synthesized-summary color. Main grid shows espresso brown
+       (your lead). Full candidate set is in the swatch strip below. NOTE: the
+       existing group-tile brown is --group #6f4a32 — a summary brown must read as
+       clearly DARKER than that or the two collide. */
+    --k-summary: #4a3528;       /* cocoa (chosen) */
+
+    --cell: 26px;
+    --gap: 5px;
+    --cols: 18;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 28px 32px 64px;
+  }
+  h1 { font-size: 18px; font-weight: 700; margin: 0 0 4px; }
+  h2 { font-size: 13px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--faint); margin: 0 0 12px; }
+  .sub { color: var(--muted); margin: 0 0 28px; max-width: 760px; }
+  .panels { display: flex; gap: 28px; align-items: flex-start; flex-wrap: wrap; }
+  .panel { flex: 1 1 440px; min-width: 420px; }
+
+  /* ---- the box (mirrors .box / .box.prot) ---- */
+  .box {
+    border-radius: 14px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    padding: 14px;
+    position: relative;
+  }
+  .box.prot {
+    border: 3px solid var(--accent-dim);
+    background: var(--panel);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
+    margin-top: 18px;
+  }
+  .box-label { font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); margin-bottom: 9px; }
+  .box.prot .box-label { color: color-mix(in srgb, var(--accent) 65%, var(--muted)); }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(var(--cols), var(--cell));
+    gap: var(--gap);
+    position: relative;
+  }
+
+  /* ---- a cell slot is always --cell wide (keeps the uniform column grid) ---- */
+  .cell {
+    width: var(--cell);
+    height: var(--cell);
+    border-radius: 3px;
+    position: relative;
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.22);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .k-user { background: var(--k-user); }
+  .k-text { background: var(--k-text); }
+  .k-thinking { background: var(--k-thinking); }
+  .k-tool_call { background: var(--k-tool_call); }
+  .k-tool_result { background: var(--k-tool_result); }
+
+  /* TODAY: folded = desaturated + dim + hatch (the current treatment) */
+  .cell.folded-today {
+    filter: saturate(.5);
+    opacity: .46;
+    background-image: repeating-linear-gradient(45deg, rgba(255,255,255,.06) 0 1px, transparent 1px 5px);
+  }
+
+  /* dice pips */
+  .pips { position: absolute; inset: 0; }
+  .pip { position: absolute; width: 22%; height: 22%; border-radius: 50%;
+    background: #fff; box-shadow: 0 0 0 1.4px rgba(0,0,0,.5);
+    transform: translate(-50%, -50%); }
+  .folded-today .pip { opacity: .55; }
+
+  /* ---- PROPOSED ---- */
+  /* The proposed lane flows mixed-width items: square live cells + compact
+     folded clusters. flex-wrap, not a strict matrix — so a folded run takes
+     only the width it needs (no dead space). */
+  /* align-items: center → live cells and the (taller, padded) fold-clusters share
+     one vertical centerline, so every block lines up despite the bubble's halo. */
+  .lane { display: flex; flex-wrap: wrap; gap: var(--gap); align-items: center; }
+
+  /* a folded run = ONE object: summary cell + tightly packed slivers, held by
+     the calm bubble (the cluster's own background — wraps perfectly, no overlay). */
+  .fold-cluster {
+    display: inline-flex; flex-wrap: wrap; align-items: center;
+    gap: 2px; padding: 4px; border-radius: 9px; max-width: 100%;
+    background: rgba(255,255,255,.035);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.07);
+  }
+
+  /* sliver: the original folded block, squeezed to a thin bar. Slivers pack
+     shoulder-to-shoulder inside the cluster (2px apart) — that's the fix. */
+  .sliver {
+    width: 8px; height: var(--cell);
+    border-radius: 2px;
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.3);
+    position: relative; overflow: hidden;
+    filter: saturate(.62);
+    flex: 0 0 auto;
+  }
+  .sliver.k-user { background: var(--k-user); }
+  .sliver.k-text { background: var(--k-text); }
+  .sliver.k-thinking { background: var(--k-thinking); }
+  .sliver.k-tool_call { background: var(--k-tool_call); }
+  .sliver.k-tool_result { background: var(--k-tool_result); }
+  /* token weight on a sliver = N horizontal lines (N = die face).
+     Uniform: every bar identical — 2px, white, same insets, centered on its
+     position via translateY(-50%) so none reads heavier than another. */
+  .sliver .bar { position: absolute; left: 1px; right: 1px; height: 2px;
+    border-radius: 1px; background: rgba(255,255,255,.9);
+    transform: translateY(-50%); }
+
+  /* summary: the replacement block, a real cell, neutral synthesized color.
+     No dashed outline (calm) — the bubble + neutral color carry the
+     "synthesized, not real output" signal. Keeps a dice face. */
+  .cell.summary {
+    background: var(--k-summary);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,.22), inset 0 0 0 2px rgba(255,255,255,.06);
+    flex: 0 0 auto;
+  }
+
+  /* legend */
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 14px; color: var(--muted); font-size: 12px; }
+  .legend .item { display: inline-flex; align-items: center; gap: 7px; }
+  .sw { width: 16px; height: 16px; border-radius: 3px; box-shadow: inset 0 0 0 1px rgba(0,0,0,.3); flex: 0 0 auto; }
+  .sw.sliver-sw { width: 8px; }
+  /* color-options strip: each candidate = a mini bubble holding summary + 2 slivers */
+  .swatches { display: flex; gap: 22px; flex-wrap: wrap; }
+  .swatch { }
+  .swatch .mini { display: inline-flex; gap: 2px; align-items: center;
+    padding: 4px; border-radius: 9px; background: rgba(255,255,255,.035);
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,.07); }
+  .swatch .lbl { display: block; margin-top: 7px; color: var(--muted); font-size: 12px; }
+  .swatch .lbl b { color: var(--text); }
+  /* reference swatch (the existing group brown) — dimmed + dashed, clearly not a pick */
+  .swatch.ref { opacity: .7; }
+  .swatch.ref .mini { background: none; box-shadow: none; outline: 1px dashed var(--line-strong, #3a4150); outline-offset: 2px; }
+  .note { margin-top: 22px; color: var(--muted); max-width: 820px; }
+  .note b { color: var(--text); }
+  code { background: var(--panel-3); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>Sliver-fold — folded blocks shrink to slivers, digests become real blocks</h1>
+  <p class="sub">
+    Same block data rendered both ways. <b>Left:</b> today's treatment (folded = dimmed,
+    hatched, full-size square). <b>Right:</b> the corrected model — when a block is folded it is
+    replaced by a real synthetic <b>cocoa block</b> (its digest, an actual block now in the
+    context with its own dice face), and the original is shown as a thin <b>sliver</b> (weight
+    lines = the original's size), the two held by a calm <b>bubble</b>. <b>One cocoa block per
+    summary.</b> An <b>ungrouped</b> folded block is its own unit — 1 cocoa + 1 sliver — and is
+    <b>never merged with its neighbours</b> (see the four adjacent folds early on: four separate
+    cocoa+sliver pairs, not one lump). Only an <b>explicit group</b> shares one cocoa summary
+    across its N member slivers (the 3-block group near the middle).
+  </p>
+
+  <div class="panels">
+    <div class="panel">
+      <h2>Today</h2>
+      <div class="box" id="today"></div>
+    </div>
+    <div class="panel">
+      <h2>Proposed</h2>
+      <div class="box" id="proposed"></div>
+      <div class="legend">
+        <span class="item"><span class="sw k-text"></span> live block</span>
+        <span class="item"><span class="sw sliver-sw" style="background:var(--k-text);filter:saturate(.62)"></span> sliver (folded)</span>
+        <span class="item"><span class="sw" style="background:var(--k-summary)"></span> summary (synthesized)</span>
+        <span class="item"><span class="sw" style="background:rgba(255,255,255,.05);box-shadow:inset 0 0 0 1px rgba(255,255,255,.12)"></span> grouping bubble</span>
+      </div>
+
+      <h2 style="margin-top:26px">Summary color — pick one</h2>
+      <div id="swatches" class="swatches"></div>
+    </div>
+  </div>
+
+  <p class="note">
+    <b>The model:</b> folding a block substitutes its content for a digest — that digest is the
+    <b>cocoa block</b>, a real (synthetic) block that genuinely occupies the context window, so it
+    gets a dice face for its own (small) size. The sliver beside it is the <i>original</i>,
+    kept visible thin so you still read its weight. <b>Grouping is the only thing that makes
+    blocks share one cocoa summary</b> — adjacency alone never does. So an ungrouped fold is a
+    1-cocoa + 1-sliver pair; an explicit group is 1-cocoa + N-slivers. Tradeoff to weigh: each
+    ungrouped fold is two tiles (cocoa + sliver) rather than one, so a folded region isn't more
+    compact than today — the win is legibility (you read the digest, and the original's weight,
+    at a glance), not density.
+  </p>
+
+<script type="module">
+  // faceFor — mirrors tileDraw.ts exactly
+  const faceFor = (t) => t > 15000 ? 6 : t > 5000 ? 5 : t > 1500 ? 4 : t > 500 ? 3 : t > 100 ? 2 : 1;
+
+  // dice pip centres on a 100x100 box — ported from tileDraw.ts PIP_POSITIONS
+  const PIPS = {
+    1: [[50,50]],
+    2: [[28,28],[72,72]],
+    3: [[28,28],[50,50],[72,72]],
+    4: [[28,28],[72,28],[28,72],[72,72]],
+    5: [[28,28],[72,28],[50,50],[28,72],[72,72]],
+    6: [[28,26],[72,26],[28,50],[72,50],[28,74],[72,74]],
+  };
+
+  function pipsEl(face) {
+    const w = document.createElement("div");
+    w.className = "pips";
+    for (const [cx, cy] of PIPS[face]) {
+      const p = document.createElement("div");
+      p.className = "pip";
+      p.style.left = cx + "%";
+      p.style.top = cy + "%";
+      w.appendChild(p);
+    }
+    return w;
+  }
+
+  // ---- a realistic conversation slice (older/foldable box) -----------------
+  // kind, tokens, folded?, and an optional GROUP id. A folded block with NO group is
+  // its OWN unit (1 sliver + its own cocoa block). Only an explicit group of folded
+  // blocks shares ONE cocoa summary (N member slivers → 1 cocoa). Adjacency does NOT
+  // mean grouped — neighbouring ungrouped folds are never merged.
+  const KINDS = ["user","text","thinking","tool_call","tool_result"];
+  const B = (kind, tokens, folded=false, group=null) => ({ kind, tokens, folded, group });
+
+  const blocks = [
+    B("user", 240),
+    // four ADJACENT but UNGROUPED folds — each becomes its OWN cocoa+sliver, NOT merged:
+    B("thinking", 1200, true), B("text", 80, true),
+    B("tool_call", 60, true), B("tool_result", 3200, true),
+    B("text", 420),
+    B("user", 90),
+    B("thinking", 5400, true), B("text", 150, true),   // two more ungrouped folds
+    B("tool_call", 40), B("tool_result", 900),
+    B("text", 70, true),                                // a lone ungrouped fold
+    B("user", 130), B("text", 260),
+    // an EXPLICIT group of 3 folded blocks → ONE cocoa + 3 slivers in one bubble:
+    B("thinking", 460, true, "g1"), B("tool_call", 50, true, "g1"),
+    B("tool_result", 18000, true, "g1"),
+    B("text", 110), B("user", 200), B("text", 640),
+    B("thinking", 320), B("tool_call", 45), B("tool_result", 1100),
+  ];
+
+  // The cocoa block holds the digest — small relative to the original(s) it replaces.
+  function cocoaTokens(members) {
+    const full = members.reduce((s,b)=>s+b.tokens,0);
+    return Math.max(40, Math.round(full * 0.1));
+  }
+
+  // ---------- render: TODAY ----------
+  function renderToday(host) {
+    const grid = document.createElement("div");
+    grid.className = "grid";
+    for (const b of blocks) {
+      const c = document.createElement("div");
+      c.className = `cell k-${b.kind}` + (b.folded ? " folded-today" : "");
+      c.appendChild(pipsEl(faceFor(b.tokens)));
+      grid.appendChild(c);
+    }
+    host.appendChild(grid);
+  }
+
+  // ---------- render: PROPOSED ----------
+  // Walk blocks; when a folded run starts, emit ONE summary cell then the run's slivers.
+  // build a sliver element (thin bar + N horizontal weight lines, N = die face)
+  const CELL_PX = parseInt(getComputedStyle(document.documentElement).getPropertyValue("--cell")) || 26;
+  const LINE_GAP = 4; // px between line centers — CONSTANT across all faces
+  function sliverEl(b) {
+    const s = document.createElement("div");
+    s.className = `sliver k-${b.kind}`;
+    const face = faceFor(b.tokens);
+    // center the stack of N lines: span = (N-1)*gap, centered in the sliver height,
+    // so the gap is identical for every face and the block never clips at face 6.
+    const start = CELL_PX / 2 - ((face - 1) * LINE_GAP) / 2;
+    for (let n = 0; n < face; n++) {
+      const bar = document.createElement("div");
+      bar.className = "bar";
+      bar.style.top = (start + n * LINE_GAP) + "px";
+      s.appendChild(bar);
+    }
+    return s;
+  }
+
+  function renderProposed(host) {
+    const lane = document.createElement("div");
+    lane.className = "lane";
+
+    let i = 0;
+    while (i < blocks.length) {
+      const b = blocks[i];
+      // live block → a square cell in the flow
+      if (!b.folded) {
+        const c = document.createElement("div");
+        c.className = `cell k-${b.kind}`;
+        c.appendChild(pipsEl(faceFor(b.tokens)));
+        lane.appendChild(c);
+        i++;
+        continue;
+      }
+      // folded block → a bubble holding its cocoa block (the real synthetic replacement)
+      // then its sliver(s). UNGROUPED = exactly this one block (1 cocoa + 1 sliver).
+      // EXPLICIT GROUP = its contiguous members (1 cocoa + N slivers). Ungrouped folds
+      // are NEVER merged with their neighbours.
+      const grp = b.group ?? null;
+      const members = [];
+      if (grp === null) {
+        members.push(b); i++;                       // ungrouped → just this block
+      } else {
+        while (i < blocks.length && blocks[i].folded && (blocks[i].group ?? null) === grp) {
+          members.push(blocks[i]); i++;             // explicit group → all its members
+        }
+      }
+      const cluster = document.createElement("div");
+      cluster.className = "fold-cluster";
+      // cocoa block = the synthetic block now in context; its dice face = the digest size.
+      const cocoa = document.createElement("div");
+      cocoa.className = "cell summary";
+      cocoa.appendChild(pipsEl(faceFor(cocoaTokens(members))));
+      cluster.appendChild(cocoa);
+      // the original folded block(s) as thin slivers (weight lines = the ORIGINAL size).
+      for (const m of members) cluster.appendChild(sliverEl(m));
+      lane.appendChild(cluster);
+    }
+
+    host.appendChild(lane);
+  }
+
+  // ---------- color-options strip: each candidate in its own mini bubble ----------
+  function renderSwatches(host) {
+    const opts = [
+      // --- browns (your lead). Espresso/cocoa are darker than the group brown; ---
+      // --- walnut sits close to it (collision risk, shown for comparison).      ---
+      { id: "A", name: "Espresso", color: "#3a2b22", hex: "#3a2b22" },
+      { id: "B", name: "Cocoa", color: "#4a3528", hex: "#4a3528" },
+      { id: "C", name: "Walnut ⚠ near group", color: "#5c4632", hex: "#5c4632" },
+      { id: "—", name: "group tile (existing)", color: "#6f4a32", hex: "#6f4a32", ref: true },
+      // --- warm neutrals ---
+      { id: "D", name: "Taupe", color: "#534a40", hex: "#534a40" },
+      { id: "E", name: "Clay-grey", color: "#4a4038", hex: "#4a4038" },
+      // --- cool neutrals ---
+      { id: "F", name: "Slate", color: "#3c4452", hex: "#3c4452" },
+      { id: "G", name: "Steel", color: "#5f6b78", hex: "#5f6b78" },
+      { id: "H", name: "Quiet panel", color: "#2c3340", hex: "#2c3340" },
+      // --- other calm hues ---
+      { id: "I", name: "Deep teal", color: "#2e4642", hex: "#2e4642" },
+      { id: "J", name: "Muted plum", color: "#43354a", hex: "#43354a" },
+      { id: "K", name: "Sage", color: "#6f8378", hex: "#6f8378" },
+    ];
+    for (const o of opts) {
+      const wrap = document.createElement("div");
+      wrap.className = "swatch" + (o.ref ? " ref" : "");
+      const mini = document.createElement("div");
+      mini.className = "mini";
+      // summary cell
+      const sum = document.createElement("div");
+      sum.className = "cell summary";
+      sum.style.background = o.color;
+      sum.appendChild(pipsEl(3));
+      mini.appendChild(sum);
+      // sample packed slivers (faces 5, 2, 3)
+      mini.appendChild(sliverEl({ kind: "thinking", tokens: 6000 }));   // face 5
+      mini.appendChild(sliverEl({ kind: "tool_result", tokens: 300 })); // face 2
+      mini.appendChild(sliverEl({ kind: "text", tokens: 900 }));        // face 3
+      wrap.appendChild(mini);
+      const lbl = document.createElement("span");
+      lbl.className = "lbl";
+      lbl.innerHTML = `<b>${o.id} — ${o.name}</b> · ${o.hex}`;
+      wrap.appendChild(lbl);
+      host.appendChild(wrap);
+    }
+  }
+
+  renderToday(document.getElementById("today"));
+  renderProposed(document.getElementById("proposed"));
+  renderSwatches(document.getElementById("swatches"));
+</script>
+</body>
+</html>

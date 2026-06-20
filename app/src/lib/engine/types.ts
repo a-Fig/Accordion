@@ -16,7 +16,7 @@ export type BlockKind =
 	| "tool_result"; // WHAT the agent saw (often huge, decays fast)
 
 /** Who last changed a block's fold state. */
-export type Actor = "you" | "agent" | "auto";
+export type Actor = "you" | "agent" | "auto" | "conductor";
 
 /**
  * A manual override that the automatic folder must respect:
@@ -58,6 +58,15 @@ export interface Block {
 	autoFolded: boolean;
 	/** Who last touched this block's fold state. */
 	by: Actor | null;
+	/**
+	 * Conductor-substituted content (ADR 0007). When set, this is exactly what a folded
+	 * block renders / the agent receives — the conductor's own digest or replacement
+	 * (`""` = the "delete" form: emptied but kept in place). Distinct from `override`,
+	 * which stays the HUMAN's alone: a conductor never writes `override`, only `subst`
+	 * (+ `autoFolded`). Cleared to baseline on every conductor pass for `override === null`
+	 * blocks. Absent → a folded block falls back to the engine's per-kind `digest()`.
+	 */
+	subst?: string;
 }
 
 /**
@@ -67,13 +76,37 @@ export interface Block {
  * member's per-block override — folding the group collapses the range; unfolding it
  * returns the members to their own fold state. The id is `g:<firstMemberDurableId>`; its
  * agent-unfold handle is `foldCode(id)`. Invariants (enforced at creation, store.createGroup):
- * contiguous · non-overlapping · flat (members are blocks, never groups) · ≥2 members ·
- * entirely older than the protected tail. `memberIds` is in conversation (block) order.
+ * contiguous · non-overlapping · flat (members are blocks, never groups) · ≥1 member
+ * (relaxed from ≥2 so a lone block can be dropped/summarized — must still collapse at least
+ * one member, i.e. not be all-stragglers) · entirely older than the protected tail.
+ * `memberIds` is in conversation (block) order.
+ *
+ * `by` is provenance: who created the group. A HUMAN group (`by:"you"`) is durable — it
+ * survives every conductor pass untouched. A conductor/auto group (`by:"auto"`/`"conductor"`,
+ * or absent) is owned by the active strategy: it is cleared at the start of each conductor
+ * pass and rebuilt from that pass's `group` commands, so a conductor that stops asking for a
+ * group (returns `[]`, or is detached) no longer strands it folded. Optional only so legacy /
+ * test-constructed literals stay valid; `createGroup` always sets it (default `"you"`).
  */
 export interface Group {
 	id: string;
 	memberIds: string[];
 	folded: boolean;
+	/**
+	 * Who created this group. `"you"` or absent ⇒ preserved (treated as human/legacy): never
+	 * touched by a conductor pass. `"auto"` or `"conductor"` ⇒ conductor-owned: cleared at the
+	 * start of each conductor pass (`clearConductorState`) and rebuilt from that pass's `group`
+	 * commands, so a group the conductor stops asking for is not left stranded. `createGroup`
+	 * always sets it (default `"you"`).
+	 */
+	by?: Actor;
+	/**
+	 * Conductor-supplied summary override (mirrors `GroupCommand.digest`):
+	 *   - `undefined` → default recap via `groupDigest` (unchanged behavior).
+	 *   - `null` or `""` → DROP: the run is removed from the wire, no message inserted.
+	 *   - Non-empty string → that exact string is used as the summary verbatim.
+	 */
+	digest?: string | null;
 }
 
 export interface SessionMeta {

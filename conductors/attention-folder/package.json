@@ -1,0 +1,15 @@
+{
+  "name": "accordion-conductor-attention-folder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Attention-based PERIODIC conductor for Accordion — a Qwen2.5-0.5B probe scores structural gravity; folds the least-attended blocks in epochs to keep the window in a 70–90% band while preserving the inference prompt cache.",
+  "main": "attention-folder.mjs",
+  "scripts": {
+    "start": "node attention-folder.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

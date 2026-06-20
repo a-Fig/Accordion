@@ -2,12 +2,17 @@
 	import { untrack, onDestroy } from "svelte";
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block, Group } from "../../engine/types";
-	import { ghosts, type Ghost } from "../../live/ghostState.svelte";
+	import type { BlockKind } from "../../engine/types";
+	import { ghosts } from "../../live/ghostState.svelte";
 	import { nextVacated } from "./drain";
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
-	import { buildDisplay, segmentDisplay, type DisplayRow } from "$lib/engine/display";
+	import { buildDisplay, segmentDisplay, buildLane, type DisplayRow } from "$lib/engine/display";
+	import { settings } from "$lib/settings.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import SegControl from "$lib/ui/SegControl.svelte";
+	import TileCanvas from "./TileCanvas.svelte";
+	import type { TileSpec } from "./tileDraw";
+	import { faceFor as faceForLib } from "./tileDraw";
 
 	let {
 		store,
@@ -30,6 +35,16 @@
 		tool_result: "Tool result",
 	};
 
+	// Involvement locks (ADR 0011): under `human-steering` the human's fold/group controls are
+	// the conductor's. Double-click-to-fold becomes a no-op and is not advertised; the inline
+	// transcript Fold button and the range→Group affordance disable. Single-click INSPECT and
+	// group PEEK stay enabled — observation is sacred, never lockable. Drive off `store.isLocked`
+	// so preview/demo/read-only mirror it exactly.
+	const steerLocked = $derived(store.isLocked("human-steering"));
+	const lockTip = $derived(
+		`Locked by ${store.lockingConductorLabel ?? "the active conductor"} — detach to take back control`,
+	);
+
 	// ---- weight as dice faces: every tile is the same square; token weight is
 	//      read as a die face 1–6 (more pips = heavier block). -----------------
 	// Upper-bound labels — a face N tile holds blocks UP TO the listed token count
@@ -42,9 +57,8 @@
 		{ f: 5, lbl: "up to 15k tok" },
 		{ f: 6, lbl: "past 15k tok" },
 	] as const;
-	function faceFor(tok: number): number {
-		return tok > 15000 ? 6 : tok > 5000 ? 5 : tok > 1500 ? 4 : tok > 500 ? 3 : tok > 100 ? 2 : 1;
-	}
+	// Use the canonical faceFor from tileDraw (single source of truth).
+	const faceFor = faceForLib;
 	// Legend hover: reveal a face's token range the instant the cursor crosses a die
 	// (pointerenter per die — no native-title delay), so values surface even mid-move.
 	let hoveredFace = $state<number | null>(null);
@@ -95,6 +109,87 @@
 	// multi-line band gets natural height instead of overflowing one fixed-height grid track.
 	const segments = $derived(segmentDisplay(displayRows));
 
+	// ---- TileSpec arrays for each canvas segment (reactive, $derived) -----------
+	// Each change to selectedId / rangeSet / fold state / blocks produces new spec
+	// arrays → the canvases redraw once. This is the performance win.
+
+	/** Build specs for a "tiles" segment (collapsed groups + plain blocks). */
+	function buildTilesSpecs(rows: DisplayRow[]): TileSpec[] {
+		const out: TileSpec[] = [];
+		for (const row of rows) {
+			if (row.type === "block") {
+				const b = row.block;
+				out.push({
+					id: b.id,
+					kind: b.kind,
+					face: faceFor(b.tokens),
+					folded: store.isFolded(b),
+					pinned: b.override === "pinned",
+					selected: b.id === selectedId,
+					inrange: rangeSet.has(b.id),
+				});
+			} else {
+				// collapsed group tile
+				const g = row.group;
+				out.push({
+					id: g.id,
+					kind: "group",
+					face: store.isDropGroup(g) ? 0 : faceFor(store.groupLiveTokens(g)),
+					folded: false,
+					pinned: false,
+					selected: selectedId === g.id,
+					inrange: false,
+				});
+			}
+		}
+		return out;
+	}
+
+	// One spec array per "tiles" segment in the older box, derived reactively.
+	// We access `selectedId` and `rangeSet` and store fold state so changes
+	// automatically trigger a redraw.
+	const olderSegmentSpecs = $derived.by<TileSpec[][]>(() => {
+		return segments.map((seg) => {
+			if (seg.kind !== "tiles") return [] as TileSpec[];
+			return buildTilesSpecs(seg.rows);
+		});
+	});
+
+	// Spec array for the protected box (vacated + protected tiles + ghosts).
+	const protSpecs = $derived.by<TileSpec[]>(() => {
+		const out: TileSpec[] = [];
+		// vacated placeholder cells
+		for (let i = 0; i < vacated; i++) {
+			out.push({ id: "", kind: "vacated", face: 1, folded: false, pinned: false, selected: false, inrange: false });
+		}
+		// protected tiles
+		for (const { b } of protectedTiles) {
+			out.push({
+				id: b.id,
+				kind: b.kind,
+				face: faceFor(b.tokens),
+				folded: store.isFolded(b),
+				pinned: b.override === "pinned",
+				selected: b.id === selectedId,
+				inrange: false, // protected tiles can't be in a range
+			});
+		}
+		// ghost tiles
+		for (const g of ghosts) {
+			out.push({
+				id: "",
+				kind: "ghost",
+				face: 1,
+				folded: false,
+				pinned: false,
+				selected: false,
+				inrange: false,
+				colorKind: g.kind as BlockKind,
+			});
+		}
+		return out;
+	});
+
 	let stage = $state<HTMLDivElement>();
 	let cell = $state(20);
 	let cols = $state(40);
@@ -108,25 +203,49 @@
 	// everything) do we reclaim the space — so the tiles move once per row, not on
 	// every single departure. `vacated` is the number of leading placeholder cells.
 	let vacated = $state(0);
-	const vacatedCells = $derived(Array.from({ length: vacated }, (_, i) => i));
 	let _prevBoundary = 0;
 	let _prevCols = 0;
 	let _prevStore: AccordionStore | null = null;
 	let _prevProtect = -1;
 
-	// ---- scroll smoothness: while the stage is actively scrolling, suppress
-	//      per-tile :hover. Otherwise ~1k tiles sliding under a STATIONARY cursor
-	//      each fire :hover in/out → a repaint per tile per frame (a repaint storm
-	//      that has nothing to do with the user actually hovering). We flip the
-	//      grid to pointer-events:none during scroll, then restore ~140ms after it
-	//      settles — so scrolling is pure layer compositing, no paint.
+	// ---- scroll smoothness -------------------------------------------------------
+	// On scroll, clear the canvas hover state and tooltip immediately so the
+	// tooltip doesn't freeze pointing at stale content (no pointermove fires
+	// during a wheel-scroll while hovering).
+	// `scrolling` suppresses lane hover repaints mid-scroll (`.stage.scrolling .lane`
+	// has `pointer-events: none`). Cleared ~140 ms after the last scroll event.
 	let scrolling = $state(false);
-	let scrollTimer: ReturnType<typeof setTimeout> | undefined;
+	let scrollEndTimer: ReturnType<typeof setTimeout> | undefined;
 	function onScroll() {
-		if (!scrolling) scrolling = true;
-		clearTimeout(scrollTimer);
-		scrollTimer = setTimeout(() => (scrolling = false), 140);
+		tooltip = null;
+		for (const ref of Object.values(canvasRefs)) {
+			ref?.clearHover();
+		}
+		scrolling = true;
+		clearTimeout(scrollEndTimer);
+		scrollEndTimer = setTimeout(() => (scrolling = false), 140);
 	}
+
+	// ---- custom tooltip (replaces native title on canvas tiles) -----------------
+	// Canvas tiles can't carry per-tile `title` attributes. We show a lightweight
+	// absolutely-positioned tooltip div at the tile's clientRect, built from the same
+	// tip()/groupTip() strings as the old DOM tiles.
+	type TooltipInfo = { text: string; rect: DOMRect };
+	let tooltip = $state<TooltipInfo | null>(null);
+
+	// ---- TileCanvas refs for arrow-key scroll -----------------------------------
+	// We need tileClientRect(id) from each canvas to scroll the focused tile into view.
+	// The older box has one canvas per "tiles" segment; the prot box has one canvas.
+	// Keyed by stable string key (segment index string for older segments, "prot" for the
+	// protected canvas) so stale/removed segments never leave dangling positional refs.
+	// Svelte 5 sets bind:this=undefined on component destroy, so after unmount each key
+	// holds undefined — the guards in scrollIdIntoView and onScroll skip those safely.
+	type CanvasInstance = {
+		tileClientRect: (id: string) => DOMRect | null;
+		clearHover: () => void;
+		allTileCenters: () => { id: string; cx: number; cy: number }[];
+	};
+	let canvasRefs = $state<Record<string, CanvasInstance | undefined>>({});
 
 	// ---- single- vs double-click disambiguation -------------------------------
 	// A plain click INSPECTS (opens the panel); a double-click FOLDS. The browser
@@ -151,8 +270,8 @@
 		}, DBL_GUARD);
 	}
 	onDestroy(() => {
-		clearTimeout(scrollTimer);
 		clearPendingClick();
+		clearTimeout(scrollEndTimer);
 	});
 
 	function fit() {
@@ -210,8 +329,22 @@
 	const k = (n: number) => { n = Math.round(n); return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`; };
 	function tip(b: Block, prot = false): string {
 		const tool = b.toolName ? ` ${b.toolName}` : "";
-		const f = store.isFolded(b) ? ` · folded ${b.tokens}→${store.effTokens(b)}` : "";
-		const action = prot ? "click to inspect · protected — never folds" : "click to inspect · double-click to fold";
+		const folded = store.isFolded(b);
+		const f = folded ? ` · folded ${b.tokens}→${store.effTokens(b)}` : "";
+		// The hint mirrors what a double-click actually DOES — steerLocked makes it a no-op, else
+		// store.toggle gated by canFold — so the tile never advertises a fold the gate would refuse:
+		// a conductor lock, a live user/tool_call, a pin, or the protected tail. Unfold stays for a folded block.
+		const action = steerLocked
+			? "click to inspect · folding locked by the conductor"
+			: folded
+				? "click to inspect · double-click to unfold"
+				: store.canFold(b)
+					? "click to inspect · double-click to fold"
+					: prot
+						? "click to inspect · protected — never folds"
+						: b.override === "pinned"
+							? "click to inspect · pinned — held live"
+							: "click to inspect · this kind never folds";
 		return `${b.kind}${tool} · ${b.tokens.toLocaleString()} tok${f}\n${action}`;
 	}
 	function groupTip(g: Group): string {
@@ -224,7 +357,19 @@
 			: "";
 		const savedStr = saved > 0 ? ` · saves ${k(saved)} tok` : "";
 		const stragStr = strag > 0 ? ` · ${strag} kept live` : "";
+		if (store.isDropGroup(g)) {
+			return `drop group · ${members.length} blocks · ${k(saved)} tok removed${stragStr}\n${turns}\nThe agent does not see this block\nclick to inspect`;
+		}
 		return `group · ${members.length} blocks · ${k(full)} tok full${savedStr}${stragStr}\n${turns}\nclick to peek · double-click to collapse`;
+	}
+
+	// ---- sliver mode helpers ------------------------------------------------
+
+	/** Title for an ungrouped fold's cocoa block — the digest now standing in for the block.
+	 *  The dice face on the cocoa shows ITS size (the digest); the sliver beside it carries the
+	 *  original block's weight. */
+	function foldTip(b: Block): string {
+		return `folded · ${k(b.tokens)}→${k(store.effTokens(b))} tok · click to inspect · double-click to unfold`;
 	}
 
 	// ---- range selection state (local — for creating groups) ----------------
@@ -274,6 +419,14 @@
 			peeked = new Set();
 		});
 	});
+	// ADR 0011: when the human-steering lock becomes active, any pending range must be
+	// cleared immediately — a range selected just before the lock engages would otherwise
+	// linger and mislead the user into a guaranteed-to-fail "Group" attempt.
+	$effect(() => {
+		if (steerLocked) {
+			untrack(() => clearRange());
+		}
+	});
 	$effect(() => {
 		if (view !== "map")
 			untrack(() => {
@@ -295,31 +448,32 @@
 	});
 
 	// ---- hit-testing helpers --------------------------------------------------
+	// The canvas tiles are resolved before reaching these handlers (TileCanvas fires
+	// onhit/ondbl with the resolved id/kind). The open-group BANDS still use DOM .cell
+	// elements (only a handful), so we keep DOM resolveHit for those.
+	//
 	// A member tile (data-id) nested inside a group band (data-group) must take
 	// precedence over the enclosing band so clicks on members 2..N are reachable.
-	// The parent group tile itself has data-group but NO data-id (it renders with
-	// only `data-group={g.id}`), so it still routes to the group handler.
-	//
-	// Resolution: find both candidates from the click target, then apply:
-	//   • data-id found AND (no data-group, OR data-group contains the data-id el)
-	//     → it's a block click (the data-id is the more specific / deeper element).
-	//   • Otherwise, data-group found → it's a group click.
-	//
-	// Returns { kind: "block", id } | { kind: "group", gid } | { kind: "none" }.
+	// The parent group tile itself has data-group but NO data-id.
 	type HitResult =
 		| { kind: "block"; id: string }
 		| { kind: "group"; gid: string }
+		/** Sliver mode: click on the summary tile of a fold-cluster. memberIds = comma-joined ids. */
+		| { kind: "summary"; memberIds: string[] }
 		| { kind: "none" };
 	function resolveHit(e: MouseEvent): HitResult {
 		const t = e.target as HTMLElement;
+		// Summary tile: data-summary takes priority unless a data-id (sliver) is closer.
+		const summaryEl = t.closest<HTMLElement>("[data-summary]");
 		const idEl = t.closest<HTMLElement>("[data-id]");
 		const groupEl = t.closest<HTMLElement>("[data-group]");
-		// A block click: a data-id element exists and is either outside any group
-		// container, or is INSIDE one (groupEl.contains(idEl) — the data-id is the
-		// more-specific descendant). The open band carries data-group, so a member
-		// tile's data-id sits inside it; the contains() check is what lets the member
-		// win over the band. A click on the band background (no data-id) falls through
-		// to the group below → toggle peek / collapse, never a dead no-op.
+		// If there's a data-id inside the summary bubble (a sliver), prefer "block".
+		const idInsideSummary = !!(summaryEl && idEl && summaryEl.contains(idEl));
+		if (!idInsideSummary && summaryEl?.dataset.summary !== undefined) {
+			const raw = summaryEl.dataset.summary ?? "";
+			const memberIds = raw ? raw.split(",") : [];
+			return { kind: "summary", memberIds };
+		}
 		const isBlockClick = !!idEl && (!groupEl || groupEl.contains(idEl));
 		if (isBlockClick && idEl!.dataset.id) return { kind: "block", id: idEl!.dataset.id };
 		if (groupEl?.dataset.group) return { kind: "group", gid: groupEl.dataset.group };
@@ -336,49 +490,25 @@
 		leavePeek(gid);
 	}
 
-	function onClick(e: MouseEvent) {
-		// A 2nd+ click in a double/triple sequence: cancel the pending single-click inspect
-		// and let onDbl handle the fold. Fires the instant the 2nd click lands, so a fold
-		// never flashes the panel even if the clicks are slower than DBL_GUARD.
-		if (e.detail > 1) {
-			clearPendingClick();
-			return;
-		}
-		const hit = resolveHit(e);
+	// ---- Shared click logic (used by both canvas callbacks and DOM band handlers) ----
 
-		if (hit.kind === "group") {
-			const gid = hit.gid;
-			// During an active range-select, a group tile is not a valid range target (groups
-			// can't nest or overlap), so shift-clicking one must NOT hijack the gesture — ignore
-			// it and let the user pick a plain block to close the range.
-			if (e.shiftKey && rangeAnchorId) return;
-			// Defer the select+peek so a double-click (which COLLAPSES the group) doesn't flash
-			// the Inspector / a peek-open first.
-			deferClick(() => {
-				const grp = store.groupById(gid);
-				// Select the GROUP id so the Inspector shows group mode. Call unconditionally so the
-				// parent's toggle (selectedId === id ? null : id) can DESELECT on a re-click — matching
-				// block behavior; the togglePeek below keeps the peek band in sync per click.
-				// Length guard: createGroup enforces >= 2 members, so an empty group is an invariant
-				// violation — but read defensively so a bad state never sets selection to undefined.
-				if (grp && grp.memberIds.length > 0) onselect(gid);
-				// A FOLDED parent tile toggles PEEK (open-for-viewing, wire UNCHANGED). An UNFOLDED
-				// group's dull parent already shows its state in the Inspector, so a plain
-				// click there only selects it — peek on folded groups is preserved.
-				if (grp?.folded) togglePeek(gid);
-			});
-			return;
-		}
+	function handleGroupClick(gid: string, shiftKey: boolean) {
+		// During an active range-select, a group tile is not a valid range target — ignore.
+		if (shiftKey && rangeAnchorId) return;
+		deferClick(() => {
+			const grp = store.groupById(gid);
+			if (grp && grp.memberIds.length > 0) onselect(gid);
+			if (grp?.folded) togglePeek(gid);
+		});
+	}
 
-		if (hit.kind !== "block") return;
-		const id = hit.id;
+	function handleBlockClick(id: string, shiftKey: boolean) {
 		const bl = store.get(id);
-
-		// Range-select → groups is a map-only gesture; in transcript a click only inspects.
-		if (view === "map" && e.shiftKey && rangeAnchorId) {
-			clearPendingClick(); // a deliberate range gesture — act now, drop any pending inspect
-			// Extend the range — but only to a groupable block. A protected-tail block, or one
-			// already in a group, can't complete a valid range; hint instead of a phantom span.
+		// Range-select only exists to build a group — a human-steering action. Under the lock
+		// it's inert; a click just inspects (observation stays). So skip all range bookkeeping.
+		// Range-select is a map-only gesture.
+		if (!steerLocked && view === "map" && shiftKey && rangeAnchorId) {
+			clearPendingClick();
 			if (!bl || store.isProtected(bl) || store.groupOf(bl)) {
 				groupErr = true;
 				return;
@@ -387,28 +517,107 @@
 			groupErr = false;
 			return;
 		}
-
-		// Plain click on a block: inspect, and (map only) anchor a range if this block could
-		// actually start one (older + ungrouped). DEFERRED so a double-click folds the block
-		// without opening the side panel first.
 		deferClick(() => {
 			onselect(id);
-			rangeAnchorId = view === "map" && bl && !store.isProtected(bl) && !store.groupOf(bl) ? id : null;
+			rangeAnchorId =
+				!steerLocked && view === "map" && bl && !store.isProtected(bl) && !store.groupOf(bl) ? id : null;
 			rangeEndId = null;
 			groupErr = false;
 		});
 	}
 
-	function onDbl(e: MouseEvent) {
-		clearPendingClick(); // cancel the pending single-click inspect/peek — this is a fold
-		const hit = resolveHit(e);
-		if (hit.kind === "group") {
-			// Double-click a parent (collapsed / peek / unfolded) → COLLAPSE. Never unfolds —
-			// going live is deliberate via the "Unfold to context" button only.
-			collapseGroup(hit.gid);
+	// ---- Canvas callbacks -------------------------------------------------------
+
+	function onCanvasHit(
+		e: { id: string; kind: TileSpec["kind"]; shiftKey: boolean; index: number },
+		_ev: MouseEvent,
+	) {
+		if (e.kind === "group") {
+			handleGroupClick(e.id, e.shiftKey);
+		} else {
+			handleBlockClick(e.id, e.shiftKey);
+		}
+	}
+
+	function onCanvasDbl(
+		e: { id: string; kind: TileSpec["kind"]; shiftKey: boolean; index: number },
+		_ev: MouseEvent,
+	) {
+		clearPendingClick();
+		if (steerLocked) return; // double-click folds, which is locked — no-op (observation is fine)
+		if (e.kind === "group") {
+			collapseGroup(e.id);
+		} else {
+			const b = store.get(e.id);
+			if (b && !store.isFolded(b) && !store.canFold(b)) return;
+			store.toggle(e.id);
+		}
+	}
+
+	function onCanvasHover(ev: { spec: TileSpec; clientRect: DOMRect } | null) {
+		if (!ev) {
+			tooltip = null;
 			return;
 		}
-		if (hit.kind === "block") store.toggle(hit.id);
+		const { spec, clientRect } = ev;
+		if (spec.kind === "vacated" || spec.kind === "ghost") {
+			tooltip = null;
+			return;
+		}
+		let text: string;
+		if (spec.kind === "group") {
+			const g = store.groupById(spec.id);
+			text = g ? groupTip(g) : spec.id;
+		} else {
+			const b = store.get(spec.id);
+			if (!b) { tooltip = null; return; }
+			const prot = store.isProtected(b);
+			text = tip(b, prot);
+		}
+		tooltip = { text, rect: clientRect };
+	}
+
+	// ---- DOM event handlers (stage level — for open-group bands and transcript) ----
+
+	function onClick(e: MouseEvent) {
+		// A 2nd+ click in a double/triple sequence: cancel the pending single-click inspect
+		// and let onDbl handle the fold. Fires the instant the 2nd click lands.
+		if (e.detail > 1) {
+			clearPendingClick();
+			return;
+		}
+		const hit = resolveHit(e);
+		if (hit.kind === "group") {
+			handleGroupClick(hit.gid, e.shiftKey);
+		} else if (hit.kind === "block") {
+			handleBlockClick(hit.id, e.shiftKey);
+		} else if (hit.kind === "summary") {
+			// Single-click summary → inspect the first block.
+			// v1 simplification: summary inspect shows first block only.
+			// TODO: future cluster inspector could show all member blocks.
+			if (hit.memberIds.length > 0) {
+				deferClick(() => onselect(hit.memberIds[0]));
+			}
+		}
+	}
+
+	function onDbl(e: MouseEvent) {
+		clearPendingClick();
+		if (steerLocked) return; // double-click folds/unfolds — locked → no-op (single-click inspect still works)
+		const hit = resolveHit(e);
+		if (hit.kind === "group") {
+			collapseGroup(hit.gid);
+		} else if (hit.kind === "block") {
+			const b = store.get(hit.id);
+			if (b && !store.isFolded(b) && !store.canFold(b)) return;
+			store.toggle(hit.id);
+		} else if (hit.kind === "summary") {
+			// Double-click summary → unfold the whole run.
+			for (const id of hit.memberIds) {
+				const b = store.get(id);
+				if (b && store.isFolded(b)) store.toggle(id);
+			}
+		}
 	}
 
 	function onKeydown(e: KeyboardEvent) {
@@ -416,8 +625,9 @@
 			if (rangeAnchorId) { clearRange(); return; }
 		}
 		// Enter commits a pending range (≥2 blocks) into a group — the keyboard twin of the
-		// "Group N blocks" button, matching the selection chip's hint.
-		if (e.key === "Enter" && rangeCount >= 2) {
+		// "Group N blocks" button, matching the selection chip's hint. No-op under the lock
+		// (ADR 0011: group creation is a human-steering action).
+		if (e.key === "Enter" && rangeCount >= 2 && !steerLocked) {
 			e.preventDefault();
 			handleCreateGroup();
 			return;
@@ -447,26 +657,134 @@
 		}
 		return out;
 	});
+	function scrollIdIntoView(id: string) {
+		if (!stage) return;
+		// Search all TileCanvas instances for a tile with this id.
+		for (const ref of Object.values(canvasRefs)) {
+			if (!ref) continue;
+			const rect = ref.tileClientRect(id);
+			if (rect) {
+				const stageRect = stage.getBoundingClientRect();
+				const relTop = rect.top - stageRect.top + stage.scrollTop;
+				const relBot = relTop + rect.height;
+				const visTop = stage.scrollTop;
+				const visBot = stage.scrollTop + stage.clientHeight;
+				if (relTop < visTop) {
+					stage.scrollTop = relTop - 8;
+				} else if (relBot > visBot) {
+					stage.scrollTop = relBot - stage.clientHeight + 8;
+				}
+				return;
+			}
+		}
+		// Fallback: sliver-mode lane items and open-group band members are DOM nodes. Prefer the
+		// cocoa summary tile (`data-summary`, the large visual anchor for an ungrouped fold) over
+		// its thin 8px sliver (`data-id`); fall back to a plain block tile / group cocoa.
+		const esc = id.replace(/"/g, '\\"');
+		const target =
+			stage?.querySelector<HTMLElement>(`[data-summary="${esc}"]`) ??
+			stage?.querySelector<HTMLElement>(`[data-id="${esc}"]`) ??
+			stage?.querySelector<HTMLElement>(`[data-group="${esc}"]`);
+		target?.scrollIntoView({ block: "nearest", inline: "nearest" });
+	}
+
 	function focusStop(blockIdx: number) {
 		const b = store.blocks[blockIdx];
 		if (!b) return;
 		const g = collapsedGroupOf(b);
 		if (g) {
-			// Select the GROUP id so the Inspector shows group mode, and scroll the
-			// folded-group tile (carries data-group, not data-id).
 			if (g.id !== selectedId) onselect(g.id);
-			const esc = g.id.replace(/"/g, '\\"');
-			stage?.querySelector<HTMLElement>(`[data-group="${esc}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+			scrollIdIntoView(g.id);
 			return;
 		}
 		if (b.id !== selectedId) onselect(b.id);
-		const esc = b.id.replace(/"/g, '\\"');
-		stage?.querySelector<HTMLElement>(`[data-id="${esc}"]`)?.scrollIntoView({ block: "nearest", inline: "nearest" });
+		scrollIdIntoView(b.id);
+	}
+	/**
+	 * Geometry-aware vertical (↑/↓) move. The grid is NOT one uniform matrix — it is
+	 * split into independent sub-grids (the older box, which open-group bands split
+	 * further, and the protected tail, which also starts with `vacated` placeholder
+	 * cells that shift its columns). A flat "± cols" step therefore lands in the wrong
+	 * column at every boundary — most visibly at the protected/unprotected seam. So we
+	 * pick the tile that is visually above/below using rendered client positions.
+	 *
+	 * Returns:
+	 *   "moved"    — selected the tile above/below; caller is done.
+	 *   "edge"     — current tile has no neighbour in that direction; stay put.
+	 *   "nocenter" — current selection has no canvas tile (e.g. an open-group band
+	 *                member) or nothing is selected; caller falls back to linear nav.
+	 */
+	function tryVerticalNav(down: boolean): "moved" | "edge" | "nocenter" {
+		if (view !== "map" || !selectedId) return "nocenter";
+		const centers: { id: string; cx: number; cy: number }[] = [];
+		for (const ref of Object.values(canvasRefs)) {
+			if (ref) centers.push(...ref.allTileCenters());
+		}
+		// Also include the DOM tiles of OPEN groups (canvas tiles have no data-* attrs, so
+		// there is no overlap): the band MEMBER tiles (`.group-band [data-id]` = block id)
+		// AND the visible open-group PARENT tile (`.group-tile-open[data-group]` = group id,
+		// a selectable stop when selectedId is the group id). We target `.group-tile-open`
+		// specifically, NOT plain `[data-group]`, so we don't grab the outer `.group-band`
+		// wrapper (its rect is the whole band, not the parent tile). getBoundingClientRect()
+		// returns client coords, the same space allTileCenters() uses (canvasRect.left + x).
+		// Also include sliver-mode lane items: `.lane [data-id]` (live tiles + slivers),
+		// `.lane [data-summary]` (a fold's cocoa, anchored on its block id), and
+		// `.lane [data-group]` (a group's cocoa, anchored on the group id).
+		if (stage) {
+			for (const el of stage.querySelectorAll<HTMLElement>(
+				".group-band [data-id], .group-tile-open[data-group], .lane [data-id], .lane [data-summary], .lane [data-group]",
+			)) {
+				let id: string | undefined;
+				if (el.dataset.summary !== undefined) {
+					// Summary tile: use the first member id as the nav anchor.
+					const raw = el.dataset.summary ?? "";
+					id = raw ? raw.split(",")[0] : undefined;
+				} else {
+					id = el.dataset.id ?? el.dataset.group;
+				}
+				if (!id) continue;
+				const r = el.getBoundingClientRect();
+				centers.push({ id, cx: r.left + r.width / 2, cy: r.top + r.height / 2 });
+			}
+		}
+		const cur = centers.find((c) => c.id === selectedId);
+		if (!cur) return "nocenter";
+		// Half a row's worth of vertical slack defines "a different row" and "same row".
+		const slack = (cell + GAP) * 0.5;
+		// Nearest row in the target direction (handles arbitrary box gaps / partial rows).
+		let rowY = down ? Infinity : -Infinity;
+		for (const c of centers) {
+			const dy = c.cy - cur.cy;
+			if (down ? dy > slack : dy < -slack) {
+				if (down ? c.cy < rowY : c.cy > rowY) rowY = c.cy;
+			}
+		}
+		if (!isFinite(rowY)) return "edge";
+		// Within that row, the tile nearest the current column.
+		let best: { id: string; cx: number; cy: number } | null = null;
+		let bestDx = Infinity;
+		for (const c of centers) {
+			if (Math.abs(c.cy - rowY) > slack) continue;
+			const dx = Math.abs(c.cx - cur.cx);
+			if (dx < bestDx) {
+				bestDx = dx;
+				best = c;
+			}
+		}
+		if (!best) return "edge";
+		if (best.id !== selectedId) onselect(best.id);
+		scrollIdIntoView(best.id);
+		return "moved";
 	}
 	function onKey(e: KeyboardEvent) {
 		const key = e.key;
 		if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "ArrowUp" && key !== "ArrowDown") return;
 		e.preventDefault();
+		if (key === "ArrowUp" || key === "ArrowDown") {
+			const r = tryVerticalNav(key === "ArrowDown");
+			// "moved"/"edge" are terminal; "nocenter" falls through to linear nav below.
+			if (r === "moved" || r === "edge") return;
+		}
 		const order = navOrder;
 		if (!order.length) return;
 		// Map the current selection to a position in `order`. A selection sitting on a hidden
@@ -540,22 +858,30 @@
 
 			<span class="grow"></span>
 
-			<!-- Range-select chip / hint -->
+			<!-- Range-select chip / hint.
+			     Under human-steering lock: the Group button and Enter hint are hidden;
+			     only the clear button remains so the user can dismiss the selection.
+			     Observation stays unlocked — range visibility itself is fine; only
+			     creating a group (a steering action) is gated (ADR 0011). -->
 			{#if rangeCount >= 2}
-				<div class="range-bar" class:err={groupErr}>
+				<div class="range-bar" class:err={groupErr && !steerLocked}>
 					<span class="range-chip">
 						<Icon name="corner-down-right" size={11} />
 						<b>{rangeCount}</b> blocks → group
-						<span class="dim">· Enter</span>
+						{#if !steerLocked}<span class="dim">· Enter</span>{/if}
 					</span>
-					{#if groupErr}<span class="range-err">overlaps a group or protected tail</span>{/if}
-					<button class="group-btn" onclick={handleCreateGroup}>Group</button>
+					{#if groupErr && !steerLocked}<span class="range-err">overlaps a group or protected tail</span>{/if}
+					{#if steerLocked}
+						<span class="range-err" title={lockTip}>Locked by conductor</span>
+					{:else}
+						<button class="group-btn" onclick={handleCreateGroup}>Group</button>
+					{/if}
 					<button class="range-clear" onclick={clearRange} title="Clear selection (Esc)">
 						<Icon name="x" size={11} />
 					</button>
 				</div>
 				<div class="tb-divider"></div>
-			{:else if rangeAnchorId}
+			{:else if rangeAnchorId && !steerLocked}
 				<span class="range-hint dim">shift-click to complete range</span>
 				<div class="tb-divider"></div>
 			{/if}
@@ -592,7 +918,9 @@
 
 			<div class="tb-divider"></div>
 
-			<span class="dim" style="font-size:var(--fs-xs)">click = inspect · dbl-click = fold</span>
+			<span class="dim" style="font-size:var(--fs-xs)">
+				{steerLocked ? "click = inspect · folding locked by the conductor" : "click = inspect · dbl-click = fold"}
+			</span>
 		{/if}
 	</div>
 
@@ -601,7 +929,7 @@
 		class="stage"
 		class:isgrid={view === "map"}
 		class:istranscript={view === "transcript"}
-		class:scrolling
+		class:scrolling={scrolling}
 		bind:this={stage}
 		role="toolbar"
 		tabindex="0"
@@ -612,15 +940,9 @@
 		onscroll={onScroll}
 	>
 		{#if view === "map"}
-			{#snippet ghostTile(g: Ghost)}
-				<div
-					class="cell ghost k-{g.kind}"
-					title="{g.kind} · forming…"
-				></div>
-			{/snippet}
 			{#snippet tile(t: { b: Block; face: number }, prot: boolean, forceFold = false)}
-				<!-- forceFold: a PEEK member is shown DULL (the `.folded` grammar) regardless of
-				     its own state — it's being previewed, not put live. -->
+				<!-- Band member tiles are still DOM .cell elements (only a handful).
+				     forceFold: a PEEK member is shown DULL regardless of its own state. -->
 				<div
 					class="cell face f{t.face} k-{t.b.kind}"
 					class:folded={forceFold || store.isFolded(t.b)}
@@ -631,6 +953,27 @@
 					title={tip(t.b, prot)}
 				></div>
 			{/snippet}
+			{#snippet sliverTile(b: Block, interactive: boolean)}
+				<!-- The ORIGINAL folded block as a thin sliver; white lines = its weight (die face).
+				     `interactive` slivers carry data-id (click=inspect / dbl=unfold); group-member
+				     slivers are display-only (the group's cocoa owns the interaction). -->
+				{@const face = faceFor(b.tokens)}
+				{@const usable = cell - 4}
+				{@const gap = face > 1 ? Math.min(4, usable / (face - 1)) : 0}
+				{@const barStart = cell / 2 - (gap * (face - 1)) / 2}
+				<div
+					class="sliver k-{b.kind}"
+					class:sel={interactive && b.id === selectedId}
+					class:inrange={rangeSet.has(b.id)}
+					style:height="{cell}px"
+					data-id={interactive ? b.id : undefined}
+					title={interactive ? foldTip(b) : `folded · ${k(b.tokens)} tok · grouped`}
+				>
+					{#each { length: face } as _, n}
+						<div class="bar" style:top="{barStart + n * gap}px"></div>
+					{/each}
+				</div>
+			{/snippet}
 			<div class="boxes" style:--cell="{cell}px" style:--cols={cols}>
 				{#if olderTiles.length}
 					<section class="box older">
@@ -638,41 +981,93 @@
 							<span class="tok"><AnimatedNumber value={olderTok} format={k} /></span>
 						</div>
 						<div class="stack">
-							{#each segments as seg (seg.kind === "band" ? "band-" + seg.row.group.id : "tiles-" + (seg.rows[0].type === "block" ? seg.rows[0].block.id : seg.rows[0].group.id))}
+							{#each segments as seg, segIdx (seg.kind === "band" ? "band-" + seg.row.group.id : "tiles-" + (seg.rows[0].type === "block" ? seg.rows[0].block.id : seg.rows[0].group.id))}
 								{#if seg.kind === "tiles"}
-									<div class="grid">
-										{#each seg.rows as row (row.type === "block" ? row.block.id : row.group.id)}
-											{#if row.type === "block"}
-												{@const t = { b: row.block, face: faceFor(row.block.tokens) }}
-												{@render tile(t, false)}
-											{:else}
-												{@const g = row.group}
-												{@const gface = faceFor(store.groupLiveTokens(g))}
-												<!-- COLLAPSED: one folder tile standing in for the range. -->
+									{#if settings.foldDisplayMode === "sliver"}
+										{@const laneItems = buildLane(seg.rows, (b) => store.isFolded(b))}
+										<!-- Sliver mode: DOM flex-wrap lane. Live block = a full square; each ungrouped
+										     folded block = its own cocoa + 1 sliver (never merged); a group = 1 cocoa + N slivers. Open
+										     group bands are still rendered below unchanged. -->
+										<div class="lane">
+											{#each laneItems as item (item.kind === "tile" ? "t-" + item.block.id : item.kind === "fold" ? "f-" + item.block.id : "g-" + item.group.id)}
+												{#if item.kind === "tile"}
+													{@const b = item.block}
+													<div
+														class="cell face f{faceFor(b.tokens)} k-{b.kind}"
+														class:sel={b.id === selectedId}
+														class:pinned={b.override === "pinned"}
+														class:inrange={rangeSet.has(b.id)}
+														style:width="{cell}px"
+														style:height="{cell}px"
+														data-id={b.id}
+														title={tip(b)}
+													></div>
+												{:else if item.kind === "fold"}
+											{@const b = item.block}
+											<!-- ungrouped fold: the cocoa block (digest = a real block now in context; its dice
+											     face = its OWN size) + the original block as a thin sliver. Each ungrouped fold
+											     is its own unit — never merged with neighbours. -->
+											<div class="fold-cluster" data-cluster-ids={b.id}>
 												<div
-													class="cell face f{gface} group-tile"
+													class="cell face f{faceFor(store.effTokens(b))} summary-tile"
+													class:sel={b.id === selectedId}
+													class:inrange={rangeSet.has(b.id)}
+													style:width="{cell}px"
+													style:height="{cell}px"
+													data-summary={b.id}
+													title={foldTip(b)}
+												></div>
+												{@render sliverTile(b, true)}
+											</div>
+										{:else}
+											{@const g = item.group}
+											<!-- explicit group: ONE shared cocoa summary + its member slivers (display-only;
+											     the cocoa owns peek/collapse via data-group, like the old group tile). -->
+											<div class="fold-cluster" data-cluster-ids={item.members.map((m) => m.id).join(",")}>
+												<div
+													class="cell face f{store.isDropGroup(g) ? 0 : faceFor(store.groupLiveTokens(g))} summary-tile"
+													class:drop-group={store.isDropGroup(g)}
 													class:sel={selectedId === g.id}
+													style:width="{cell}px"
+													style:height="{cell}px"
 													data-group={g.id}
 													title={groupTip(g)}
 												></div>
-											{/if}
-										{/each}
-									</div>
+												{#each item.members as m (m.id)}
+													{@render sliverTile(m, false)}
+												{/each}
+											</div>
+										{/if}
+											{/each}
+										</div>
+									{:else}
+										<!-- Classic mode: canvas (unchanged) -->
+										<TileCanvas
+											bind:this={canvasRefs[String(segIdx)]}
+											specs={olderSegmentSpecs[segIdx] ?? []}
+											{cols}
+											{cell}
+											gap={4}
+											onhit={onCanvasHit}
+											ondbl={onCanvasDbl}
+											onhover={onCanvasHover}
+										/>
+									{/if}
 								{:else}
 									{@const g = seg.row.group}
 									{@const live = seg.row.live}
-									<!-- OPEN GROUP — its own full-width row at natural height (NOT a grid track, so the
-									     band can't overflow/overlap the tiles). live=false → PEEK (dull preview, wire
-									     unchanged); live=true → UNFOLDED (members live). Accented left edge = one group.
-									     data-group on the band itself: clicking the band background/padding resolves to
-									     the group (toggle peek / collapse), while a member tile's data-id still wins via
-									     groupEl.contains(idEl) in resolveHit — so no region of the band is a dead no-op. -->
+									<!-- OPEN GROUP — its own full-width row at natural height (NOT a grid track).
+									     data-group on the band itself: clicking the band background routes to the group.
+									     Member tiles are still DOM .cell elements — resolveHit handles them. -->
 									<div class="group-band" class:live data-group={g.id}>
 										<div
-											class="cell face f{faceFor(store.groupLiveTokens(g))} group-tile group-tile-open"
+											class="cell face f{store.isDropGroup(g) ? 0 : faceFor(store.groupLiveTokens(g))} group-tile group-tile-open"
+											class:drop-group={store.isDropGroup(g)}
 											class:sel={selectedId === g.id}
 											data-group={g.id}
-											title="{live ? 'group (unfolded — live)' : 'group (peek — preview only)'} · {seg.row.members.length} blocks · double-click to collapse"
+											title={store.isDropGroup(g)
+												? `drop group · ${seg.row.members.length} blocks · The agent does not see this block · double-click to collapse`
+												: `${live ? 'group (unfolded — live)' : 'group (peek — preview only)'} · ${seg.row.members.length} blocks · double-click to collapse`}
 										></div>
 										<div class="band-members">
 											{#each seg.row.members as mb (mb.id)}
@@ -686,17 +1081,25 @@
 						</div>
 					</section>
 				{/if}
-				{#if protectedTiles.length}
+				{#if protSpecs.length}
 				<section class="box prot">
 					<div class="rail" title="{protTok.toLocaleString()} tokens · protected working tail">
 						<span class="tok"><AnimatedNumber value={protTok} format={k} /></span>
 					</div>
-					<div class="grid">
-						{#each vacatedCells as i (i)}<div class="cell vacated"></div>{/each}
-						{#each protectedTiles as t (t.b.id)}{@render tile(t, true)}{/each}
-						{#each ghosts as g (g.contentIndex)}
-							{@render ghostTile(g)}
-						{/each}
+					<!-- Single canvas for prot box: vacated placeholders + protected tiles + ghosts.
+					     The wrapper div takes flex: 1 (matching the old .grid) so the canvas
+					     fills the box horizontally after the token rail. -->
+					<div class="canvas-fill">
+						<TileCanvas
+							bind:this={canvasRefs["prot"]}
+							specs={protSpecs}
+							{cols}
+							{cell}
+							gap={4}
+							onhit={onCanvasHit}
+							ondbl={onCanvasDbl}
+							onhover={onCanvasHover}
+						/>
 					</div>
 				</section>
 				{/if}
@@ -709,6 +1112,7 @@
 				{#each store.blocks as b (b.id)}
 					{@const folded = store.isFolded(b)}
 					{@const prot = store.isProtected(b)}
+					{@const canFold = store.canFold(b)}
 					<article
 						class="tr-msg k-{b.kind}"
 						class:folded
@@ -730,11 +1134,14 @@
 								<span class="tr-flag" title="pinned — held full"><Icon name="pin" size={10} /></span>
 							{/if}
 							<span class="grow"></span>
-							{#if !prot}
+							{#if folded || canFold}
 								<button
 									class="tr-btn"
+									class:locked={steerLocked}
+									disabled={steerLocked}
+									aria-disabled={steerLocked}
 									onclick={(e) => { e.stopPropagation(); store.toggle(b.id); }}
-									title={folded ? "Unfold to full text" : "Fold to digest"}
+									title={steerLocked ? lockTip : folded ? "Unfold to full text" : "Fold to digest"}
 								>
 									<Icon name={folded ? "chevrons-up-down" : "chevrons-down-up"} size={12} />
 									{folded ? "Unfold" : "Fold"}
@@ -747,6 +1154,17 @@
 			</div>
 		{/if}
 	</div>
+	<!-- Custom tooltip for canvas tiles (fixed in viewport, not clipped by scroll). -->
+	{#if tooltip}
+		{@const TARG = tooltip.rect}
+		<div
+			class="tile-tip"
+			style:left="{TARG.left + TARG.width / 2}px"
+			style:top="{TARG.bottom + 8}px"
+		>
+			{tooltip.text}
+		</div>
+	{/if}
 </div>
 
 <style>
@@ -1093,9 +1511,15 @@
 		box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent), var(--shadow-1);
 	}
 
-	/* ---- the older box's content: a vertical stack of tile-grids and open-group bands
-	   (paragraph-like). Splitting at each open group keeps every grid uniform and lets bands
-	   size to their content. The protected box has no groups, so it uses a bare .grid. ---- */
+	/* canvas-fill: flex wrapper for TileCanvas inside a box (fills the space after the rail). */
+	.canvas-fill {
+		flex: 1;
+		min-width: 0;
+	}
+
+	/* ---- the older box's content: a vertical stack of canvas segments and open-group bands
+	   (paragraph-like). Splitting at each open group keeps every canvas segment uniform and
+	   lets bands size to their content. ---- */
 	.stack {
 		flex: 1;
 		min-width: 0;
@@ -1103,26 +1527,9 @@
 		flex-direction: column;
 		gap: 8px;
 	}
-	/* ---- grid: uniform squares, conversation order (no dense backfill) ---- */
-	.grid {
-		display: grid;
-		grid-template-columns: repeat(var(--cols), var(--cell));
-		grid-auto-rows: var(--cell);
-		gap: 4px;
-		align-content: start;
-		justify-content: center;
-		flex: 1;
-		min-width: 0;
-	}
-	/* Inside the stack each grid is natural height (a column child must not grow vertically). */
-	.stack .grid {
-		flex: 0 0 auto;
-	}
-	/* while scrolling, make tiles transparent to the pointer so a stationary cursor
-	   doesn't trigger :hover on every tile that slides past it (repaint storm). */
-	.stage.scrolling .grid {
-		pointer-events: none;
-	}
+
+	/* ---- band member tiles: still DOM .cell elements (only a handful per open group) ---- */
+	/* Base cell: shared by band member tiles and group-tile-open. */
 	.cell {
 		box-sizing: border-box;
 		border-radius: 3px;
@@ -1130,7 +1537,6 @@
 		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.22);
 	}
 	.cell:hover {
-		/* instant (no transition) so scrolling past tiles doesn't animate a repaint storm */
 		filter: brightness(1.22);
 		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3);
 		z-index: 2;
@@ -1152,23 +1558,7 @@
 	.cell.pinned {
 		box-shadow: inset 0 0 0 2px #fff;
 	}
-	/* vacated slot: a block left the protected tail but we hold its place (no reflow)
-	   until the whole leading row empties. Reads as an empty outline, not a tile. */
-	.cell.vacated {
-		background: transparent;
-		border: 1px dashed color-mix(in srgb, var(--accent) 30%, transparent);
-		box-shadow: none;
-		cursor: default;
-		pointer-events: none;
-	}
-	.cell.vacated:hover {
-		filter: none;
-		box-shadow: none;
-	}
-
-	/* pending range selection highlight — a warm "building" treatment so the range reads
-	   as forming a NEW object, not hiding one. Bold amber inset ring + a dark inset for
-	   contrast; the faint warm fill is an inset box-shadow (no per-tile gradient/filter). */
+	/* inrange, sel for band member tiles */
 	.cell.inrange {
 		box-shadow: inset 0 0 0 2px var(--group-accent),
 		            inset 0 0 0 3px rgba(0, 0, 0, 0.4),
@@ -1177,26 +1567,71 @@
 	.cell.inrange:hover {
 		filter: brightness(1.22);
 	}
-
 	@keyframes pop {
 		0%   { transform: scale(1); }
 		45%  { transform: scale(1.08); }
 		100% { transform: scale(1); }
 	}
 	.cell.sel {
-		/* inset-only: an outset ring would clip against neighbouring tiles in the dense grid */
 		box-shadow: inset 0 0 0 2px var(--accent), inset 0 0 0 3px rgba(0, 0, 0, 0.55);
 		filter: brightness(1.18);
 		z-index: 3;
 		animation: pop var(--dur-fast) var(--ease-spring);
 	}
 
-	/* ---- group tile: the single "folder" tile representing a folded group ---- */
+	/* ---- face pip SVGs — kept for the 6 toolbar dice and band member .face tiles ---- */
+	.face {
+		position: relative;
+	}
+	.face::before {
+		content: "";
+		position: absolute;
+		inset: 0;
+		border-radius: inherit;
+		background-repeat: no-repeat;
+		background-position: center;
+		background-size: 100% 100%;
+		pointer-events: none;
+	}
+	.f1::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='50' cy='50' r='11'/></g></svg>");
+	}
+	.f2::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+	}
+	.f3::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='50' cy='50' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+	}
+	.f4::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='28' r='11'/><circle cx='28' cy='72' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+	}
+	.f5::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='28' r='11'/><circle cx='50' cy='50' r='11'/><circle cx='28' cy='72' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+	}
+	.f6::before {
+		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='26' r='11'/><circle cx='72' cy='26' r='11'/><circle cx='28' cy='50' r='11'/><circle cx='72' cy='50' r='11'/><circle cx='28' cy='74' r='11'/><circle cx='72' cy='74' r='11'/></g></svg>");
+	}
+	/* Face 0: blank die — no pips. Used for drop groups (0 tokens on the wire). */
+	.f0::before {
+		background-image: none;
+	}
+
+	/* Drop-group tile: extra visual cue that this group is deleted from the wire.
+	   A dashed border + reduced opacity signals "gone" without inventing new colors. */
+	.drop-group {
+		opacity: 0.55;
+		outline: 1.5px dashed color-mix(in srgb, var(--faint) 60%, transparent);
+		outline-offset: -2px;
+	}
+	.drop-group:hover {
+		opacity: 0.75;
+	}
+
+	/* ---- group tile styles — for .group-tile-open in the open-group band ---- */
+	/* The collapsed group tile in tile grids is now drawn on canvas (no DOM .group-tile
+	   needed there). Only .group-tile-open (the dull parent inside the band) remains DOM. */
 	.group-tile {
-		/* Warm dark-brown body so a group reads as a different KIND of object — not a block
-		   kind, not the accent-blue. The folder/stack hint is INSET ONLY (CLAUDE.md: outset
-		   box-shadows clip): a lighter inset top-left highlight + a darker inset bottom-right
-		   edge fakes a raised, stacked sheet. The dice pips (.face::before) sit on top. */
+		/* Kept for .group-tile-open which also uses this base. */
 		background: var(--group);
 		box-shadow:
 			inset 0 0 0 1px var(--group-edge),
@@ -1218,10 +1653,8 @@
 		animation: pop var(--dur-fast) var(--ease-spring);
 	}
 
-	/* dull parent tile inside an open row (peek or unfolded) — recessed; one element per
-	   group, so a single `filter` here is acceptable (not the 982-grid). */
+	/* dull parent tile inside an open row (peek or unfolded) */
 	.group-tile-open {
-		/* In the flex band (no longer a grid cell) the tile has no intrinsic size — pin it. */
 		width: var(--cell);
 		height: var(--cell);
 		flex: 0 0 auto;
@@ -1276,66 +1709,121 @@
 		height: var(--cell);
 		flex: 0 0 auto;
 	}
-	/* ---- ghost tiles: third visual state — "forming" ----
-	   A ghost is a presentation-only pulsing placeholder. It is NOT a block, NOT
-	   selectable, and NOT foldable. It uses the same kind color as a real tile but
-	   in a clearly distinct state: reduced opacity pulsing via a compositor-only
-	   opacity animation (transform/opacity only — no filter/box-shadow/gradients,
-	   per CLAUDE.md perf rules). There are at most a few ghosts at a time so one
-	   cheap keyframe each is fine.                                                  */
-	.cell.ghost {
-		cursor: default;
-		/* Compositor-only animation: opacity pulse — no filter, no box-shadow. */
-		animation: ghost-pulse 1.4s ease-in-out infinite;
-		/* Dashed inset ring marks it visually as "not yet real." */
-		box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.35);
-		/* pointer-events: none so it never hijacks clicks/hovers on real tiles */
+	/* ---- custom canvas tile tooltip (replaces native title attribute) ---- */
+	.tile-tip {
+		position: fixed;
+		transform: translateX(-50%);
+		background: var(--panel-4);
+		color: var(--text);
+		border: 1px solid var(--line-strong);
+		border-radius: var(--radius-sm);
+		padding: 4px 10px;
+		font-size: var(--fs-xs);
 		pointer-events: none;
-	}
-	.cell.ghost:hover {
-		/* Override the inherited :hover brightness — ghosts are not interactive. */
-		filter: none;
-		box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.35);
-	}
-	@keyframes ghost-pulse {
-		0%, 100% { opacity: 0.55; transform: scale(1); }
-		50%       { opacity: 0.85; transform: scale(0.93); }
+		box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+		z-index: 100;
+		max-width: 280px;
+		white-space: pre-wrap;
 	}
 
-	/* ---- dice-face pips: token weight read as a die face 1–6 ----
-	   Each face is ONE cached SVG image (decoded once, blitted cheaply) instead
-	   of live radial gradients — gradients re-rasterize on every repaint and
-	   tanked interaction across 982 tiles. Pips scale with the tile via the SVG. */
-	.face {
-		position: relative;
+	/* ---- sliver fold mode ---- */
+
+	/* Lane: a flex-wrap row containing live cells, group tiles, and fold-clusters.
+	   align-items:center ensures cells and clusters share one vertical centerline.
+	   gap mirrors the canvas grid gap (4px). */
+	.lane {
+		display: flex;
+		flex-wrap: wrap;
+		gap: var(--gap, 4px);
+		align-items: center;
 	}
-	.face::before {
-		content: "";
-		position: absolute;
-		inset: 0;
-		border-radius: inherit;
-		background-repeat: no-repeat;
-		background-position: center;
-		background-size: 100% 100%;
+	/* Kill hover repaints mid-scroll (mirrors `.stage.scrolling .grid` for canvases). */
+	.stage.scrolling .lane {
 		pointer-events: none;
 	}
-	.f1::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='50' cy='50' r='11'/></g></svg>");
+
+	/* Fold-cluster: a cocoa summary + its sliver(s) as one compact object. No bubble —
+	   an invisible layout wrapper; proximity (tight 2px gap vs the lane's 4px) is what pairs
+	   the cocoa with its slivers. Still carries the click-routing data attributes. */
+	.fold-cluster {
+		display: inline-flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 2px;
+		flex: 0 0 auto;
 	}
-	.f2::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+
+	/* Summary tile: stands in for the whole folded run; cocoa color signals synthesis.
+	   Reuses .cell.face.fN for dice pips (::before pseudo, no extra markup needed).
+	   No dashed outline — the cocoa color alone carries the "synthesized" signal. */
+	.summary-tile {
+		background: var(--k-summary);
+		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.22),
+		            inset 0 0 0 2px rgba(255, 255, 255, 0.06);
+		flex: 0 0 auto;
+		cursor: pointer;
 	}
-	.f3::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='50' cy='50' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+	.summary-tile:hover {
+		filter: brightness(1.22);
+		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3);
 	}
-	.f4::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='28' r='11'/><circle cx='28' cy='72' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+	.summary-tile.sel {
+		box-shadow: inset 0 0 0 2px var(--accent),
+		            inset 0 0 0 3px rgba(0, 0, 0, 0.55);
+		filter: brightness(1.18);
+		z-index: 3;
+		animation: pop var(--dur-fast) var(--ease-spring);
 	}
-	.f5::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='28' r='11'/><circle cx='72' cy='28' r='11'/><circle cx='50' cy='50' r='11'/><circle cx='28' cy='72' r='11'/><circle cx='72' cy='72' r='11'/></g></svg>");
+
+	/* Sliver: the original folded block squeezed to an 8px-wide vertical bar.
+	   Full --cell height, kind-colored at reduced saturation (filter:saturate(.62)).
+	   Weight = N horizontal white bars (count = die face); bars set via inline `top`. */
+	.sliver {
+		width: 8px;
+		border-radius: 2px;
+		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.3);
+		position: relative;
+		overflow: hidden;
+		flex: 0 0 auto;
+		cursor: pointer;
 	}
-	.f6::before {
-		background-image: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><g fill='%23fff' stroke='%23000' stroke-opacity='.5' stroke-width='3.6'><circle cx='28' cy='26' r='11'/><circle cx='72' cy='26' r='11'/><circle cx='28' cy='50' r='11'/><circle cx='72' cy='50' r='11'/><circle cx='28' cy='74' r='11'/><circle cx='72' cy='74' r='11'/></g></svg>");
+	.sliver.k-user        { background: color-mix(in srgb, var(--k-user)        66%, var(--panel-3)); }
+	.sliver.k-text        { background: color-mix(in srgb, var(--k-text)        66%, var(--panel-3)); }
+	.sliver.k-thinking    { background: color-mix(in srgb, var(--k-thinking)    66%, var(--panel-3)); }
+	.sliver.k-tool_call   { background: color-mix(in srgb, var(--k-tool_call)   66%, var(--panel-3)); }
+	.sliver.k-tool_result { background: color-mix(in srgb, var(--k-tool_result) 66%, var(--panel-3)); }
+	.sliver:hover {
+		filter: brightness(1.12);
+		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3);
+	}
+	.sliver.sel {
+		box-shadow: inset 0 0 0 2px var(--accent),
+		            inset 0 0 0 3px rgba(0, 0, 0, 0.55);
+		filter: brightness(1.18);
+	}
+	/* In a shift-range selection, folded slivers must show membership too (parity with the
+	   .cell.inrange tiles) — a ring is enough on an 8px bar; the full tinted fill would swamp it. */
+	.sliver.inrange {
+		box-shadow: inset 0 0 0 2px var(--group-accent),
+		            inset 0 0 0 3px rgba(0, 0, 0, 0.4);
+	}
+
+	/* Weight bars: horizontal white lines, centered in the sliver.
+	   N bars (N = die face), each 2px tall, 4px gap between centers.
+	   Position is set inline via `top` + translateY(-50%) so no bar reads heavier. */
+	.sliver .bar {
+		position: absolute;
+		left: 1px;
+		right: 1px;
+		height: 2px;
+		border-radius: 1px;
+		background: rgba(255, 255, 255, 0.9);
+		transform: translateY(-50%);
+	}
+
+	/* Lane live tiles: .cell base, but explicit width/height set inline (--cell px value) */
+	.lane .cell {
+		flex: 0 0 auto;
 	}
 
 	/* ---- transcript (the readable, scrollable concretion) ---- */
@@ -1450,5 +1938,21 @@
 		opacity: 1;
 		outline: none;
 		box-shadow: var(--focus-ring);
+	}
+	/* human-steering locked: the inline Fold control shows disabled (the honest mirror). */
+	.tr-btn.locked,
+	.tr-btn:disabled {
+		cursor: not-allowed;
+		opacity: 0.4;
+	}
+	.tr-msg:hover .tr-btn.locked,
+	.tr-msg.sel .tr-btn.locked {
+		opacity: 0.4;
+	}
+	.tr-btn.locked:hover,
+	.tr-btn:disabled:hover {
+		color: var(--muted);
+		background: var(--panel-2);
+		border-color: var(--line);
 	}
 </style>

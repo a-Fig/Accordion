@@ -189,14 +189,6 @@ export function wireToBlock(w: WireBlock): Block {
 	};
 }
 
-/**
- * How many of the most-recent messages the extension refuses to fold no matter
- * what plan it receives — a coarse, local defense-in-depth backstop. The real,
- * token-based protected tail lives in the GUI engine; this only guards against a
- * buggy plan touching the very newest messages.
- */
-export const PROTECT_RECENT_MSGS = 2;
-
 /** The durable block ids a single message emits + its tool-pair callIds (mirrors `linearize`). */
 interface MsgInfo {
 	ids: string[];
@@ -244,9 +236,11 @@ function messageInfo(m: PiMessage, i: number): MsgInfo {
 }
 
 /** Apply one message's in-place FoldOps (the original substitution path). Returns the same
- *  message by reference when nothing folds; clones lazily otherwise. `mark()` flags a change. */
-function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, protectFrom: number, mark: () => void): PiMessage {
-	if (i >= protectFrom) return m; // backstop: never fold the most-recent messages
+ *  message by reference when nothing folds; clones lazily otherwise. `mark()` flags a change.
+ *  The wire trusts the engine's plan: the engine is the single foldability gate and it never
+ *  folds a protected block, so no separate wire-side position protection is needed here.
+ *  The durable-id + structural guards (kind checks, non-empty digest) remain the safety floor. */
+function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () => void): PiMessage {
 	if (m.role === "assistant" && Array.isArray(m.content)) {
 		let parts: PiPart[] | null = null; // lazily cloned only if we actually fold
 		(m.content as PiPart[]).forEach((b, j) => {
@@ -292,12 +286,13 @@ function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, protectFrom
  *
  *   • `GroupOp` — RANGE COLLAPSE (ADR 0006): remove a contiguous run of WHOLE messages and
  *     insert ONE synthetic summary message. The ONLY op that changes the message count.
- *     Three independent guards, re-derived here (never trusting the GUI):
+ *     Two independent guards, re-derived here (never trusting the GUI):
  *       1. whole + durable — a message is removable only if EVERY block it emits is durable
  *          and a member of one group (a partially-covered or positional-id message stays);
  *       2. balanced pairs — a removed tool_call must have its tool_result removed too, to a
- *          fixpoint; an unbalanced message is demoted to stay-live (the straggler);
- *       3. recent backstop — the newest PROTECT_RECENT_MSGS messages are never removed.
+ *          fixpoint; an unbalanced message is demoted to stay-live (the straggler).
+ *     The wire trusts the engine's plan: the engine is the single foldability gate and never
+ *     folds a protected block, so no separate wire-side position backstop is needed.
  *     Each maximal run of same-group removable messages becomes one message (role = the
  *     run's first message's role, mapped to user/assistant; content = the summary text).
  *
@@ -314,20 +309,21 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 	// member would otherwise throw inside the `context` hook (e.g. `isDurableId(null)`) and
 	// defeat the passthrough guarantee. Re-derive every guard defensively and drop anything off.
 	const safeOps = (ops ?? []).filter((o) => o && typeof o.id === "string" && isDurableId(o.id) && typeof o.digestText === "string" && o.digestText);
-	// summaryText must be a NON-EMPTY string and every member id a string (a number/object/
-	// whitespace value would emit a provider-invalid text part or throw downstream).
+	// A group is valid if:
+	//   • every member id is a string (non-string ids would throw inside isDurableId)
+	//   • summaryText is null (drop group — valid) OR a non-empty, non-whitespace string
+	//     (a whitespace-only string would emit a provider-invalid text part; empty string
+	//     is not a drop op — it is a malformed non-drop op, so we reject it).
 	const safeGroups = (groups ?? []).filter(
 		(g) =>
 			g &&
-			typeof g.summaryText === "string" &&
-			g.summaryText.trim() &&
 			Array.isArray(g.memberIds) &&
 			g.memberIds.length &&
-			g.memberIds.every((m) => typeof m === "string"),
+			g.memberIds.every((m) => typeof m === "string") &&
+			(g.summaryText === null || (typeof g.summaryText === "string" && g.summaryText.trim())),
 	);
 	if (!safeOps.length && !safeGroups.length) return messages;
 
-	const protectFrom = Math.max(0, messages.length - PROTECT_RECENT_MSGS);
 	const byId = new Map(safeOps.map((o) => [o.id, o] as const));
 
 	// ── Phase A: decide which whole messages each group may remove ───────────────
@@ -336,10 +332,10 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 		const memberToGroup = new Map<string, GroupOp>();
 		for (const g of safeGroups) for (const id of g.memberIds) if (isDurableId(id)) memberToGroup.set(id, g);
 		const infos = messages.map((m, i) => messageInfo(m, i));
-		// Initial: a message older than the backstop, all of whose emitted ids are durable
-		// and members of ONE group.
+		// Initial: a message all of whose emitted ids are durable and members of ONE group.
+		// The wire trusts the engine's plan (the engine never folds a protected block), so
+		// no position-based backstop is applied here.
 		for (let i = 0; i < messages.length; i++) {
-			if (i >= protectFrom) continue;
 			const info = infos[i];
 			if (!info.ids.length || info.hasNonDurable) continue;
 			let g: GroupOp | null = null;
@@ -384,17 +380,23 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 	for (let i = 0; i < messages.length; ) {
 		const g = owner[i];
 		if (g) {
-			// Consume the maximal consecutive run owned by the SAME group → one entry. A
-			// group split by an interior straggler yields one entry per run (same summary).
-			const role = messages[i].role === "assistant" ? "assistant" : "user";
+			// Consume the maximal consecutive run owned by the SAME group. A group split by
+			// an interior straggler yields one entry per run (same group object, same decision).
 			let j = i + 1;
 			while (j < messages.length && owner[j] === g) j++;
-			out.push({ role, content: [{ type: "text", text: g.summaryText }] } as PiMessage);
-			changed = true;
+			if (g.summaryText === null) {
+				// DROP: consume the run and push nothing — the agent never sees these messages.
+				changed = true;
+			} else {
+				// REPLACE: insert ONE synthetic summary message (existing behavior).
+				const role = messages[i].role === "assistant" ? "assistant" : "user";
+				out.push({ role, content: [{ type: "text", text: g.summaryText }] } as PiMessage);
+				changed = true;
+			}
 			i = j;
 			continue;
 		}
-		out.push(foldOne(messages[i], i, byId, protectFrom, mark));
+		out.push(foldOne(messages[i], i, byId, mark));
 		i++;
 	}
 	return changed ? out : messages;

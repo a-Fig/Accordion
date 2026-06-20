@@ -31,6 +31,9 @@
 	--k-thinking: #b483e0;
 	--k-tool_call: #34d3c2;
 	--k-tool_result: #f0a35e;
+	/* synthesized-summary tile (sliver fold mode) — cocoa; darker than --group (#6f4a32) so
+	   the summary never visually collides with a collapsed group tile */
+	--k-summary: #4a3528;
 
 	/* multiblock folds (groups) — DO NOT CHANGE */
 	--group: #6f4a32;

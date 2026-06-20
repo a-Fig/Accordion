@@ -5,9 +5,9 @@ clean quality gate. For *what* the product is, read [VISION.md](VISION.md); for 
 the code is organized and the conventions to follow*, read [CLAUDE.md](CLAUDE.md) — it
 is the authoritative guide to working in this codebase.
 
-The active surface is the desktop app in **`app/`** (Tauri 2 + SvelteKit) and the pi
-extension in **`extension/`** (the live link). The repo-root `src/` and `visualizer/`
-are older POCs — not the focus.
+The active surface is the desktop app in **`app/`** (Tauri 2 + SvelteKit), the pi
+extension in **`extension/`** (the live link), and the conductor strategies in
+**`conductors/`**.
 
 ---
 
@@ -118,6 +118,50 @@ up in the app's **Sessions** sidebar within ~1s — click it (or run `/accordion
 terminal to foreground the app on it) and its context populates live. Folding is preview-only
 by default; use the header's **Folding** toggle to opt in to steering the live agent's
 context.
+
+### Keeping the `/accordion` app binary current
+
+`/accordion` does **not** run a dev server — it launches a pre-built binary. The extension
+(`extension/accordion.ts → resolveAccordionApp`) picks the first one it finds, in this order:
+
+1. the `--accordion-app <path>` pi flag, then the `ACCORDION_APP_PATH` env var (explicit overrides);
+2. an installed bundle — `%LOCALAPPDATA%\Programs\Accordion\Accordion.exe`, `Program Files\Accordion\…`, etc.;
+3. the repo build outputs, **release first**: `app/src-tauri/target/release/app.exe`, then `…/target/debug/app.exe`.
+
+With no installed bundle (the common dev setup), it launches the **repo release build**. A Tauri
+*release* build **bakes the SvelteKit frontend in at compile time** — so merging new UI to `main`
+does *not* update what `/accordion` shows. You must rebuild the binary. The checkout that matters
+is the one whose path is registered in `~/.pi/agent/settings.json → extensions` (that path's repo
+root is where `target/release/app.exe` is resolved).
+
+To refresh it after `main` moves:
+
+```powershell
+# 0. Close any open Accordion window first — a running app.exe locks the file and the
+#    linker will fail to overwrite it. (Check: Get-Process app,Accordion -ErrorAction SilentlyContinue)
+
+# 1. Update the registered checkout to the new main
+cd "<the repo whose extension/accordion.ts is in settings.json>"
+git checkout main
+git pull
+
+# 2. Install deps — easy to forget, and a missing new dependency fails the build at the
+#    Vite step (e.g. the design-system overhaul added @fontsource-variable/inter).
+cd app
+npm install
+
+# 3. Rebuild. cargo must be on PATH (see Platform gotchas).
+$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:USERPROFILE\.rustup\bin;$env:PATH"
+npm run tauri build -- --no-bundle   # builds target/release/app.exe; --no-bundle skips
+                                     # the slower MSI/NSIS installers /accordion doesn't use
+```
+
+The fresh binary lands at `app/src-tauri/target/release/app.exe` — the exact path `/accordion`
+launches. No reload needed for the *app*; the next `/accordion` opens the new build. (If the
+**extension** code itself changed, restart pi so it reloads `accordion.ts`.)
+
+> Drop `-- --no-bundle` if you also want the distributable installers
+> (`target/release/bundle/…`). A clean release compile takes ~2 min.
 
 ---
 

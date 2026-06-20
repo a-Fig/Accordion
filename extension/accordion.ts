@@ -20,7 +20,8 @@
  *     UNMODIFIED. We never corrupt context.
  *   • pi's native /compact is suppressed ONLY while the GUI is attached.
  *   • The shared mapping (linearize/applyPlan) carries the provider-safety rules
- *     and a coarse "never fold the newest messages" backstop.
+ *     (durable-id + kind checks); the engine is the single foldability gate and
+ *     never folds a protected block, so no wire-side position backstop is needed.
  *
  * Milestone 1: the GUI replies with an empty plan, so this never alters a model
  * call — it only proves the loop and powers the live view.
@@ -39,7 +40,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { linearize, applyPlan, type PiMessage } from "../app/src/lib/live/mapping";
-import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage } from "../app/src/lib/live/protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
 
 /** The GUI's reply to a sync: in-place fold ops + group-collapse ops (ADR 0006). */
 type Plan = { ops: FoldOp[]; groups: GroupOp[] };
@@ -57,6 +58,9 @@ const REQUEST_TIMEOUT_MS = 250; // how long pi waits on the GUI before passing t
 // Unfold replies arrive during the agent's OWN turn (not on the model-call critical
 // path), so a generous wait is fine — the user's next message isn't blocked.
 const UNFOLD_TIMEOUT_MS = 2000;
+// Recall (ADR 0011) likewise runs during the agent's own turn — a read that echoes the
+// folded block's full content back THIS turn — so the same generous wait applies.
+const RECALL_TIMEOUT_MS = 2000;
 
 // Base dir is overridable for tests (smoke.mjs) so they don't touch the real home.
 const HOME = process.env.ACCORDION_HOME || os.homedir();
@@ -214,6 +218,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// GUI can never alias a fresh request's reqId, and flushPending() drains the map anyway.
 	let unfoldSeq = 0;
 	const pendingUnfold = new Map<number, (res: { restored: Array<{ code: string; kind: string; label: string }>; missing: string[] } | null) => void>();
+	// Recall requests (ADR 0011): keyed by reqId, resolved when the GUI replies (or null on
+	// flush). Same lifecycle as pendingUnfold; recall is a pure READ (the GUI never mutates
+	// fold state) and the result carries the folded block's ORIGINAL full content, echoed to
+	// the agent THIS turn.
+	let recallSeq = 0;
+	const pendingRecall = new Map<number, (res: { restored: RecallContent[]; missing: string[] } | null) => void>();
 	// Last messages snapshot seen at `context` or `agent_end`. Used by the
 	// `message_end` committed-streaming path to build a full array for linearize
 	// without losing global turn/order numbering (see Phase 3 in ADR 0003).
@@ -231,6 +241,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// session that already has turns (especially a RESUMED session, where no
 	// `context`/`agent_end` has fired yet so `lastMessages` would still be empty).
 	let latestCtx: ExtensionContext | null = null;
+	// Most recent model object, updated both from full hook contexts and the immediate
+	// `/model` event. Completion requests use this so `model: "current"` really follows a
+	// just-selected model instead of waiting for the next `context` hook to refresh latestCtx.
+	let latestModel: any = null;
 
 	// ── discovery (registry) state ──────────────────────────────────────────────
 	let port = 0; // actual ephemeral port, filled once the server is listening
@@ -250,6 +264,9 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		// attached" — the tool returns a safe "did not respond" message to the agent.
 		for (const resolve of pendingUnfold.values()) resolve(null);
 		pendingUnfold.clear();
+		// Same for in-flight recall reads — resolve as null so the tool reports cleanly.
+		for (const resolve of pendingRecall.values()) resolve(null);
+		pendingRecall.clear();
 	}
 
 	function send(ws: WebSocket, m: ServerMessage): void {
@@ -338,10 +355,15 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 */
 	function readSessionMessages(c: ExtensionContext | null): PiMessage[] {
 		if (!c) return [];
-		const sm = c.sessionManager as unknown as {
+		let sm: {
 			buildSessionContext?: () => { messages?: unknown };
 			getBranch?: (fromId?: string) => Array<{ type: string; message?: unknown }>;
 		} | undefined;
+		try {
+			sm = c.sessionManager as unknown as typeof sm;
+		} catch {
+			return [];
+		}
 		if (!sm) return [];
 		try {
 			const sc = sm.buildSessionContext?.();
@@ -362,6 +384,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	/** Adopt a model's id + context window into the live + meta state (best-effort). */
 	function applyModel(m: { id?: string; contextWindow?: number } | undefined): void {
 		if (!m) return;
+		latestModel = m;
 		if (m.id) {
 			model = m.id;
 			meta.model = m.id;
@@ -464,6 +487,89 @@ export default function accordionLive(pi: ExtensionAPI): void {
 						});
 					}
 				}
+				if (msg?.type === "recallResult" && typeof msg.reqId === "number") {
+					const resolve = pendingRecall.get(msg.reqId);
+					if (resolve) {
+						pendingRecall.delete(msg.reqId);
+						resolve({
+							restored: Array.isArray(msg.restored) ? msg.restored : [],
+							missing: Array.isArray(msg.missing) ? msg.missing : [],
+						});
+					}
+				}
+				if (msg?.type === "completeRequest" && typeof msg.reqId === "number") {
+					// Out-of-band: fire async and NEVER block the message handler or any hook.
+					// Dynamic import so the module is resolved lazily — at pi load time pi's jiti
+					// alias table maps "@earendil-works/pi-ai" to its bundled copy; the smoke test
+					// never triggers a real model call so it never reaches this import.
+					const req = msg as CompleteRequestMessage;
+					const capturedWs = ws;
+					void (async () => {
+						const reply = (r: CompleteResultMessage): void => {
+							// Only send if this GUI is still the active client (reconnect guard).
+							if (capturedWs === client && capturedWs.readyState === 1) send(capturedWs, r);
+						};
+						// Validate prompt before doing any async work.
+						if (typeof req.prompt !== "string" || req.prompt.length === 0) {
+							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "missing or empty prompt" });
+							return;
+						}
+						try {
+							const ctx = latestCtx;
+							const m = latestModel ?? ctx?.model;
+							if (!ctx || !m) {
+								reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "no model available" });
+								return;
+							}
+							const auth = await ctx.modelRegistry.getApiKeyAndHeaders(m);
+							if (!auth.ok) {
+								reply({ type: "completeResult", reqId: req.reqId, ok: false, error: `could not resolve API key: ${(auth as any).error ?? "unknown"}` });
+								return;
+							}
+							const { complete } = await import("@earendil-works/pi-ai");
+							// Pass system only if it's a string; treat as optional.
+							const context = {
+								...(typeof req.system === "string" ? { systemPrompt: req.system } : {}),
+								messages: [{ role: "user" as const, content: req.prompt, timestamp: Date.now() }],
+							};
+							// Clamp requested maxOutputTokens to the model's own output ceiling
+							// so a conductor requesting more than the model allows can't trigger a provider
+							// rejection; the model still hard-caps generation (truncates at the limit).
+							let maxTokens: number | undefined;
+							if (typeof req.maxOutputTokens === "number" && req.maxOutputTokens > 0) {
+								const modelCeiling = typeof m.maxTokens === "number" && m.maxTokens > 0 ? m.maxTokens : undefined;
+								maxTokens = modelCeiling !== undefined ? Math.min(req.maxOutputTokens, modelCeiling) : req.maxOutputTokens;
+							}
+							const result = await complete(m, context, {
+								apiKey: auth.apiKey,
+								headers: auth.headers,
+								...(maxTokens !== undefined ? { maxTokens } : {}),
+							});
+							// Concatenate ALL text parts in order (a multi-part response must not be
+							// truncated to the first part only). Defensively guard non-array content
+							// and missing/non-string part text.
+							let text = "";
+							if (Array.isArray(result.content)) {
+								text = result.content
+									.filter((p: any) => p?.type === "text")
+									.map((p: any) => (typeof p?.text === "string" ? p.text : ""))
+									.join("");
+							}
+							reply({
+								type: "completeResult",
+								reqId: req.reqId,
+								ok: true,
+								text,
+								model: result.model,
+								inputTokens: typeof result.usage?.input === "number" ? result.usage.input : undefined,
+								outputTokens: typeof result.usage?.output === "number" ? result.usage.output : undefined,
+							});
+						} catch (err: unknown) {
+							const errMsg = err instanceof Error ? err.message : String(err);
+							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: errMsg });
+						}
+					})();
+				}
 			});
 			const drop = () => {
 				if (client === ws) client = null;
@@ -509,6 +615,25 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			}, UNFOLD_TIMEOUT_MS);
 			pendingUnfold.set(reqId, (res) => { clearTimeout(timer); resolve(res); });
 			send(ws, { type: "unfoldRequest", reqId, codes } as UnfoldRequestMessage);
+		});
+	}
+
+	/**
+	 * Ask the GUI for the ORIGINAL full content of folded blocks by their codes (ADR 0011).
+	 * Mirrors requestUnfold in structure, but the GUI replies with the blocks' full content
+	 * (a pure READ — fold state is never changed). The tool echoes that content to the agent
+	 * THIS turn. Resolves null if unsent (no GUI) or on timeout.
+	 */
+	function requestRecall(codes: string[]): Promise<{ restored: RecallContent[]; missing: string[] } | null> {
+		return new Promise((resolve) => {
+			const ws = client;
+			if (!ws || ws.readyState !== 1) return resolve(null);
+			const reqId = ++recallSeq;
+			const timer = setTimeout(() => {
+				if (pendingRecall.has(reqId)) { pendingRecall.delete(reqId); resolve(null); }
+			}, RECALL_TIMEOUT_MS);
+			pendingRecall.set(reqId, (res) => { clearTimeout(timer); resolve(res); });
+			send(ws, { type: "recallRequest", reqId, codes } as RecallRequestMessage);
 		});
 	}
 
@@ -771,6 +896,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 		wss = null;
 		client = null;
+		latestCtx = null;
 	});
 
 	// ── /accordion : focus the app on this session + show status ────────────────
@@ -838,6 +964,59 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			}
 			// Every input code resolves to restored or missing, so `lines` is always non-empty.
 			return { content: [{ type: "text", text: lines.join("\n") }], details: res };
+		},
+	});
+
+	// ── recall tool: an UNBLOCKABLE READ of folded content (ADR 0011) ───────────
+	// recall is the agent's counterpart to the human's "peek": it returns a folded block's
+	// ORIGINAL full content AS a tool result THIS turn (like read_file) and does NOT change
+	// what is standing in the agent's context — no override is created, the block stays
+	// folded. That makes it safe-by-construction and therefore never lockable: it is the net
+	// that keeps a locked `unfold` from blinding the agent. "GUI drives, extension is thin":
+	// the extension only relays the request and echoes back the content the GUI returns.
+	pi.registerTool({
+		name: "recall",
+		label: "Recall Folded Content",
+		description:
+			"Read folded context WITHOUT changing what's standing in your context. Accordion (the live context manager attached to this session) may replace older parts of YOUR OWN context with a short summary tagged like `{#3f9a2c FOLDED}`. The original content is preserved, not lost. Call this tool with the short code(s) from those tags to get the FULL original content back AS THIS tool's result, immediately — like reading a file. Unlike `unfold`, recall does NOT force the block open: your standing context is unchanged (the block stays folded), so recall costs nothing beyond this one tool result. Use it when you need folded detail RIGHT NOW for the current step.",
+		promptSnippet: "recall(codes) — read folded content right now (returned as the tool result; does not change your standing context).",
+		promptGuidelines: [
+			"When you see a `{#<code> FOLDED}` marker and need the full content for the current step, call `recall` with the code(s) — the full original content comes back as this tool's result immediately, and your standing context is left unchanged (the block stays folded). Prefer `recall` over `unfold` when you only need the detail once; use `unfold` when you want the block to stay open across future turns.",
+		],
+		parameters: Type.Object({
+			codes: Type.Array(Type.String({ description: 'A fold code copied verbatim from a {#<code> FOLDED} tag, e.g. "3f9a2c". Always a string (codes may have leading zeros).' }), {
+				description: "One or more fold codes whose full original content to read.",
+			}),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const codes = Array.isArray(params.codes)
+				? params.codes.map((s) => String(s).trim()).filter((s) => s.length > 0)
+				: [];
+			if (!codes.length) {
+				return { content: [{ type: "text", text: 'No fold codes given. Pass the code(s) from a {#<code> FOLDED} tag, e.g. recall({codes:["3f9a2c"]}).' }] };
+			}
+			if (!attached()) {
+				return { content: [{ type: "text", text: "Accordion isn't attached, so nothing in your context is folded right now — it is already full." }] };
+			}
+			const res = await requestRecall(codes);
+			if (res === null) {
+				return { content: [{ type: "text", text: "Accordion did not respond. If it has detached, your context is already full; otherwise try again." }], isError: true };
+			}
+			// The defining difference from `unfold`: echo the FULL original content back THIS turn,
+			// one text block per recalled item, each prefixed with its label + code so the agent
+			// knows what it is reading. A short note lists any codes that resolved to nothing.
+			const content: Array<{ type: "text"; text: string }> = [];
+			for (const r of res.restored) {
+				content.push({ type: "text", text: `[recalled ${r?.label ?? "block"} (#${r?.code ?? "?"})]\n${r?.text ?? ""}` });
+			}
+			if (res.missing.length) {
+				content.push({ type: "text", text: `No folded block for: ${res.missing.map((c) => "#" + c).join(", ")} (already full, or not in this session's context).` });
+			}
+			if (!content.length) {
+				// Defensive: every input code resolves to restored or missing, so this is unreachable.
+				content.push({ type: "text", text: "Nothing to recall." });
+			}
+			return { content, details: res };
 		},
 	});
 

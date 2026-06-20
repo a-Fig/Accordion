@@ -36,6 +36,8 @@ export const REGISTRY_PROTOCOL = 1;
 /** Layout under the user's home directory. Rust mirrors these (lib.rs). */
 export const REGISTRY_DIR = ".accordion";
 export const SESSIONS_SUBDIR = "sessions";
+/** Subdir under ~/.accordion where conductors advertise themselves (ADR 0007). */
+export const CONDUCTORS_SUBDIR = "conductors";
 export const FOCUS_FILE = "focus.json";
 
 /**
@@ -77,11 +79,6 @@ export interface FocusRequest {
 	ts: number;
 }
 
-/** Relative path (under the home dir) of a session descriptor. */
-export function sessionEntryRelPath(sessionId: string): string {
-	return `${REGISTRY_DIR}/${SESSIONS_SUBDIR}/${sessionId}.json`;
-}
-
 /** True when an entry parses as a current-protocol, non-stale, dialable session. */
 export function isLiveEntry(e: unknown, now: number): e is SessionEntry {
 	if (!e || typeof e !== "object") return false;
@@ -95,3 +92,34 @@ export function isLiveEntry(e: unknown, now: number): e is SessionEntry {
 		now - (v.heartbeatAt as number) <= STALE_AFTER_MS
 	);
 }
+
+/**
+ * A conductor advertising itself for discovery. Mirrors SessionEntry, but a conductor
+ * exposes a full ws:// URL (it may be remote, not just an ephemeral local port) and its
+ * own protocol version (the conductor wire, distinct from the pi wire PROTOCOL_VERSION).
+ */
+export interface ConductorEntry {
+	registryProtocol: number;   // must === REGISTRY_PROTOCOL
+	conductorProtocol: number;  // the conductor wire version it speaks
+	id: string;                 // stable conductor id
+	label: string;              // human-facing name for the switcher
+	url: string;                // ws:// endpoint the app connects to (as a client)
+	pid: number;
+	startedAt: number;
+	heartbeatAt: number;        // liveness signal — stale after STALE_AFTER_MS
+}
+
+/** True if `e` is a well-formed, non-stale conductor advertisement. */
+export function isLiveConductor(e: unknown, now: number): e is ConductorEntry {
+	if (!e || typeof e !== "object") return false;
+	const v = e as Record<string, unknown>;
+	return (
+		v.registryProtocol === REGISTRY_PROTOCOL &&
+		typeof v.id === "string" &&
+		typeof v.url === "string" &&
+		v.url.length > 0 &&
+		typeof v.heartbeatAt === "number" &&
+		now - (v.heartbeatAt as number) <= STALE_AFTER_MS
+	);
+}
+

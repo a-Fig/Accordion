@@ -1,9 +1,11 @@
 <script lang="ts">
 	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
+	import { folding } from "$lib/live/folding.svelte";
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import SegControl from "$lib/ui/SegControl.svelte";
+	import SettingsPanel from "$lib/ui/SettingsPanel.svelte";
 	import { relTime } from "$lib/utils";
 
 	let {
@@ -40,6 +42,7 @@
 	}
 
 	let collapsed = $state(loadCollapsed());
+	let settingsOpen = $state(false);
 
 	$effect(() => {
 		if (typeof localStorage !== "undefined") {
@@ -81,7 +84,6 @@
 	}
 
 	const activeCount = $derived(source === "pi" ? sessions.length : claudeSessions.length);
-	const railCCSessions = $derived(claudeSessions.slice(0, 12));
 </script>
 
 <aside class="rail" class:collapsed>
@@ -117,22 +119,33 @@
 						aria-label={label(s)}
 						onclick={() => onselect(s)}
 					>
-						<span class="status-dot" class:on={isSel && connected}></span>
+						<span class="status-dot" class:on={isSel && connected} class:steering={isSel && connected && folding.enabled}></span>
 					</button>
 				{/each}
 			</div>
-			<button
-				class="rail-btn dot-btn demo-icon"
-				class:sel={demoSelected}
-				title="Demo session (bundled sample)"
-				aria-label="Demo session"
-				onclick={ondemo}
-			>
-				<span class="status-dot demo-dot"></span>
-			</button>
+			<!-- Bottom group: Demo + gear, flush at the rail foot -->
+			<div class="rail-foot">
+				<button
+					class="rail-btn dot-btn demo-icon"
+					class:sel={demoSelected}
+					title="Demo session (bundled sample)"
+					aria-label="Demo session"
+					onclick={ondemo}
+				>
+					<span class="status-dot demo-dot"></span>
+				</button>
+				<button
+					class="rail-btn settings-icon"
+					title="Settings"
+					aria-label="Settings"
+					onclick={() => (settingsOpen = true)}
+				>
+					<Icon name="sliders-horizontal" size={16} />
+				</button>
+			</div>
 		{:else}
 			<div class="icon-list">
-				{#each railCCSessions as s (s.sessionId)}
+				{#each claudeSessions.slice(0, 12) as s (s.sessionId)}
 					{@const isSel = s.sessionId === claudeSelected}
 					<button
 						class="rail-btn dot-btn"
@@ -145,6 +158,17 @@
 					</button>
 				{/each}
 			</div>
+			<!-- Bottom group: gear only (no Demo in CC mode) -->
+			<div class="rail-foot">
+				<button
+					class="rail-btn settings-icon"
+					title="Settings"
+					aria-label="Settings"
+					onclick={() => (settingsOpen = true)}
+				>
+					<Icon name="sliders-horizontal" size={16} />
+				</button>
+			</div>
 		{/if}
 	{:else}
 		<!-- Expanded sidebar -->
@@ -153,18 +177,6 @@
 				<Icon name="accordion" size={16} class="accent-icon" />
 			</span>
 			<span class="wordmark">Accordion</span>
-
-			<!-- Segmented source switcher -->
-			<SegControl
-				options={[
-					{ id: "pi", label: "pi", icon: "terminal" },
-					{ id: "claude", label: "Claude Code", icon: "message-square" },
-				]}
-				value={source}
-				onchange={(v) => onsource(v as "pi" | "claude")}
-				ariaLabel="Session source"
-				iconSize={11}
-			/>
 
 			<span class="count tnum" aria-label="{activeCount} sessions">{activeCount}</span>
 
@@ -176,6 +188,21 @@
 			>
 				<Icon name="chevrons-left" size={14} />
 			</button>
+		</div>
+
+		<!-- Source switcher on its own row so the header stays slim and the collapse
+		     button is never clipped in the narrow (232px) rail. -->
+		<div class="source-row">
+			<SegControl
+				options={[
+					{ id: "pi", label: "pi", icon: "terminal" },
+					{ id: "claude", label: "Claude Code", icon: "message-square" },
+				]}
+				value={source}
+				onchange={(v) => onsource(v as "pi" | "claude")}
+				ariaLabel="Session source"
+				iconSize={11}
+			/>
 		</div>
 
 		{#if source === "pi"}
@@ -193,7 +220,7 @@
 							{@const isSel = s.sessionId === selected}
 							<li>
 								<button class="row" class:sel={isSel} onclick={() => onselect(s)} title={s.cwd}>
-									<span class="status-dot" class:on={isSel && connected}></span>
+									<span class="status-dot" class:on={isSel && connected} class:steering={isSel && connected && folding.enabled}></span>
 									<span class="body">
 										<span class="t1">{label(s)}</span>
 										<span class="t2 mono">{shortModel(s.model)}</span>
@@ -261,8 +288,20 @@
 				50 newest · use Open… for older
 			</div>
 		{/if}
+
+		<!-- Settings entry: pinned at the very bottom of the expanded sidebar, always visible -->
+		<div class="settings-foot">
+			<button class="row settings-row" onclick={() => (settingsOpen = true)} title="Open settings">
+				<Icon name="sliders-horizontal" size={13} class="settings-row-icon" />
+				<span class="body">
+					<span class="t1">Settings</span>
+				</span>
+			</button>
+		</div>
 	{/if}
 </aside>
+
+<SettingsPanel open={settingsOpen} onclose={() => (settingsOpen = false)} />
 
 <style>
 	/* ===== Rail shell ===== */
@@ -331,12 +370,19 @@
 		color: var(--accent);
 	}
 	.demo-icon {
-		margin-top: auto;
 		border-style: dashed;
 		border-color: var(--line-strong);
 	}
 	.demo-icon:hover {
 		border-color: var(--accent);
+	}
+	/* Bottom-pinned group in the collapsed rail (Demo + gear in pi; gear only in CC) */
+	.rail-foot {
+		margin-top: auto;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: var(--sp-1);
 	}
 
 	/* ===== Collapsed source pill ===== */
@@ -369,6 +415,14 @@
 		align-items: center;
 		gap: var(--sp-2);
 		padding: 10px var(--sp-3);
+		border-bottom: 1px solid var(--line);
+		flex: 0 0 auto;
+	}
+	/* Source switcher gets its own row beneath the header (keeps the collapse
+	   button in the header from being pushed out of the 232px rail). */
+	.source-row {
+		display: flex;
+		padding: var(--sp-2) var(--sp-3);
 		border-bottom: 1px solid var(--line);
 		flex: 0 0 auto;
 	}
@@ -522,14 +576,18 @@
 		transition: background var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out), opacity var(--dur-fast) var(--ease-out);
 	}
 	@keyframes halo-pulse {
-		0%, 100% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 28%, transparent); }
-		50%       { box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 10%, transparent); }
+		0%, 100% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--dot-color) 28%, transparent); }
+		50%       { box-shadow: 0 0 0 4px color-mix(in srgb, var(--dot-color) 10%, transparent); }
 	}
 	.status-dot.on {
-		background: var(--ok);
+		--dot-color: var(--accent);
+		background: var(--dot-color);
 		opacity: 1;
-		box-shadow: 0 0 0 2px color-mix(in srgb, var(--ok) 28%, transparent);
+		box-shadow: 0 0 0 2px color-mix(in srgb, var(--dot-color) 28%, transparent);
 		animation: halo-pulse var(--dur-slow) ease-in-out infinite;
+	}
+	.status-dot.on.steering {
+		--dot-color: var(--ok);
 	}
 	.demo-dot {
 		background: transparent;
@@ -671,5 +729,42 @@
 	/* ===== Accent icon helper (applied via class prop on Icon) ===== */
 	:global(.accent-icon) {
 		color: var(--accent);
+	}
+
+	/* ===== Settings entry — expanded sidebar ===== */
+	.settings-foot {
+		flex: 0 0 auto;
+		padding: var(--sp-1) var(--sp-2);
+		border-top: 1px solid var(--line);
+	}
+	.settings-row {
+		color: var(--muted);
+	}
+	.settings-row .t1 {
+		color: var(--muted);
+		font-weight: 500;
+	}
+	.settings-row:hover .t1 {
+		color: var(--text);
+	}
+	:global(.settings-row-icon) {
+		color: var(--faint);
+		flex: 0 0 auto;
+		opacity: 0.75;
+	}
+	.settings-row:hover :global(.settings-row-icon) {
+		color: var(--muted);
+		opacity: 1;
+	}
+	.settings-row:focus-visible {
+		outline: none;
+		box-shadow: var(--focus-ring);
+	}
+
+	/* ===== Settings icon — collapsed icon rail ===== */
+	/* margin-top: auto removed — now handled by .rail-foot wrapper */
+	.settings-icon:focus-visible {
+		outline: none;
+		box-shadow: var(--focus-ring);
 	}
 </style>

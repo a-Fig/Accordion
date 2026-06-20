@@ -25,8 +25,13 @@
  * is proven end-to-end while never altering a single model call.
  */
 
-/** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 4;
+/**
+ * Bump on any breaking change to the message shapes below. History:
+ *  - v4: group collapse ops (`GroupOp`, `PlanMessage.groups`).
+ *  - v5: recall tool (`recallRequest` / `recallResult`) plus completion relay
+ *        (`completeRequest` / `completeResult`) for out-of-band model completions.
+ */
+export const PROTOCOL_VERSION = 5;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi
@@ -86,17 +91,23 @@ export interface FoldOp {
  * text, carrying the group's `{#<code> FOLDED}` tag where `code = foldCode(group.id)` — ONE
  * handle for the whole range, so the agent restores it all with one `unfold` code.
  *
+ * `summaryText === null` means DROP: the run is removed from the wire and NO replacement
+ * message is inserted. The agent never sees those blocks. Phase A (tool-pair balancing) still
+ * applies — only whole, balanced messages are removed. Phase B simply emits nothing.
+ *
  * Provider safety lives on BOTH sides (defense in depth, like `FoldOp`): the extension's
  * `applyPlan` re-derives tool-pair balance independently and only removes WHOLE, balanced,
- * durable, non-backstop messages — on ANY doubt the affected messages pass through
- * untouched. Safe because `applyPlan`'s output feeds the model only; the GUI's block sync
- * and `sentCount` cursor run off the un-collapsed `linearize`, so a removal can never desync
- * the view.
+ * durable messages — on ANY doubt the affected messages pass through untouched. The wire
+ * trusts the engine's plan (the engine is the single foldability gate and never folds a
+ * protected block), so no separate wire-side position backstop is applied. Safe because
+ * `applyPlan`'s output feeds the model only; the GUI's block sync and `sentCount` cursor
+ * run off the un-collapsed `linearize`, so a removal can never desync the view.
  */
 export interface GroupOp {
 	id: string;
 	memberIds: string[];
-	summaryText: string;
+	/** `null` = drop (remove the run, insert no message); non-null string = the summary text. */
+	summaryText: string | null;
 }
 
 // ── Server → client (extension → GUI) ────────────────────────────────────────
@@ -163,7 +174,50 @@ export interface UnfoldRequestMessage {
 	codes: string[];
 }
 
-export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage;
+/**
+ * Sent by the extension when the live AGENT calls the `recall` tool (protocol v5 —
+ * ADR 0011). `recall` is the agent's counterpart to the human's "peek": an UNBLOCKABLE
+ * read that returns a folded block's ORIGINAL full content AS a tool result THIS turn,
+ * WITHOUT mutating the standing view (no override created, the block stays folded). It
+ * is the safety net that makes locking the agent's `unfold` non-blinding, so it is never
+ * gated by any lock.
+ *
+ * `codes` are the short fold codes the agent read from the `{#<code> FOLDED}` tags. The
+ * GUI resolves each code to every folded block carrying it and returns the full content
+ * (NOT the lossy digest) in the `recallResult` reply — the defining difference from
+ * `unfoldRequest`, which schedules a state change and echoes nothing.
+ */
+export interface RecallRequestMessage {
+	type: "recallRequest";
+	reqId: number;
+	codes: string[];
+}
+
+/**
+ * Extension → GUI: the result of a `completeRequest` (protocol v5).
+ *
+ * `reqId` correlates 1-to-1 with the `completeRequest` that triggered this. `ok:false`
+ * means the completion failed (no model available, key resolution error, the model itself
+ * errored, etc.) — `error` describes what went wrong and `text`/`model` are absent.
+ *
+ * On success (`ok:true`):
+ *  - `text` is the model's full text output.
+ *  - `model` is the model id that actually ran.
+ *  - `inputTokens` / `outputTokens` are usage counts, when the extension can supply them.
+ */
+export interface CompleteResultMessage {
+	type: "completeResult";
+	reqId: number;
+	ok: boolean;
+	text?: string;
+	model?: string;
+	inputTokens?: number;
+	outputTokens?: number;
+	/** Present when ok:false — a human-readable description of the failure. */
+	error?: string;
+}
+
+export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage | CompleteResultMessage;
 
 // ── Client → server (GUI → extension) ────────────────────────────────────────
 
@@ -176,10 +230,36 @@ export interface PlanMessage {
 	groups?: GroupOp[];
 }
 
-/** Optional: the GUI announcing itself (reserved; unused in M1). */
-export interface AttachMessage {
-	type: "attach";
-	protocolVersion: number;
+/**
+ * GUI → extension: ask the extension to run an out-of-band model completion (protocol v5).
+ *
+ * This is a SEPARATE model invocation — independent of the agent's own turn. It is
+ * designed for a conductor that needs the host's model link (e.g. to summarize aged
+ * context blocks). Hard invariants:
+ *
+ *  - This call MUST NEVER block or alter the agent's own model call or the `context`
+ *    hook. The extension fulfils it on a side channel, completely outside the
+ *    sync→plan→apply loop.
+ *  - "Extension is thin" — the extension makes NO folding decision. It runs exactly the
+ *    completion it is handed and returns the raw result. Strategy lives in the GUI.
+ *  - `reqId` is GUI-assigned (monotonic integer). The extension echoes it in
+ *    `completeResult` so the GUI can match responses even if multiple requests overlap.
+ */
+export interface CompleteRequestMessage {
+	type: "completeRequest";
+	reqId: number;
+	/** Optional system instruction (e.g. a compaction persona or template). */
+	system?: string;
+	/** The user-role content to operate on (e.g. aged context blocks to summarize). */
+	prompt: string;
+	/**
+	 * Requested cap on output tokens. The extension clamps this to the model's own
+	 * max-output ceiling before forwarding — so a conductor can safely pass any positive
+	 * number without risking a provider rejection. The model enforces the (clamped) value
+	 * as a hard cap; over-long output is truncated, not rejected. Omit to use the model
+	 * default.
+	 */
+	maxOutputTokens?: number;
 }
 
 /** One block restored by an `unfoldResult`. */
@@ -189,6 +269,8 @@ export interface UnfoldRestored {
 	kind: WireBlock["kind"];
 	/** Short human label for a useful confirmation, e.g. "tool_result read_file · turn 12". */
 	label: string;
+	/** The block ids this restore actually touched (≥1; >1 on a hash collision or a group unfold). */
+	ids: string[];
 }
 
 /**
@@ -205,18 +287,39 @@ export interface UnfoldResultMessage {
 	missing: string[];
 }
 
-export type ClientMessage = PlanMessage | AttachMessage | UnfoldResultMessage;
+/** One block's original full content returned by a `recallResult` (ADR 0011). */
+export interface RecallContent {
+	/** The fold code the agent referenced (the block stays folded — recall is read-only). */
+	code: string;
+	/** Short human label, e.g. "tool_result read_file · turn 12" or "group · 4 blocks". */
+	label: string;
+	/** The block's ORIGINAL full text (NOT the folded digest) — for a group, its members joined. */
+	text: string;
+	/** The block ids this content covers (≥1; >1 on a hash collision or a group recall). */
+	ids: string[];
+}
+
+/**
+ * The GUI's reply to a `recallRequest` (protocol v5, ADR 0011). `restored` carries the
+ * ORIGINAL full content of each matched folded block (the agent gets it back THIS turn,
+ * like a `read_file` result); `missing` lists codes the GUI could not resolve to any
+ * folded block (unknown, or already full). This is a PURE READ — recall NEVER changes
+ * fold state, so the standing view is untouched (the block stays folded in context).
+ */
+export interface RecallResultMessage {
+	type: "recallResult";
+	reqId: number;
+	restored: RecallContent[];
+	missing: string[];
+}
+
+export type ClientMessage = PlanMessage | UnfoldResultMessage | RecallResultMessage | CompleteRequestMessage;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 export function isServerMessage(v: unknown): v is ServerMessage {
 	if (!v || typeof v !== "object" || !("type" in v)) return false;
 	const t = (v as any).type;
-	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest";
+	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult";
 }
 
-export function isClientMessage(v: unknown): v is ClientMessage {
-	if (!v || typeof v !== "object" || !("type" in v)) return false;
-	const t = (v as any).type;
-	return t === "plan" || t === "attach" || t === "unfoldResult";
-}

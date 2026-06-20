@@ -29,27 +29,19 @@ Accordion shows the agent's context as a list of **sections** — one per turn �
 
 Nothing is ever deleted — folding only changes what the agent is *shown*, never what's *stored* — so every fold is instantly reversible, with no database or search index behind it.
 
-And the recent past is always safe: the most recent ~20k tokens of context are protected, so the agent's working tail — its latest reasoning — stays at full fidelity. That tail is an absolute no-fold zone: automatic folding, manual folding, and group creation all stop before it.
+And the recent past is always safe: the most recent ~20k tokens of context are protected, so the agent's working tail — its latest reasoning — stays at full fidelity. That tail is an absolute no-fold zone under a collaborative conductor (the default); an exclusive conductor you approve can manage it.
 
 ## Three hands on the same controls
 
 - **You** — fold, unfold, pin, and peek, by hand.
-- **The agent** — reaches back to unfold or pin context it needs mid-task.
+- **The agent** — reaches back to unfold or pin context it needs mid-task, or **recall** a folded block as a tool result (like `read_file`) without changing what's standing in context.
 - **The Conductor** — Accordion's automatic mode: between every turn it folds what's gone cold and unfolds what's becoming relevant, on its own.
+
+A Conductor is **collaborative** by default (you steer alongside it — your overrides always win) or **exclusive** (autopilot: you approve it taking over specific controls, and steer via the **detach** kill switch). Either way, observation is always yours — you can always see, and you can always leave.
 
 And folds nest: cold turns fold into **groups**, groups into bigger groups, so a session of thousands of turns stays small enough to fit and complete enough to recover. It all happens in a **separate window** where every change is shown and attributed — open it to watch and steer, close it to let the Conductor run.
 
 → Full details, capability matrix, and a walkthrough: **[VISION.md](VISION.md)**
-
-## See it: the visualizer
-
-There's a working **[visualizer demo](visualizer/)** — a standalone window that renders a real agent context window and lets you fold, unfold, pin, and peek it, with the automatic **Conductor** keeping the live context inside a token budget. It loads real saved sessions from **Claude Code**, **pi**, or **OMP**.
-
-```bash
-cd visualizer && node serve.js   # then open http://localhost:8080
-```
-
-Drag any session `.jsonl` onto the window, or use the bundled sample. Everything runs locally — nothing is uploaded. See [visualizer/README.md](visualizer/README.md).
 
 ## Why it's different
 
@@ -81,9 +73,8 @@ Drag any session `.jsonl` onto the window, or use the bundled sample. Everything
 
 Honest about what's **not** there yet: there is no autonomous Conductor on a live session,
 no agent-driven pinning, no nested/hierarchical groups, no LLM-generated summaries, no
-replay — that's the build ahead. There's also an
-older terminal-only POC (`src/accordion.ts`, `/expand` · `/collapse` · `/accordion`) that
-predates the app.
+replay — that's the build ahead. (An older terminal-only POC — `src/accordion.ts`,
+`/expand` · `/collapse` · `/accordion` — predated the app and has since been removed.)
 
 ### Try it
 
@@ -114,10 +105,11 @@ setup, and platform gotchas) is in **[CONTRIBUTING.md](CONTRIBUTING.md)**.
 - [x] Live link to a running pi session + auto-discovery
 - [x] Opt-in live steering — apply the fold plan to what the agent is shown
 - [x] Agent-driven unfold from `{#code FOLDED}` tags
+- [x] Involvement locks — exclusive conductors, the consent gate, freeze-on-detach kill switch, and agent `recall`
 - [ ] LLM-generated summaries, computed once and cached
 - [ ] The Conductor — automatic fold/unfold between turns, based on context
 - [ ] Hierarchical folding — fold the folds, for million-turn sessions
-- [ ] Agent-driven unfold and pin
+- [ ] Agent-driven pin
 - [ ] Replay — scrub how the context evolved across a session
 
 ---

@@ -38,8 +38,9 @@ interface Group { id: string; memberIds: string[]; folded: boolean }
 
 The "new kind of block" the owner pictured is purely the **UI tile**. Invariants enforced
 at creation: members are **contiguous** in block order, **non-overlapping** (a block is in
-≤1 group), **flat** (no nesting — a member is always a block, never a group), at least two
-members, **entirely older than the protected tail** (`protectedFromIndex`), and **collapse
+≤1 group), **flat** (no nesting — a member is always a block, never a group), at least one
+member (originally two; relaxed to one — see the addendum below), **entirely older than the
+protected tail** (`protectedFromIndex`), and **collapse
 at least one member** — a group whose every member is a split tool-pair half (nothing folds
 into the summary) is refused, since a folded group must *replace* its blocks with the parent
 summary, not hide live blocks behind a zero-saving tile. The group
@@ -102,9 +103,11 @@ interface GroupOp { id: string; memberIds: string[]; summaryText: string }
    demoted to stay-live (the owner's "leave straggler live" choice). `applyPlan`
    **re-derives** this independently of the GUI (defense in depth, ADR 0004 style): it
    never emits an array with an orphaned tool call/result.
-3. **Recent backstop.** The newest `PROTECT_RECENT_MSGS` messages are never removed (this
-   is on top of the engine's token-based protected tail, which already bars protected
-   blocks from groups at all).
+3. ~~**Recent backstop.** The newest `PROTECT_RECENT_MSGS` messages are never removed.~~
+   *Superseded (ADR 0011): the message-count position backstop was removed — under the
+   `tail-size` lock it was stricter than the view and folded-in-GUI content stayed whole on
+   the wire. The engine's token-based protected tail is now the sole protection (it already
+   bars protected blocks from groups); `applyPlan` keeps only the structural guards above.*
 
 Each maximal run of removable messages collapses to one message: **role = the role of the
 first message in the run**, content = a single text part = `summaryText` (which carries the
@@ -213,3 +216,124 @@ recent message, passes through on any guard failure, stays pure; `computeGroupOp
 and the protect-tail/group interactions; `groupDigest` shape/determinism. Extension
 `smoke.mjs`: an armed group-collapse round-trip and a group-code unfold. Full gate:
 `svelte-check` 0/0/0, `vitest` green, extension smoke.
+
+---
+
+## Addendum — `digest: null` DROP and single-member groups (2026-06-17)
+
+### New capability
+
+`GroupCommand` gains an optional `digest?: string | null` field; the wire `GroupOp.summaryText`
+is now `string | null` (was `string`). Together they introduce a **DROP** mode and relax the
+minimum-member constraint:
+
+- `digest === undefined` → default recap summary + `{#code FOLDED}` tag. **Byte-identical to
+  existing behavior**; no existing conductor is affected.
+- `digest === null` (or `""`) → **DROP**: the run is removed from the wire and NO replacement
+  is inserted. The agent never sees those blocks, and **the agent cannot recover them** —
+  `recall`/`unfold` have no handle to a dropped run. Phase A (tool-pair balancing) still runs,
+  so no orphaned tool pairs can result. **"Permanent" is scoped, not destructive:** the app
+  never destroys the block — it stays in the engine (shown as the folded drop-group tile) and
+  is merely *withheld* from the model's message array. While a drop group stands it is
+  irrecoverable by the agent, and by the human too if a conductor holds `human-steering`. The
+  one escape hatch is the kill switch: after **detach**, `freezeForDetach` reassigns the drop
+  group to the human (keeping `digest: null`, so it still drops), `human-steering` unlocks, and
+  the human may `deleteGroup` it — which returns the blocks to live and re-admits them to the
+  agent on the next pass. That is consistent with ADR 0011 ("detach freezes the view and folds
+  remain human-reversible") and with this repo's source-of-truth stance (Accordion withholds
+  context, it does not delete history). If a future requirement needs deletion to survive
+  detach, that is a deliberate change to the kill-switch contract, not a bug here.
+- Non-empty string → that exact string is used as the summary verbatim (like `FoldCommand.digest`,
+  no tag added).
+
+A group may now have a **single member** (was ≥2). This enables dropping or summarizing one
+lone block without needing to fabricate a companion.
+
+### Relation to the "content substitution, never structural removal" rule
+
+This is the **second deliberate exception** to the founding rule stated in `conductors/contract/conductor.ts`
+(the first being the existing group→summary collapse that already removed messages and inserted
+one synthetic entry). DROP is a stricter extension of that same exception: same Phase A
+whole-message / pair-balanced guards; Phase B simply emits nothing instead of a summary.
+
+**Provider safety:** DROP reuses the Phase A whole-message / tool-pair-balanced removal that
+already ships in `applyPlan`, so no orphaned tool pair can result. The remaining concern is
+**same-role adjacency** — removing a non-`user` run between two user turns leaves two adjacent
+user messages. What is *verified*: the worked providers in this setup are OpenAI-compatible
+(`openrouter`, `openai-codex` per `~/.pi/agent/settings.json`), which accept consecutive
+same-role messages; and the existing group→summary path *already* emits same-role adjacency
+(a `tool_result`-led run maps to a `role:"user"` summary, `mapping.ts`), so DROP introduces no
+new adjacency class. What is *not* verified: pi's exact provider send/normalization path (the
+provider client is not in the published dist), so we do **not** rely on pi coalescing same-role
+messages. If a strictly-alternating provider (e.g. Anthropic's native Messages API) is ever
+used, the fallback is to insert a minimal placeholder message per dropped run instead of
+nothing — the same Phase A machinery, Phase B emitting a one-token entry. Not built; flagged.
+
+**How `""` resolves to a drop (no contradiction):** the engine normalizes `digest === ""` to a
+drop *before* the wire. `store.isDropGroup(g)` is true for both `null` and `""`, and
+`computeGroupOps` emits `summaryText: store.isDropGroup(g) ? null : …` — so a `""`-digest group
+reaches the wire as `summaryText: null`, exactly like an explicit `null`. The wire therefore
+never receives a literal `""` from the normal engine path.
+
+**`applyPlan` wire-side enforcement** (`app/src/lib/live/mapping.ts`): when `g.summaryText === null`
+Phase B consumes the run and pushes nothing to `out`. The `safeGroups` filter accepts
+`summaryText === null` (DROP) or a non-empty, non-whitespace string (summary), and rejects a
+literal `""`/whitespace string as a malformed op (passing those messages through untouched).
+That rejection is pure defense-in-depth for a hand-crafted op — it is unreachable through the
+engine, which always sends `null` for a drop.
+
+### Introduces: `sliding-window` conductor
+
+`conductors/sliding-window/` ships this hard-delete capability. It issues `group` commands
+with `digest: null` to remove the oldest non-`user` blocks (skipping user messages, which stay
+live). It locks `human-steering` + `agent-unfold` (NOT `tail-size`) so that, while attached,
+neither a human override nor an agent `unfold` can re-admit content it dropped — recovery is
+only via the detach kill switch (see the DROP bullet above). It leaves `tail-size` unlocked so
+the human keeps the protected-tail dial.
+
+**Hysteresis band (high-water 90% / low-water 70%).** The host clears conductor-owned folds
+before every pass (`runConductor` → `clearConductorState`), so `view.liveTokens` is always the
+raw, fully-unfolded size — which only grows. A *stateless* trigger comparing that to 90% would
+therefore re-fire on every pass once the raw size first crossed 90%, pinning the agent's window
+at 70% forever. So the conductor keeps internal state: `dropped`, the committed (monotonic)
+drop-set. Each pass it computes the **agent-visible** window (`liveTokens − Σ tokens of dropped
+blocks still eligible`) and only *grows* the drop-set when *that* crosses 90%, bringing it back
+to ~70%, then **holds** — re-emitting the same `group(digest:null)` commands so the deletes
+stay applied while the window refills toward 90% again. The set is monotonic (a dropped block
+is gone), pruned only of ids no longer present.
+
+### Known limitations (`sliding-window`)
+
+The conductor decides at **block** granularity, but the host enforces deletion at **whole-message
++ tool-pair** granularity (`createGroup` snaps a run outward to whole messages; `applyPlan`
+Phase A keeps a message live if a tool pair straddles the removal boundary). The conductor's
+token accounting models neither, so two bounded discrepancies exist. Both are **self-correcting**
+(the next grow pass closes them) and err in the **safe direction** — the agent keeps *more*
+context than the target, never less — and neither reintroduces the "pinned at 70%" behavior the
+hysteresis band fixed.
+
+- **Straggler over-credit.** When a dropped `tool_call`'s `tool_result` is *not* also in the
+  drop-set (it sits in the protected tail, or the remove loop stopped before reaching it), Phase A
+  keeps that message **live** as a straggler — but the conductor already counted its full tokens
+  as freed. So the visible window can sit a little above the 70% target. It self-corrects: the
+  next time the window refills past 90%, the grow pass extends the run to include the result, the
+  pair balances, and the overshoot closes. Worst case is a *frozen* session running slightly over
+  a soft target — moot, since a frozen session makes no model calls.
+
+- **Snap over-deletion.** If the remove loop's boundary falls mid-message (it drops an assistant
+  turn's `thinking` block but stops before that turn's `text`/`tool_call` blocks), `createGroup`
+  snaps the run outward to the whole message and deletes the rest of that same turn. This
+  over-deletes relative to the conductor's target, but only ever the *remainder of a turn it had
+  already begun deleting*, and it stays under budget.
+
+**Why not fixed.** Closing both exactly means teaching the conductor to reason in whole messages
+and pair `tool_call`/`tool_result` by `callId`. Pairing is cheap (`callId` is already in
+`ConductorView`), but whole-message reasoning needs message identity, which today lives only in
+the block-id string convention (`messageKey`, `app/src/lib/engine/ids.ts`) — the conductor would
+have to parse a format the engine owns, or `ViewBlock` would need an additive `messageKey` field.
+Not worth the coupling or the protocol bump for a bounded, self-correcting, safe-direction
+overshoot. This is the same root cause already flagged for cold-score auto-coalesce ("align runs
+to whole-message boundaries and model the host's straggler cost", `conductors/README.md`). The
+deeper reason exactness is awkward: the `ConductorView` is always the **raw baseline**, so a
+history-dependent strategy like this must *predict* its own effect open-loop rather than observe
+it — and the straggler drift lives in that prediction.

@@ -7,6 +7,7 @@
 		| 'chevrons-left'
 		| 'chevrons-right'
 		| 'x'
+		| 'check'
 		| 'pin'
 		| 'pin-off'
 		| 'lock'
@@ -32,6 +33,8 @@
 		| 'message-square'
 		| 'sliders-horizontal'
 		| 'activity'
+		| 'play'
+		| 'square'
 		| 'accordion';
 
 	// Raw inner SVG markup for each icon (Lucide 24×24 path geometry).
@@ -43,6 +46,7 @@
 		'chevrons-left': `<polyline points="11 17 6 12 11 7"/><polyline points="18 17 13 12 18 7"/>`,
 		'chevrons-right': `<polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/>`,
 		'x': `<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>`,
+		'check': `<polyline points="20 6 9 17 4 12"/>`,
 		'pin': `<line x1="12" y1="17" x2="12" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17z"/>`,
 		'pin-off': `<line x1="2" y1="2" x2="22" y2="22"/><line x1="12" y1="17" x2="12" y2="22"/><path d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h12"/><path d="M15 9.34V6h1a2 2 0 0 0 0-4H7.89"/>`,
 		'lock': `<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>`,
@@ -71,6 +75,8 @@
 		'message-square': `<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>`,
 		'sliders-horizontal': `<line x1="21" y1="6" x2="3" y2="6"/><line x1="21" y1="12" x2="3" y2="12"/><line x1="21" y1="18" x2="3" y2="18"/><circle cx="9" cy="6" r="2" fill="none"/><circle cx="15" cy="12" r="2" fill="none"/><circle cx="9" cy="18" r="2" fill="none"/>`,
 		'activity': `<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>`,
+		'play': `<polygon points="5 3 19 12 5 21 5 3"/>`,
+		'square': `<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>`,
 		// Custom accordion brand mark: 4 vertical bellows folds on a 24×24 grid.
 		// A rounded rect outline (the body) with three interior zig-zag fold lines
 		// suggesting a compressed bellows / accordion. Reads crisply at 16–28px.
