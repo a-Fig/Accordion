@@ -91,6 +91,44 @@ fn conductors_root() -> Option<PathBuf> {
 /// Managed state: map of conductor id → spawned child process handle.
 struct ConductorProcs(std::sync::Mutex<std::collections::HashMap<String, std::process::Child>>);
 
+/// Managed state: the single fake-pi mock-server child, if running. Launched from
+/// Settings ("Fake pi session") so the desktop app can be exercised without real pi.
+struct MockProc(std::sync::Mutex<Option<std::process::Child>>);
+
+/// Browser control-panel port the mock server serves (CONTROL_PORT in mock-server.mjs,
+/// defaulting to PORT+1 = 4318). Kept in lockstep with the extension's default.
+const MOCK_CONTROL_PORT: u16 = 4318;
+
+/// Locate the repo's `extension/` directory (home of `mock-server.mjs`).
+///
+/// Resolution mirrors `conductors_root()`:
+/// 1. `ACCORDION_EXTENSION_DIR` if it points at a real directory.
+/// 2. Walk upward from `current_exe()`; the first ancestor whose `extension/` holds
+///    `mock-server.mjs` AND which has a sibling `app/` dir (the repo-root signature)
+///    wins — return that `extension/`. Requiring `app/` too prevents matching some
+///    unrelated `extension/` higher in the tree.
+fn extension_root() -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("ACCORDION_EXTENSION_DIR") {
+        let p = PathBuf::from(&val);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?;
+    loop {
+        let candidate = dir.join("extension");
+        if candidate.join("mock-server.mjs").is_file() && dir.join("app").is_dir() {
+            return Some(candidate);
+        }
+        match dir.parent() {
+            Some(p) => dir = p,
+            None => return None,
+        }
+    }
+}
+
 /// Read every session descriptor. Returns raw JSON values; the app validates the
 /// protocol/staleness (registry.ts `isLiveEntry`) so the rules live in one place.
 #[tauri::command]
@@ -333,6 +371,123 @@ fn stop_conductor(
     }
 
     Ok(())
+}
+
+/// Launch the fake-pi mock server (`node extension/mock-server.mjs`).
+///
+/// Spawns the process detached (CREATE_NO_WINDOW on Windows, stdio → null), tracks the
+/// single child in `MockProc`, and returns the browser control-panel port so the caller
+/// can open it. Idempotent: if a child is already alive, returns the port without
+/// re-spawning. A short post-spawn check surfaces an immediate crash (e.g. missing deps)
+/// as an actionable error instead of a phantom "running" state.
+#[tauri::command]
+fn launch_mock_session(procs: tauri::State<'_, MockProc>) -> Result<u16, String> {
+    // Already running? (Mirrors launch_conductor's try_wait handling.)
+    {
+        let mut slot = procs.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(child) = slot.as_mut() {
+            match child.try_wait() {
+                Ok(None) => return Ok(MOCK_CONTROL_PORT), // still running
+                Ok(Some(_)) => {
+                    *slot = None; // cleanly exited — fall through to re-launch
+                }
+                Err(_) => return Ok(MOCK_CONTROL_PORT), // state unknown — treat as alive
+            }
+        }
+    }
+
+    let dir = extension_root().ok_or_else(|| {
+        "Could not locate the extension/ directory. Set ACCORDION_EXTENSION_DIR to your checkout's extension/ folder.".to_string()
+    })?;
+
+    // Pre-flight: the mock needs `ws` + `jiti` from extension/node_modules; without them it
+    // dies the instant it `import`s. Catch that with a clear message rather than a silent crash.
+    if !dir.join("node_modules").is_dir() {
+        return Err(
+            "The fake pi session isn't set up yet. Run `npm install` in extension/ first.".to_string(),
+        );
+    }
+
+    let mut cmd = std::process::Command::new("node");
+    cmd.arg("mock-server.mjs")
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "Could not start the fake pi session: 'node' was not found on PATH. Install Node.js or add it to PATH.".to_string()
+        } else {
+            format!("Could not start the fake pi session: {e}")
+        }
+    })?;
+
+    // Insert immediately so a concurrent app-exit can find and kill it. If a racing launch
+    // already stored a child, kill the older one so it can't orphan-hold the WS port.
+    {
+        let mut slot = procs.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mut old) = slot.replace(child) {
+            let _ = old.kill();
+            let _ = old.try_wait();
+        }
+    }
+
+    // Early-exit detection: a bad spawn (e.g. deps that pre-flight missed) dies in well
+    // under 400ms. Give it a beat, then report if it already exited.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    {
+        let mut slot = procs.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(child) = slot.as_mut() {
+            if let Ok(Some(status)) = child.try_wait() {
+                *slot = None;
+                return Err(format!(
+                    "The fake pi session started but exited immediately ({status}). Check that extension/ deps are installed (npm install)."
+                ));
+            }
+        }
+    }
+
+    Ok(MOCK_CONTROL_PORT)
+}
+
+/// Stop the fake-pi mock server if running. Idempotent. A hard kill skips the mock's own
+/// registry cleanup, but the app reaps the stale session descriptor after STALE_AFTER_MS.
+#[tauri::command]
+fn stop_mock_session(procs: tauri::State<'_, MockProc>) -> Result<(), String> {
+    let child = {
+        let mut slot = procs.0.lock().unwrap_or_else(|e| e.into_inner());
+        slot.take()
+    };
+    if let Some(mut c) = child {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    Ok(())
+}
+
+/// Report whether the fake-pi mock server is currently running (reaps a dead handle).
+#[tauri::command]
+fn mock_session_running(procs: tauri::State<'_, MockProc>) -> bool {
+    let mut slot = procs.0.lock().unwrap_or_else(|e| e.into_inner());
+    match slot.as_mut() {
+        Some(child) => match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                *slot = None;
+                false
+            }
+            Err(_) => true,
+        },
+        None => false,
+    }
 }
 
 /// Delete a stale/dead session descriptor (the app reaps when a heartbeat lapses).
@@ -659,6 +814,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(ConductorProcs(Default::default()))
+        .manage(MockProc(Default::default()))
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             list_conductors,
@@ -669,7 +825,10 @@ pub fn run() {
             read_claude_session,
             list_launchable_conductors,
             launch_conductor,
-            stop_conductor
+            stop_conductor,
+            launch_mock_session,
+            stop_mock_session,
+            mock_session_running
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -686,6 +845,12 @@ pub fn run() {
                 let mut map = state.0.lock().unwrap_or_else(|e| e.into_inner());
                 let mut children: Vec<std::process::Child> = map.drain().map(|(_, c)| c).collect();
                 drop(map); // release the lock; no callers remain during Exit
+
+                // Fold the fake-pi mock child (if any) into the same kill+reap pass.
+                let mock = app_handle.state::<MockProc>();
+                if let Some(c) = mock.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    children.push(c);
+                }
 
                 // Phase 1: issue kill() to every child without waiting.
                 for child in &mut children {

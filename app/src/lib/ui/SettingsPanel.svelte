@@ -2,6 +2,7 @@
 	import Icon from "$lib/ui/Icon.svelte";
 	import SegControl from "$lib/ui/SegControl.svelte";
 	import { settings } from "$lib/settings.svelte";
+	import { isTauriEnv } from "$lib/session.svelte";
 
 	let {
 		open = false,
@@ -10,6 +11,59 @@
 		open?: boolean;
 		onclose?: () => void;
 	} = $props();
+
+	// ── Fake pi session (dev tool) ────────────────────────────────────────────
+	// Spawns extension/mock-server.mjs via a Tauri command and opens its browser
+	// control panel. Desktop-only: the spawn + opener live in native code, and the
+	// fake advertises itself through ~/.accordion which a plain browser can't read.
+	let mockRunning = $state(false);
+	let mockBusy = $state(false);
+	let mockError = $state("");
+	let mockPort = $state(4318);
+
+	async function invoke<T>(cmd: string): Promise<T> {
+		const { invoke } = await import("@tauri-apps/api/core");
+		return invoke<T>(cmd);
+	}
+	async function openUrl(url: string): Promise<void> {
+		const { openUrl } = await import("@tauri-apps/plugin-opener");
+		await openUrl(url);
+	}
+
+	// Refresh the running state each time the panel opens, so Launch/Stop is accurate
+	// even if the mock was started/stopped elsewhere.
+	$effect(() => {
+		if (!open || !isTauriEnv) return;
+		invoke<boolean>("mock_session_running")
+			.then((r) => (mockRunning = r))
+			.catch(() => {});
+	});
+
+	async function launchMock() {
+		mockBusy = true;
+		mockError = "";
+		try {
+			mockPort = await invoke<number>("launch_mock_session");
+			mockRunning = true;
+			await openUrl(`http://localhost:${mockPort}`);
+		} catch (e) {
+			mockError = e instanceof Error ? e.message : String(e);
+		} finally {
+			mockBusy = false;
+		}
+	}
+	async function stopMock() {
+		mockBusy = true;
+		mockError = "";
+		try {
+			await invoke("stop_mock_session");
+			mockRunning = false;
+		} catch (e) {
+			mockError = e instanceof Error ? e.message : String(e);
+		} finally {
+			mockBusy = false;
+		}
+	}
 
 	// Focus management: move focus into the close button when the panel opens,
 	// and restore focus to the previously-focused element when it closes.
@@ -86,6 +140,42 @@
 					</div>
 				</div>
 			</section>
+
+			{#if isTauriEnv}
+				<section class="s-section">
+					<h2 class="s-title">Developer</h2>
+					<div class="s-row">
+						<div class="s-label-wrap">
+							<span class="s-label">Fake pi session</span>
+							<span class="s-helper">
+								Streams the bundled sample as a live pi session so you can drive a conductor
+								without running pi. Opens a browser panel to play / pause / restart and set
+								speed — then pick the session from the sidebar.
+							</span>
+							{#if mockError}
+								<span class="s-error">{mockError}</span>
+							{/if}
+						</div>
+						<div class="s-control mock-control">
+							{#if mockRunning}
+								<button class="btn" disabled={mockBusy} onclick={() => openUrl(`http://localhost:${mockPort}`)}>
+									<Icon name="activity" size={13} />
+									Control panel
+								</button>
+								<button class="btn btn-danger" disabled={mockBusy} onclick={stopMock}>
+									<Icon name="square" size={12} />
+									Stop
+								</button>
+							{:else}
+								<button class="btn btn-accent" disabled={mockBusy} onclick={launchMock}>
+									<Icon name="play" size={13} />
+									{mockBusy ? "Launching…" : "Launch"}
+								</button>
+							{/if}
+						</div>
+					</div>
+				</section>
+			{/if}
 		</div>
 	</div>
 {/if}
@@ -211,11 +301,68 @@
 		color: var(--faint);
 		line-height: 1.55;
 	}
+	.s-error {
+		font-size: var(--fs-xs);
+		color: var(--danger);
+		line-height: 1.5;
+	}
 	.s-control {
 		flex: 0 0 auto;
 		display: flex;
 		align-items: center;
 		padding-top: 1px; /* optical alignment with label baseline */
+	}
+	/* Mock-session controls can stack two buttons; let them wrap, right-aligned. */
+	.mock-control {
+		flex-direction: column;
+		align-items: flex-end;
+		gap: var(--sp-2);
+	}
+
+	/* ── Buttons (dev section) ────────────────────────────────────────────── */
+	.btn {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--sp-1);
+		white-space: nowrap;
+		padding: var(--sp-1) var(--sp-3);
+		border: 1px solid var(--line-strong);
+		border-radius: var(--radius-sm);
+		background: var(--panel-2);
+		color: var(--text);
+		font-size: var(--fs-sm);
+		font-weight: 600;
+		cursor: pointer;
+		transition:
+			background var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out);
+	}
+	.btn:hover:not(:disabled) {
+		background: var(--panel-3);
+		border-color: var(--line-strong);
+	}
+	.btn:disabled {
+		opacity: 0.55;
+		cursor: default;
+	}
+	.btn:focus-visible {
+		outline: none;
+		box-shadow: var(--focus-ring);
+	}
+	.btn-accent {
+		background: var(--accent-soft);
+		border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+		color: var(--accent);
+	}
+	.btn-accent:hover:not(:disabled) {
+		background: var(--accent-soft);
+		border-color: var(--accent);
+		color: var(--accent-hover);
+	}
+	.btn-danger:hover:not(:disabled) {
+		border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+		color: var(--danger);
 	}
 
 	/* ── Animations ───────────────────────────────────────────────────────── */
