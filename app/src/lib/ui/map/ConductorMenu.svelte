@@ -617,7 +617,7 @@
 		box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent);
 	}
 	.cond-status-dot.error {
-		background: var(--k-tool_result, #f0a35e);
+		background: var(--k-tool_result, #E19C7D);
 	}
 
 	/* Exclusive (locked) conductor — the trigger wears a warning accent so the handover is
@@ -853,7 +853,7 @@
 	.cond-url-error {
 		margin: 0;
 		font-size: var(--fs-2xs);
-		color: var(--k-tool_result, #f0a35e);
+		color: var(--k-tool_result, #E19C7D);
 	}
 
 	/* ── Launch / Stop action buttons ── */
@@ -912,7 +912,7 @@
 	.cond-launch-error {
 		margin: 2px 8px 3px;
 		font-size: var(--fs-2xs);
-		color: var(--k-tool_result, #f0a35e);
+		color: var(--k-tool_result, #E19C7D);
 		line-height: 1.4;
 		word-break: break-word;
 	}
