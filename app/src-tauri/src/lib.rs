@@ -775,12 +775,15 @@ fn list_claude_sessions() -> Vec<Value> {
 /// and we make the HTTPS call here so the API key never leaves native code in a form a
 /// webview can leak (and so the engine stays network-free / pure).
 ///
-/// Assumption: the REST response is a JSON object with a top-level string field `output`
-/// (both Token Company SDKs surface `result.output`). We extract that. Anything else is
-/// reported as an unexpected shape, with a short body snippet for debugging.
+/// Wire shape verified against the `thetokencompany` SDK source (`_client.py` / `_types.py`):
+///   request  → POST /v1/compress  `{ "model": "bear-2", "input": <text>,
+///              "compression_settings": { "aggressiveness": <f64> } }`
+///   response → `{ "output": <str>, "output_tokens": <int>, "original_input_tokens": <int> }`
+/// We extract the top-level string `output`. Anything else is reported as an unexpected
+/// shape, with a short body snippet for debugging.
 ///
 /// SECURITY: `api_key` is NEVER logged or echoed into any error message — only the request
-/// body's `text`/`output` and HTTP status/snippet ever appear in returns.
+/// body's `input`/`output` and HTTP status/snippet ever appear in returns.
 #[tauri::command]
 async fn compress_text(text: String, api_key: String, aggressiveness: f64) -> Result<String, String> {
     // A bounded request timeout: without it a hung call permanently consumes one of the
@@ -794,9 +797,9 @@ async fn compress_text(text: String, api_key: String, aggressiveness: f64) -> Re
         .header("Authorization", format!("Bearer {api_key}"))
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
-            "text": text,
             "model": "bear-2",
-            "aggressiveness": aggressiveness,
+            "input": text,
+            "compression_settings": { "aggressiveness": aggressiveness },
         }))
         .send()
         .await
