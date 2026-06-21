@@ -1,0 +1,21 @@
+{
+  "name": "accordion-conductor-the-conductor-v2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "V2 of the_conductor's context strategy as an Accordion external (WebSocket) conductor: recoverable custom digests, host-native summaries, structured telemetry, self-calibrating fold-target band, graduated Full/Trim/Digest/Group fold levels, three-stage relevance, and risk-aware unfold floors.",
+  "main": "the-conductor.ts",
+  "scripts": {
+    "start": "node the-conductor.ts",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.8.1"
+  }
+}

@@ -65,6 +65,7 @@ class TrackingConductor implements Conductor {
 	detachCalls = 0;
 	conductCalls = 0;
 	capturedHost: ConductorHost | null = null;
+	lastView: ConductorView | null = null;
 	cmds: Command[] | null = [];
 
 	constructor(id = "tracking") {
@@ -77,8 +78,9 @@ class TrackingConductor implements Conductor {
 		this.capturedHost = host;
 	}
 
-	conduct(_view: ConductorView): Command[] | null {
+	conduct(view: ConductorView): Command[] | null {
 		this.conductCalls++;
+		this.lastView = view;
 		return this.cmds;
 	}
 
@@ -620,9 +622,15 @@ describe("AccordionStore host — setStatus()", () => {
 		expect(s.conductorStatus.text).toBe("waiting for live model link");
 		expect(s.conductorStatus.metrics.aged).toBe(3);
 
+		conductor.capturedHost!.setStatus("ledger ready", { aged: 4 }, { factLedger: [{ cat: "paths", value: "app.ts", turn: 2 }] });
+		expect(s.conductorStatus.text).toBe("ledger ready");
+		expect(s.conductorStatus.metrics.aged).toBe(4);
+		expect(s.conductorStatus.details).toEqual({ factLedger: [{ cat: "paths", value: "app.ts", turn: 2 }] });
+
 		conductor.capturedHost!.setStatus(null);
 		expect(s.conductorStatus.text).toBe("");
 		expect(s.conductorStatus.metrics).toEqual({});
+		expect(s.conductorStatus.details).toBeUndefined();
 	});
 
 	it("ignores setStatus() from a stale detached conductor host", () => {
@@ -635,5 +643,24 @@ describe("AccordionStore host — setStatus()", () => {
 
 		oldHost.setStatus("stale");
 		expect(s.conductorStatus.text).toBe("");
+	});
+});
+
+describe("AccordionStore conductor view — messageKey", () => {
+	it("surfaces host message boundaries to conductors", () => {
+		const s = makeStore([
+			blk(0, "thinking", 100, { id: "a:resp:p0", order: 0 }),
+			blk(1, "text", 100, { id: "a:resp:p1", order: 1 }),
+			blk(2, "tool_result", 100, { id: "r:call1", order: 2 }),
+		]);
+		s.setProtect(0);
+		const conductor = new TrackingConductor();
+		s.attach(conductor);
+
+		expect(conductor.lastView?.blocks.map((b) => [b.id, b.messageKey])).toEqual([
+			["a:resp:p0", "a:resp"],
+			["a:resp:p1", "a:resp"],
+			["r:call1", "r:call1"],
+		]);
 	});
 });

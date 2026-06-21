@@ -14,7 +14,7 @@
 import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
 import { digest, digestTokens, groupDigest, groupDigestTokens, substTokens, wireFoldable } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
-import type { Conductor, ConductorView, Command, ClampReport, ClampReason, LockName, ConductorHost, CompletionRequest, CompletionResult } from "$conductors/contract";
+import type { Conductor, ConductorView, Command, ClampReport, ClampReason, LockName, ConductorHost, CompletionRequest, CompletionResult, JSONValue } from "$conductors/contract";
 import { hasLock } from "$conductors/contract";
 import { BuiltinConductor } from "$conductors";
 
@@ -138,9 +138,10 @@ export class AccordionStore {
 	 */
 	onHumanOverride: ((ids: string[], action: string) => void) | null = null;
 	/** Display-only status from the active in-process conductor. */
-	conductorStatus = $state<{ text: string; metrics: Record<string, number | string | boolean> }>({
+	conductorStatus = $state<{ text: string; metrics: Record<string, number | string | boolean>; details?: JSONValue }>({
 		text: "",
 		metrics: {},
+		details: undefined,
 	});
 
 	/**
@@ -465,6 +466,7 @@ export class AccordionStore {
 	private clearConductorStatus(): void {
 		this.conductorStatus.text = "";
 		this.conductorStatus.metrics = {};
+		this.conductorStatus.details = undefined;
 	}
 
 	/**
@@ -510,10 +512,11 @@ export class AccordionStore {
 				const b = store.get(id);
 				return b ? digest(b) : null;
 			},
-			setStatus(text: string | null, metrics: Record<string, number | string | boolean> = {}): void {
+			setStatus(text: string | null, metrics: Record<string, number | string | boolean> = {}, details?: JSONValue): void {
 				if (store.conductor !== forConductor || store.conductorEpoch !== epoch) return;
 				store.conductorStatus.text = text ?? "";
 				store.conductorStatus.metrics = text ? metrics : {};
+				store.conductorStatus.details = text ? details : undefined;
 			},
 			requestRerun: () => store.requestConductorRerun(forConductor, epoch),
 		};
@@ -905,6 +908,7 @@ export class AccordionStore {
 	private buildView(protectedFrom: number): ConductorView {
 		const blocks = this.blocks.map((b, i) => ({
 			id: b.id,
+			messageKey: messageKey(b.id),
 			kind: b.kind,
 			turn: b.turn,
 			order: b.order,

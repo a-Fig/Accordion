@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "../engine/store.svelte";
 import { foldCode } from "../engine/digest";
-import { computeGroupOps, resolveUnfold } from "./plan";
+import { computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
 import type { Block, ParsedSession } from "../engine/types";
 
 function b(id: string, kind: Block["kind"], turn: number, order: number, tokens: number, callId?: string): Block {
@@ -34,6 +34,23 @@ describe("computeGroupOps", () => {
 		expect(ops[0].id).toBe(g.id);
 		expect(ops[0].memberIds).toEqual(["a:r1:p0", "a:r1:p1", "a:r1:p2", "r:c1"]);
 		expect(ops[0].summaryText!.startsWith(`{#${foldCode(g.id)} FOLDED} group ·`)).toBe(true);
+	});
+
+	it("preserves conductor custom group summaries with recovery tags", () => {
+		const s = makeStore();
+		const g = s.createGroup("a:r1:p0", "r:c1", "you", `{#${foldCode("g:a:r1:p0")} FOLDED} conductor group summary`)!;
+		const ops = computeGroupOps(s);
+		expect(ops.length).toBe(1);
+		expect(ops[0].summaryText).toBe(`{#${foldCode(g.id)} FOLDED} conductor group summary`);
+
+		const recalled = resolveRecall(s, [foldCode(g.id)]);
+		expect(recalled.missing).toEqual([]);
+		expect(recalled.restored[0].ids).toEqual(g.memberIds);
+
+		const unfolded = resolveUnfold(s, [foldCode(g.id)]);
+		expect(unfolded.missing).toEqual([]);
+		expect(unfolded.restored[0].ids).toEqual(g.memberIds);
+		expect(s.groupById(g.id)!.folded).toBe(false);
 	});
 
 	it("emits nothing for an UNFOLDED group (open groups are wire-invisible)", () => {

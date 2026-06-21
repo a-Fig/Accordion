@@ -20,7 +20,7 @@
  * conductor author copies these shapes; they should not have to vendor the whole engine.
  * See `docs/conductor-protocol.md` for a copy-paste reference conductor.
  */
-import type { Command, ClampReport, ViewBlock, LockName } from "./conductor";
+import type { Command, ClampReport, ViewBlock, LockName, JSONValue } from "./conductor";
 
 /**
  * Bumped on any breaking change to the messages below. Independent of the pi wire's
@@ -201,11 +201,13 @@ export interface CapRequestMessage {
  * recognise the type just ignores it.
  *  - "text"    — a one-line human summary (e.g. "82% full · holding · band 70–90% · 14 folded").
  *  - "metrics" — optional structured key/values, for a host that wants to render them itself.
+ *  - "details" — optional JSON-shaped detail payload for richer human-only UI.
  */
 export interface ConductorStatusMessage {
 	type: "conductor/status";
 	text?: string;
 	metrics?: Record<string, number | string | boolean>;
+	details?: JSONValue;
 }
 
 export type ConductorMessage =

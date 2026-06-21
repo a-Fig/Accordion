@@ -97,6 +97,7 @@ beforeEach(() => {
 	// can't make a later assertion pass (or flake) by luck of ordering.
 	conductorStatus.text = "";
 	conductorStatus.metrics = {};
+	conductorStatus.details = undefined;
 });
 afterEach(() => {
 	(globalThis as any).WebSocket = savedWS;
@@ -230,6 +231,26 @@ describe("RemoteRunner — capabilities", () => {
 		expect(ok.value).toBe(store.get("m0:p0")!.text);
 		expect(bad.ok).toBe(false);
 		expect(bad.error).toContain("nope");
+	});
+
+	it("proxies complete requests through the store completer", async () => {
+		const store = makeStore(2);
+		store.completer = async (req) => ({
+			text: `summary: ${req.prompt}`,
+			model: "test-model",
+			inputTokens: 12,
+			outputTokens: 4,
+		});
+		const { ws } = connectRunner(store);
+		ws.emit({ type: "cap/request", reqId: "c4", capability: "complete", completion: { prompt: "fold this", maxOutputTokens: 80 } });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		const res = ws.framesOfType("cap/result").pop();
+		expect(res.reqId).toBe("c4");
+		expect(res.ok).toBe(true);
+		expect(res.value).toBe("summary: fold this");
+		expect(res.model).toBe("test-model");
+		expect(res.inputTokens).toBe(12);
+		expect(res.outputTokens).toBe(4);
 	});
 });
 
@@ -414,10 +435,12 @@ describe("RemoteRunner — conductor/status telemetry (display-only)", () => {
 			type: "conductor/status",
 			text: "82% full · holding · band 70–90% · 14 folded",
 			metrics: { fullness: 82, action: "hold", folded: 14, scoring: false },
+			details: { factLedger: [{ cat: "paths", value: "app/src/lib/engine/store.svelte.ts", turn: 3 }] },
 		});
 
 		expect(conductorStatus.text).toBe("82% full · holding · band 70–90% · 14 folded");
 		expect(conductorStatus.metrics.fullness).toBe(82);
+		expect(conductorStatus.details).toEqual({ factLedger: [{ cat: "paths", value: "app/src/lib/engine/store.svelte.ts", turn: 3 }] });
 		// Display-only: it must NOT fold anything or emit a commandResult.
 		expect(store.isFolded(store.get("m0:p0")!)).toBe(false);
 		expect(ws.framesOfType("host/commandResult").length).toBe(resultsBefore);
