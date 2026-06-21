@@ -16,6 +16,7 @@ import { ColdEpochConductor } from "./cold-epoch/cold-epoch";
 import { SlidingWindowConductor } from "./sliding-window/sliding-window";
 import { GarbageCollectorConductor } from "./garbage-collector/garbage-collector";
 import { NaiveCompactionConductor } from "./compaction-naive/compaction-naive";
+import { Bear2HybridConductor } from "./bear2-hybrid/bear2-hybrid";
 import type { Conductor, LockName } from "./contract";
 
 export { BuiltinConductor } from "./builtin/builtin";
@@ -24,6 +25,7 @@ export { ColdEpochConductor } from "./cold-epoch/cold-epoch";
 export { SlidingWindowConductor } from "./sliding-window/sliding-window";
 export { GarbageCollectorConductor } from "./garbage-collector/garbage-collector";
 export { NaiveCompactionConductor } from "./compaction-naive/compaction-naive";
+export { Bear2HybridConductor } from "./bear2-hybrid/bear2-hybrid";
 
 /**
  * A conductor compiled into the app (in-process).
@@ -51,6 +53,12 @@ export const IN_PROCESS_CONDUCTORS: InProcessConductor[] = [
     label: "Naive compaction",
     locks: ["human-steering", "agent-unfold"],
     create: () => new NaiveCompactionConductor(),
+  },
+  {
+    id: "bear2-hybrid",
+    label: "Bear-2 hybrid",
+    locks: ["human-steering", "agent-unfold"],
+    create: () => new Bear2HybridConductor(),
   },
 ];
 

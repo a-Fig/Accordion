@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from "svelte";
 	import { session, isTauriEnv, loadSample, openFile, loadFilePath } from "$lib/session.svelte.ts";
+	import { settings } from "$lib/settings.svelte.ts";
 	import { connectLive, disconnectLive, live } from "$lib/live/liveClient.svelte";
 	import { discovery, startDiscovery, stopDiscovery, DEMO_ID } from "$lib/live/discovery.svelte";
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery } from "$lib/live/claudeDiscovery.svelte";
@@ -61,6 +62,32 @@
 		// Suppress the built-in fallback while the process is still starting up.
 		if (isLaunching(activeId) && !list.some((c) => c.id === activeId)) return;
 		attachConductor(store, activeId, list);
+	});
+
+	// Wire the host's `compress` capability (Bear-2 via The Token Company) onto the active
+	// store. Unlike `completer` (a live-pi-only model link set by the WS client), compression
+	// is a standalone app-side HTTP call — so it's wired here at the route level and works for
+	// EVERY session source (demo, read-only Claude Code, live pi). It tracks `session.store`,
+	// `isTauriEnv`, and the reactive `settings.bear2ApiKey`, so `can("compress")` flips to
+	// false the instant the key is cleared or in browser dev (no Tauri) — letting a conductor
+	// show a "set your key" prompt instead of failing mid-fold. Aggressiveness is fixed at 0.2
+	// here (the single place it's specified); the host contract keeps it off the call surface.
+	$effect(() => {
+		const store = session.store;
+		if (!store) return;
+		const key = settings.bear2ApiKey;
+		if (isTauriEnv && key.trim() !== "") {
+			store.compressor = async (text: string) => {
+				const { invoke } = await import("@tauri-apps/api/core");
+				return await invoke<string>("compress_text", {
+					text,
+					apiKey: key,
+					aggressiveness: 0.2,
+				});
+			};
+		} else {
+			store.compressor = null;
+		}
 	});
 
 	const selectedBlock = $derived(
