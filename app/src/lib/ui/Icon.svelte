@@ -85,11 +85,10 @@
 		'square': `<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>`,
 		// Brand 'fold' glyph — the signature action icon (stroke-width 2).
 		'fold': `<path stroke-width="2" d="M8 5l4 3 4-3"/><path stroke-width="2" d="M4 12h16"/><path stroke-width="2" d="M8 19l4-3 4 3"/>`,
-		// Accordion brand symbol: the bellows-A. A bold letter "A" on the left
-		// (two legs + crossbar) sits beside a folded accordion bellows on the right
-		// (a zig-zag of peaked pleats), recreating the official brand mark. Pure
-		// stroke + currentColor so it recolors in chrome; reads crisply at 16–24px.
-		'accordion': `<path d="M2 21 L6.3 3 L10.6 21"/><line x1="3.7" y1="14.2" x2="8.9" y2="14.2"/><path d="M12.5 5.5 L12.5 19 L15.5 20.8 L15.5 6.2 L18.5 4.4 L18.5 18.6 L21.5 20.4 L21.5 6"/>`,
+		// Generic bellows glyph fallback. The real brand mark is raster art
+		// (brand.md: "not vector"), rendered from the PNG via Logo.svelte — the
+		// chrome uses <Logo>, not this icon. Kept only as a named fallback.
+		'accordion': `<rect x="4" y="3" width="16" height="18" rx="2.5"/><polyline points="4 8 8 6 12 8 16 6 20 8"/><polyline points="4 13 8 11 12 13 16 11 20 13"/><polyline points="4 18 8 16 12 18 16 16 20 18"/>`,
 	};
 
 	let {

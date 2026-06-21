@@ -4,6 +4,7 @@
 	import { folding } from "$lib/live/folding.svelte";
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
+	import Logo from "$lib/ui/Logo.svelte";
 	import SegControl from "$lib/ui/SegControl.svelte";
 	import SettingsPanel from "$lib/ui/SettingsPanel.svelte";
 	import { relTime } from "$lib/utils";
@@ -95,7 +96,7 @@
 			aria-label="Expand sidebar"
 			onclick={() => (collapsed = false)}
 		>
-			<Icon name="accordion" size={18} class="accent-icon" />
+			<Logo size={20} />
 		</button>
 
 		<!-- Tiny source toggle pill -->
@@ -174,7 +175,7 @@
 		<!-- Expanded sidebar -->
 		<div class="head">
 			<span class="logo-wrap" aria-hidden="true">
-				<Icon name="accordion" size={16} class="accent-icon" />
+				<Logo size={18} />
 			</span>
 			<span class="wordmark">Accordion</span>
 
