@@ -59,6 +59,10 @@ export function formatTokens(n: number | undefined | null): string {
 	return r >= 1000 ? `${(r / 1000).toFixed(r >= 10000 ? 0 : 1)}k` : `${r}`;
 }
 
+export function formatCount(n: number | undefined | null): string {
+	return n == null || !Number.isFinite(n) ? "n/a" : Math.round(n).toLocaleString();
+}
+
 export function normalizeDiagnostics(details: JSONValue | undefined): ConductorDiagnostics {
 	const root = obj(details);
 	if (!root) return {};
@@ -214,7 +218,8 @@ export function healthFromStore(
 	contextWindow: number | null,
 ): ConductorHealthSnapshot {
 	const assembled = health?.assembledTokens ?? liveTokens;
-	const budgetTokens = health?.budgetTokens ?? budget;
+	const budgetCap = contextWindow && contextWindow > 0 ? Math.min(budget, contextWindow) : budget;
+	const budgetTokens = health?.budgetTokens ?? budgetCap;
 	return {
 		...health,
 		assembledTokens: assembled,
@@ -224,23 +229,66 @@ export function healthFromStore(
 	};
 }
 
-export function computeNeededStats(events: readonly DecisionEvent[]): NeededStats {
-	const folds = new Map<string, "pending" | "needed" | "harmless">();
-	for (const ev of [...events].reverse()) {
-		if (ev.by === "auto" && (ev.action === "fold" || ev.action === "replace" || ev.action === "group")) {
-			for (const id of ev.ids) if (id && !id.startsWith("g:")) folds.set(id, "pending");
-		}
-		if ((ev.action === "unfold" || ev.action === "restore" || ev.action === "ungroup") && ev.by !== "auto") {
-			for (const id of ev.ids) if (folds.get(id) === "pending") folds.set(id, "needed");
-		}
-	}
+interface Attempt {
+	turn?: number;
+}
+
+function blockKeys(ids: readonly string[]): string[] {
+	return ids.filter((id) => id && !id.startsWith("g:")).map((id) => `b:${id}`);
+}
+
+function groupKey(ids: readonly string[]): string | null {
+	const id = ids.find((x) => x?.startsWith("g:"));
+	return id ? `g:${id}` : null;
+}
+
+export function computeNeededStats(events: readonly DecisionEvent[], currentTurn?: number): NeededStats {
+	const active = new Map<string, Attempt>();
 	let needed = 0;
 	let harmless = 0;
-	let pending = 0;
-	for (const status of folds.values()) {
+
+	const start = (key: string, turn?: number) => {
+		if (!active.has(key)) active.set(key, { turn });
+	};
+	const close = (key: string, status: "needed" | "harmless") => {
+		if (!active.has(key)) return;
+		active.delete(key);
 		if (status === "needed") needed++;
-		else if (status === "pending") pending++;
 		else harmless++;
+	};
+
+	for (const ev of [...events].reverse()) {
+		if (ev.by === "auto" && (ev.action === "fold" || ev.action === "replace")) {
+			for (const key of blockKeys(ev.ids)) start(key, ev.turn);
+			continue;
+		}
+		if (ev.by === "auto" && ev.action === "group") {
+			const key = groupKey(ev.ids);
+			if (key) start(key, ev.turn);
+			continue;
+		}
+		if (ev.by === "auto" && ev.action === "restore") {
+			for (const key of blockKeys(ev.ids)) close(key, "harmless");
+			continue;
+		}
+		if (ev.by === "auto" && ev.action === "ungroup") {
+			const key = groupKey(ev.ids);
+			if (key) close(key, "harmless");
+			continue;
+		}
+		if (ev.by !== "auto" && (ev.action === "unfold" || ev.action === "restore")) {
+			for (const key of blockKeys(ev.ids)) close(key, "needed");
+			continue;
+		}
+		if (ev.by !== "auto" && ev.action === "ungroup") {
+			const key = groupKey(ev.ids);
+			if (key) close(key, "needed");
+		}
+	}
+	let pending = 0;
+	for (const attempt of active.values()) {
+		if (currentTurn !== undefined && attempt.turn !== undefined && attempt.turn < currentTurn) harmless++;
+		else pending++;
 	}
 	const resolved = needed + harmless;
 	return { needed, harmless, pending, resolved, neededRate: resolved > 0 ? needed / resolved : null };

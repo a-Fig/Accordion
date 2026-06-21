@@ -272,6 +272,8 @@ function handleCapResult(state: ConnState, msg: any): void {
 	state.pendingCompletions.delete(String(msg.reqId));
 	clearTimeout(pending.timer);
 	if (msg.ok && typeof msg.value === "string") {
+		state.lastSummaryError = "";
+		state.accState.providerError = undefined;
 		pending.resolve(msg.value);
 		return;
 	}
@@ -450,7 +452,7 @@ function sendStatus(
 						pending: state.pendingCompletions.size,
 						size: Object.keys(state.accState.summaryCache).length,
 						errors: state.summaryErrors,
-						latestError: state.lastSummaryError,
+						latestError: state.lastSummaryError || undefined,
 					},
 					embedding: {
 						size: Object.keys(state.accState.embeddingCache).length,
@@ -460,7 +462,7 @@ function sendStatus(
 						size: Object.keys(state.accState.rerankCache).length,
 						provider: RERANK_ENABLED ? (rerankProvider ? "cross-encoder" : "fallback") : "disabled",
 					},
-					latestProviderError: state.accState.providerError || state.lastSummaryError,
+					latestProviderError: state.accState.providerError || state.lastSummaryError || undefined,
 				},
 				// Backward-compatible shape for the existing MapHeader tooltip.
 				summary: {
@@ -468,7 +470,7 @@ function sendStatus(
 					pending: state.pendingCompletions.size,
 					cached: Object.keys(state.accState.summaryCache).length,
 					errors: state.summaryErrors,
-					lastError: state.lastSummaryError,
+					lastError: state.lastSummaryError || undefined,
 				},
 			},
 		}),
@@ -520,6 +522,8 @@ wss.on("connection", (ws) => {
 		summaryProvider: connectionSummaryProvider,
 		onSummary: () => {
 			if (state.closed) return; // a late summary on a dead connection: drop it
+			state.lastSummaryError = "";
+			state.accState.providerError = undefined;
 			state.lastSig = null;
 			recomputeAndSend(ws, state, state.lastView?.rev ?? -1);
 		},

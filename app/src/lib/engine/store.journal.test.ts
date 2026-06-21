@@ -51,14 +51,36 @@ describe("decision journal", () => {
 	it("records conductor transitions once and does not spam on identical refolds", () => {
 		const s = makeStore();
 		const stub = new StubConductor();
-		stub.cmds = [{ kind: "fold", ids: ["m0:p0"] }];
+		stub.cmds = [{ kind: "fold", ids: ["m0:p0", "m1:p0"] }];
 
 		s.attach(stub);
-		const firstCount = s.decisionJournal.filter((e) => e.by === "auto" && e.action === "fold" && e.ids[0] === "m0:p0").length;
-		expect(firstCount).toBe(1);
+		const firstCount = s.decisionJournal.filter((e) => e.by === "auto" && e.action === "fold").length;
+		expect(firstCount).toBe(2);
+		const aggregateEntries = s.log.filter((e) => e.by === "auto" && e.action === "conductor update");
+		expect(aggregateEntries).toHaveLength(1);
+		expect(aggregateEntries[0].detail).toContain("folded 2 blocks");
+		expect(s.log.some((e) => e.by === "auto" && e.action === "folded")).toBe(false);
 
 		s.refold();
-		const secondCount = s.decisionJournal.filter((e) => e.by === "auto" && e.action === "fold" && e.ids[0] === "m0:p0").length;
-		expect(secondCount).toBe(1);
+		const secondCount = s.decisionJournal.filter((e) => e.by === "auto" && e.action === "fold").length;
+		expect(secondCount).toBe(2);
+		expect(s.log.filter((e) => e.by === "auto" && e.action === "conductor update")).toHaveLength(1);
+	});
+
+	it("records conductor-created folded groups once without per-member fold inflation", () => {
+		const s = makeStore();
+		const stub = new StubConductor();
+		stub.cmds = [{ kind: "group", ids: ["m0:p0", "m1:p0"], digest: "group digest" }];
+
+		s.attach(stub);
+
+		const autoGroups = s.decisionJournal.filter((e) => e.by === "auto" && e.action === "group");
+		const autoBlockFolds = s.decisionJournal.filter((e) => e.by === "auto" && e.action === "fold");
+		expect(autoGroups).toHaveLength(1);
+		expect(autoGroups[0].ids).toEqual(["g:m0:p0"]);
+		expect(autoBlockFolds).toHaveLength(0);
+		const aggregateEntries = s.log.filter((e) => e.by === "auto" && e.action === "conductor update");
+		expect(aggregateEntries).toHaveLength(1);
+		expect(aggregateEntries[0].detail).toContain("grouped 1 group");
 	});
 });

@@ -6,6 +6,7 @@
 	import {
 		computeHealthVerdict,
 		computeNeededStats,
+		formatCount,
 		formatTokens,
 		healthFromStore,
 		levelName,
@@ -22,12 +23,20 @@
 	const health = $derived(
 		store ? healthFromStore(diagnostics.health, store.liveTokens, store.budget, store.contextWindow) : undefined,
 	);
-	const needed = $derived(computeNeededStats(store?.decisionJournal ?? []));
+	const currentTurn = $derived(store?.blocks.reduce((mx, b) => Math.max(mx, b.turn), 0));
+	const needed = $derived(computeNeededStats(store?.decisionJournal ?? [], currentTurn));
 	const verdict = $derived(health ? computeHealthVerdict(diagnostics.unitTrace ?? [], health, needed) : null);
 	const withinBudget = $derived((health?.assembledTokens ?? 0) <= (health?.budgetTokens ?? Number.POSITIVE_INFINITY));
 	const stale = $derived(!!requestedId && live.sessionId !== requestedId);
 	const unitRows = $derived(
 		[...(diagnostics.unitTrace ?? [])].sort((a, b) => (b.level ?? 0) - (a.level ?? 0) || (a.score ?? 0) - (b.score ?? 0)),
+	);
+	const hasRichDiagnostics = $derived(
+		!!diagnostics.unitTrace ||
+			!!diagnostics.factLedger ||
+			!!diagnostics.relevanceTOC ||
+			!!diagnostics.proactiveUnfolds ||
+			!!diagnostics.caches,
 	);
 
 	const pct = (n: number | null | undefined) => n == null ? "n/a" : `${Math.round(n * 100)}%`;
@@ -104,53 +113,62 @@
 		</section>
 
 		<main class="dash-grid">
-			<section class="panel trace-panel">
-				<div class="panel-head">
-					<h2>Fold Units</h2>
-					<span>{unitRows.length} rows</span>
-				</div>
-				{#if unitRows.length}
-					<div class="table-wrap">
-						<table>
-							<thead>
-								<tr>
-									<th>id</th>
-									<th>kind w</th>
-									<th>overlap</th>
-									<th>recency</th>
-									<th>score</th>
-									<th>stage</th>
-									<th>tokens</th>
-									<th>level</th>
-									<th>reason</th>
-								</tr>
-							</thead>
-							<tbody>
-								{#each unitRows as unit (unit.id)}
-									<tr>
-										<td class="mono unit-id" title={unit.blockIds.join(", ")}>{unit.id}{unit.blockIds.length > 1 ? ` ×${unit.blockIds.length}` : ""}</td>
-										<td>{score(unit.kindWeight)}</td>
-										<td>{score(unit.overlap)}</td>
-										<td>{score(unit.recency)}</td>
-										<td>{score(unit.score)}</td>
-										<td>{stageName(unit.stage)}</td>
-										<td class="mono">{formatTokens(unit.fullTokens)} → {formatTokens(unit.foldedTokens)}</td>
-										<td>{levelName(unit.fromLevel)} → {levelName(unit.level)}</td>
-										<td class="reason" title={unit.reason}>{unit.reason}</td>
-									</tr>
-								{/each}
-							</tbody>
-						</table>
+			{#if diagnostics.unitTrace}
+				<section class="panel trace-panel">
+					<div class="panel-head">
+						<h2>Fold Units</h2>
+						<span>{unitRows.length} rows</span>
 					</div>
-				{:else}
-					<div class="empty">No fold-unit trace has arrived from the active conductor.</div>
-				{/if}
-			</section>
+					{#if unitRows.length}
+						<div class="table-wrap">
+							<table>
+								<thead>
+									<tr>
+										<th>id</th>
+										<th>kind w</th>
+										<th>overlap</th>
+										<th>recency</th>
+										<th>score</th>
+										<th>stage</th>
+										<th>tokens</th>
+										<th>level</th>
+										<th>reason</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each unitRows as unit (unit.id)}
+										<tr>
+											<td class="mono unit-id" title={unit.blockIds.join(", ")}>{unit.id}{unit.blockIds.length > 1 ? ` ×${unit.blockIds.length}` : ""}</td>
+											<td>{score(unit.kindWeight)}</td>
+											<td>{score(unit.overlap)}</td>
+											<td>{score(unit.recency)}</td>
+											<td>{score(unit.score)}</td>
+											<td>{stageName(unit.stage)}</td>
+											<td class="mono">{formatTokens(unit.fullTokens)} → {formatTokens(unit.foldedTokens)}</td>
+											<td>{levelName(unit.fromLevel)} → {levelName(unit.level)}</td>
+											<td class="reason" title={unit.reason}>{unit.reason}</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						</div>
+					{:else}
+						<div class="empty">No fold-unit rows reported.</div>
+					{/if}
+				</section>
+			{:else}
+				<section class="panel trace-panel">
+					<div class="panel-head"><h2>Diagnostics</h2></div>
+					<div class="empty">
+						{hasRichDiagnostics ? "No fold-unit trace reported." : "The active conductor has not reported rich dashboard diagnostics."}
+					</div>
+				</section>
+			{/if}
 
 			<aside class="side-stack">
-				<section class="panel">
-					<div class="panel-head"><h2>Fact Ledger</h2></div>
-					{#if diagnostics.factLedger?.length}
+				{#if diagnostics.factLedger}
+					<section class="panel">
+						<div class="panel-head"><h2>Fact Ledger</h2></div>
 						{#each diagnostics.factLedger.slice(0, 12) as fact}
 							<div class="list-row">
 								<span class="tag">{fact.category}</span>
@@ -158,14 +176,12 @@
 								{#if fact.turn != null}<span class="mono faint">t{fact.turn}</span>{/if}
 							</div>
 						{/each}
-					{:else}
-						<div class="empty">No structured facts reported.</div>
-					{/if}
-				</section>
+					</section>
+				{/if}
 
-				<section class="panel">
-					<div class="panel-head"><h2>Relevance TOC</h2></div>
-					{#if diagnostics.relevanceTOC?.length}
+				{#if diagnostics.relevanceTOC}
+					<section class="panel">
+						<div class="panel-head"><h2>Relevance TOC</h2></div>
 						{#each diagnostics.relevanceTOC.slice(0, 10) as row}
 							<div class="list-row">
 								<span class="mono">t{row.turn}</span>
@@ -173,36 +189,36 @@
 								<span class="mono faint">{score(row.score)}</span>
 							</div>
 						{/each}
-					{:else}
-						<div class="empty">No folded-turn TOC reported.</div>
-					{/if}
-				</section>
+					</section>
+				{/if}
 
-				<section class="panel">
-					<div class="panel-head"><h2>Proactive Unfolds</h2></div>
-					{#if diagnostics.proactiveUnfolds?.length}
+				{#if diagnostics.proactiveUnfolds}
+					<section class="panel">
+						<div class="panel-head"><h2>Proactive Unfolds</h2></div>
 						{#each diagnostics.proactiveUnfolds as item}
 							<div class="list-row">
 								<span class="mono">{item.blockId ?? item.id ?? item.blockIds?.[0]}</span>
 								<span>{item.reason ?? "restored by conductor"}</span>
 							</div>
 						{/each}
-					{:else}
-						<div class="empty">No proactive unfolds this turn.</div>
-					{/if}
-				</section>
+					</section>
+				{/if}
 
-				<section class="panel">
-					<div class="panel-head"><h2>Caches</h2></div>
-					{#if diagnostics.caches}
-						<div class="cache-row"><span>summary</span><span>{formatTokens(diagnostics.caches.summary?.size)} cached · {formatTokens(diagnostics.caches.summary?.pending)} pending</span></div>
-						<div class="cache-row"><span>embedding</span><span>{formatTokens(diagnostics.caches.embedding?.size)} cached</span></div>
-						<div class="cache-row"><span>rerank</span><span>{formatTokens(diagnostics.caches.rerank?.size)} cached</span></div>
+				{#if diagnostics.caches}
+					<section class="panel">
+						<div class="panel-head"><h2>Caches</h2></div>
+						{#if diagnostics.caches.summary}
+							<div class="cache-row"><span>summary</span><span>{formatCount(diagnostics.caches.summary.size)} cached · {formatCount(diagnostics.caches.summary.pending)} pending</span></div>
+						{/if}
+						{#if diagnostics.caches.embedding}
+							<div class="cache-row"><span>embedding</span><span>{formatCount(diagnostics.caches.embedding.size)} cached</span></div>
+						{/if}
+						{#if diagnostics.caches.rerank}
+							<div class="cache-row"><span>rerank</span><span>{formatCount(diagnostics.caches.rerank.size)} cached</span></div>
+						{/if}
 						{#if diagnostics.caches.latestProviderError}<div class="cache-error">{diagnostics.caches.latestProviderError}</div>{/if}
-					{:else}
-						<div class="empty">No cache diagnostics reported.</div>
-					{/if}
-				</section>
+					</section>
+				{/if}
 			</aside>
 		</main>
 	{/if}

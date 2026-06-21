@@ -80,6 +80,12 @@ export interface DecisionEvent {
 interface FoldSnapshot {
 	folded: boolean;
 	digest: string;
+	grouped: boolean;
+}
+
+interface GroupSnapshot {
+	memberIds: string[];
+	digest: string | null | undefined;
 }
 
 export class AccordionStore {
@@ -805,6 +811,7 @@ export class AccordionStore {
 		this.conducting = true;
 		try {
 			const before = this.snapshotFoldState();
+			const beforeGroups = this.snapshotFoldedConductorGroups();
 			// A group can never overlap the protected tail; drop any that now does (e.g. the
 			// tail was widened over it) before anything reads group state this pass.
 			this.pruneProtectedGroups();
@@ -849,7 +856,7 @@ export class AccordionStore {
 				this.emit(by, `clamped · ${r.reason}`, r.detail);
 				this.recordDecision(by, "clamp", r.ids, r.detail, r.reason);
 			}
-			this.recordConductorTransitions(before);
+			this.recordConductorTransitions(before, beforeGroups);
 		} finally {
 			this.conducting = false;
 		}
@@ -1080,7 +1087,7 @@ export class AccordionStore {
 
 	private recordDecision(by: Actor, action: DecisionAction, ids: string[], detail: string, reason?: string): void {
 		const first = ids.length ? this.get(ids[0]) : undefined;
-		this.decisionJournal.unshift({
+		this.prependDecisionEvents([{
 			n: this.decisionN++,
 			at: Date.now(),
 			by,
@@ -1090,12 +1097,11 @@ export class AccordionStore {
 			turn: first?.turn,
 			kind: first?.kind,
 			reason,
-		});
-		if (this.decisionJournal.length > 500) this.decisionJournal.pop();
+		}]);
 	}
 
 	private recordGroupDecision(by: Actor, action: DecisionAction, g: Group, detail: string): void {
-		this.decisionJournal.unshift({
+		this.prependDecisionEvents([{
 			n: this.decisionN++,
 			at: Date.now(),
 			by,
@@ -1104,31 +1110,83 @@ export class AccordionStore {
 			detail,
 			turn: this.get(g.memberIds[0])?.turn,
 			kind: "group",
-		});
-		if (this.decisionJournal.length > 500) this.decisionJournal.pop();
+		}]);
+	}
+
+	private prependDecisionEvents(events: DecisionEvent[]): void {
+		if (!events.length) return;
+		this.decisionJournal = [...events, ...this.decisionJournal].slice(0, 500);
 	}
 
 	private snapshotFoldState(): Map<string, FoldSnapshot> {
 		const m = new Map<string, FoldSnapshot>();
 		for (const b of this.blocks) {
 			const folded = this.isFolded(b);
-			m.set(b.id, { folded, digest: folded ? this.digestOf(b) : "" });
+			m.set(b.id, { folded, digest: folded ? this.digestOf(b) : "", grouped: this.groupWire.has(b.id) });
 		}
 		return m;
 	}
 
-	private recordConductorTransitions(before: Map<string, FoldSnapshot>): void {
+	private snapshotFoldedConductorGroups(): Map<string, GroupSnapshot> {
+		const m = new Map<string, GroupSnapshot>();
+		for (const g of this.groups) {
+			if (!g.folded || (g.by !== "auto" && g.by !== "conductor")) continue;
+			m.set(g.id, { memberIds: [...g.memberIds], digest: g.digest });
+		}
+		return m;
+	}
+
+	private sameGroupSnapshot(a: GroupSnapshot | undefined, b: Group): boolean {
+		return !!a && a.digest === b.digest && a.memberIds.length === b.memberIds.length && a.memberIds.every((id, i) => id === b.memberIds[i]);
+	}
+
+	private recordConductorTransitions(before: Map<string, FoldSnapshot>, beforeGroups: Map<string, GroupSnapshot>): void {
 		const rows: DecisionEvent[] = [];
+		const counts = { fold: 0, replace: 0, restore: 0, group: 0, ungroup: 0 };
+		const afterGroups = this.snapshotFoldedConductorGroups();
+		for (const g of this.groups) {
+			if (!g.folded || (g.by !== "auto" && g.by !== "conductor")) continue;
+			if (this.sameGroupSnapshot(beforeGroups.get(g.id), g)) continue;
+			rows.push({
+				n: this.decisionN++,
+				at: Date.now(),
+				by: "auto",
+				action: "group",
+				ids: [g.id],
+				detail: `${g.memberIds.length} blocks`,
+				turn: this.get(g.memberIds[0])?.turn,
+				kind: "group",
+			});
+			counts.group++;
+		}
+		for (const [id, snap] of beforeGroups) {
+			if (afterGroups.has(id)) continue;
+			rows.push({
+				n: this.decisionN++,
+				at: Date.now(),
+				by: "auto",
+				action: "ungroup",
+				ids: [id],
+				detail: `${snap.memberIds.length} blocks`,
+				turn: this.get(snap.memberIds[0])?.turn,
+				kind: "group",
+			});
+			counts.ungroup++;
+		}
 		for (const b of this.blocks) {
 			const prev = before.get(b.id);
 			const folded = this.isFolded(b);
 			const digestText = folded ? this.digestOf(b) : "";
 			if (!prev) continue;
+			if (prev.grouped || this.groupWire.has(b.id)) continue;
 			if (prev.folded === folded && prev.digest === digestText) continue;
 			let action: DecisionAction;
 			if (!prev.folded && folded) action = "fold";
 			else if (prev.folded && !folded) action = "restore";
 			else action = "replace";
+			if (action === "fold") counts.fold++;
+			else if (action === "restore") counts.restore++;
+			else if (action === "replace") counts.replace++;
 			rows.push({
 				n: this.decisionN++,
 				at: Date.now(),
@@ -1141,12 +1199,14 @@ export class AccordionStore {
 			});
 		}
 		if (!rows.length) return;
-		for (const ev of rows.reverse()) {
-			this.decisionJournal.unshift(ev);
-			const verb = ev.action === "restore" ? "restored" : ev.action === "replace" ? "updated" : "folded";
-			this.emit(ev.by, verb, ev.detail);
-		}
-		while (this.decisionJournal.length > 500) this.decisionJournal.pop();
+		this.prependDecisionEvents(rows.reverse());
+		const parts: string[] = [];
+		if (counts.fold) parts.push(`folded ${counts.fold} block${counts.fold === 1 ? "" : "s"}`);
+		if (counts.replace) parts.push(`updated ${counts.replace} block${counts.replace === 1 ? "" : "s"}`);
+		if (counts.restore) parts.push(`restored ${counts.restore} block${counts.restore === 1 ? "" : "s"}`);
+		if (counts.group) parts.push(`grouped ${counts.group} group${counts.group === 1 ? "" : "s"}`);
+		if (counts.ungroup) parts.push(`ungrouped ${counts.ungroup} group${counts.ungroup === 1 ? "" : "s"}`);
+		this.emit("auto", "conductor update", parts.join(" · "));
 	}
 
 	/**

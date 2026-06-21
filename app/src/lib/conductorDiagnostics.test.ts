@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeHealthVerdict, computeNeededStats, normalizeDiagnostics, pressureLabel } from "./conductorDiagnostics";
+import { computeHealthVerdict, computeNeededStats, healthFromStore, normalizeDiagnostics, pressureLabel } from "./conductorDiagnostics";
 import type { DecisionEvent } from "$lib/engine/store.svelte";
 
 describe("conductor diagnostics normalization", () => {
@@ -46,11 +46,57 @@ describe("conductor diagnostics normalization", () => {
 
 	it("labels conductor folds later opened by a human or agent as needed", () => {
 		const events: DecisionEvent[] = [
-			{ n: 1, at: 1, by: "you", action: "unfold", ids: ["b1"], detail: "b1" },
-			{ n: 0, at: 0, by: "auto", action: "fold", ids: ["b1"], detail: "b1" },
+			{ n: 1, at: 1, by: "you", action: "unfold", ids: ["b1"], detail: "b1", turn: 1 },
+			{ n: 0, at: 0, by: "auto", action: "fold", ids: ["b1"], detail: "b1", turn: 1 },
 		];
 		const stats = computeNeededStats(events);
 		expect(stats.needed).toBe(1);
 		expect(stats.neededRate).toBe(1);
+	});
+
+	it("settles older still-folded attempts as harmless", () => {
+		const events: DecisionEvent[] = [
+			{ n: 0, at: 0, by: "auto", action: "fold", ids: ["b1"], detail: "b1", turn: 1 },
+		];
+		const stats = computeNeededStats(events, 2);
+		expect(stats).toMatchObject({ needed: 0, harmless: 1, pending: 0, resolved: 1, neededRate: 0 });
+	});
+
+	it("keeps a needed result when a later auto re-fold starts a new pending attempt", () => {
+		const events: DecisionEvent[] = [
+			{ n: 2, at: 2, by: "auto", action: "fold", ids: ["b1"], detail: "b1", turn: 2 },
+			{ n: 1, at: 1, by: "agent", action: "unfold", ids: ["b1"], detail: "b1", turn: 1 },
+			{ n: 0, at: 0, by: "auto", action: "fold", ids: ["b1"], detail: "b1", turn: 1 },
+		];
+		const stats = computeNeededStats(events, 2);
+		expect(stats.needed).toBe(1);
+		expect(stats.pending).toBe(1);
+		expect(stats.neededRate).toBe(1);
+	});
+
+	it("leaves current-turn attempts pending while older attempts sweep harmless", () => {
+		const events: DecisionEvent[] = [
+			{ n: 1, at: 1, by: "auto", action: "fold", ids: ["b2"], detail: "b2", turn: 2 },
+			{ n: 0, at: 0, by: "auto", action: "fold", ids: ["b1"], detail: "b1", turn: 1 },
+		];
+		const stats = computeNeededStats(events, 2);
+		expect(stats.harmless).toBe(1);
+		expect(stats.pending).toBe(1);
+		expect(stats.neededRate).toBe(0);
+	});
+
+	it("counts group attempts once by group id", () => {
+		const events: DecisionEvent[] = [
+			{ n: 0, at: 0, by: "auto", action: "group", ids: ["g:m0:p0", "m0:p0", "m1:p0"], detail: "2 blocks", turn: 1, kind: "group" },
+		];
+		const stats = computeNeededStats(events, 2);
+		expect(stats.harmless).toBe(1);
+		expect(stats.resolved).toBe(1);
+	});
+
+	it("uses the smaller context window as fallback pressure basis", () => {
+		const health = healthFromStore(undefined, 90_000, 200_000, 100_000);
+		expect(health.budgetTokens).toBe(100_000);
+		expect(health.pressure).toBe("tight");
 	});
 });
