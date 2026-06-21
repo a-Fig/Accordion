@@ -1,0 +1,6 @@
+{
+  "id": "the-conductor-v2",
+  "label": "The Conductor v2",
+  "command": "node",
+  "args": ["the-conductor.ts"]
+}

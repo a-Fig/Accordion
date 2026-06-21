@@ -37,6 +37,9 @@ export type LockName = "human-steering" | "agent-unfold" | "tail-size";
 /** All lockable controls, in canonical order (for UIs that render the lock table). */
 export const LOCK_NAMES: readonly LockName[] = ["human-steering", "agent-unfold", "tail-size"];
 
+/** JSON-shaped telemetry payloads a conductor may attach to display-only status. */
+export type JSONValue = null | boolean | number | string | JSONValue[] | { [key: string]: JSONValue };
+
 /** True if `locks` claims `name`. The single predicate the host/UI use to test a lock. */
 export function hasLock(locks: readonly LockName[] | undefined, name: LockName): boolean {
 	return !!locks && locks.includes(name);
@@ -50,6 +53,8 @@ export function isExclusive(locks: readonly LockName[] | undefined): boolean {
 /** One block as every conductor sees it — pure serializable data, identical in-process and on the wire. */
 export interface ViewBlock {
 	id: string;
+	/** Stable provider-message grouping key. Blocks with the same key snap together in groups. */
+	messageKey?: string;
 	kind: ConductorBlockKind;
 	turn: number;
 	order: number;
@@ -297,7 +302,7 @@ export interface ConductorHost {
 	/** The engine's per-kind folded digest for block `id`, or `null` if unknown. */
 	digestOf(id: string): string | null;
 	/** Surface display-only conductor status to the human; `null`/empty clears it. */
-	setStatus(text: string | null, metrics?: Record<string, number | string | boolean>): void;
+	setStatus(text: string | null, metrics?: Record<string, number | string | boolean>, details?: JSONValue): void;
 	/** Ask the host to re-run `conduct()` after async work completes. */
 	requestRerun(): void;
 }

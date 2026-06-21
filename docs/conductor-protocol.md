@@ -86,6 +86,7 @@ wire:
 | field          | type     | notes                                                                            |
 |----------------|----------|----------------------------------------------------------------------------------|
 | `id`           | string   | durable block id — what every command references                                 |
+| `messageKey`   | string?  | provider-message grouping key; blocks with the same key snap together in groups  |
 | `kind`         | string   | `user` · `text` · `thinking` · `tool_call` · `tool_result`                       |
 | `turn`         | number   | 1-based user turn                                                                 |
 | `order`        | number   | global 0-based position in the conversation                                      |
@@ -385,11 +386,16 @@ tokenizer). The host answers with a `cap/result` carrying the same `reqId`.
 calculating, for the host to surface to a human near the conductor switcher.
 
 ```json
-{ "type": "conductor/status", "text": "82% full · holding · band 70–90% · 14 folded", "metrics": { "fullness": 82, "scoring": false } }
+{
+  "type": "conductor/status",
+  "text": "82% full · holding · band 70–90% · 14 folded",
+  "metrics": { "fullness": 82, "scoring": false },
+  "details": { "factLedger": [{ "cat": "paths", "value": "app/src/lib/engine/store.svelte.ts", "turn": 3 }] }
+}
 ```
 
 Purely informational. The host renders `text` (and may use the optional structured
-`metrics`) and does **nothing else** — it never folds, alters commands, or triggers a model
+`metrics` / JSON-shaped `details`) and does **nothing else** — it never folds, alters commands, or triggers a model
 call on this. Additive and non-breaking: it carries no `rev` and expects no reply, so it is
 safe to emit (or never emit) independently of `conductor/commands`. A conductor that never
 sends one simply shows no readout. See `conductors/attention-folder/` for a worked emitter.
@@ -510,7 +516,7 @@ instance-state reads and command emission.
 | `complete` | `(req: CompletionRequest) => Promise<CompletionResult>` | Run an out-of-band model completion asynchronously. Not on the `conduct()` hot path — use the async pattern above. Rejects if `"complete"` is unavailable or the `AbortSignal` fires. In this version, specific model id strings are reserved for future use and treated as `"current"`. |
 | `countTokens` | `(text: string) => number` | Synchronous token estimate for `text` using the host's tokenizer (chars/4 for Accordion's default). Safe to call inside `conduct()`. |
 | `digestOf` | `(id: string) => string \| null` | The engine's per-kind folded digest for block `id` — the exact string the agent receives when that block is folded (including the `{#code FOLDED}` tag). Returns `null` if the block is unknown. Synchronous; safe inside `conduct()`. |
-| `setStatus` | `(text: string \| null, metrics?: Record<string, number \| string \| boolean>) => void` | Surface display-only conductor status to the human. `null`/empty clears it. This never steers context; it is for visible unavailable/working/error states. |
+| `setStatus` | `(text: string \| null, metrics?: Record<string, number \| string \| boolean>, details?: JSONValue) => void` | Surface display-only conductor status to the human. `null`/empty clears it. This never steers context; it is for visible unavailable/working/error states. |
 | `requestRerun` | `() => void` | Ask the host to re-run `conduct()` now. Call this from an async completion handler after stashing the result. Has no effect if the conductor is no longer attached (stale calls after `detach()` are ignored). |
 
 `HostCapabilityId` is `"complete" | "countTokens" | "digest"`.

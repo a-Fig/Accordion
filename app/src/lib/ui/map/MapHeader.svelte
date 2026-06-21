@@ -8,6 +8,7 @@
 	import { folding, setFolding } from "$lib/live/folding.svelte";
 	import { live } from "$lib/live/liveClient.svelte";
 	import { conductorStatus } from "$lib/live/conductorClient.svelte";
+	import type { JSONValue } from "$conductors/contract";
 
 	let { store, readOnly = false }: { store: AccordionStore; readOnly?: boolean } = $props();
 
@@ -28,6 +29,7 @@
 
 	const denom = $derived(Math.max(store.fullTokens, store.budget, 1));
 	const conductorStatusText = $derived(store.conductorStatus.text || conductorStatus.text);
+	const conductorStatusDetails = $derived(store.conductorStatus.text ? store.conductorStatus.details : conductorStatus.details);
 	// fmt/k formatters must round their input because AnimatedNumber passes a float mid-tween
 	const fmt = (n: number) => Math.round(n).toLocaleString();
 	const pct = (n: number, d: number) => (d > 0 ? Math.round((n / d) * 100) : 0);
@@ -40,6 +42,36 @@
 		return r >= 1000 ? `${(r / 1000).toFixed(r >= 10000 ? 0 : 1)}k` : `${r}`;
 	};
 	const fmtOverBy = (n: number) => k(Math.round(n));
+	function formatStatusDetails(value: JSONValue | undefined): string {
+		if (value == null) return "";
+		const lines: string[] = [];
+		const pushList = (title: string, items: JSONValue | undefined) => {
+			if (!Array.isArray(items) || items.length === 0) return;
+			lines.push(title);
+			for (const item of items.slice(0, 8)) {
+				if (item && typeof item === "object" && !Array.isArray(item)) {
+					const obj = item as Record<string, JSONValue>;
+					const turn = typeof obj.turn === "number" ? `t${obj.turn}: ` : "";
+					const cat = typeof obj.cat === "string" ? `[${obj.cat}] ` : "";
+					const label = typeof obj.label === "string" ? obj.label : typeof obj.value === "string" ? obj.value : JSON.stringify(item);
+					lines.push(`  ${turn}${cat}${label}`);
+				} else {
+					lines.push(`  ${String(item)}`);
+				}
+			}
+		};
+		if (typeof value === "object" && !Array.isArray(value)) {
+			const obj = value as Record<string, JSONValue>;
+			pushList("facts", obj.factLedger);
+			pushList("folded TOC", obj.relevanceTOC);
+			const summary = obj.summary;
+			if (summary && typeof summary === "object" && !Array.isArray(summary)) {
+				lines.push(`summaries ${JSON.stringify(summary)}`);
+			}
+			if (lines.length) return lines.join("\n");
+		}
+		return JSON.stringify(value, null, 2);
+	}
 
 	// ── Protected tail: an on-bar handle (left = 0, drag right to protect more) ──
 	const PROT_MAX = 60_000;
@@ -249,9 +281,17 @@
 
 	<!-- ── Conductor telemetry (display-only): one-line status from the active conductor. -->
 	{#if conductorStatusText}
-		<div class="cond-telemetry" role="status" title={conductorStatusText}>
-			<Icon name="activity" size={11} />
-			<span class="cond-telemetry-text mono">{conductorStatusText}</span>
+		<div class="cond-telemetry-wrap">
+			<div class="cond-telemetry" role="status" title={conductorStatusText}>
+				<Icon name="activity" size={11} />
+				<span class="cond-telemetry-text mono">{conductorStatusText}</span>
+			</div>
+			{#if conductorStatusDetails}
+				<details class="cond-detail">
+					<summary class="cond-detail-trigger mono">details</summary>
+					<pre class="cond-detail-body mono">{formatStatusDetails(conductorStatusDetails)}</pre>
+				</details>
+			{/if}
 		</div>
 	{/if}
 
@@ -593,6 +633,13 @@
 
 	/* ── Conductor telemetry line: one muted, mono status from the active conductor ──
 	   Right-aligned so it sits under the conductor switcher in the controls cluster. */
+	.cond-telemetry-wrap {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-end;
+		gap: 3px;
+		min-width: 0;
+	}
 	.cond-telemetry {
 		display: flex;
 		align-items: center;
@@ -610,6 +657,30 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		min-width: 0;
+	}
+	.cond-detail {
+		max-width: min(760px, 100%);
+		color: var(--muted);
+		font-size: var(--fs-2xs);
+	}
+	.cond-detail-trigger {
+		cursor: pointer;
+		color: var(--faint);
+		list-style: none;
+		text-align: right;
+	}
+	.cond-detail-trigger::-webkit-details-marker {
+		display: none;
+	}
+	.cond-detail-body {
+		margin: 2px 0 0;
+		padding: var(--sp-2);
+		max-height: 180px;
+		overflow: auto;
+		white-space: pre-wrap;
+		border: 1px solid var(--line-soft);
+		background: var(--panel-2);
+		color: var(--muted);
 	}
 
 	/* ── Composition bar area: bar + on-bar protected control + underline ── */

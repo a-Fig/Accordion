@@ -35,6 +35,7 @@ import {
 	type HostHelloMessage,
 	type ContextUpdateMessage,
 	type LockName,
+	type JSONValue,
 } from "$conductors/contract";
 
 /** The well-known id of the in-process default conductor. */
@@ -55,15 +56,17 @@ export const conductorLink = $state<{ status: "idle" | "connecting" | "connected
  * folds or steers on this. Empty `text` ⇒ no readout (the in-process built-in never emits one,
  * and we clear this whenever the remote drops or is swapped out). One active remote at a time,
  * mirroring `conductorLink`. */
-export const conductorStatus = $state<{ text: string; metrics: Record<string, number | string | boolean> }>({
+export const conductorStatus = $state<{ text: string; metrics: Record<string, number | string | boolean>; details?: JSONValue }>({
 	text: "",
 	metrics: {},
+	details: undefined,
 });
 
 /** Clear the status readout — on disconnect, swap, or detach, so no stale line lingers. */
 function clearConductorStatus(): void {
 	conductorStatus.text = "";
 	conductorStatus.metrics = {};
+	conductorStatus.details = undefined;
 }
 
 /** Bumped when a remote conductor that HAD connected drops unexpectedly. The attach effect
@@ -301,6 +304,7 @@ export class RemoteRunner implements Conductor {
 				// refold or touch any command/fold path — this channel never steers context.
 				conductorStatus.text = m.text ?? "";
 				conductorStatus.metrics = m.metrics ?? {};
+				conductorStatus.details = m.details;
 				break;
 		}
 	}

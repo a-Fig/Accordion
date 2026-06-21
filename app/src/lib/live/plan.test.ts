@@ -377,6 +377,31 @@ describe("resolveUnfold", () => {
 });
 
 describe("resolveRecall", () => {
+	it("works for conductor custom digests that carry the recovery tag", () => {
+		order = 0;
+		const ORIGINAL = "CUSTOM DIGEST ORIGINAL " + "padding ".repeat(200);
+		const id = "a:resp1:p0";
+		const s = makeStore([
+			blk({ id, kind: "text", tokens: 8000, text: ORIGINAL }),
+			blk({ id: "u:1000", kind: "user", tokens: 50, text: "hi" }),
+		]);
+		s.setProtect(40);
+		s.applyCommands([{ kind: "fold", ids: [id], digest: `{#${foldCode(id)} FOLDED} conductor summary` }], "auto");
+		const b = s.get(id)!;
+		expect(s.isFolded(b)).toBe(true);
+		expect(s.digestOf(b)).toBe(`{#${foldCode(id)} FOLDED} conductor summary`);
+
+		const recalled = resolveRecall(s, [foldCode(id)]);
+		expect(recalled.missing).toEqual([]);
+		expect(recalled.restored[0].text).toBe(ORIGINAL);
+		expect(s.isFolded(b)).toBe(true);
+
+		const unfolded = resolveUnfold(s, [foldCode(id)]);
+		expect(unfolded.missing).toEqual([]);
+		expect(unfolded.restored[0].ids).toEqual([id]);
+		expect(s.isFolded(b)).toBe(false);
+	});
+
 	it("returns the ORIGINAL full text (not the digest) for a folded block and never mutates", () => {
 		order = 0;
 		const ORIGINAL = "THE ORIGINAL FULL CONTENT " + "padding ".repeat(200);
