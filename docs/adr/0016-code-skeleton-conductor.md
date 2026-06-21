@@ -178,6 +178,37 @@ is left to future work.
 - **Granular unfold is whole-file.** `unfold` restores the entire block (the whole file), not
   the single method body the agent asked about; sub-block addressing is future work.
 
+## Prior art
+
+This conductor was built before surveying the field; a follow-up prior-art pass (aider,
+repomix, tree-sitter, ctags, LSP/SCIP, the academic literature, and how Cursor / Cline /
+Claude Code manage code context) confirmed the technique and sharpened where it sits.
+
+- **The technique is established, not novel.** A "signature skeleton" — keep imports /
+  declarations / signatures / docstrings, elide bodies — is a named, mainstream approach:
+  **repomix `--compress`** does exactly this via tree-sitter (~70% reduction); **aider's
+  repo-map** and **Cline / Roo's `list_code_definition_names`** extract the same signature
+  view; the literature calls it "skeleton compression." What is genuinely new here is the
+  **reversibility**: repomix's compression is one-way and aider's "recovery" is re-adding the
+  whole file, whereas this conductor's `{#code FOLDED}` tag makes every skeleton individually
+  `unfold`/`recall`-able. On that axis the conductor is ahead of the named tools, not behind.
+- **The real gap is the parser, not the idea.** Every serious implementation uses
+  **tree-sitter**, not the hand-rolled regex / brace-masking here. Tree-sitter would dissolve
+  the exact bug classes the adversarial review found (string/comment masking, brace miscounts,
+  dropped declarations, catastrophic backtracking) and is error-tolerant on truncated files. It
+  is a sturdier *implementation of the same technique*, not a better technique — the output is
+  the same skeleton — and it is recorded as deferred future work because its costs collide with
+  this repo's constraints (a runtime dependency vs the dependency-free-conductor rule, several
+  MB of per-language grammar WASM, a one-time async init, undocumented-though-real determinism).
+- **The niche fits a structural skeleton.** For a file the agent *already read and chose*, now
+  aging out of context, a cheap-but-reversible structural stand-in beats the alternatives:
+  embeddings/RAG solve a different problem (finding *unread* code — and Claude Code and Cline
+  both reject RAG for the agentic case); LLM summarization is lossy, costly, non-deterministic,
+  and irreversible; token-level prompt compression (LLMLingua) damages code syntactically and is
+  query-conditioned (uncacheable). The one honest competitor is plain **on-demand re-read** (zero
+  standing cost), which wins when a file won't be touched again — exactly the case the
+  precision-first classifier + downgrade-to-digest pass already route away from a skeleton.
+
 ## Rejected alternatives
 
 - **LLM summarization of code files.** Rejected for the core: non-deterministic (cache-breaking),
@@ -197,6 +228,14 @@ is left to future work.
 - **Skeletonizing writes by collapsing the write `tool_call`+result into a `group`.** Deferred:
   it changes block structure (a group), and v1's clean `replace`-on-tool_result path is the
   robust, reversible foundation. Noted in §6.
+- **Token-level prompt compression (LLMLingua / LongLLMLingua).** Rejected: it drops tokens by
+  perplexity, which breaks code syntactically (a removed bracket or keyword); it is
+  query-conditioned, so the compressed prefix changes per turn and can't be prompt-cached; and
+  it is irreversible. All three collide with this conductor's requirements (the code-specific
+  damage is documented in LongCodeZip and "Compressing Code Context for LLM Issue Resolution").
+- **Embeddings / RAG retrieval.** Rejected for this niche: RAG answers "find relevant code in a
+  repo I haven't read," not "keep a file the agent already read cheaply present and reversible."
+  Claude Code and Cline both reject RAG for the agentic case for the same reason.
 
 ## Future work
 
@@ -208,3 +247,13 @@ is left to future work.
   `recoverable` reversibility.
 - **A "proactive" mode** — skeletonize stale large code reads before budget pressure, behind a
   toggle, for cache-warmth and context hygiene.
+- **A tree-sitter skeletonizer** (the engine every serious peer uses), if language coverage
+  grows or the regex parser proves fragile in practice — weighed against the real cost in this
+  environment: a runtime dependency (vs the "dependency-free conductor" rule), several MB of
+  per-language grammar WASM, a one-time async init (so `conduct()` gains a not-ready state),
+  undocumented-though-real determinism with a grammar-version cache-bust risk, and per-language
+  queries still to maintain. A robustness/maintainability upgrade, not a capability one.
+- **Intra-file ranking for overflow** (borrowed from aider's PageRank, done deterministically as
+  an in-file reference-count proxy): when a single skeleton still overruns the budget, keep the
+  exported / most-referenced signatures and collapse the rest to a `// + N more` line, rather
+  than declining the block or downgrading it wholesale to a one-line digest.
