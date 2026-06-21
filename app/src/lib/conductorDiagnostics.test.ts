@@ -44,6 +44,20 @@ describe("conductor diagnostics normalization", () => {
 		expect(verdict.withinBudget).toBe(true);
 	});
 
+	it("does not mark low fold coverage red while the session is comfortably under budget", () => {
+		const verdict = computeHealthVerdict(
+			[
+				{ id: "a", blockIds: ["a"], fullTokens: 100, level: 0, eligible: true },
+				{ id: "b", blockIds: ["b"], fullTokens: 100, level: 0, eligible: true },
+			],
+			{ assembledTokens: 500, budgetTokens: 1000, pressure: "comfortable" },
+			{ needed: 0, harmless: 0, pending: 0, resolved: 0, neededRate: null },
+		);
+		expect(verdict.foldCoverage).toBe(0);
+		expect(verdict.withinBudget).toBe(true);
+		expect(verdict.level).toBe("green");
+	});
+
 	it("labels conductor folds later opened by a human or agent as needed", () => {
 		const events: DecisionEvent[] = [
 			{ n: 1, at: 1, by: "you", action: "unfold", ids: ["b1"], detail: "b1", turn: 1 },
@@ -92,6 +106,16 @@ describe("conductor diagnostics normalization", () => {
 		const stats = computeNeededStats(events, 2);
 		expect(stats.harmless).toBe(1);
 		expect(stats.resolved).toBe(1);
+	});
+
+	it("labels an auto group opened by a human as needed", () => {
+		const events: DecisionEvent[] = [
+			{ n: 1, at: 1, by: "you", action: "unfold-group", ids: ["g:m0:p0", "m0:p0", "m1:p0"], detail: "2 blocks", turn: 1, kind: "group" },
+			{ n: 0, at: 0, by: "auto", action: "group", ids: ["g:m0:p0"], detail: "2 blocks", turn: 1, kind: "group" },
+		];
+		const stats = computeNeededStats(events, 1);
+		expect(stats.needed).toBe(1);
+		expect(stats.neededRate).toBe(1);
 	});
 
 	it("uses the smaller context window as fallback pressure basis", () => {

@@ -116,7 +116,8 @@ export interface GroupOp {
 export interface HelloMessage {
 	type: "hello";
 	protocolVersion: number;
-	sessionId: string;
+	/** Present on current extensions; older or malformed hello frames are treated as no active session id. */
+	sessionId?: string;
 	meta: { title: string; cwd: string; model: string; contextWindow: number | null; format: "pi" };
 }
 
@@ -322,4 +323,3 @@ export function isServerMessage(v: unknown): v is ServerMessage {
 	const t = (v as any).type;
 	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult";
 }
-

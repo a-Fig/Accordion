@@ -521,7 +521,7 @@
 		grid-template-columns: minmax(0, 1fr) minmax(280px, 320px);
 	}
 	.main.open.activity {
-		grid-template-columns: minmax(0, 1fr) minmax(280px, 320px) minmax(360px, 30vw);
+		grid-template-columns: minmax(0, 1fr) minmax(200px, 260px) minmax(360px, 30vw);
 	}
 	.canvas {
 		min-width: 0;

@@ -63,7 +63,19 @@ interface LogEntry {
 	n: number;
 }
 
-export type DecisionAction = "fold" | "replace" | "restore" | "unfold" | "pin" | "unpin" | "group" | "ungroup" | "clamp" | "reset";
+export type DecisionAction =
+	| "fold"
+	| "replace"
+	| "restore"
+	| "unfold"
+	| "pin"
+	| "unpin"
+	| "group"
+	| "ungroup"
+	| "fold-group"
+	| "unfold-group"
+	| "clamp"
+	| "reset";
 
 export interface DecisionEvent {
 	n: number;
@@ -1483,7 +1495,7 @@ export class AccordionStore {
 		g.folded = true;
 		this.groups = [...this.groups];
 		this.emit(by, "group folded", `${g.memberIds.length} blocks`);
-		this.recordGroupDecision(by, "group", g, `${g.memberIds.length} blocks`);
+		this.recordGroupDecision(by, "fold-group", g, `${g.memberIds.length} blocks`);
 		this.refold();
 	}
 	unfoldGroup(id: string, by: Actor = "you"): void {
@@ -1498,7 +1510,7 @@ export class AccordionStore {
 		g.folded = false;
 		this.groups = [...this.groups];
 		this.emit(by, "group unfolded", `${g.memberIds.length} blocks`);
-		this.recordGroupDecision(by, "ungroup", g, `${g.memberIds.length} blocks`);
+		this.recordGroupDecision(by, "unfold-group", g, `${g.memberIds.length} blocks`);
 		this.refold();
 	}
 	toggleGroup(id: string, by: Actor = "you"): void {

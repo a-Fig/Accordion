@@ -220,7 +220,7 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				return;
 			}
 			live.status = "connected";
-			live.sessionId = msg.sessionId;
+			live.sessionId = typeof msg.sessionId === "string" ? msg.sessionId : null;
 			session.error = "";
 			session.filePath = null;
 			// A live pi session is steerable, never a read-only recording. Reset here —
