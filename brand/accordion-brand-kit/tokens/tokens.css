@@ -1,0 +1,54 @@
+:root{
+  /* color — monochrome base */
+  --color-ink: #0A0A0A;
+  --color-charcoal: #1C1C1C;
+  --color-slate: #4A4A4A;
+  --color-smoke: #9A9A9A;
+  --color-cloud: #E8E8E8;
+  --color-paper: #F6F6F6;
+  --color-white: #FFFFFF;
+
+  /* color — spectrum (semantic: block kinds) */
+  --color-user: #044EFF;
+  --color-thinking: #B480DF;
+  --color-tool-call: #21D4C1;
+  --color-tool-result: #E19C7D;
+  --gradient-spectrum: linear-gradient(90deg,#21D4C1 0%,#1AA6E8 30%,#044EFF 48%,#7D6EE6 64%,#B480DF 78%,#E19C7D 100%);
+
+  /* type */
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  --font-size-caption: 11px;
+  --font-size-small: 13px;
+  --font-size-body: 15px;
+  --font-size-lead: 17px;
+  --font-size-h3: 22px;
+  --font-size-h2: 26px;
+  --font-size-h1: 46px;
+  --font-size-display: 64px;
+  --line-height-tight: 1.0;
+  --line-height-snug: 1.12;
+  --line-height-normal: 1.5;
+  --line-height-relaxed: 1.62;
+
+  /* spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 22px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  /* radius */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-pill: 999px;
+
+  /* shadow */
+  --shadow-card: 0 8px 22px rgba(10,10,10,.14);
+  --shadow-tile: 0 6px 18px rgba(52,211,194,.30);
+}
