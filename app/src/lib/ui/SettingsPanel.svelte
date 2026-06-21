@@ -141,6 +141,27 @@
 				</div>
 			</section>
 
+			<section class="s-section">
+				<h2 class="s-title">Bear-2</h2>
+				<div class="s-row">
+					<div class="s-label-wrap">
+						<span class="s-label">Bear-2 API key</span>
+						<span class="s-helper">Used by the Bear-2 hybrid conductor for lite prose compression. Stored locally on this device only.</span>
+					</div>
+					<div class="s-control">
+						<input
+							type="password"
+							class="s-input"
+							placeholder="ttc_sk_..."
+							value={settings.bear2ApiKey}
+							oninput={(e) => settings.set("bear2ApiKey", e.currentTarget.value)}
+							autocomplete="off"
+							spellcheck={false}
+						/>
+					</div>
+				</div>
+			</section>
+
 			{#if isTauriEnv}
 				<section class="s-section">
 					<h2 class="s-title">Developer</h2>
@@ -363,6 +384,28 @@
 	.btn-danger:hover:not(:disabled) {
 		border-color: color-mix(in srgb, var(--danger) 55%, transparent);
 		color: var(--danger);
+	}
+
+	/* ── Input ────────────────────────────────────────────────────────────── */
+	.s-input {
+		min-width: 180px;
+		height: 28px;
+		padding: 0 var(--sp-2);
+		background: var(--panel-2);
+		border: 1px solid var(--line);
+		border-radius: var(--radius-sm);
+		color: var(--text);
+		font-size: var(--fs-sm);
+		font-family: inherit;
+		outline: none;
+		transition: border-color var(--dur-fast) var(--ease-out);
+	}
+	.s-input::placeholder {
+		color: var(--faint);
+	}
+	.s-input:focus-visible {
+		border-color: transparent;
+		box-shadow: var(--focus-ring);
 	}
 
 	/* ── Animations ───────────────────────────────────────────────────────── */

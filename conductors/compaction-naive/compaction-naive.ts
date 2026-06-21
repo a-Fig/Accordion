@@ -106,7 +106,7 @@ const MAX_SUMMARY_TOKENS = 8000;
  * for the first and recursive passes; only the user-prompt preamble differs (see
  * `buildPrompt`), which carries the recursive merge instructions.
  */
-const COMPACTION_SYSTEM = `\
+export const COMPACTION_SYSTEM = `\
 You are a context-compaction assistant. Your task is to read a segment of an AI \
 assistant's conversation history and produce a compact, structured briefing that the \
 assistant can use to continue working effectively without seeing the original messages.
@@ -591,7 +591,7 @@ export class NaiveCompactionConductor implements Conductor {
 // ── utilities ─────────────────────────────────────────────────────────────────
 
 /** Sum the full token cost of a set of blocks. */
-function sumTokens(blocks: ViewBlock[]): number {
+export function sumTokens(blocks: ViewBlock[]): number {
 	let n = 0;
 	for (const b of blocks) n += b.tokens;
 	return n;
@@ -601,7 +601,7 @@ function sumTokens(blocks: ViewBlock[]): number {
  * A short human-readable label for a block, used when building the compaction prompt.
  * Mirrors the role labeling convention in the Transcript view.
  */
-function blockLabel(b: ViewBlock): string {
+export function blockLabel(b: ViewBlock): string {
 	switch (b.kind) {
 		case "user":
 			return "user";

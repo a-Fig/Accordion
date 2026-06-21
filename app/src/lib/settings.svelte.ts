@@ -17,12 +17,14 @@ export type FoldDisplayMode = "classic" | "sliver";
 /** All user-configurable preferences. Extend by adding a field + default here. */
 interface SettingsShape {
 	foldDisplayMode: FoldDisplayMode;
+	bear2ApiKey: string;
 }
 
 // ─── Defaults ────────────────────────────────────────────────────────────────
 
 const DEFAULTS: SettingsShape = {
 	foldDisplayMode: "classic",
+	bear2ApiKey: "",
 };
 
 // ─── localStorage helpers ─────────────────────────────────────────────────────
@@ -61,6 +63,8 @@ function validate<K extends keyof SettingsShape>(key: K, raw: string): SettingsS
 				? (raw as FoldDisplayMode)
 				: DEFAULTS.foldDisplayMode) as SettingsShape[K];
 		}
+		case "bear2ApiKey":
+			return raw as SettingsShape[K];
 		default:
 			return DEFAULTS[key];
 	}
@@ -70,6 +74,7 @@ function validate<K extends keyof SettingsShape>(key: K, raw: string): SettingsS
 
 class Settings {
 	foldDisplayMode = $state<FoldDisplayMode>(loadKey("foldDisplayMode"));
+	bear2ApiKey = $state<string>(loadKey("bear2ApiKey"));
 
 	/**
 	 * Generic setter — updates reactive state and persists to localStorage.
@@ -79,6 +84,9 @@ class Settings {
 		switch (key) {
 			case "foldDisplayMode":
 				this.foldDisplayMode = value as FoldDisplayMode;
+				break;
+			case "bear2ApiKey":
+				this.bear2ApiKey = value as string;
 				break;
 		}
 		persistKey(key, value);

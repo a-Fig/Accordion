@@ -224,8 +224,9 @@ export type ClampReason =
  *  - "complete"     — run an out-of-band model completion (requires a live session model).
  *  - "countTokens"  — synchronous token estimate using the host's tokenizer.
  *  - "digest"       — the engine's per-kind folded digest for a known block id.
+ *  - "compress"     — extractive prose compression (e.g. Bear-2) of a single block of text.
  */
-export type HostCapabilityId = "complete" | "countTokens" | "digest";
+export type HostCapabilityId = "complete" | "countTokens" | "digest" | "compress";
 
 /**
  * A provider-agnostic request to the host to run a model completion off to the side.
@@ -292,6 +293,17 @@ export interface ConductorHost {
 	can(capability: HostCapabilityId): boolean;
 	/** Run an out-of-band model completion asynchronously; reject if unavailable. */
 	complete(req: CompletionRequest): Promise<CompletionResult>;
+	/**
+	 * Optional extractive-compression capability (e.g. The Token Company's Bear-2). Returns
+	 * a subsequence-compressed version of `text`: a small classifier deletes low-signal tokens,
+	 * so the output is shorter prose the agent can still read directly. Deterministic for a
+	 * given input. Implemented app-side (Tauri HTTP), NOT on the pi wire — so it is only
+	 * present in the desktop app with an API key configured. Always gate calls on
+	 * `can("compress")`; the promise rejects if the capability is unavailable or the upstream
+	 * call fails. The aggressiveness level is fixed by the host implementation (not a parameter
+	 * here), keeping this surface minimal.
+	 */
+	compress?(text: string): Promise<string>;
 	/** Synchronous token estimate for `text`, using the host's tokenizer. */
 	countTokens(text: string): number;
 	/** The engine's per-kind folded digest for block `id`, or `null` if unknown. */

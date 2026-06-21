@@ -154,6 +154,21 @@ export class AccordionStore {
 	 */
 	completer: ((req: CompletionRequest) => Promise<CompletionResult>) | null = null;
 
+	/**
+	 * Optional prose-compression backend injected by the app layer. Set from outside (the
+	 * route component wires it to a Tauri command that calls The Token Company's Bear-2 over
+	 * HTTPS) so the engine stays pure — NO settings or Tauri import lives here. The host
+	 * exposes it to conductors via `ConductorHost.compress()`; `can("compress")` reports it
+	 * honestly.
+	 *
+	 * Null whenever compression is unavailable — browser dev (no Tauri) or no Bear-2 API key
+	 * configured. Unlike `completer`, this is NOT tied to a live pi model link: it works for
+	 * demo and read-only Claude Code sessions too, since it is a standalone app-side HTTP call.
+	 * Conductors MUST call `host.can("compress")` before depending on it; the host rejects if
+	 * it is called while null.
+	 */
+	compressor: ((text: string) => Promise<string>) | null = null;
+
 	// ---- involvement locks (ADR 0011) -------------------------------------
 	/**
 	 * Reactive snapshot of the active conductor's declared lock-set (ADR 0011). Empty ⇒
@@ -467,6 +482,9 @@ export class AccordionStore {
 				if (capability === "complete") {
 					return store.conductor === forConductor && store.conductorEpoch === epoch && store.completer != null;
 				}
+				if (capability === "compress") {
+					return store.conductor === forConductor && store.conductorEpoch === epoch && store.compressor != null;
+				}
 				if (capability === "countTokens") return true;
 				if (capability === "digest") return true;
 				return false;
@@ -477,6 +495,13 @@ export class AccordionStore {
 				}
 				if (!store.completer) return Promise.reject(new Error("completion capability unavailable"));
 				return store.completer(req);
+			},
+			compress(text: string): Promise<string> {
+				if (store.conductor !== forConductor || store.conductorEpoch !== epoch) {
+					return Promise.reject(new Error("stale conductor host"));
+				}
+				if (!store.compressor) return Promise.reject(new Error("compress capability unavailable"));
+				return store.compressor(text);
 			},
 			countTokens(text: string): number {
 				return estTokens(text);
