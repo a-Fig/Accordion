@@ -5,7 +5,6 @@
 	import type { BlockKind } from "../../engine/types";
 	import { ghosts } from "../../live/ghostState.svelte";
 	import { nextVacated } from "./drain";
-	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 	import { buildDisplay, segmentDisplay, buildLane, type DisplayRow } from "$lib/engine/display";
 	import { settings } from "$lib/settings.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
@@ -59,6 +58,17 @@
 	] as const;
 	// Use the canonical faceFor from tileDraw (single source of truth).
 	const faceFor = faceForLib;
+
+	// Color = kind legend (toolbar). Each block kind owns one spectrum hue (--k-*);
+	// this names them so the grid's colours are self-explaining. Order follows the
+	// conversation grammar: you → reply → thinking → tool call → tool result.
+	const KINDS: { kind: BlockKind; lbl: string }[] = [
+		{ kind: "user", lbl: "user" },
+		{ kind: "text", lbl: "reply" },
+		{ kind: "thinking", lbl: "thinking" },
+		{ kind: "tool_call", lbl: "tool call" },
+		{ kind: "tool_result", lbl: "tool result" },
+	];
 	// Legend hover: reveal a face's token range the instant the cursor crosses a die
 	// (pointerenter per die — no native-title delay), so values surface even mid-move.
 	let hoveredFace = $state<number | null>(null);
@@ -74,10 +84,6 @@
 	const protectedFrom = $derived(store.protectedFromIndex);
 	const olderTiles = $derived(tiles.slice(0, protectedFrom));
 	const protectedTiles = $derived(tiles.slice(protectedFrom));
-	// live (effective) token weight in each box — shown as a vertical tally on the
-	// box's left rail. The protected tail never folds, so its eff == full.
-	const olderTok = $derived(olderTiles.reduce((s, t) => s + store.effTokens(t.b), 0));
-	const protTok = $derived(protectedTiles.reduce((s, t) => s + t.b.tokens, 0));
 
 	// ---- PEEK: pure UI-local "open for viewing" state (the redesign). -------------
 	// A group id in `peeked` renders its members OPEN-but-DULL while the group stays
@@ -856,6 +862,19 @@
 				</div>
 			</div>
 
+			<div class="tb-divider"></div>
+
+			<!-- Color = kind legend: what each block colour means. Sits beside the WEIGHT
+			     dice so the two grammars (colour = kind, pips = weight) read together. -->
+			<div class="kinds">
+				<span class="tlbl">KIND</span>
+				{#each KINDS as kd}
+					<span class="kind-pair" title={kd.lbl}>
+						<i class="ksw k-{kd.kind}"></i><span class="ksw-lbl">{kd.lbl}</span>
+					</span>
+				{/each}
+			</div>
+
 			<span class="grow"></span>
 
 			<!-- Range-select chip / hint.
@@ -977,14 +996,6 @@
 			<div class="boxes" style:--cell="{cell}px" style:--cols={cols}>
 				{#if olderTiles.length}
 					<section class="box older">
-						<div class="box-eyebrow" title="{olderTok.toLocaleString()} live tokens · foldable">
-							<span class="eb-label">FOLDED · OLDER</span>
-							<span class="eb-meta">
-								<span class="eb-tok"><AnimatedNumber value={olderTok} format={k} /></span>
-								<span class="eb-sep">·</span>
-								{olderTiles.length} blocks
-							</span>
-						</div>
 						<div class="stack">
 							{#each segments as seg, segIdx (seg.kind === "band" ? "band-" + seg.row.group.id : "tiles-" + (seg.rows[0].type === "block" ? seg.rows[0].block.id : seg.rows[0].group.id))}
 								{#if seg.kind === "tiles"}
@@ -1088,13 +1099,6 @@
 				{/if}
 				{#if protSpecs.length}
 				<section class="box prot">
-					<div class="box-eyebrow" title="{protTok.toLocaleString()} live tokens · protected working tail">
-						<span class="eb-label">PROTECTED TAIL · <span class="eb-live">LIVE</span></span>
-						<span class="eb-meta">
-							<span class="eb-tok"><AnimatedNumber value={store.protectTokens} format={k} /></span>
-							reserved
-						</span>
-					</div>
 					<!-- Single canvas for prot box: vacated placeholders + protected tiles + ghosts.
 					     The wrapper div takes flex: 1 so the canvas fills the box horizontally. -->
 					<div class="canvas-fill">
@@ -1232,6 +1236,36 @@
 		color: var(--faint);
 		text-transform: uppercase;
 	}
+	/* ---- color = kind legend ---- */
+	.kinds {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--sp-2);
+		min-width: 0;
+	}
+	.kind-pair {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		white-space: nowrap;
+	}
+	.ksw {
+		width: 10px;
+		height: 10px;
+		border-radius: 3px;
+		flex: 0 0 auto;
+		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+	}
+	.ksw.k-user { background: var(--k-user); }
+	.ksw.k-text { background: var(--k-text); }
+	.ksw.k-thinking { background: var(--k-thinking); }
+	.ksw.k-tool_call { background: var(--k-tool_call); }
+	.ksw.k-tool_result { background: var(--k-tool_result); }
+	.ksw-lbl {
+		font-size: var(--fs-xs);
+		color: var(--muted);
+	}
+
 	/* bare dice — no surrounding bubble; anchors the hover tooltip. gap(4)+die(16)=20px
 	   step, which the .die-pop left offset mirrors. */
 	.tier-strip {
@@ -1489,49 +1523,10 @@
 		border-radius: var(--radius-lg);
 		border: 1px solid var(--line);
 		background: var(--panel-2);
-		padding: var(--sp-3) var(--sp-4) var(--sp-4);
+		padding: var(--sp-3);
 		display: flex;
 		flex-direction: column;
 		align-items: stretch;
-		gap: var(--sp-3);
-	}
-	/* box eyebrow: the signature mono UPPERCASE micro-label (left) + a mono data
-	   readout (right). Replaces the old rotated vertical token rail. */
-	.box-eyebrow {
-		flex: 0 0 auto;
-		display: flex;
-		align-items: baseline;
-		justify-content: space-between;
-		gap: var(--sp-3);
-		user-select: none;
-	}
-	.eb-label {
-		font-family: var(--mono);
-		text-transform: uppercase;
-		letter-spacing: 0.12em;
-		font-size: var(--fs-2xs);
-		color: var(--faint);
-		white-space: nowrap;
-	}
-	.eb-meta {
-		font-family: var(--mono);
-		font-size: var(--fs-xs);
-		letter-spacing: 0.02em;
-		color: var(--faint);
-		font-variant-numeric: tabular-nums;
-		white-space: nowrap;
-	}
-	.eb-tok {
-		color: var(--muted);
-		font-weight: 600;
-	}
-	.eb-sep {
-		opacity: 0.5;
-		margin: 0 2px;
-	}
-	/* the protected box's LIVE state, tinted tool-call teal (the live-context hue). */
-	.eb-live {
-		color: var(--k-tool_call);
 	}
 	/* the protected box: meaningfully thicker, accented frame = protection signal.
 	   Keep this visually distinct — it's a key part of the visual grammar. */
@@ -1539,10 +1534,6 @@
 		border: 3px solid var(--accent-dim);
 		background: var(--panel);
 		box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent), var(--shadow-1);
-	}
-	/* the protected box's data readout reads as live, not faint — tint toward accent. */
-	.box.prot .eb-meta {
-		color: var(--muted);
 	}
 
 	/* canvas-fill: flex wrapper for TileCanvas inside a box (fills the space after the rail). */
@@ -1682,11 +1673,9 @@
 	/* The collapsed group tile in tile grids is now drawn on canvas (no DOM .group-tile
 	   needed there). Only .group-tile-open (the dull parent inside the band) remains DOM. */
 	.group-tile {
-		/* Kept for .group-tile-open which also uses this base. Folded group = the brand
-		   spectrum gradient, darkened to a smoky field over Ink (matches the canvas tile). */
-		background:
-			linear-gradient(rgba(10, 10, 10, 0.42), rgba(10, 10, 10, 0.42)),
-			var(--gradient-spectrum);
+		/* Kept for .group-tile-open which also uses this base. Folded group = a solid
+		   recessed CHESTNUT brown (--group), matching the canvas group tile. */
+		background: var(--group);
 		box-shadow:
 			inset 0 0 0 1px var(--group-edge),
 			inset 2px 2px 0 -1px color-mix(in srgb, #fff 16%, transparent),
@@ -1810,10 +1799,10 @@
 
 	/* Summary tile: stands in for the whole folded run; recessed charcoal signals synthesis.
 	   Reuses .cell.face.fN for dice pips (::before pseudo, no extra markup needed).
-	   The palette is now monochrome, so --k-summary (#2A2A2A) sits a hair darker than the
-	   group cocoa (--group #2C2C2C). To keep the two distinct without a hue cue, the summary
-	   tile carries a thin SMOKE-grey rim (--group-accent) — a flat, light-edged synthesized
-	   tile vs the group's heavy beveled cocoa with its dark --group-edge ring. */
+	   --k-summary (#2A2A2A) is a neutral dark tile — a single folded block's digest, NOT a
+	   multiblock group, so it deliberately stays grey while a group is chestnut (--group).
+	   The summary carries a thin SMOKE-grey rim (--group-accent) — a flat, light-edged
+	   synthesized tile vs the group's heavy beveled brown with its dark --group-edge ring. */
 	.summary-tile {
 		background: var(--k-summary);
 		box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--group-accent) 38%, transparent),

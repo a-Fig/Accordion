@@ -154,17 +154,9 @@
 
 <div class="hdr">
 	<div class="top">
-		<!-- ── Left: the brand data device — CONTEXT eyebrow, hero live number,
-		     live/folded mono readout (live teal · folded smoke). ── -->
+		<!-- ── Left: the hero live number / budget. Single focal stat — no echoing
+		     CONTEXT eyebrow or live·folded readout (those just restated this). ── -->
 		<div class="nums">
-			<!-- Eyebrow: CONTEXT · {fullTokens} (mono, uppercase, smoke) -->
-			<span class="data-eyebrow mono">
-				<span class="eyebrow-key">CONTEXT</span>
-				<span class="eyebrow-sep" aria-hidden="true">·</span>
-				<span class="eyebrow-val tnum"><AnimatedNumber value={store.fullTokens} format={k} /></span>
-			</span>
-
-			<!-- Hero live number / budget denominator -->
 			<div class="hero-line">
 				<span class="hero-stat mono tnum" class:over={store.overBudget}>
 					<AnimatedNumber value={store.liveTokens} format={fmt} />
@@ -176,13 +168,6 @@
 					</span>
 				{/if}
 			</div>
-
-			<!-- Signature readout: live {n} · folded {n} — live tinted teal, folded smoke. -->
-			<span class="lf-readout mono" class:over={store.overBudget}>
-				<span class="lf-live tnum">live <AnimatedNumber value={store.liveTokens} format={k} /></span>
-				<span class="lf-sep" aria-hidden="true">·</span>
-				<span class="lf-folded tnum">folded <AnimatedNumber value={store.savedTokens} format={k} /></span>
-			</span>
 		</div>
 
 		<!-- ── Right: controls cluster ── -->
@@ -394,28 +379,6 @@
 		min-width: 0;
 	}
 
-	/* CONTEXT · {n} eyebrow — mono, uppercase, smoke, wide tracking */
-	.data-eyebrow {
-		display: inline-flex;
-		align-items: center;
-		gap: 6px;
-		font-size: var(--fs-xs);
-		text-transform: uppercase;
-		letter-spacing: 0.12em;
-		color: var(--faint);
-		line-height: 1;
-	}
-	.data-eyebrow .eyebrow-key {
-		color: var(--muted);
-	}
-	.data-eyebrow .eyebrow-sep {
-		color: var(--line-strong);
-	}
-	.data-eyebrow .eyebrow-val {
-		color: var(--muted);
-		letter-spacing: 0.04em;
-	}
-
 	/* Hero line: live number + denominator + optional over-flag */
 	.hero-line {
 		display: flex;
@@ -447,29 +410,6 @@
 		font-size: var(--fs-xs);
 		font-weight: 600;
 		letter-spacing: 0.02em;
-		color: var(--danger);
-	}
-
-	/* Signature live/folded readout — live teal, folded smoke */
-	.lf-readout {
-		display: inline-flex;
-		align-items: center;
-		gap: 8px;
-		font-size: var(--fs-sm);
-		line-height: 1;
-		letter-spacing: 0.01em;
-	}
-	.lf-live {
-		color: var(--k-tool_call);
-	}
-	.lf-folded {
-		color: var(--muted);
-	}
-	.lf-sep {
-		color: var(--line-strong);
-	}
-	/* Over budget: the live count flips to danger so the readout stays legible. */
-	.lf-readout.over .lf-live {
 		color: var(--danger);
 	}
 

@@ -90,23 +90,11 @@ export function readPalette(): Palette {
     },
     accent: v("--accent") || "#E8E8E8",
     accentDim: v("--accent-dim") || "#2d4a7a",
-    group: v("--group") || "#14131C",
+    group: v("--group") || "#7C5230",
     groupEdge: v("--group-edge") || "#0A0A0A",
     groupAccent: v("--group-accent") || "#E8E8E8",
   };
 }
-
-// The brand "Spectrum" gradient stops (brand.md). A folded GROUP renders this as a
-// smoky field over Ink — "the colors of the context window fold together into one
-// continuous spectrum." Sparse (groups are few), so per-tile gradients are fine here.
-const SPECTRUM_STOPS: [number, string][] = [
-  [0.0, "#21D4C1"],
-  [0.3, "#1AA6E8"],
-  [0.48, "#044EFF"],
-  [0.64, "#7D6EE6"],
-  [0.78, "#B480DF"],
-  [1.0, "#E19C7D"],
-];
 
 // ---------------------------------------------------------------------------
 // Color utilities
@@ -507,14 +495,10 @@ export function drawTile(
   ctx.save();
 
   if (isGroup) {
-    // Folded group = the brand spectrum gradient, made smoky over Ink. A
-    // horizontal spectrum sweep, then a dark wash so white pips/controls read
-    // and it sits as a recessed "folded" field rather than a bright rainbow.
-    const grad = ctx.createLinearGradient(x, y, x + w, y);
-    for (const [off, col] of SPECTRUM_STOPS) grad.addColorStop(off, col);
-    ctx.fillStyle = grad;
-    roundRectFill(ctx, x, y, w, h, 4);
-    ctx.fillStyle = "rgba(10,10,10,0.42)";
+    // Folded group = a solid recessed CHESTNUT brown tile (palette.group). The
+    // bevel + edge ring below give it the "stacked, folded-away" depth; brown
+    // reads as its own object, distinct from the four spectrum kind hues.
+    ctx.fillStyle = baseColor;
     roundRectFill(ctx, x, y, w, h, 4);
   } else {
     ctx.fillStyle = baseColor;

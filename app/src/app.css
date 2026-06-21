@@ -41,14 +41,15 @@
 	--k-tool_call: #21D4C1;
 	--k-tool_result: #E19C7D;
 	/* synthesized-summary tile (sliver fold mode) — dark neutral recessed tone; distinct
-	   from a folded group's spectrum gradient so the summary never collides */
+	   from a folded group's brown so the summary never collides */
 	--k-summary: #2A2A2A;
 
-	/* multiblock folds (groups) — the brand SPECTRUM GRADIENT made smoky over Ink
-	   ("the colors fold together into one continuous spectrum"). The canvas paints the
-	   gradient (tileDraw); DOM group surfaces use --gradient-spectrum darkened. */
-	--group: #14131C;               /* smoky fallback base (canvas uses the gradient) */
-	--group-edge: #0A0A0A;          /* crisp Ink rim around the gradient tile */
+	/* multiblock folds (groups) — a solid recessed CHESTNUT brown. A folded group is
+	   its own object (several blocks stacked into one), so it gets its own non-spectrum
+	   hue — distinct from the four kind colors and clearly apart from peach tool_result.
+	   Canvas (tileDraw) and DOM group/summary surfaces both read --group. */
+	--group: #7C5230;               /* Chestnut — the group tile fill */
+	--group-edge: #0A0A0A;          /* crisp Ink rim around the brown tile */
 	--group-accent: #E8E8E8;        /* Cloud — group selection rings / band edge / controls */
 	--group-band: rgba(255, 255, 255, 0.05);
 	--group-ink: #0A0A0A;           /* Ink text on the light group button */
