@@ -83,4 +83,17 @@ describe("decision journal", () => {
 		expect(aggregateEntries).toHaveLength(1);
 		expect(aggregateEntries[0].detail).toContain("grouped 1 group");
 	});
+
+	it("records group tile fold and unfold with distinct journal actions", () => {
+		const s = makeStore();
+		const g = s.createGroup("m0:p0", "m1:p0");
+		expect(g).toBeTruthy();
+
+		s.unfoldGroup(g!.id);
+		s.foldGroup(g!.id);
+
+		expect(s.decisionJournal[0]).toMatchObject({ by: "you", action: "fold-group", ids: [g!.id, ...g!.memberIds] });
+		expect(s.decisionJournal[1]).toMatchObject({ by: "you", action: "unfold-group", ids: [g!.id, ...g!.memberIds] });
+		expect(s.decisionJournal[2]).toMatchObject({ by: "you", action: "group", ids: [g!.id, ...g!.memberIds] });
+	});
 });

@@ -239,7 +239,7 @@ function blockKeys(ids: readonly string[]): string[] {
 
 function groupKey(ids: readonly string[]): string | null {
 	const id = ids.find((x) => x?.startsWith("g:"));
-	return id ? `g:${id}` : null;
+	return id ?? null;
 }
 
 export function computeNeededStats(events: readonly DecisionEvent[], currentTurn?: number): NeededStats {
@@ -280,7 +280,7 @@ export function computeNeededStats(events: readonly DecisionEvent[], currentTurn
 			for (const key of blockKeys(ev.ids)) close(key, "needed");
 			continue;
 		}
-		if (ev.by !== "auto" && ev.action === "ungroup") {
+		if (ev.by !== "auto" && (ev.action === "ungroup" || ev.action === "unfold-group")) {
 			const key = groupKey(ev.ids);
 			if (key) close(key, "needed");
 		}
@@ -309,7 +309,7 @@ export function computeHealthVerdict(
 	}
 	const foldCoverage = eligibleMass > 0 ? foldedMass / eligibleMass : null;
 	const withinBudget = (health.assembledTokens ?? 0) <= (health.budgetTokens ?? Number.POSITIVE_INFINITY);
-	if ((foldCoverage !== null && foldCoverage < 0.5) || !withinBudget) {
+	if (!withinBudget || (foldCoverage !== null && foldCoverage < 0.5 && health.pressure === "tight")) {
 		return { level: "red", foldCoverage, withinBudget, neededRate: needed.neededRate };
 	}
 	if (needed.neededRate !== null && needed.neededRate > 0.5) {
