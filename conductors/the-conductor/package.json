@@ -1,0 +1,21 @@
+{
+  "name": "accordion-conductor-the-conductor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Faithful port of the_conductor's context strategy as an Accordion external (WebSocket) conductor: self-calibrating fold-target band, graduated Full/Trim/Digest/Group fold levels, three-stage relevance (keyword -> embeddings -> cross-encoder rerank), risk-aware unfold floors, and conductor pins. Strategy vendored from the_conductor/src/conductor.ts; only the I/O ends are re-expressed against the conductor contract.",
+  "main": "the-conductor.ts",
+  "scripts": {
+    "start": "node the-conductor.ts",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.8.1"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "id": "thermocline",
+  "label": "Thermocline",
+  "command": "node",
+  "args": ["thermocline.mjs"]
+}

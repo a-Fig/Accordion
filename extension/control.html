@@ -1,0 +1,188 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>fake pi — control</title>
+<style>
+	:root {
+		--bg: #15171c;
+		--panel: #1c1f26;
+		--line: #2a2e38;
+		--ink: #e7e9ee;
+		--dim: #8b93a3;
+		--teal: #34d3c2;
+		--blue: #6ea8fe;
+		--orange: #f0a35e;
+		--green: #57d98a;
+	}
+	* { box-sizing: border-box; }
+	body {
+		margin: 0;
+		font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+		background: var(--bg);
+		color: var(--ink);
+		display: flex;
+		justify-content: center;
+		padding: 32px 16px;
+	}
+	.wrap { width: 100%; max-width: 520px; }
+	header { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+	header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+	.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--dim); margin-left: auto; transition: background 0.2s; }
+	.dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
+	.sub { color: var(--dim); font-size: 12.5px; margin: 0 0 20px; }
+	.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 14px; }
+	.row { display: flex; gap: 10px; }
+	button {
+		flex: 1; cursor: pointer; font: inherit; font-weight: 600;
+		color: var(--bg); background: var(--teal); border: 0; border-radius: 9px; padding: 12px 14px;
+		transition: filter 0.12s, opacity 0.12s;
+	}
+	button:hover { filter: brightness(1.08); }
+	button:active { filter: brightness(0.94); }
+	button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+	button.play.is-playing { background: var(--orange); }
+	button.focus { width: 100%; margin-top: 10px; background: var(--blue); }
+	button:disabled { opacity: 0.45; cursor: not-allowed; }
+	.lbl { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 10px; }
+	.tps-head { display: flex; align-items: baseline; justify-content: space-between; }
+	.tps-val { font-variant-numeric: tabular-nums; font-size: 22px; font-weight: 700; color: var(--teal); }
+	.tps-val span { font-size: 12px; color: var(--dim); font-weight: 500; margin-left: 3px; }
+	input[type="range"] { width: 100%; accent-color: var(--teal); margin: 12px 0 10px; }
+	.presets { display: flex; gap: 6px; }
+	.presets button { padding: 7px 0; font-size: 12.5px; font-weight: 600; background: transparent; color: var(--dim); border: 1px solid var(--line); }
+	.presets button:hover { color: var(--ink); }
+	.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+	.cell { background: var(--panel); padding: 12px 14px; }
+	.cell .k { color: var(--dim); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+	.cell .v { font-size: 19px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+	.apps .v.none { color: var(--orange); }
+	.apps .v.has { color: var(--green); }
+	.hint { color: var(--dim); font-size: 12px; margin-top: 14px; text-align: center; }
+	.hint.warn { color: var(--orange); }
+</style>
+
+<div class="wrap">
+	<header>
+		<h1>🪗 fake pi — control</h1>
+		<div class="dot" id="dot" title="control link"></div>
+	</header>
+	<p class="sub" id="sub">connecting…</p>
+
+	<div class="panel">
+		<div class="row">
+			<button class="play" id="play" disabled>Play</button>
+			<button class="ghost" id="restart" disabled style="flex: 0 0 38%">↺ Restart</button>
+		</div>
+		<button class="focus" id="focus" disabled title="Simulate /accordion — focus Accordion and open this session">⤢ Focus in Accordion</button>
+	</div>
+
+	<div class="panel">
+		<div class="tps-head">
+			<div class="lbl">generation speed</div>
+			<div class="tps-val" id="tpsVal">—<span>tok/s</span></div>
+		</div>
+		<input type="range" id="tps" min="1" max="1000" step="1" value="60" disabled />
+		<div class="presets">
+			<button data-tps="1">1</button>
+			<button data-tps="30">30</button>
+			<button data-tps="60">60</button>
+			<button data-tps="200">200</button>
+			<button data-tps="100000">instant</button>
+		</div>
+	</div>
+
+	<div class="grid">
+		<div class="cell"><div class="k">Turn</div><div class="v" id="turn">—</div></div>
+		<div class="cell"><div class="k">Loop</div><div class="v" id="loop">—</div></div>
+		<div class="cell"><div class="k">Blocks streamed</div><div class="v" id="blocks">—</div></div>
+		<div class="cell"><div class="k">Tokens / budget</div><div class="v" id="tokens">—</div></div>
+		<div class="cell apps"><div class="k">App connected</div><div class="v" id="apps">—</div></div>
+		<div class="cell"><div class="k">State</div><div class="v" id="state">—</div></div>
+	</div>
+
+	<p class="hint" id="hint">open the desktop Accordion app and pick this session in the sidebar.</p>
+</div>
+
+<script>
+	const $ = (id) => document.getElementById(id);
+	const fmt = (n) => (n == null ? "—" : n.toLocaleString());
+	let ws = null,
+		playing = false,
+		connected = false;
+
+	function setLink(on) {
+		connected = on;
+		$("dot").classList.toggle("on", on);
+		const ctrls = ["play", "restart", "tps", "focus"];
+		ctrls.forEach((id) => ($(id).disabled = !on));
+		if (!on) $("sub").textContent = "control link lost — retrying…";
+	}
+
+	function render(s) {
+		playing = s.playing;
+		$("sub").textContent = `"${s.sessionTitle}" · ${fmt(s.sessionBlocks)} blocks · ${s.grow ? "growing" : "reset-loop"}`;
+		const play = $("play");
+		play.textContent = playing ? "⏸ Pause" : "▶ Play";
+		play.classList.toggle("is-playing", playing);
+		$("state").textContent = playing ? "playing" : "paused";
+		$("state").style.color = playing ? "var(--green)" : "var(--dim)";
+		$("turn").textContent = fmt(s.turn);
+		$("loop").textContent = fmt(s.loop);
+		$("blocks").textContent = fmt(s.blocksStreamed);
+		$("tokens").textContent = `${fmt(s.totalTokens)} / ${fmt(s.budget)}`;
+		const apps = $("apps");
+		apps.textContent = s.appsConnected ? `● ${s.appsConnected}` : "none";
+		apps.className = "v " + (s.appsConnected ? "has" : "none");
+		$("hint").textContent = s.appsConnected
+			? "connected — pick your conductor in Accordion's sidebar."
+			: "open the desktop Accordion app and pick this session in the sidebar.";
+		$("hint").classList.toggle("warn", !s.appsConnected);
+		// Only snap the slider when the user isn't dragging it.
+		if (document.activeElement !== $("tps")) {
+			$("tps").value = Math.min(1000, s.tps);
+			$("tpsVal").innerHTML = `${fmt(s.tps)}<span>tok/s</span>`;
+		}
+	}
+
+	function sendCmd(o) {
+		if (ws && ws.readyState === 1) ws.send(JSON.stringify(o));
+	}
+
+	function connect() {
+		ws = new WebSocket(`ws://${location.host}/ws`);
+		ws.onopen = () => setLink(true);
+		ws.onmessage = (e) => {
+			const m = JSON.parse(e.data);
+			if (m.type === "status") render(m);
+		};
+		ws.onclose = () => {
+			setLink(false);
+			setTimeout(connect, 1000);
+		};
+		ws.onerror = () => ws.close();
+	}
+
+	$("play").onclick = () => sendCmd({ cmd: playing ? "pause" : "play" });
+	$("restart").onclick = () => sendCmd({ cmd: "restart" });
+	$("focus").onclick = () => {
+		sendCmd({ cmd: "focus" });
+		const b = $("focus");
+		b.textContent = "✓ sent — check Accordion";
+		setTimeout(() => (b.textContent = "⤢ Focus in Accordion"), 1600);
+	};
+	$("tps").oninput = (e) => {
+		const v = Number(e.target.value);
+		$("tpsVal").innerHTML = `${fmt(v)}<span>tok/s</span>`;
+		sendCmd({ cmd: "tps", value: v });
+	};
+	document.querySelectorAll(".presets button").forEach((b) => {
+		b.onclick = () => {
+			const v = Number(b.dataset.tps);
+			$("tps").value = Math.min(1000, v);
+			$("tpsVal").innerHTML = `${fmt(v)}<span>tok/s</span>`;
+			sendCmd({ cmd: "tps", value: v });
+		};
+	});
+
+	connect();
+</script>
