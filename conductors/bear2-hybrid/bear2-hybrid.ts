@@ -34,8 +34,11 @@
  * savings sources:
  *     visible       = liveTokens − summarySaving − bear2Saving
  *     summarySaving = Σ(original tokens of summarized older-half blocks) − summaryTokenCost
- *     bear2Saving   = Σ over CURRENT newer-half blocks with a cached compressed value of
- *                       (block.tokens − compressedTokens)
+ *     bear2Saving   = Σ over CURRENT newer-half blocks with a SHRINKING cached compressed value of
+ *                       (tokenLen(originalTrimmed) − tokenLen(compressed))   [the bear2Delta gate]
+ * The shrink decision and the saving measure go through ONE helper (`bear2Delta`) on ONE unit
+ * (trimmed-text tokens), so a block credited in this math is exactly a block `emitState` emits a
+ * `replace` for — no two-unit drift (FIX 3).
  * Both treatments shrink `visible`; the single 90% trigger fires both and waits for the window
  * to refill before acting again (the sliding-window / naive-compaction high-water band).
  *
@@ -45,7 +48,10 @@
  *   - NO KEY / capability unavailable → idle, actionable prompt, return [] (clear to raw). This
  *     is "not configured", NOT the FAILED alarm; the older-half compaction does NOT run either.
  *   - TRANSIENT failure → one retry: per-block retry counter; while count < 2 the block stays
- *     uncached and is retried on a later pass.
+ *     uncached and is retried on a later pass. NOTE: that retry fires on the very next pass
+ *     (microtask) — it only guards an INSTANTANEOUS blip. Any sustained failure (network / 429 /
+ *     5xx lasting longer than a tick) exhausts the retry and trips the hard freeze below. By
+ *     design (freeze hard, alert loud) — there is deliberately no backoff.
  *   - HARD failure → when a block's retry count reaches 2 (failed twice), set sticky `failed`.
  *     Once failed: freeze hard — loud persistent status, return null (hold last applied state,
  *     emit nothing new). Stays failed until detach/re-attach.
@@ -218,10 +224,21 @@ export class Bear2HybridConductor implements Conductor {
 			return [];
 		}
 
-		// Degenerate config / empty session: nothing to manage. Hold any existing state.
+		// Degenerate config / empty session: nothing to manage. Hold any existing state. Clear any
+		// stale "Bear-2: …" metrics status first so the status bar doesn't keep showing the last
+		// session's numbers after the view empties out.
 		if (view.budget <= 0 || view.blocks.length === 0) {
+			this.host.setStatus(null);
 			return this.emitState(view);
 		}
+
+		// PRUNE STALE Bear-2 bookkeeping. bear2Cache / bear2Retries are otherwise only cleared when
+		// a block enters compactedIds — so an id that vanishes from view.blocks by ANY other path
+		// (resync, truncation, the human discarding history) would leak forever. Drop every entry
+		// whose id is no longer present in the live view.
+		const liveIds = new Set(view.blocks.map((b) => b.id));
+		for (const id of this.bear2Cache.keys()) if (!liveIds.has(id)) this.bear2Cache.delete(id);
+		for (const id of this.bear2Retries.keys()) if (!liveIds.has(id)) this.bear2Retries.delete(id);
 
 		// AGED REGION: every block older than the protected working tail, not human-held, not
 		// already inside a (non-conductor) group. Index-ordered oldest→newest.
@@ -346,18 +363,36 @@ export class Bear2HybridConductor implements Conductor {
 	}
 
 	/**
+	 * THE SINGLE BEAR-2 SHRINK GATE (FIX 3 — one consistent basis). Given a block's ORIGINAL
+	 * trimmed text and a candidate compressed string, returns the TOKEN saving
+	 * `tokenLen(originalTrimmed) − tokenLen(compressed)`. Positive ⇒ Bear-2 genuinely shrank the
+	 * block; ≤ 0 ⇒ no useful compression (and an empty result is treated as 0, never a saving).
+	 *
+	 * EVERY site that asks "did this block shrink, and by how much?" routes through here — the
+	 * cache-store decision in `launchBear2`, the `replace` gate in `emitState`, `bear2Saving`, and
+	 * `reportMetrics`. Previously the gate/emit used CHARACTER length on the trimmed text while
+	 * `bear2Saving` used TOKENS against the untrimmed `b.tokens`; that two-unit drift could credit a
+	 * block in the trigger math that `emitState` then refused to `replace` (or vice-versa). One
+	 * helper, one unit (trimmed-text tokens), so they can never diverge again.
+	 */
+	private bear2Delta(originalTrimmed: string, compressed: string): number {
+		if (compressed.length === 0) return 0;
+		return this.tokenLen(originalTrimmed) - this.tokenLen(compressed);
+	}
+
+	/**
 	 * The Bear-2 saving: Σ over CURRENT newer-half blocks that have a cached compressed value of
-	 * (block.tokens − compressedTokens). Only current newer-half membership counts — a block that
-	 * aged into the older half is summarized instead, so its Bear-2 saving must not be
-	 * double-counted against the summary saving.
+	 * `bear2Delta(originalTrimmed, compressed)` — the SAME shrink gate `emitState` uses to decide
+	 * whether to emit a `replace`, on the SAME unit (FIX 3). Only current newer-half membership
+	 * counts — a block that aged into the older half is summarized instead, so its Bear-2 saving
+	 * must not be double-counted against the summary saving.
 	 */
 	private bear2Saving(newerHalf: ViewBlock[]): number {
 		let saved = 0;
 		for (const b of newerHalf) {
 			const compressed = this.bear2Cache.get(b.id);
 			if (compressed === undefined) continue;
-			const compressedTokens = this.tokenLen(compressed);
-			const delta = b.tokens - compressedTokens;
+			const delta = this.bear2Delta((b.text ?? "").trim(), compressed);
 			if (delta > 0) saved += delta;
 		}
 		return saved;
@@ -418,16 +453,16 @@ export class Bear2HybridConductor implements Conductor {
 					}
 					this.bear2InFlight.delete(id);
 					// Bear-2 is deterministic ⇒ cache forever; the block is never compressed again.
-					// Guard against a degenerate empty/expanded result: only cache if it actually
-					// shrinks the text (else treat the original as the better representation and
-					// just leave it raw — no replace emitted for it).
+					// Guard against a degenerate empty/expanded result via the SINGLE shrink gate
+					// (FIX 3 — same predicate/unit as emitState and bear2Saving): only cache the
+					// compressed value if it genuinely shrinks the block (token delta > 0).
 					const out = compressed ?? "";
-					if (out.length > 0 && out.length < text.length) {
+					if (this.bear2Delta(text, out) > 0) {
 						this.bear2Cache.set(id, out);
 					} else {
 						// No useful compression (e.g. structured content Bear-2 no-ops on). Cache the
-						// ORIGINAL so we never re-call for this block; bear2Saving sees delta ≤ 0 and
-						// contributes nothing, and emitState skips the replace (content === original).
+						// ORIGINAL so we never re-call for this block; bear2Delta(text, text) === 0 so
+						// bear2Saving contributes nothing and emitState skips the replace (no shrink).
 						this.bear2Cache.set(id, text);
 					}
 					this.bear2Retries.delete(id);
@@ -637,7 +672,10 @@ export class Bear2HybridConductor implements Conductor {
 				const compressed = this.bear2Cache.get(b.id);
 				if (compressed === undefined) continue;
 				const original = (b.text ?? "").trim();
-				if (compressed.length >= original.length || compressed.length === 0) continue;
+				// SINGLE shrink gate (FIX 3): emit a replace only when Bear-2 genuinely shrank the
+				// block — same predicate/unit as the cache-store decision and bear2Saving, so a
+				// block credited in the trigger math is exactly a block we emit a replace for.
+				if (this.bear2Delta(original, compressed) <= 0) continue;
 				cmds.push({ kind: "replace", id: b.id, content: compressed });
 			}
 		}
@@ -713,7 +751,8 @@ export class Bear2HybridConductor implements Conductor {
 		for (const b of newerHalf) {
 			const compressed = this.bear2Cache.get(b.id);
 			if (compressed === undefined) continue;
-			const delta = b.tokens - this.tokenLen(compressed);
+			// SINGLE shrink gate (FIX 3): the displayed metric uses the same delta as bear2Saving.
+			const delta = this.bear2Delta((b.text ?? "").trim(), compressed);
 			if (delta <= 0) continue; // no-op compression (e.g. structured content) — not a "saved" block
 			bearBlocks += 1;
 			bearOriginal += b.tokens;

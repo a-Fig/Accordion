@@ -22,9 +22,10 @@
 
 import { describe, it, expect } from "vitest";
 import { Bear2HybridConductor } from "$conductors/bear2-hybrid/bear2-hybrid";
+import { IN_PROCESS_CONDUCTORS } from "$conductors";
 import { AccordionStore } from "./store.svelte";
 import type { Block, ParsedSession } from "./types";
-import type { CompletionRequest, CompletionResult } from "$conductors/contract";
+import type { CompletionRequest, CompletionResult, ConductorView } from "$conductors/contract";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -356,14 +357,45 @@ describe("Bear2HybridConductor — hard-failure freeze on persistent Bear-2 erro
 		// We need enough flush rounds for all the fire-and-forget promises to reject.
 		await flushMicrotasks(30);
 
-		// After hard failure: the conductor should NOT have folded any block (it returns
-		// null = hold-last, and before first success there was nothing to hold).
-		// The status text must contain the FAILED alarm.
-		// (The store surfaces conductor status via the host's setStatus; we can't read it
-		// directly from the store, but we can verify no folds were applied.)
+		// ── PROVE THE FREEZE (not just absence of folds — a do-nothing conductor would also
+		// fold nothing). Three independent assertions, each of which a do-nothing conductor
+		// would FAIL:
 
-		// No block in the aged region should be folded (failed before any success).
-		// The tail is also protected. All blocks should remain live.
+		// (1) The store's conductor-status text — set via host.setStatus — must carry the loud
+		//     FAILED alarm. A conductor that never freezes never sets this.
+		expect(s.conductorStatus.text).toContain("FAILED");
+
+		// (2) The sticky internal `failed` flag is set. (Whitebox, but it is the state machine's
+		//     single source of truth and a do-nothing conductor never trips it.)
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		expect((conductor as any).failed).toBe(true);
+
+		// (3) A subsequent conduct() now returns null (hold-last freeze), NOT [] or commands. We
+		//     call conduct() directly with a minimal live view; the host is still attached so the
+		//     FAILED early-return path runs. A do-nothing conductor would return [] here.
+		const frozenView: ConductorView = {
+			blocks: s.blocks.map((b, i) => ({
+				id: b.id,
+				kind: b.kind,
+				turn: b.turn,
+				order: i,
+				tokens: b.tokens,
+				foldedTokens: b.tokens,
+				held: false,
+				folded: false,
+				protected: false,
+				grouped: false,
+			})),
+			budget: 40_000,
+			liveTokens: 45_000,
+			contextWindow: null,
+			protectedFromIndex: s.blocks.length,
+			protectTokens: 20_000,
+		};
+		expect(conductor.conduct(frozenView)).toBeNull();
+
+		// ── And the original invariants still hold: the conductor froze BEFORE emitting any
+		// fold/group (it failed before any success, so there is nothing to hold).
 		for (const b of s.blocks) {
 			// Group-member blocks have their folded state managed by the group — the
 			// conductor failed before emitting any group, so none should be grouped either.
@@ -375,5 +407,16 @@ describe("Bear2HybridConductor — hard-failure freeze on persistent Bear-2 erro
 		// never reached the emission stage (hard failure freezes before emitState).
 		expect(s.lastReports.some((r) => r.reason === "invalid-group")).toBe(false);
 		expect(s.lastReports.some((r) => r.reason === "not-foldable")).toBe(false);
+	});
+});
+
+// ── Registry lock-drift guard (mirror of the sliding-window test) ─────────────
+
+describe("Bear2HybridConductor — lock declaration", () => {
+	it("registry entry locks deep-equal instance locks (drift guard)", () => {
+		const entry = IN_PROCESS_CONDUCTORS.find((c) => c.id === "bear2-hybrid");
+		expect(entry).toBeDefined();
+		const instance = new Bear2HybridConductor();
+		expect(entry!.locks).toEqual([...instance.locks]);
 	});
 });

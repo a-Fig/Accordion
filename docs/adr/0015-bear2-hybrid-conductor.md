@@ -1,6 +1,6 @@
 # ADR 0015 — Bear-2 hybrid conductor: a recency-graded compression gradient
 
-**Status:** proposed (build plan — not yet implemented)
+**Status:** accepted (implemented — PR #70)
 **Date:** 2026-06-20
 **Builds on:** [ADR 0007](0007-conductor-protocol.md) (the conductor seam), [ADR
 0008](0008-conductor-first-party-one-view.md) (one public `ConductorView`), [ADR
@@ -150,7 +150,7 @@ conductor whose entire identity is Bear-2).
 | State | Behavior |
 |---|---|
 | **No key set** (not configured) | Idle. Actionable prompt: `setStatus("Bear-2 needs an API key — set it in Settings")`. Not the FAILED alarm. |
-| **Transient network timeout** | Exactly **one** retry, so a single dropped packet doesn't nuke the session. |
+| **Transient network timeout** | Exactly **one** retry — but it fires on the very next pass (microtask), so it only guards an *instantaneous* blip. Any sustained failure (network/429/5xx lasting longer than a tick) exhausts the retry and trips the hard freeze below — by design. |
 | **Hard runtime error** (401/429/5xx, or retry exhausted) | **Freeze hard**: hold last state, emit nothing new (no `replace`, no `group`), raise a loud persistent `setStatus("⛔ Bear-2 FAILED — conductor halted")` with a failure count. |
 | **LLM summary `complete` failure** | Inherit naive compaction's handling (hold prior state, don't hammer). |
 
