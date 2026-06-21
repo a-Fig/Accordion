@@ -1026,8 +1026,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	pi.on("resources_discover", () => {
 		try {
 			const here = path.dirname(fileURLToPath(import.meta.url));
-			const skillDir = path.join(here, "skills", "accordion-context-folding");
-			if (fs.existsSync(skillDir)) return { skillPaths: [skillDir] };
+			const skillPaths: string[] = [];
+			for (const name of ["accordion-context-folding", "accordion-context-recall"]) {
+				const dir = path.join(here, "skills", name);
+				if (fs.existsSync(dir)) skillPaths.push(dir);
+			}
+			if (skillPaths.length) return { skillPaths };
 		} catch {
 			/* best-effort — never break a session over skill discovery */
 		}
