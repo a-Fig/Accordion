@@ -21,6 +21,10 @@
 		claudeSessions = [],
 		claudeSelected = null,
 		onselectclaude = () => {},
+		browserServed = false,
+		servedTitle = "",
+		servedModel = "",
+		onreconnect = () => {},
 	}: {
 		source?: "pi" | "claude";
 		onsource?: (s: "pi" | "claude") => void;
@@ -33,6 +37,12 @@
 		claudeSessions?: ClaudeCodeSession[];
 		claudeSelected?: string | null;
 		onselectclaude?: (s: ClaudeCodeSession) => void;
+		// Browser-served mode: single-session, no discovery. Trims the rail to the one
+		// connected session + Demo + Settings; hides the source toggle and session list.
+		browserServed?: boolean;
+		servedTitle?: string;
+		servedModel?: string;
+		onreconnect?: () => void;
 	} = $props();
 
 	const STORE_KEY = "accordion.sidebar.collapsed";
@@ -84,7 +94,7 @@
 		return baseName(s.cwd) || s.title || "session";
 	}
 
-	const activeCount = $derived(source === "pi" ? sessions.length : claudeSessions.length);
+	const activeCount = $derived(browserServed ? 1 : source === "pi" ? sessions.length : claudeSessions.length);
 </script>
 
 <aside class="rail" class:collapsed>
@@ -99,6 +109,39 @@
 			<Logo size={20} />
 		</button>
 
+		{#if browserServed}
+			<!-- Browser-served: one connected session, no source toggle -->
+			<div class="icon-list">
+				<button
+					class="rail-btn dot-btn"
+					class:sel={connected}
+					title={servedTitle || "pi session"}
+					aria-label={servedTitle || "pi session"}
+					onclick={onreconnect}
+				>
+					<span class="status-dot" class:on={connected} class:steering={connected && folding.enabled}></span>
+				</button>
+			</div>
+			<div class="rail-foot">
+				<button
+					class="rail-btn dot-btn demo-icon"
+					class:sel={demoSelected}
+					title="Demo session (bundled sample)"
+					aria-label="Demo session"
+					onclick={ondemo}
+				>
+					<span class="status-dot demo-dot"></span>
+				</button>
+				<button
+					class="rail-btn settings-icon"
+					title="Settings"
+					aria-label="Settings"
+					onclick={() => (settingsOpen = true)}
+				>
+					<Icon name="sliders-horizontal" size={16} />
+				</button>
+			</div>
+		{:else}
 		<!-- Tiny source toggle pill -->
 		<button
 			class="src-pill"
@@ -171,6 +214,7 @@
 				</button>
 			</div>
 		{/if}
+		{/if}
 	{:else}
 		<!-- Expanded sidebar -->
 		<div class="head">
@@ -191,6 +235,43 @@
 			</button>
 		</div>
 
+		{#if browserServed}
+			<!-- Browser-served: the one connected session (click to reconnect, e.g. back from Demo) -->
+			<div class="list-header">
+				<span class="eyebrow">Session</span>
+			</div>
+			<div class="scroll">
+				<ul class="list">
+					<li>
+						<button class="row" class:sel={connected} onclick={onreconnect} title={servedTitle || "pi session"}>
+							<span class="status-dot" class:on={connected} class:steering={connected && folding.enabled}></span>
+							<span class="body">
+								<span class="t1">{servedTitle || "pi session"}</span>
+								<span class="t2 mono">{shortModel(servedModel)}</span>
+							</span>
+							{#if !connected}<span class="badge mono">reconnect</span>{/if}
+						</button>
+					</li>
+				</ul>
+			</div>
+
+			<!-- Bundled demo, pinned at the foot -->
+			<div class="demo-foot">
+				<div class="list-header list-header-demo">
+					<span class="eyebrow">Demo</span>
+				</div>
+				<div class="demo-inner">
+					<button class="row demo" class:sel={demoSelected} onclick={ondemo} title="Bundled sample session — a static demo transcript">
+						<span class="status-dot demo-dot"></span>
+						<span class="body">
+							<span class="t1">Demo session</span>
+							<span class="t2 mono">bundled · static</span>
+						</span>
+						<span class="badge mono">demo</span>
+					</button>
+				</div>
+			</div>
+		{:else}
 		<!-- Source eyebrow + switcher -->
 		<div class="source-section">
 			<span class="eyebrow">Source</span>
@@ -307,6 +388,7 @@
 			<div class="cc-foot mono">
 				50 newest · use Open… for older
 			</div>
+		{/if}
 		{/if}
 
 		<!-- Settings entry: pinned at the very bottom of the expanded sidebar, always visible -->

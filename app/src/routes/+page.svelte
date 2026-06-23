@@ -135,6 +135,15 @@
 		loadSample();
 	}
 
+	// Browser-served mode is single-session: the extension that served this page hosts the
+	// live WS on the SAME origin port. This is the "way back" to the live session — e.g.
+	// after viewing the Demo — since the browser has no multi-session discovery to pick from.
+	function reconnectServed(): void {
+		discovery.selected = null;
+		claudeDiscovery.selected = null;
+		connectLive(Number(window.location.port) || DEFAULT_PORT);
+	}
+
 	// A Claude Code transcript: load it read-only and tail it for appends. There is
 	// no live socket to steer — folds here are a personal lens (see MapHeader badge).
 	function selectClaudeSession(s: ClaudeCodeSession): void {
@@ -204,8 +213,8 @@
 
 <svelte:head><title>Accordion</title></svelte:head>
 
-<div class="shell" class:railed={isTauriEnv}>
-	{#if isTauriEnv}
+<div class="shell" class:railed={isTauriEnv || browserServed}>
+	{#if isTauriEnv || browserServed}
 		<SessionsSidebar
 			{source}
 			onsource={(s) => (source = s)}
@@ -218,6 +227,10 @@
 			claudeSessions={claudeDiscovery.sessions}
 			claudeSelected={claudeDiscovery.selected}
 			onselectclaude={selectClaudeSession}
+			{browserServed}
+			servedTitle={session.store?.meta.title ?? "pi session"}
+			servedModel={session.store?.meta.model ?? ""}
+			onreconnect={reconnectServed}
 		/>
 	{/if}
 
