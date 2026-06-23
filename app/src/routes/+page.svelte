@@ -24,6 +24,8 @@
 	let selectedId = $state<string | null>(null);
 	let manualPort = $state(DEFAULT_PORT);
 	let activityOpen = $state(false);
+	let browserServed = $state(false);
+	let servedSessionId = $state<string | null>(null);
 
 	// Which session source the sidebar lists: live pi vs read-only Claude Code.
 	const SRC_KEY = "accordion.sidebar.source";
@@ -150,6 +152,30 @@
 	onMount(() => {
 		startDiscovery(onFocusRequest);
 		startConductorDiscovery();
+
+		// Browser-served auto-connect: if this page was served by the pi extension on a
+		// loopback port, /__accordion/meta returns { served: true, sessionId, protocolVersion }.
+		// In any other context (Vite dev server, static host) the endpoint is absent — 404 or
+		// non-JSON — so we silently fall through and leave the manual UI visible.
+		if (!isTauriEnv && typeof window !== "undefined") {
+			(async () => {
+				try {
+					const res = await fetch("/__accordion/meta", { credentials: "same-origin" });
+					if (!res.ok) return;
+					const ct = res.headers.get("content-type") ?? "";
+					if (!ct.includes("application/json")) return;
+					const body = await res.json() as { served?: boolean; sessionId?: string; protocolVersion?: number };
+					if (body.served !== true) return;
+					browserServed = true;
+					servedSessionId = body.sessionId ?? null;
+					const port = Number(window.location.port) || DEFAULT_PORT;
+					connectLive(port);
+				} catch {
+					// 404, network error, non-JSON — leave browserServed false; manual UI stays.
+				}
+			})();
+		}
+
 		return () => {
 			stopDiscovery();
 			stopClaudeDiscovery();
@@ -322,24 +348,36 @@
 						</div>
 						<p class="hint">Or open the <strong>Demo session</strong> at the bottom of the sidebar.</p>
 					{:else}
-						<p class="hint">
-							Live session discovery is a desktop feature — run <code>npm run tauri dev</code>. In the browser you can dial a known port or load the sample.
-						</p>
-						<div class="port-row">
-							<input class="port" type="number" min="1" max="65535" bind:value={manualPort} aria-label="pi port" />
-							<button
-								class="btn-primary"
-								onclick={() => connectLive(manualPort)}
-								disabled={live.status === "connecting"}
-							>
-								<Icon name="activity" size={14} />
-								{live.status === "connecting" ? "Connecting…" : "Connect to port"}
+						{#if browserServed}
+							<p class="hint">
+								{#if live.status === "connected"}
+									Connected to your pi session.
+								{:else if live.status === "connecting"}
+									Connecting to your pi session…
+								{:else}
+									Waiting for your pi session…
+								{/if}
+							</p>
+						{:else}
+							<p class="hint">
+								Live session discovery is a desktop feature — run <code>npm run tauri dev</code>. In the browser you can dial a known port or load the sample.
+							</p>
+							<div class="port-row">
+								<input class="port" type="number" min="1" max="65535" bind:value={manualPort} aria-label="pi port" />
+								<button
+									class="btn-primary"
+									onclick={() => connectLive(manualPort)}
+									disabled={live.status === "connecting"}
+								>
+									<Icon name="activity" size={14} />
+									{live.status === "connecting" ? "Connecting…" : "Connect to port"}
+								</button>
+							</div>
+							<button class="btn-secondary" onclick={loadSample}>
+								<Icon name="file-text" size={13} />
+								Load sample (982 blocks)
 							</button>
-						</div>
-						<button class="btn-secondary" onclick={loadSample}>
-							<Icon name="file-text" size={13} />
-							Load sample (982 blocks)
-						</button>
+						{/if}
 					{/if}
 					{#if live.status === "error"}<p class="err">{live.detail}</p>{/if}
 					{#if session.error}<p class="err">{session.error}</p>{/if}

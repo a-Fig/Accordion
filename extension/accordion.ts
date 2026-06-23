@@ -33,6 +33,8 @@ import { WebSocketServer, type WebSocket } from "ws";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
+import * as http from "node:http";
+import * as crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { Type } from "typebox";
@@ -205,6 +207,15 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	});
 
 	let wss: WebSocketServer | null = null;
+	// The HTTP server that BOTH hosts the WebSocket upgrade AND serves the browser
+	// build of the Accordion app on the same ephemeral port (feat/browser-served-extension).
+	// One server per pi session; closed alongside `wss` at shutdown.
+	let httpServer: http.Server | null = null;
+	// Per-session token gating the HTTP static-file serving ONLY. Generated once when
+	// the server starts. The WS upgrade path stays UNAUTHENTICATED (see startServer's
+	// banner): the desktop Tauri app dials ws://127.0.0.1:<port> with no token and must
+	// keep working unchanged, so the token never guards the WebSocket — only file serving.
+	let webToken = "";
 	let client: WebSocket | null = null; // the GUI (one driver at a time in M1)
 	let sessionId = "";
 	let meta = { title: "pi session", cwd: "", model: "", contextWindow: null as number | null, format: "pi" as const };
@@ -414,12 +425,175 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 	}
 
-	function startServer(): void {
-		if (wss) return;
+	// ── static file serving for the browser build ──────────────────────────────
+	// extension→MIME map. Unknown extensions fall back to application/octet-stream.
+	const MIME: Record<string, string> = {
+		".html": "text/html; charset=utf-8",
+		".js": "text/javascript",
+		".mjs": "text/javascript",
+		".css": "text/css",
+		".json": "application/json",
+		".png": "image/png",
+		".svg": "image/svg+xml",
+		".ico": "image/x-icon",
+		".woff2": "font/woff2",
+		".woff": "font/woff",
+		".txt": "text/plain",
+		".map": "application/json",
+	};
+
+	/**
+	 * Resolve the directory holding the browser build, or null if none exists.
+	 * Two layouts:
+	 *   • dist/client          — the PUBLISHED layout (build-client.mjs copies app/build here)
+	 *   • ../app/build         — the repo DEV layout (SvelteKit's adapter-static output)
+	 * First existing wins; checked on every request (cheap) so a build appearing later works.
+	 */
+	function resolveClientRoot(): string | null {
 		try {
+			const here = path.dirname(fileURLToPath(import.meta.url));
+			const candidates = [path.join(here, "dist", "client"), path.resolve(here, "..", "app", "build")];
+			for (const dir of candidates) {
+				try {
+					if (fs.statSync(dir).isDirectory()) return dir;
+				} catch {
+					/* try next */
+				}
+			}
+		} catch {
+			/* fall through to null */
+		}
+		return null;
+	}
+
+	/** Is this request authenticated for static-file serving? (token query OR cookie.) */
+	function isWebAuthed(req: http.IncomingMessage, u: URL): boolean {
+		if (!webToken) return false;
+		if (u.searchParams.get("token") === webToken) return true;
+		const cookie = req.headers["cookie"];
+		if (typeof cookie === "string" && cookie.split(";").some((c) => c.trim() === `accordion_token=${webToken}`)) return true;
+		return false;
+	}
+
+	/**
+	 * HTTP request handler — serves the browser build of the Accordion app, gated by a
+	 * per-session token. Runs ENTIRELY off the pi `context`/model-call hook path: it does
+	 * no folding, touches no plan, and a failure to serve a file never crashes a session
+	 * (every path is wrapped). The token gates ONLY file serving; `/__accordion/meta` is
+	 * deliberately reachable WITHOUT a token (it leaks only sessionId + protocol version,
+	 * which are unreadable cross-origin since we send NO CORS headers).
+	 */
+	function handleHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
+		try {
+			const u = new URL(req.url || "/", "http://127.0.0.1");
+
+			// Meta endpoint — UNGATED so the browser (and the smoke test) can probe the
+			// server without the token. Harmless: same-origin policy hides the body from
+			// any other origin because we set no CORS headers.
+			if (u.pathname === "/__accordion/meta") {
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION }));
+				return;
+			}
+
+			// Everything below is the static file surface — token-gated.
+			if (!isWebAuthed(req, u)) {
+				res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
+				res.end("Forbidden — open Accordion via the /accordion command's Browser link (it carries the session token).");
+				return;
+			}
+			// A valid ?token mints a cookie so subsequent same-origin requests (the SvelteKit
+			// asset fetches, which don't carry the query string) stay authenticated.
+			const headers: Record<string, string> = {};
+			if (u.searchParams.get("token") === webToken) {
+				headers["Set-Cookie"] = `accordion_token=${webToken}; HttpOnly; SameSite=Strict; Path=/`;
+			}
+
+			const root = resolveClientRoot();
+			if (!root) {
+				res.writeHead(404, { ...headers, "Content-Type": "text/plain; charset=utf-8" });
+				res.end("No browser build found. Run `npm run build` in app/, or `npm run build:client` in extension/.");
+				return;
+			}
+
+			// Map the URL path to a file under root. "/" → index.html.
+			let rel = decodeURIComponent(u.pathname);
+			if (rel === "/") rel = "/index.html";
+			let filePath = path.join(root, rel);
+
+			// Path-traversal guard: the resolved absolute path MUST stay under root.
+			const rootResolved = path.resolve(root);
+			if (path.resolve(filePath) !== rootResolved && !path.resolve(filePath).startsWith(rootResolved + path.sep)) {
+				res.writeHead(403, { ...headers, "Content-Type": "text/plain; charset=utf-8" });
+				res.end("Forbidden");
+				return;
+			}
+
+			// SPA fallback: adapter-static emits `fallback: index.html`. If the requested
+			// path doesn't exist AND has no file extension (i.e. it's a client route, not a
+			// missing asset), serve index.html so deep links / refreshes work. A missing
+			// path WITH an extension is a genuine 404.
+			let exists = false;
+			try {
+				exists = fs.statSync(filePath).isFile();
+			} catch {
+				exists = false;
+			}
+			if (!exists) {
+				if (path.extname(rel) === "") {
+					filePath = path.join(root, "index.html");
+				} else {
+					res.writeHead(404, { ...headers, "Content-Type": "text/plain; charset=utf-8" });
+					res.end("Not found");
+					return;
+				}
+			}
+
+			let body: Buffer;
+			try {
+				body = fs.readFileSync(filePath);
+			} catch {
+				res.writeHead(404, { ...headers, "Content-Type": "text/plain; charset=utf-8" });
+				res.end("Not found");
+				return;
+			}
+			const mime = MIME[path.extname(filePath).toLowerCase()] || "application/octet-stream";
+			res.writeHead(200, { ...headers, "Content-Type": mime });
+			res.end(body);
+		} catch {
+			// Best-effort: never let a serving error escape and crash the session.
+			try {
+				res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
+				res.end("Internal error");
+			} catch {
+				/* response already gone */
+			}
+		}
+	}
+
+	function startServer(): void {
+		if (wss || httpServer) return;
+		// Per-session token for the HTTP static surface. The WS upgrade is NEVER gated by
+		// it (see the file banner + handleHttp): the desktop app dials the WS tokenless and
+		// must keep working, so authentication lives only on file serving, not the socket.
+		webToken = crypto.randomBytes(16).toString("hex");
+		try {
+			// One HTTP server hosts BOTH halves on the SAME ephemeral port:
+			//   • HTTP GETs → handleHttp (the browser build, token-gated)
+			//   • WS upgrades → the WebSocketServer below (UNAUTHENTICATED, unchanged)
 			// port 0 ⇒ OS assigns a free ephemeral port (one server per pi session).
-			wss = new WebSocketServer({ host: "127.0.0.1", port: 0 }, () => {
-				const addr = wss?.address();
+			httpServer = http.createServer(handleHttp);
+			// Attach the WS server to the HTTP server (NOT { port: 0 }) so the upgrade
+			// shares the port. `wss.on("connection")` below is byte-for-byte unchanged.
+			wss = new WebSocketServer({ server: httpServer });
+			httpServer.on("error", () => {
+				// e.g. unexpected bind failure — run headless (passthrough).
+				try { httpServer?.close(); } catch { /* ignore */ }
+				httpServer = null;
+				wss = null;
+			});
+			httpServer.listen(0, "127.0.0.1", () => {
+				const addr = httpServer?.address();
 				if (addr && typeof addr === "object") {
 					port = addr.port;
 					writeEntry(); // advertise immediately, now that the port is known
@@ -430,6 +604,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				}
 			});
 		} catch {
+			try { httpServer?.close(); } catch { /* ignore */ }
+			httpServer = null;
 			wss = null;
 			return;
 		}
@@ -578,7 +754,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			ws.on("error", drop);
 		});
 		wss.on("error", () => {
-			/* e.g. unexpected bind failure — run headless (passthrough) */
+			/* e.g. unexpected WS error — run headless (passthrough). Tear down the shared
+			   HTTP server too so we don't leave an orphaned listener serving files. */
+			try { httpServer?.close(); } catch { /* ignore */ }
+			httpServer = null;
 			wss = null;
 		});
 	}
@@ -894,6 +1073,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		} catch {
 			/* ignore */
 		}
+		// Close the shared HTTP server too — it owns the ephemeral port the WS rode on,
+		// so leaving it open would keep serving files (and hold the port) after shutdown.
+		try {
+			httpServer?.close();
+		} catch {
+			/* ignore */
+		}
+		httpServer = null;
 		wss = null;
 		client = null;
 		latestCtx = null;
@@ -915,6 +1102,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				action.text,
 				`Live link: ${wasAttached ? "attached" : "detached"} · port ${port || "starting"} · streamed ${sentCount} blocks`,
 			];
+			// Browser entry point: the extension also serves the web build of Accordion on
+			// the same ephemeral port, gated by a per-session token. Surface the tokenized
+			// URL so the user can open the UI in a browser instead of the desktop app.
+			if (port && webToken) lines.push(`Browser: http://127.0.0.1:${port}/?token=${webToken}`);
+			else lines.push("Browser: starting…");
 			ctx.ui.notify(lines.join("\n"), action.type);
 		},
 	});
