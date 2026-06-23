@@ -2,7 +2,7 @@
 
 # 🪗 Accordion
 
-### Your agent's memory shouldn't have to forget to keep going.
+### Intelligent context management build for developers. 
 
 **See everything your AI agent is holding in context — and fold, unfold, and pin any part of it, by hand or automatically.**
 
