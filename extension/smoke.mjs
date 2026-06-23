@@ -12,8 +12,10 @@
 import { createJiti } from "jiti";
 import { WebSocket } from "ws";
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Point the registry at a throwaway dir BEFORE loading the extension (it reads
 // ACCORDION_HOME at module load) so we never touch the real ~/.accordion.
@@ -106,6 +108,65 @@ if (accordionCmd) {
 		fails.push("/accordion did not warn for an invalid explicit ACCORDION_APP_PATH");
 } else {
 	fails.push("accordion command was not registered");
+}
+
+// ── browser-served extension: HTTP static surface on the SAME ephemeral port ──
+// The extension now ALSO serves the SvelteKit browser build over HTTP on `PORT`,
+// gated by a per-session token. We harvest the token from the /accordion notify
+// line (`Browser: http://127.0.0.1:<port>/?token=<token>`) — the token lives in a
+// closure, so the command's own output is the intended, side-effect-free way to get
+// it. Assertions:
+//   • /__accordion/meta is reachable WITHOUT a token (ungated) → 200 JSON served:true
+//   • a static file request WITHOUT a token → 403 (the gate works)
+//   • GET /?token=<token> → 200 (index.html), IF app/build/index.html exists; else skip
+//     the index assertion with a printed note (meta + 403 still prove the surface + gate)
+{
+	const browserLine = notifications.map((n) => n.message).reverse().find((m) => m.includes("Browser: http"));
+	const tokenMatch = browserLine && browserLine.match(/token=([0-9a-f]+)/);
+	const TOKEN = tokenMatch ? tokenMatch[1] : null;
+	if (!TOKEN) fails.push("/accordion did not surface a Browser URL carrying a token");
+
+	const httpGet = (urlPath, headers = {}) =>
+		new Promise((resolve, reject) => {
+			const r = http.get({ host: "127.0.0.1", port: PORT, path: urlPath, headers }, (res) => {
+				let buf = "";
+				res.on("data", (d) => (buf += d));
+				res.on("end", () => resolve({ status: res.statusCode, body: buf, headers: res.headers }));
+			});
+			r.on("error", reject);
+		});
+
+	// meta — UNGATED, must answer 200 JSON with served:true even with no token.
+	const meta = await httpGet("/__accordion/meta");
+	if (meta.status !== 200) fails.push(`/__accordion/meta (no token) returned ${meta.status}, expected 200`);
+	else {
+		let parsed = null;
+		try { parsed = JSON.parse(meta.body); } catch { /* fall through */ }
+		if (!parsed || parsed.served !== true) fails.push("/__accordion/meta did not return JSON with served:true");
+		if (parsed && parsed.sessionId !== entry.sessionId) fails.push("/__accordion/meta sessionId mismatch");
+	}
+
+	// static file request WITHOUT a token → 403 (the gate works).
+	const noToken = await httpGet("/");
+	if (noToken.status !== 403) fails.push(`GET / without a token returned ${noToken.status}, expected 403`);
+
+	// GET /?token=<token> → 200 index.html (only if the build exists).
+	if (TOKEN) {
+		const buildIndex = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "app", "build", "index.html");
+		const indexExists = fs.existsSync(buildIndex);
+		if (indexExists) {
+			const ok = await httpGet(`/?token=${TOKEN}`);
+			if (ok.status !== 200) fails.push(`GET /?token=<valid> returned ${ok.status}, expected 200`);
+			const setCookie = ok.headers["set-cookie"];
+			if (!setCookie || !String(setCookie).includes(`accordion_token=${TOKEN}`))
+				fails.push("GET /?token=<valid> did not mint the accordion_token cookie");
+			// Cookie-only auth (no query token) must ALSO pass the gate.
+			const viaCookie = await httpGet("/", { Cookie: `accordion_token=${TOKEN}` });
+			if (viaCookie.status !== 200) fails.push(`GET / with cookie auth returned ${viaCookie.status}, expected 200`);
+		} else {
+			console.log("NOTE: app/build/index.html absent — skipping the index 200 assertion (meta + 403 still verified). Run `npm run build` in app/ to cover it.");
+		}
+	}
 }
 
 // 4 messages with real timestamps and responseIds so the WS round-trip exercises

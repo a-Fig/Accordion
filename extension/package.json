@@ -1,9 +1,12 @@
 {
-  "name": "accordion-pi-extension",
+  "name": "@a-fig/accordion",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "description": "Accordion live link — a pi extension that streams context to the Accordion GUI and applies the fold plan the GUI returns.",
+  "scripts": {
+    "build:client": "node ./build-client.mjs"
+  },
   "dependencies": {
     "typebox": "^1.1.24",
     "ws": "^8.18.0"
