@@ -148,7 +148,7 @@ groups, no replay. That's the build ahead.
 - [ ] Agent-driven pin
 - [ ] Replay — scrub how context evolved across a session
 - [ ] Better conductors — research, develop, and test stronger context strategies
-- [ ] Beyond pi — bring Accordion's steering to more agents
+- [ ] Expand accordion beyond pi
 
 ## Contributing
 
