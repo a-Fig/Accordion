@@ -137,22 +137,67 @@ groups, no replay. That's the build ahead.
 
 ## Quick start
 
-Accordion runs in your browser or on your desktop as a tauri app. Some conductors are only available in the app as they require additional resources to run.
+### Part 1 — Browser (no install required)
+
+The fastest path. The pi extension HTTP-serves Accordion in your browser — no Rust, no
+desktop app needed. Single session only.
+
+**1. Clone and install the extension:**
 
 ```bash
-cd app && npm install && npm run tauri dev
+git clone https://github.com/a-Fig/accordion.git
+cd accordion/extension && npm install
 ```
 
-Register the extension in `~/.pi/agent/settings.json`:
+**2. Register it with pi** — add to `~/.pi/agent/settings.json`:
 
 ```json
-{ "extensions": ["<path-to-this-repo>/extension/accordion.ts"] }
+{ "extensions": ["<absolute-path-to-repo>/extension/accordion.ts"] }
 ```
 
-Now run `pi` in any project. It shows up in Accordion's **Sessions** sidebar within a
-second — click it (or run `/accordion` in that terminal) and watch its context populate
-live. Folding is **off by default**; flip the header toggle to arm it and start steering
-what the agent is shown.
+**3. Run pi in any project, then open Accordion in your browser:**
+
+```bash
+/accordion   # prints the local URL and opens it
+```
+
+That's it. The page auto-connects to the running session. Folding is **off by default**;
+flip the **Folding** toggle in the header to start steering what the agent sees.
+
+---
+
+### Part 2 — Desktop app (full feature set)
+
+The desktop app adds **multi-session discovery** (switch between running pi sessions from
+a sidebar), conductors that require local model resources, and the `/accordion` command
+that foregrounds the right session automatically. It requires Node 20+ and Rust.
+
+**Prerequisites:** install [Node 20 LTS](https://nodejs.org) and
+[Rust via rustup](https://rustup.rs), then follow the one-time platform setup at
+**https://v2.tauri.app/start/prerequisites/** (WebView2 + MSVC on Windows, Xcode CLT on
+macOS).
+
+**1. Clone and install:**
+
+```bash
+git clone https://github.com/a-Fig/accordion.git
+cd accordion/app && npm install
+```
+
+**2. Register the extension with pi** — same as above, in `~/.pi/agent/settings.json`:
+
+```json
+{ "extensions": ["<absolute-path-to-repo>/extension/accordion.ts"] }
+```
+
+**3. Launch the desktop app:**
+
+```bash
+npm run tauri dev   # opens the native window; hot-reloads on save
+```
+
+**4. Run pi in any project.** It appears in Accordion's **Sessions** sidebar within ~1s.
+Click it (or run `/accordion` in that terminal) and its context populates live.
 
 ## Contributing
 
