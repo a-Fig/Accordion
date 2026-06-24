@@ -1,6 +1,11 @@
 <div align="center">
 
-# 🪗 Accordion
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-lockup-white.png">
+  <img alt="Accordion" src="docs/assets/logo-lockup-black.png" width="440">
+</picture>
+
+### The full vision
 
 **See everything your AI agent is holding in context — and fold, unfold, and pin any part of it, by hand or automatically.**
 
@@ -18,6 +23,11 @@ An agent's context window is a fixed size. During a long task it fills up, and s
 
 Accordion shows the agent's whole context as a list of **sections** — one per turn of the conversation — and treats that context as something you can resize, not a buffer that has to be flushed. Any section can shrink to a short summary and expand back to full detail, instantly, as many times as you like. Nothing is ever thrown away: folding changes only what the agent is *shown*, never what is *stored*.
 
+<div align="center">
+<img src="docs/assets/map-hero.png" alt="The context Map — a live session as a grid of colored blocks, sized by token weight" width="820">
+<br><sub>The whole context window at a glance: one square per section, sized by token weight, colored by kind — live above, protected working tail below.</sub>
+</div>
+
 ## The states a section can be in
 
 - **Full** — the agent sees it in complete detail.
@@ -25,6 +35,11 @@ Accordion shows the agent's whole context as a list of **sections** — one per 
 - **Pinned** — a lock added to a Full section so it can never be folded automatically.
 
 Full and Folded are the two real states. Pinned is a protection you put on top of Full.
+
+<div align="center">
+<img src="docs/assets/fold-region.png" alt="A region of folded sections — dimmed and hatched, still on the wire as compact digests" width="820">
+<br><sub>Folded sections recede — dimmed and hatched — but stay on the wire as a <code>{#code FOLDED}</code> digest, instantly reversible.</sub>
+</div>
 
 ## The actions
 
@@ -53,6 +68,11 @@ Three parties operate the same accordion. Not all of them can do everything — 
 - **The Conductor** is Accordion's automatic mode. Between every turn it reads what the agent is doing, folds the sections that have gone cold, and unfolds the ones becoming relevant again — keeping the most useful context in view and within budget on its own. A Conductor comes in one of two postures. A **collaborative** Conductor — the default — steers alongside you exactly as the matrix shows: it never pins, because a pin exists precisely to overrule it, and you can always reach in. An **exclusive** Conductor, with your approval, locks specific controls and takes uncontested command of them — including, if it claims your hand-steering, your pins; you approved that when you attached it, and detaching is how you overrule it then.
 
 The matrix above shows the **collaborative default**. Exclusivity — when and how a Conductor takes some of these controls off the table — is covered next.
+
+<div align="center">
+<img src="docs/assets/attention-conductor.png" alt="A Conductor's attention view — each section tinted by how much the working tail still attends back to it" width="600">
+<br><sub>One Conductor's lens: each section tinted by how much the working tail still attends back to it. Cold sections fold first; warm ones stay full.</sub>
+</div>
 
 ## Collaborative and exclusive conductors
 
