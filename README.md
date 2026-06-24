@@ -6,6 +6,7 @@
 </picture>
 
 ### /compact a naive solution — Developers hate it.
+### Accordion is different
 
 **See everything your AI agent holds in context — and fold it like an accordion instead.**
 
