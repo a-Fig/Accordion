@@ -10,13 +10,6 @@
 
 **See everything your AI agent holds in context — and fold it like an accordion instead.**
 
-
-<img src="docs/assets/accordion-hero.gif" alt="Accordion — the context map demo: blocks folding and unfolding while the protected tail stays intact" width="820">
-
-<a href="docs/assets/accordion-demo.mp4"><img src="docs/assets/map-hero.png" alt="Accordion's context Map — a live pi session rendered as a grid of colored blocks" width="860"></a>
-
-<sub>Your whole context window, one square per block — live above, protected working tail below. &nbsp;·&nbsp; ▶ <a href="docs/assets/accordion-demo.mp4">Watch the demo</a></sub>
-
 </div>
 
 ---
@@ -28,6 +21,12 @@ lets you **fold**, **unfold**, and **pin** any part of it, by hand or automatica
 Nothing is ever deleted. Folding only changes what the agent is *shown*, never what's
 *stored* — so every fold is instantly reversible, with no database or search index
 behind it.
+
+<img src="docs/assets/accordion-hero.gif" alt="Accordion — the context map demo: blocks folding and unfolding while the protected tail stays intact" width="820">
+
+<a href="docs/assets/accordion-demo.mp4"><img src="docs/assets/map-hero.png" alt="Accordion's context Map — a live pi session rendered as a grid of colored blocks" width="860"></a>
+
+<sub>Your whole context window, one square per block — live above, protected working tail below. &nbsp;·&nbsp; ▶ <a href="docs/assets/accordion-demo.mp4">Watch the demo</a></sub>
 
 > 📖 **[VISION.md](VISION.md)** is the full product north star. This page is the short version.
 
