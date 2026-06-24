@@ -3,16 +3,15 @@
 ### /compact is the naive solution, Accordion is the intelligent one.
 
 **See everything your AI agent holds in context — and fold it like an accordion instead.**
-<div align="center">
-
-<img src="docs/assets/accordion-hero.gif" alt="Accordion — the context map demo: blocks folding and unfolding while the protected tail stays intact" width="820">
-
-ummmm wtf
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-lockup-white.png">
   <img alt="Accordion" src="docs/assets/logo-lockup-black.png" width="440">
 </picture>
+
+<div align="center">
+
+<img src="docs/assets/accordion-hero.gif" alt="Accordion — the context map demo: blocks folding and unfolding while the protected tail stays intact" width="820">
 
 <a href="docs/assets/accordion-demo.mp4"><img src="docs/assets/map-hero.png" alt="Accordion's context Map — a live pi session rendered as a grid of colored blocks" width="860"></a>
 
