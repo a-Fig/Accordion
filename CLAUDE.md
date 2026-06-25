@@ -141,9 +141,18 @@ cd app/src-tauri && cargo check    # Rust layer — run from PowerShell (see bel
 - **preview/screenshot MCP is flaky** — prefer `preview_eval` / `preview_inspect` for UI verification
 - Always `npx svelte-check --tsconfig ./tsconfig.json` before declaring done
 
+## Branching & PR workflow
+
+**`devmain` is the active development branch.** It is the default base for all new work and the default PR target.
+
+- **Branch from `devmain`** — start every feature, fix, or chore branch off the latest `origin/devmain`, not `main`.
+- **PRs target `devmain`** — open pull requests against `devmain`, not `main`.
+- **`devmain` is merged into `main` periodically** — `main` is a release/stable trunk; do not branch from or PR into it directly. Dev work accumulates on `devmain` and is promoted to `main` in batches.
+- **Keep `devmain` green** — branches should be short-lived and rebased onto the latest `devmain` before merge.
+
 ## Post-merge routine
 
-After a PR lands on `main`: close any open Accordion window (the running binary locks the file), pull `main` on the registered checkout (`~/.pi/agent/settings.json → extensions`), run `npm install` inside `app/` if deps changed, rebuild with `npm run tauri build -- --no-bundle` (cargo must be on PATH). The next `/accordion` call picks up the new binary. If the extension changed, restart pi.
+After a PR lands on `devmain` (and when `devmain` is periodically promoted to `main`): close any open Accordion window (the running binary locks the file), pull `main` on the registered checkout (`~/.pi/agent/settings.json → extensions`), run `npm install` inside `app/` if deps changed, rebuild with `npm run tauri build -- --no-bundle` (cargo must be on PATH). The next `/accordion` call picks up the new binary. If the extension changed, restart pi.
 
 ## Data & security
 
