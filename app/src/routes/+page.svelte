@@ -353,13 +353,10 @@
 
 					<!-- Primary + secondary actions -->
 					{#if isTauriEnv}
-						<div class="action-group">
-							<button class="btn-primary" onclick={openFile}>
-								<Icon name="folder" size={14} />
-								Open session file…
-							</button>
-						</div>
-						<p class="hint">Or open the <strong>Demo session</strong> at the bottom of the sidebar.</p>
+						<ol class="start-steps">
+							<li><span class="step-num">1</span> Open <strong>pi</strong> in your terminal</li>
+							<li><span class="step-num">2</span> Run <code>/accordion</code> to start the extension</li>
+						</ol>
 					{:else}
 						{#if browserServed}
 							<p class="hint">
@@ -726,14 +723,6 @@
 		line-height: 1.55;
 	}
 
-	/* Action group */
-	.action-group {
-		display: flex;
-		gap: var(--sp-2);
-		align-items: center;
-		margin-top: var(--sp-1);
-	}
-
 	/* Primary CTA — Paper solid: white surface, Ink text (brand's one bright affordance) */
 	.btn-primary {
 		display: inline-flex;
@@ -807,10 +796,6 @@
 		max-width: 400px;
 		line-height: 1.6;
 	}
-	.hint strong {
-		color: var(--muted);
-		font-weight: 600;
-	}
 	.hint code {
 		font-family: var(--mono);
 		font-size: var(--fs-xs);
@@ -819,6 +804,45 @@
 		padding: 1px 5px;
 		border-radius: var(--radius-xs);
 		border: 1px solid var(--line);
+	}
+	.start-steps {
+		list-style: none;
+		padding: 0;
+		margin: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		font-size: var(--fs-xs);
+		color: var(--faint);
+	}
+	.start-steps li {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.start-steps strong {
+		color: var(--muted);
+		font-weight: 600;
+	}
+	.start-steps code {
+		font-family: var(--mono);
+		font-size: var(--fs-xs);
+		background: var(--panel-2);
+		color: var(--muted);
+		padding: 1px 5px;
+		border-radius: var(--radius-xs);
+		border: 1px solid var(--line);
+	}
+	.step-num {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 20px;
+		height: 20px;
+		border-radius: 50%;
+		border: 1px solid var(--faint);
+		font-size: 0.7rem;
+		flex-shrink: 0;
 	}
 
 	.fallback .err {
