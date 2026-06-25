@@ -135,17 +135,22 @@ groups, no replay. That's the build ahead.
 
 ## Quick start
 
-### Part 1 — Browser (no install required)
+### Part 1 — Browser (no Rust, no desktop app)
 
 The fastest path. The pi extension HTTP-serves Accordion in your browser — no Rust, no
 desktop app needed. Single session only.
 
-**1. Clone and install the extension:**
+**1. Clone, build the browser UI, and install the extension:**
 
 ```bash
 git clone https://github.com/a-Fig/accordion.git
-cd accordion/extension && npm install
+cd accordion
+npm install --prefix app && npm run build --prefix app   # builds the static browser bundle (app/build)
+cd extension && npm install                              # the pi extension that serves it
 ```
+
+> The extension serves the UI from `app/build` (produced by `npm run build` above).
+> Without that build, `/accordion` opens to a "No browser build found" page.
 
 **2. Register it with pi** — add to `~/.pi/agent/settings.json`:
 
