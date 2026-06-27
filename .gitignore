@@ -1,5 +1,7 @@
 node_modules/
 *.log
+.tmp-tauri-dev.*
+app/.tmp-tauri-dev.*
 .DS_Store
 dist/
 .pi/
