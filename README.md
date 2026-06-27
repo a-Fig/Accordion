@@ -154,32 +154,81 @@ The desktop app adds **multi-session discovery** (switch between running pi sess
 a sidebar), conductors that require local model resources, and the `/accordion` command
 that foregrounds the right session automatically. It requires Node 20+ and Rust.
 
+> **Don't double-register the extension.** Part 1's `pi install npm:@a-fig/accordion`
+> already registered the extension (the `/accordion` command, the `unfold`/`recall`
+> tools, and the skills all come from the npm package). That same extension is what the
+> local `extension/accordion.ts` builds into. **Adding `extension/accordion.ts` to
+> `extensions` while the npm package is still installed loads it twice** — a duplicate
+> `/accordion` command, duplicate tool registration, and a duplicate context hook. Pick
+> **one** of the two paths below; don't do both.
+
 **Prerequisites:** install [Node 20 LTS](https://nodejs.org) and
 [Rust via rustup](https://rustup.rs), then follow the one-time platform setup at
 **https://v2.tauri.app/start/prerequisites/** (WebView2 + MSVC on Windows, Xcode CLT on
 macOS).
 
-**1. Clone and install:**
+#### Path A — Place a built binary (recommended; keeps the npm package)
+
+`/accordion` launches a **pre-built binary** from disk — it does not connect to a dev
+server. So all you need is a built `app` binary in one of the locations the extension
+scans. If you already ran Part 1, this is the only step: no `settings.json` edit, no
+duplicate extension.
 
 ```bash
 git clone https://github.com/a-Fig/accordion.git
 cd accordion/app && npm install
+npm run tauri build -- --no-bundle   # builds target/release/app(.exe); --no-bundle
+                                     # skips the slower MSI/NSIS/.dmg installers
 ```
 
-**2. Register the extension with pi** — add to `~/.pi/agent/settings.json`:
+Then drop the binary where the extension looks for an installed bundle:
+
+| OS | Path |
+|---|---|
+| **Windows** | `%LOCALAPPDATA%\Programs\Accordion\Accordion.exe` |
+| **macOS** | `/Applications/Accordion.app` |
+| **Linux** | `~/.local/share/Accordion/accordion` |
+
+(Without an installed bundle, `/accordion` falls back to the repo build outputs
+`app/src-tauri/target/release/app` then `…/debug/app`.) Run `/accordion` in any pi
+session and it launches (or focuses, via single-instance) the desktop app on that session.
+
+#### Path B — Register the local extension (for extension development)
+
+Only choose this if you'll edit the extension itself. Remove the npm package first, then
+point pi at your checkout instead. From `~/.pi/agent/settings.json`, drop
+`"npm:@a-fig/accordion"` from `packages` and add to `extensions`:
 
 ```json
 { "extensions": ["<absolute-path-to-repo>/extension/accordion.ts"] }
 ```
 
-**3. Launch the desktop app:**
+The extension has its own runtime deps, so install them too:
+
+```bash
+cd accordion/extension && npm install
+```
+
+#### Run the app + live session
 
 ```bash
 npm run tauri dev   # opens the native window; hot-reloads on save
 ```
 
-**4. Run pi in any project.** It appears in Accordion's **Sessions** sidebar within ~1s.
-Click it (or run `/accordion` in that terminal) and its context populates live.
+> `npm run tauri dev` is a Vite dev server for UI iteration. It is **not** what
+> `/accordion` connects to — `/accordion` always launches a built binary
+> (`target/release/app`). To produce that binary, run
+> `npm run tauri build -- --no-bundle`. Both `npm run dev` and `npm run tauri dev` want
+> **port 1420**; run only one at a time.
+
+Run pi in any project. It advertises itself in `~/.accordion/sessions/` and appears in
+Accordion's **Sessions** sidebar within ~1s. Click it (or run `/accordion` in that
+terminal) and its context populates live. Folding is preview-only by default; use the
+header's **Folding** toggle to opt in to steering the live agent's context.
+
+To refresh the binary after `main` moves (close any open Accordion window first so the
+file isn't locked, then `git pull`, `npm install`, and rebuild): see
+**[CONTRIBUTING.md](CONTRIBUTING.md)**.
 
 ## Contributing
 
