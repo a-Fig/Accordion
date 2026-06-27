@@ -486,7 +486,15 @@
 		void geo; // depend on geometry changes
 		if (canvas) {
 			resizeCanvas();
-			scheduleRedraw();
+			// Redraw SYNCHRONOUSLY, not via scheduleRedraw(). Setting
+			// canvas.width/height (in resizeCanvas) clears the backing store to
+			// transparent; deferring the repaint to the next animation frame leaves
+			// a blank frame on every resize tick -- visible as flicker while the
+			// window is being dragged. Drawing right now keeps the old -> new
+			// transition atomic. A pending scheduled/partial rAF is harmless: the
+			// scheduled full redraw just re-paints identically, and a pending
+			// partial snapshots an already-empty dirty set.
+			redraw();
 		}
 	});
 

@@ -297,19 +297,35 @@
 		cols = Math.max(4, Math.floor((W + GAP) / (c + GAP)));
 		cell = c;
 	}
+	// Coalesce fit() into a single rAF. A window-drag fires the ResizeObserver
+	// dozens of times per second; each direct fit() re-reads layout (forced
+	// reflow) and rewrites `cell`/`cols`, which resizes + clears every canvas.
+	// Batching to one fit per animation frame removes the reflow storm and the
+	// intermediate-size jitter that reads as flicker.
+	let fitRaf: ReturnType<typeof requestAnimationFrame> | null = null;
+	function scheduleFit() {
+		if (fitRaf !== null) return;
+		fitRaf = requestAnimationFrame(() => {
+			fitRaf = null;
+			fit();
+		});
+	}
 	$effect(() => {
 		if (!stage) return;
-		const ro = new ResizeObserver(() => fit());
+		const ro = new ResizeObserver(() => scheduleFit());
 		ro.observe(stage);
-		fit();
-		return () => ro.disconnect();
+		fit(); // first paint: immediate so the grid is sized before the first frame
+		return () => {
+			ro.disconnect();
+			if (fitRaf !== null) cancelAnimationFrame(fitRaf);
+		};
 	});
 	$effect(() => {
 		// refit when these change
 		void view;
 		void nudge;
 		void count;
-		fit();
+		scheduleFit();
 	});
 
 	// Track the protected boundary so a departing block leaves a hole instead of
