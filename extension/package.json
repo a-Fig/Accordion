@@ -5,9 +5,11 @@
   "description": "Accordion live link — a pi extension that streams context to the Accordion GUI and applies the fold plan the GUI returns.",
   "keywords": ["pi-package"],
   "scripts": {
+    "build:app": "npm --prefix ../app run build",
     "build:extension": "node ./build-extension.mjs",
     "build:client": "node ./build-client.mjs",
-    "build": "npm run build:client && npm run build:extension",
+    "build": "npm run build:app && npm run build:client && npm run build:extension",
+    "prepack": "npm run build && npm run smoke",
     "smoke": "node smoke.mjs"
   },
   "pi": {

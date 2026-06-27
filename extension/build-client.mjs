@@ -9,7 +9,8 @@
  * resolveClientRoot() probes). This script produces that copy.
  *
  * Run: node ./build-client.mjs   (or `npm run build:client`)
- * Prereq: run `npm run build` in ../app first so app/build exists.
+ * Prereq when called directly: run `npm run build` in ../app first so app/build exists.
+ * The package-level `npm run build` / `npm pack` path runs that app build for you.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";

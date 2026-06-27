@@ -297,19 +297,53 @@
 		cols = Math.max(4, Math.floor((W + GAP) / (c + GAP)));
 		cell = c;
 	}
+	// Coalesce fit() into a single rAF. A window-drag fires the ResizeObserver
+	// dozens of times per second; each direct fit() re-reads layout (forced
+	// reflow) and rewrites `cell`/`cols`, which resizes + clears every canvas.
+	// Batching to one fit per animation frame removes the reflow storm and the
+	// intermediate-size jitter that reads as flicker.
+	let fitRaf: ReturnType<typeof requestAnimationFrame> | null = null;
+	let fitQueuedDuringRaf = false;
+	function scheduleFit() {
+		if (fitRaf !== null) {
+			fitQueuedDuringRaf = true;
+			return;
+		}
+		fitRaf = requestAnimationFrame(() => {
+			fitRaf = null;
+			fit();
+			// If more resize notifications arrived while this frame was pending,
+			// run one trailing fit. This preserves the “at most one fit per frame”
+			// coalescing but does not drop the final geometry from a window drag.
+			if (fitQueuedDuringRaf) {
+				fitQueuedDuringRaf = false;
+				scheduleFit();
+			}
+		});
+	}
 	$effect(() => {
 		if (!stage) return;
-		const ro = new ResizeObserver(() => fit());
+		const ro = new ResizeObserver(() => scheduleFit());
+		const onWindowResize = () => scheduleFit();
 		ro.observe(stage);
-		fit();
-		return () => ro.disconnect();
+		window.addEventListener("resize", onWindowResize);
+		fit(); // first paint: immediate so the grid is sized before the first frame
+		return () => {
+			ro.disconnect();
+			window.removeEventListener("resize", onWindowResize);
+			if (fitRaf !== null) {
+				cancelAnimationFrame(fitRaf);
+				fitRaf = null;
+			}
+			fitQueuedDuringRaf = false;
+		};
 	});
 	$effect(() => {
 		// refit when these change
 		void view;
 		void nudge;
 		void count;
-		fit();
+		scheduleFit();
 	});
 
 	// Track the protected boundary so a departing block leaves a hole instead of
