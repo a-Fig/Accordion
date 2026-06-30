@@ -1,0 +1,20 @@
+{
+  "name": "@a-fig/accordion",
+  "version": "0.1.1-git",
+  "private": true,
+  "type": "module",
+  "description": "Accordion live link — pi extension (git fork)",
+  "keywords": ["pi-package"],
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "pi": {
+    "extensions": ["./extension/accordion.js"]
+  },
+  "files": [
+    "extension/accordion.js",
+    "extension/dist",
+    "extension/skills",
+    "extension/README.md"
+  ]
+}
