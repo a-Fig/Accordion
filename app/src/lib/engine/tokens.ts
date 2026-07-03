@@ -46,12 +46,17 @@ export function remainingPct(full: number, live: number): number {
 }
 
 /**
- * Remaining percentage as a single decile digit (0-9): drop the ones place,
- * keep the tens digit of remainingPct. Used only for the compact badge
- * stamped directly on a folded tile — a coarser, faster-to-scan signal than
- * the precise "X% remains" text shown in tooltips/Transcript/Inspector.
- * Clamped to 9 so a 100% (fully intact) value doesn't overflow to two digits.
+ * Remaining percentage bucketed into 6 discrete bands (0-5), used to size the
+ * corner-bracket "erosion border" stamped directly on a folded tile — a
+ * coarser, glanceable signal than the precise "X% remains" text shown in
+ * tooltips/Transcript/Inspector. Band 5 (>=90%) renders as a nearly-complete
+ * border; band 0 (<10%) renders no border at all.
  */
-export function remainingDigit(pct: number): number {
-	return Math.min(9, Math.max(0, Math.floor(pct / 10)));
+export function remainingBand(pct: number): number {
+	if (pct >= 90) return 5;
+	if (pct >= 75) return 4;
+	if (pct >= 50) return 3;
+	if (pct >= 25) return 2;
+	if (pct >= 10) return 1;
+	return 0;
 }

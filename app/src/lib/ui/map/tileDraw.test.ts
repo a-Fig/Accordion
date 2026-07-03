@@ -1,5 +1,16 @@
 import { describe, it, expect } from "vitest";
-import { faceFor, computeGeometry, tileRectCss, hitTest, desaturate, resetSprites, getSprites, type TileSpec } from "./tileDraw";
+import {
+  faceFor,
+  computeGeometry,
+  tileRectCss,
+  hitTest,
+  desaturate,
+  resetSprites,
+  getSprites,
+  erosionArmLength,
+  BAND_ARM_MAX_FRACTION,
+  type TileSpec,
+} from "./tileDraw";
 
 // ---------------------------------------------------------------------------
 // faceFor
@@ -289,6 +300,38 @@ describe("resetSprites — clears sprite cache so DPR change forces rebuild", ()
     resetSprites();
     resetSprites();
     expect(getSprites()).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// erosionArmLength — corner-bracket geometry for the 6-band erosion border
+// ---------------------------------------------------------------------------
+
+describe("erosionArmLength", () => {
+  it("band 0 (empty) has zero arm length", () => {
+    expect(erosionArmLength(30, 0)).toBe(0);
+  });
+
+  it("band 5 (full) uses the full BAND_ARM_MAX_FRACTION of tile size", () => {
+    expect(erosionArmLength(30, 5)).toBeCloseTo(30 * BAND_ARM_MAX_FRACTION, 5);
+  });
+
+  it("steps linearly between bands 0 and 5", () => {
+    const size = 30;
+    const full = erosionArmLength(size, 5);
+    expect(erosionArmLength(size, 1)).toBeCloseTo(full * (1 / 5), 5);
+    expect(erosionArmLength(size, 2)).toBeCloseTo(full * (2 / 5), 5);
+    expect(erosionArmLength(size, 3)).toBeCloseTo(full * (3 / 5), 5);
+    expect(erosionArmLength(size, 4)).toBeCloseTo(full * (4 / 5), 5);
+  });
+
+  it("scales proportionally with tile size", () => {
+    expect(erosionArmLength(60, 5)).toBeCloseTo(erosionArmLength(30, 5) * 2, 5);
+  });
+
+  it("clamps out-of-range bands to [0, 5]", () => {
+    expect(erosionArmLength(30, -1)).toBe(0);
+    expect(erosionArmLength(30, 6)).toBeCloseTo(erosionArmLength(30, 5), 5);
   });
 });
 

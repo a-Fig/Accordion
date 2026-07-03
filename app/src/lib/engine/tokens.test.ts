@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { estTokens, BLOCK_OVERHEAD, clip, firstLine, remainingPct, remainingDigit } from "./tokens";
+import { estTokens, BLOCK_OVERHEAD, clip, firstLine, remainingPct, remainingBand } from "./tokens";
 
 // ---------------------------------------------------------------------------
 // remainingPct — how much of a fold's original content is still on the wire
@@ -47,28 +47,38 @@ describe("remainingPct", () => {
 });
 
 // ---------------------------------------------------------------------------
-// remainingDigit — decile bucket (0-9) for the compact on-tile badge
+// remainingBand — 6-band bucket (0-5) for the on-tile erosion border
 // ---------------------------------------------------------------------------
 
-describe("remainingDigit", () => {
-	it("drops the ones place and keeps the tens digit", () => {
-		expect(remainingDigit(73)).toBe(7);
-		expect(remainingDigit(40)).toBe(4);
-		expect(remainingDigit(99)).toBe(9);
+describe("remainingBand", () => {
+	it("bands >=90% as 5 (full)", () => {
+		expect(remainingBand(100)).toBe(5);
+		expect(remainingBand(90)).toBe(5);
 	});
 
-	it("floors any 1-9% remaining to 0 (still shown — almost nothing left)", () => {
-		expect(remainingDigit(1)).toBe(0);
-		expect(remainingDigit(9)).toBe(0);
+	it("bands 75-89% as 4", () => {
+		expect(remainingBand(89)).toBe(4);
+		expect(remainingBand(75)).toBe(4);
 	});
 
-	it("floors an exact 0% remaining to 0", () => {
-		expect(remainingDigit(0)).toBe(0);
+	it("bands 50-74% as 3", () => {
+		expect(remainingBand(74)).toBe(3);
+		expect(remainingBand(50)).toBe(3);
 	});
 
-	it("clamps a 100% (fully intact) value to 9, not 10", () => {
-		expect(remainingDigit(100)).toBe(9);
-		expect(remainingDigit(90)).toBe(9);
+	it("bands 25-49% as 2", () => {
+		expect(remainingBand(49)).toBe(2);
+		expect(remainingBand(25)).toBe(2);
+	});
+
+	it("bands 10-24% as 1", () => {
+		expect(remainingBand(24)).toBe(1);
+		expect(remainingBand(10)).toBe(1);
+	});
+
+	it("bands <10% as 0 (empty — no border)", () => {
+		expect(remainingBand(9)).toBe(0);
+		expect(remainingBand(0)).toBe(0);
 	});
 });
 
