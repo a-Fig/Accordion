@@ -131,7 +131,7 @@ export function stopDiscovery(): void {
  * not just a tooltip. Worst case (two sessions sharing an exact `startedAt` ms whose readdir
  * order flips) is a redundant reassign, never a missed update.
  */
-function sameSessions(a: SessionEntry[], b: SessionEntry[]): boolean {
+export function sameSessions(a: SessionEntry[], b: SessionEntry[]): boolean {
 	if (a.length !== b.length) return false;
 	for (let i = 0; i < a.length; i++) {
 		const x = a[i];

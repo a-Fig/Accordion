@@ -15,6 +15,13 @@
  * best-effort launch/reinvoke the desktop app (single-instance keeps that from
  * becoming duplicate windows).
  *
+ * Browser-served multi-session discovery: a browser tab has no filesystem access, but
+ * THIS process does (it's Node, not sandboxed) — so any one session's HTTP server can
+ * read every OTHER session's registry file and serve the list over `/__accordion/sessions`
+ * (token-gated). The browser UI polls that endpoint and dials whichever session's port the
+ * user picks, giving a single browser tab the same multi-session sidebar the desktop app
+ * gets from its Tauri `list_sessions` command — no desktop app required.
+ *
  * Safety:
  *   • No GUI connected, or the plan reply times out → pass messages through
  *     UNMODIFIED. We never corrupt context.
@@ -52,6 +59,7 @@ import {
 	SESSIONS_SUBDIR,
 	FOCUS_FILE,
 	HEARTBEAT_INTERVAL_MS,
+	isLiveEntry,
 	type SessionEntry,
 	type FocusRequest,
 } from "../app/src/lib/live/registry";
@@ -405,6 +413,36 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Read every OTHER live session's advertised entry alongside our own. This is plain
+	 * Node `fs` access (unlike a browser tab, this extension process is never filesystem-
+	 * sandboxed) — the same directory the desktop app's Tauri layer reads, just read from
+	 * the other side. Powers the browser-served multi-session sidebar (no Tauri required):
+	 * any one session's HTTP server can list every session on the machine. Best-effort:
+	 * an unreadable directory or a partially-written/corrupt file is skipped, never thrown.
+	 */
+	function listLiveSessions(): SessionEntry[] {
+		const now = Date.now();
+		const out: SessionEntry[] = [];
+		let names: string[] = [];
+		try {
+			names = fs.readdirSync(SESSIONS_DIR);
+		} catch {
+			return out;
+		}
+		for (const name of names) {
+			if (!name.endsWith(".json")) continue;
+			try {
+				const raw = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, name), "utf8"));
+				if (isLiveEntry(raw, now)) out.push(raw);
+			} catch {
+				/* partial write / corrupt file — skip it, never crash the request */
+			}
+		}
+		out.sort((a, b) => a.startedAt - b.startedAt);
+		return out;
+	}
+
 	/** /accordion writes a one-shot request for the app to focus us once it is open. */
 	function writeFocusRequest(): void {
 		if (!sessionId) return;
@@ -562,6 +600,20 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			if (u.pathname === "/__accordion/meta") {
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION }));
+				return;
+			}
+
+			// Session list — powers the browser-served multi-session sidebar. TOKEN-GATED
+			// (unlike /meta): it reveals cwd/title/model across every live session on the
+			// machine, not just this one, so it must not be reachable without the token.
+			if (u.pathname === "/__accordion/sessions") {
+				if (!isWebAuthed(req, u)) {
+					res.writeHead(403, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ error: "forbidden" }));
+					return;
+				}
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ sessions: listLiveSessions() }));
 				return;
 			}
 

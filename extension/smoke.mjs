@@ -167,6 +167,48 @@ if (accordionCmd) {
 			console.log("NOTE: app/build/index.html absent — skipping the index 200 assertion (meta + 403 still verified). Run `npm run build` in app/ to cover it.");
 		}
 	}
+
+	// ── multi-session discovery: /__accordion/sessions ──────────────────────────
+	// Token-gated (unlike /meta): a request with no token must be refused. With the
+	// token, it must list EVERY live session on the machine — not just this process's
+	// own — by reading the registry directory straight off disk (plain Node fs; this
+	// process is never filesystem-sandboxed the way a browser tab is). Simulate a
+	// second live pi session by writing a second well-formed, fresh-heartbeat entry
+	// directly into the registry directory.
+	const sessionsNoToken = await httpGet("/__accordion/sessions");
+	if (sessionsNoToken.status !== 403) fails.push(`GET /__accordion/sessions without a token returned ${sessionsNoToken.status}, expected 403`);
+
+	if (TOKEN) {
+		const otherEntry = {
+			registryProtocol: 1,
+			protocolVersion: entry.protocolVersion,
+			sessionId: "s-other-999",
+			port: 54321,
+			pid: 999999,
+			cwd: "/tmp/other-project",
+			title: "other pi session",
+			model: "other/model",
+			tokens: null,
+			contextWindow: null,
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		};
+		fs.writeFileSync(path.join(SESSIONS_DIR, "s-other-999.json"), JSON.stringify(otherEntry));
+
+		const withToken = await httpGet(`/__accordion/sessions?token=${TOKEN}`);
+		if (withToken.status !== 200) fails.push(`GET /__accordion/sessions with token returned ${withToken.status}, expected 200`);
+		else {
+			let parsed = null;
+			try { parsed = JSON.parse(withToken.body); } catch { /* fall through */ }
+			const listed = Array.isArray(parsed?.sessions) ? parsed.sessions : null;
+			if (!listed) fails.push("/__accordion/sessions did not return a JSON { sessions: [...] } body");
+			else {
+				if (!listed.some((s) => s.sessionId === entry.sessionId)) fails.push("/__accordion/sessions did not list this session's own entry");
+				if (!listed.some((s) => s.sessionId === "s-other-999")) fails.push("/__accordion/sessions did not list a sibling session's entry (cross-session discovery broken)");
+			}
+		}
+		fs.unlinkSync(path.join(SESSIONS_DIR, "s-other-999.json"));
+	}
 }
 
 // 4 messages with real timestamps and responseIds so the WS round-trip exercises
