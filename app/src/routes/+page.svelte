@@ -4,6 +4,7 @@
 	import { settings } from "$lib/settings.svelte.ts";
 	import { connectLive, disconnectLive, live } from "$lib/live/liveClient.svelte";
 	import { discovery, startDiscovery, stopDiscovery, DEMO_ID } from "$lib/live/discovery.svelte";
+	import { startBrowserDiscovery, stopBrowserDiscovery } from "$lib/live/browserDiscovery.svelte";
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery } from "$lib/live/claudeDiscovery.svelte";
 	import { conductorState } from "$lib/live/conductor.svelte";
 	import { startConductorDiscovery, stopConductorDiscovery, allConductors, isLaunching } from "$lib/live/conductorDiscovery.svelte";
@@ -25,7 +26,6 @@
 	let manualPort = $state(DEFAULT_PORT);
 	let activityOpen = $state(false);
 	let browserServed = $state(false);
-	let servedSessionId = $state<string | null>(null);
 
 	// Which session source the sidebar lists: live pi vs read-only Claude Code.
 	const SRC_KEY = "accordion.sidebar.source";
@@ -118,12 +118,38 @@
 		return p ? p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p : "";
 	}
 
+	// Forward the per-session token (when present in the page URL ?token=…) on the WS
+	// upgrade so an off-loopback (0.0.0.0-bound) session can be steered from a remote
+	// browser. NOTE: the accordion_token cookie is HttpOnly, so JS cannot read it here —
+	// that is deliberate. On a reload without ?token=…, readServedToken() returns null and
+	// the WS URL carries no token, but the browser still sends the HttpOnly cookie on the
+	// same-origin WS upgrade and the extension's verifyWsUpgrade accepts that cookie
+	// (mirroring isWebAuthed). So the cookie fallback lives on the server side of the
+	// upgrade, not in JS.
+	function readServedToken(): string | null {
+		if (typeof window === "undefined") return null;
+		return new URLSearchParams(window.location.search).get("token");
+	}
+
 	function selectAndConnect(s: SessionEntry): void {
 		if (discovery.selected === s.sessionId && live.status === "connected") return;
 		session.readOnly = false; // a live pi session is steerable, not read-only
 		claudeDiscovery.selected = null;
 		discovery.selected = s.sessionId;
-		connectLive(s.port);
+		// Only browser-served mode dials over host/token: desktop (Tauri) always reaches pi
+		// on plain loopback with no static-file gate to carry a token from. Reusing the page's
+		// OWN hostname/token for every discovered session (not just the one that served this
+		// page) is safe even when they differ: verifyWsUpgrade ignores the token entirely for
+		// a loopback peer (the common case), and for a genuinely remote peer dialing a DIFFERENT
+		// off-loopback session, a mismatched token is rejected exactly as if none were sent —
+		// each session mints its own independent token, so there is no shared secret to reuse
+		// across sessions to steer them from a fully remote browser (a known limitation, not a
+		// regression: browser-served mode could not switch sessions here AT ALL before this).
+		if (browserServed) {
+			connectLive(s.port, { host: window.location.hostname, token: readServedToken() ?? undefined });
+		} else {
+			connectLive(s.port);
+		}
 	}
 
 	// The bundled demo behaves like a session you can pick — it just loads the
@@ -133,28 +159,6 @@
 		claudeDiscovery.selected = null;
 		discovery.selected = DEMO_ID;
 		loadSample();
-	}
-
-	// Browser-served mode is single-session: the extension that served this page hosts the
-	// live WS on the SAME origin port. This is the "way back" to the live session — e.g.
-	// after viewing the Demo — since the browser has no multi-session discovery to pick from.
-	// Forward the per-session token (when present in the page URL ?token=…) on the
-	// WS upgrade so an off-loopback (0.0.0.0-bound) session can be steered from a
-	// remote browser. NOTE: the accordion_token cookie is HttpOnly, so JS cannot read
-	// it here — that is deliberate. On a reload without ?token=…, readServedToken()
-	// returns null and the WS URL carries no token, but the browser still sends the
-	// HttpOnly cookie on the same-origin WS upgrade and the extension's verifyWsUpgrade
-	// accepts that cookie (mirroring isWebAuthed). So the cookie fallback lives on the
-	// server side of the upgrade, not in JS.
-	function readServedToken(): string | null {
-		if (typeof window === "undefined") return null;
-		return new URLSearchParams(window.location.search).get("token");
-	}
-
-	function reconnectServed(): void {
-		discovery.selected = null;
-		claudeDiscovery.selected = null;
-		connectLive(Number(window.location.port) || DEFAULT_PORT, { host: window.location.hostname, token: readServedToken() ?? undefined });
 	}
 
 	// A Claude Code transcript: load it read-only and tail it for appends. There is
@@ -189,9 +193,12 @@
 					const body = await res.json() as { served?: boolean; sessionId?: string; protocolVersion?: number };
 					if (body.served !== true) return;
 					browserServed = true;
-					servedSessionId = body.sessionId ?? null;
+					// This session's own port is dialed immediately so the view doesn't wait on
+					// the first discovery poll; the sidebar itself (below) is populated by
+					// startBrowserDiscovery, which lists every OTHER live session too.
 					const port = Number(window.location.port) || DEFAULT_PORT;
 					connectLive(port, { host: window.location.hostname, token: readServedToken() ?? undefined });
+					startBrowserDiscovery();
 				} catch {
 					// 404, network error, non-JSON — leave browserServed false; manual UI stays.
 				}
@@ -200,6 +207,7 @@
 
 		return () => {
 			stopDiscovery();
+			stopBrowserDiscovery();
 			stopClaudeDiscovery();
 			stopConductorDiscovery();
 			disconnectLive();
@@ -208,6 +216,16 @@
 
 	const isLive = $derived(live.status === "connected");
 	const isWatching = $derived(session.readOnly && !isLive);
+
+	// Browser-served mode has no explicit "select" step for the session this page auto-
+	// connected to on mount (selectAndConnect is only invoked by a sidebar click) — sync
+	// `discovery.selected` from the live socket's own sessionId so that session's row shows
+	// as selected/live in the sidebar once startBrowserDiscovery's poll lists it.
+	$effect(() => {
+		if (browserServed && live.status === "connected" && live.sessionId) {
+			discovery.selected = live.sessionId;
+		}
+	});
 
 	// View↔wire fold alarm (indicator-only): re-run the divergence check on every settled
 	// store change. `st.version` is the settled-change signal (manual fold, conductor pass,
@@ -241,9 +259,6 @@
 			claudeSelected={claudeDiscovery.selected}
 			onselectclaude={selectClaudeSession}
 			{browserServed}
-			servedTitle={session.store?.meta.title ?? "pi session"}
-			servedModel={session.store?.meta.model ?? ""}
-			onreconnect={reconnectServed}
 		/>
 	{/if}
 

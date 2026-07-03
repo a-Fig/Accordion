@@ -15,6 +15,13 @@
  * best-effort launch/reinvoke the desktop app (single-instance keeps that from
  * becoming duplicate windows).
  *
+ * Browser-served multi-session discovery: a browser tab has no filesystem access, but
+ * THIS process does (it's Node, not sandboxed) — so any one session's HTTP server can
+ * read every OTHER session's registry file and serve the list over `/__accordion/sessions`
+ * (token-gated). The browser UI polls that endpoint and dials whichever session's port the
+ * user picks, giving a single browser tab the same multi-session sidebar the desktop app
+ * gets from its Tauri `list_sessions` command — no desktop app required.
+ *
  * Safety:
  *   • No GUI connected, or the plan reply times out → pass messages through
  *     UNMODIFIED. We never corrupt context.
@@ -52,6 +59,7 @@ import {
 	SESSIONS_SUBDIR,
 	FOCUS_FILE,
 	HEARTBEAT_INTERVAL_MS,
+	isLiveEntry,
 	type SessionEntry,
 	type FocusRequest,
 } from "../app/src/lib/live/registry";
@@ -405,6 +413,57 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 	}
 
+	/**
+	 * Read every OTHER live session's advertised entry alongside our own. This is plain
+	 * Node `fs` access (unlike a browser tab, this extension process is never filesystem-
+	 * sandboxed) — the same directory the desktop app's Tauri layer reads, just read from
+	 * the other side. Powers the browser-served multi-session sidebar (no Tauri required):
+	 * any one session's HTTP server can list every session on the machine. Best-effort:
+	 * an unreadable directory or a partially-written/corrupt file is skipped, never thrown.
+	 *
+	 * ASYNC (fs.promises), not fs.*Sync: this runs on the same event loop as the `context`
+	 * hook's `requestPlan`, which only allows REQUEST_TIMEOUT_MS (250ms) before falling back
+	 * to passthrough. A browser tab polls this every second — synchronous directory/file I/O
+	 * here would add avoidable jitter to that budget; the async form yields between files.
+	 *
+	 * Opportunistically REAPS dead entries it encounters (unlike a bare read): a browser-only
+	 * user has no desktop app ever running to clean up `~/.accordion/sessions/` after a
+	 * SIGKILLed pi (skips session_shutdown's own deleteEntry), so if nothing reaps here, stale
+	 * files accumulate forever for exactly this feature's target user. Mirrors the desktop
+	 * app's own reap-on-poll behavior (discovery.svelte.ts). Deleting a stale file is itself
+	 * best-effort and never blocks the response.
+	 */
+	async function listLiveSessions(): Promise<SessionEntry[]> {
+		const now = Date.now();
+		const out: SessionEntry[] = [];
+		let names: string[] = [];
+		try {
+			names = await fs.promises.readdir(SESSIONS_DIR);
+		} catch {
+			return out;
+		}
+		for (const name of names) {
+			if (!name.endsWith(".json")) continue;
+			const filePath = path.join(SESSIONS_DIR, name);
+			let raw: unknown;
+			try {
+				raw = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
+			} catch {
+				continue; // partial write / corrupt file / deleted mid-scan — skip, never crash
+			}
+			if (isLiveEntry(raw, now)) {
+				out.push(raw);
+			} else if (raw && typeof raw === "object" && typeof (raw as { sessionId?: unknown }).sessionId === "string") {
+				// Recognizably a registry entry, just stale or an old protocol version — reap it.
+				// A merely-paused (not dead) session self-heals: its next heartbeat rewrites the
+				// file, so reaping a transient staleness read is harmless.
+				fs.promises.unlink(filePath).catch(() => {});
+			}
+		}
+		out.sort((a, b) => a.startedAt - b.startedAt);
+		return out;
+	}
+
 	/** /accordion writes a one-shot request for the app to focus us once it is open. */
 	function writeFocusRequest(): void {
 		if (!sessionId) return;
@@ -562,6 +621,35 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			if (u.pathname === "/__accordion/meta") {
 				res.writeHead(200, { "Content-Type": "application/json" });
 				res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION }));
+				return;
+			}
+
+			// Session list — powers the browser-served multi-session sidebar. TOKEN-GATED
+			// (unlike /meta): it reveals cwd/title/model across every live session on the
+			// machine, not just this one, so it must not be reachable without the token.
+			// Accepted tradeoff (deliberate, not accidental): because the WS itself is
+			// PERMANENTLY unauthenticated by design (so the desktop app can dial tokenlessly —
+			// see startServer's banner), a leaked token+URL for THIS session now also reveals
+			// the port/cwd/title/model of every OTHER live session on the machine, where before
+			// this endpoint existed it only exposed the one session whose URL leaked. That is a
+			// real increase in blast radius from a single leaked token, traded for the feature
+			// this PR adds; it is not mitigated further here (e.g. no per-session confirmation).
+			if (u.pathname === "/__accordion/sessions") {
+				if (!isWebAuthed(req, u)) {
+					res.writeHead(403, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ error: "forbidden" }));
+					return;
+				}
+				void listLiveSessions().then(
+					(sessions) => {
+						res.writeHead(200, { "Content-Type": "application/json" });
+						res.end(JSON.stringify({ sessions }));
+					},
+					() => {
+						res.writeHead(500, { "Content-Type": "application/json" });
+						res.end(JSON.stringify({ error: "internal error" }));
+					},
+				);
 				return;
 			}
 

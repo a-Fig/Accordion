@@ -167,6 +167,73 @@ if (accordionCmd) {
 			console.log("NOTE: app/build/index.html absent — skipping the index 200 assertion (meta + 403 still verified). Run `npm run build` in app/ to cover it.");
 		}
 	}
+
+	// ── multi-session discovery: /__accordion/sessions ──────────────────────────
+	// Token-gated (unlike /meta): a request with no token must be refused. With the
+	// token, it must list EVERY live session on the machine — not just this process's
+	// own — by reading the registry directory straight off disk (plain Node fs; this
+	// process is never filesystem-sandboxed the way a browser tab is). Simulate a
+	// second live pi session by writing a second well-formed, fresh-heartbeat entry
+	// directly into the registry directory.
+	const sessionsNoToken = await httpGet("/__accordion/sessions");
+	if (sessionsNoToken.status !== 403) fails.push(`GET /__accordion/sessions without a token returned ${sessionsNoToken.status}, expected 403`);
+
+	if (TOKEN) {
+		const otherEntry = {
+			registryProtocol: 1,
+			protocolVersion: entry.protocolVersion,
+			sessionId: "s-other-999",
+			port: 54321,
+			pid: 999999,
+			cwd: "/tmp/other-project",
+			title: "other pi session",
+			model: "other/model",
+			tokens: null,
+			contextWindow: null,
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		};
+		// A stale sibling (heartbeat way past STALE_AFTER_MS=15000ms): must be EXCLUDED from
+		// the listing, and — since listLiveSessions() reaps entries it recognizes as dead —
+		// its file must eventually disappear from disk too (opportunistic cleanup for the
+		// browser-only user who has no desktop app ever running to do this).
+		const staleEntry = { ...otherEntry, sessionId: "s-stale-111", heartbeatAt: Date.now() - 60_000 };
+		// A corrupt/partially-written sibling: must be skipped silently, never a 500.
+		const corruptPath = path.join(SESSIONS_DIR, "s-corrupt-222.json");
+		const otherPath = path.join(SESSIONS_DIR, "s-other-999.json");
+		const stalePath = path.join(SESSIONS_DIR, "s-stale-111.json");
+
+		try {
+			fs.writeFileSync(otherPath, JSON.stringify(otherEntry));
+			fs.writeFileSync(stalePath, JSON.stringify(staleEntry));
+			fs.writeFileSync(corruptPath, "{ not valid json,,,");
+
+			const withToken = await httpGet(`/__accordion/sessions?token=${TOKEN}`);
+			if (withToken.status !== 200) fails.push(`GET /__accordion/sessions with token returned ${withToken.status}, expected 200 (corrupt sibling file must not 500 the request)`);
+			else {
+				let parsed = null;
+				try { parsed = JSON.parse(withToken.body); } catch { /* fall through */ }
+				const listed = Array.isArray(parsed?.sessions) ? parsed.sessions : null;
+				if (!listed) fails.push("/__accordion/sessions did not return a JSON { sessions: [...] } body");
+				else {
+					if (!listed.some((s) => s.sessionId === entry.sessionId)) fails.push("/__accordion/sessions did not list this session's own entry");
+					if (!listed.some((s) => s.sessionId === "s-other-999")) fails.push("/__accordion/sessions did not list a sibling session's entry (cross-session discovery broken)");
+					if (listed.some((s) => s.sessionId === "s-stale-111")) fails.push("/__accordion/sessions listed a stale-heartbeat sibling (isLiveEntry staleness check broken)");
+					if (listed.some((s) => s.sessionId === "s-corrupt-222")) fails.push("/__accordion/sessions somehow parsed the corrupt sibling file");
+				}
+			}
+
+			// Reap is fire-and-forget (unlink not awaited before the response is sent), so
+			// give it a moment to land before asserting the stale file is gone from disk.
+			await waitFor(() => !fs.existsSync(stalePath), 1000, "stale sibling reaped from disk").catch(
+				() => fails.push("/__accordion/sessions did not reap the stale sibling's registry file"),
+			);
+		} finally {
+			for (const p of [otherPath, stalePath, corruptPath]) {
+				try { fs.unlinkSync(p); } catch { /* already gone, or never created */ }
+			}
+		}
+	}
 }
 
 // 4 messages with real timestamps and responseIds so the WS round-trip exercises
