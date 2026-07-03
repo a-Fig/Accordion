@@ -26,6 +26,10 @@
 	let manualPort = $state(DEFAULT_PORT);
 	let activityOpen = $state(false);
 	let browserServed = $state(false);
+	// The sessionId that SERVED this page (from /__accordion/meta). In browser-served mode
+	// its per-session token is the one carried in our URL, so off-loopback it is the ONLY
+	// session we can actually steer — see crossSessionRemote / selectAndConnect.
+	let servedSessionId = $state<string | null>(null);
 
 	// Which session source the sidebar lists: live pi vs read-only Claude Code.
 	const SRC_KEY = "accordion.sidebar.source";
@@ -131,8 +135,34 @@
 		return new URLSearchParams(window.location.search).get("token");
 	}
 
+	// A page origin the extension's verifyWsUpgrade treats as loopback — dialed tokenless,
+	// so cross-session switching Just Works. Anything else (a LAN IP or a real hostname) is
+	// off-loopback: the WS upgrade then requires each session's OWN token, and we only hold
+	// the served session's. Mirrors isLoopbackPeer in extension/accordion.ts.
+	function isLoopbackHost(host: string): boolean {
+		return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+	}
+
+	// True when this browser-served page was reached over a NON-loopback origin. In that case
+	// only the served session is steerable (its token is in our URL); every OTHER discovered
+	// session carries a different token the extension would reject, so we mark those rows as
+	// loopback-only rather than let a click fail with a generic "could not reach pi" error.
+	// Gated on knowing the served id: without it we can't tell WHICH row is the steerable one,
+	// so we fail open (mark nothing) rather than risk locking the connected session too.
+	const crossSessionRemote = $derived(
+		browserServed &&
+			typeof window !== "undefined" &&
+			!isLoopbackHost(window.location.hostname) &&
+			servedSessionId !== null,
+	);
+
 	function selectAndConnect(s: SessionEntry): void {
 		if (discovery.selected === s.sessionId && live.status === "connected") return;
+		// Off-loopback, only the served session's token is valid (see crossSessionRemote). The
+		// sidebar already renders these rows as loopback-only/non-clickable; guard here too so
+		// no path (e.g. an /accordion focus request) can dial a session that would just be
+		// token-rejected and surface a misleading "could not reach pi" error.
+		if (crossSessionRemote && s.sessionId !== servedSessionId) return;
 		session.readOnly = false; // a live pi session is steerable, not read-only
 		claudeDiscovery.selected = null;
 		discovery.selected = s.sessionId;
@@ -193,6 +223,7 @@
 					const body = await res.json() as { served?: boolean; sessionId?: string; protocolVersion?: number };
 					if (body.served !== true) return;
 					browserServed = true;
+					servedSessionId = body.sessionId ?? null;
 					// This session's own port is dialed immediately so the view doesn't wait on
 					// the first discovery poll; the sidebar itself (below) is populated by
 					// startBrowserDiscovery, which lists every OTHER live session too.
@@ -259,6 +290,8 @@
 			claudeSelected={claudeDiscovery.selected}
 			onselectclaude={selectClaudeSession}
 			{browserServed}
+			{crossSessionRemote}
+			{servedSessionId}
 		/>
 	{/if}
 
