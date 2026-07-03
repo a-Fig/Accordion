@@ -50,10 +50,11 @@ const pendingCompletions = new Map<number, { resolve: (r: CompletionResult) => v
 let completionReqId = 0;
 
 /** Live connection status, for the UI. */
-export const live = $state<{ status: "idle" | "connecting" | "connected" | "error"; detail: string; sessionId: string | null }>({
+export const live = $state<{ status: "idle" | "connecting" | "connected" | "error"; detail: string; sessionId: string | null; port: number | null }>({
 	status: "idle",
 	detail: "",
 	sessionId: null,
+	port: null,
 });
 
 /**
@@ -194,6 +195,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 	live.status = "connecting";
 	live.detail = `ws://${host}:${port}`;
 	live.sessionId = null;
+	live.port = port;
 	session.error = "";
 
 	let ws: WebSocket;
@@ -202,6 +204,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 	} catch (e) {
 		live.status = "error";
 		live.detail = e instanceof Error ? e.message : String(e);
+		live.port = null;
 		return;
 	}
 	socket = ws;
@@ -405,6 +408,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 		live.status = "error";
 		live.detail = `could not reach pi on :${port} — is a pi session running with the accordion extension?`;
 		live.sessionId = null;
+		live.port = null;
 	};
 
 	ws.onclose = () => {
@@ -418,6 +422,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 		if (socket === ws) {
 			socket = null;
 			live.sessionId = null;
+			live.port = null;
 			// Clear the completion backend so `host.can("complete")` returns false while
 			// disconnected. Drain any pending completion promises with a disconnection error
 			// so they do not hang indefinitely.
@@ -456,4 +461,5 @@ export function disconnectLive(): void {
 	}
 	if (live.status !== "error") live.status = "idle";
 	live.sessionId = null;
+	live.port = null;
 }

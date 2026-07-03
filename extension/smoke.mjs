@@ -193,21 +193,46 @@ if (accordionCmd) {
 			startedAt: Date.now(),
 			heartbeatAt: Date.now(),
 		};
-		fs.writeFileSync(path.join(SESSIONS_DIR, "s-other-999.json"), JSON.stringify(otherEntry));
+		// A stale sibling (heartbeat way past STALE_AFTER_MS=15000ms): must be EXCLUDED from
+		// the listing, and — since listLiveSessions() reaps entries it recognizes as dead —
+		// its file must eventually disappear from disk too (opportunistic cleanup for the
+		// browser-only user who has no desktop app ever running to do this).
+		const staleEntry = { ...otherEntry, sessionId: "s-stale-111", heartbeatAt: Date.now() - 60_000 };
+		// A corrupt/partially-written sibling: must be skipped silently, never a 500.
+		const corruptPath = path.join(SESSIONS_DIR, "s-corrupt-222.json");
+		const otherPath = path.join(SESSIONS_DIR, "s-other-999.json");
+		const stalePath = path.join(SESSIONS_DIR, "s-stale-111.json");
 
-		const withToken = await httpGet(`/__accordion/sessions?token=${TOKEN}`);
-		if (withToken.status !== 200) fails.push(`GET /__accordion/sessions with token returned ${withToken.status}, expected 200`);
-		else {
-			let parsed = null;
-			try { parsed = JSON.parse(withToken.body); } catch { /* fall through */ }
-			const listed = Array.isArray(parsed?.sessions) ? parsed.sessions : null;
-			if (!listed) fails.push("/__accordion/sessions did not return a JSON { sessions: [...] } body");
+		try {
+			fs.writeFileSync(otherPath, JSON.stringify(otherEntry));
+			fs.writeFileSync(stalePath, JSON.stringify(staleEntry));
+			fs.writeFileSync(corruptPath, "{ not valid json,,,");
+
+			const withToken = await httpGet(`/__accordion/sessions?token=${TOKEN}`);
+			if (withToken.status !== 200) fails.push(`GET /__accordion/sessions with token returned ${withToken.status}, expected 200 (corrupt sibling file must not 500 the request)`);
 			else {
-				if (!listed.some((s) => s.sessionId === entry.sessionId)) fails.push("/__accordion/sessions did not list this session's own entry");
-				if (!listed.some((s) => s.sessionId === "s-other-999")) fails.push("/__accordion/sessions did not list a sibling session's entry (cross-session discovery broken)");
+				let parsed = null;
+				try { parsed = JSON.parse(withToken.body); } catch { /* fall through */ }
+				const listed = Array.isArray(parsed?.sessions) ? parsed.sessions : null;
+				if (!listed) fails.push("/__accordion/sessions did not return a JSON { sessions: [...] } body");
+				else {
+					if (!listed.some((s) => s.sessionId === entry.sessionId)) fails.push("/__accordion/sessions did not list this session's own entry");
+					if (!listed.some((s) => s.sessionId === "s-other-999")) fails.push("/__accordion/sessions did not list a sibling session's entry (cross-session discovery broken)");
+					if (listed.some((s) => s.sessionId === "s-stale-111")) fails.push("/__accordion/sessions listed a stale-heartbeat sibling (isLiveEntry staleness check broken)");
+					if (listed.some((s) => s.sessionId === "s-corrupt-222")) fails.push("/__accordion/sessions somehow parsed the corrupt sibling file");
+				}
+			}
+
+			// Reap is fire-and-forget (unlink not awaited before the response is sent), so
+			// give it a moment to land before asserting the stale file is gone from disk.
+			await waitFor(() => !fs.existsSync(stalePath), 1000, "stale sibling reaped from disk").catch(
+				() => fails.push("/__accordion/sessions did not reap the stale sibling's registry file"),
+			);
+		} finally {
+			for (const p of [otherPath, stalePath, corruptPath]) {
+				try { fs.unlinkSync(p); } catch { /* already gone, or never created */ }
 			}
 		}
-		fs.unlinkSync(path.join(SESSIONS_DIR, "s-other-999.json"));
 	}
 }
 
