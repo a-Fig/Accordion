@@ -5,30 +5,30 @@
  * because a browser tab cannot read `~/.accordion/` itself. But the pi extension serving
  * this page CAN — it's a Node process, not filesystem-sandboxed — so it exposes the same
  * registry over `/__accordion/sessions` (token-gated; see extension/accordion.ts). This
- * module polls that HTTP endpoint instead of `invoke`, and writes into the SAME reactive
- * `discovery.sessions` state discovery.svelte.ts exports, so the sidebar and session-select
- * plumbing need no separate code path for browser-served vs desktop.
+ * module polls that HTTP endpoint instead of `invoke`, and shares discovery.svelte.ts's
+ * `publishSessions()` to write into the SAME reactive `discovery.sessions` state, so the
+ * sidebar and session-select plumbing need no separate code path for browser-served vs
+ * desktop, and the two sources can't drift on the publish/reap-selection invariant.
  *
  * No focus-request consumption here (that needs a second one-shot endpoint this PR doesn't
  * add) and no CLIENT-side reap of dead siblings (the server already reaps opportunistically
- * in listLiveSessions — see accordion.ts). Discovery stays best-effort, per the live-link
- * invariant: a fetch failure just leaves the last-known list in place, EXCEPT for the
- * actively-connected session, which connectedFallback() below guarantees never disappears.
+ * in listLiveSessions — see accordion.ts, which also does the isLiveEntry staleness/shape
+ * filtering, so the response here is trusted as-is rather than re-validated).
  *
  * Known limitation: `fetch("/__accordion/sessions")` is a RELATIVE url, so it always targets
- * the origin that served this page (call it session A) — not whichever session the user has
- * since switched to via the sidebar (connectLive(B.port) dials a different port over the
- * WebSocket, but there is no cross-port equivalent for this HTTP poll without either a CORS
- * change to accordion.ts, currently deliberately absent everywhere, or routing discovery over
- * the WS itself). If session A's pi process exits, this tab's polling goes permanently silent
- * — new sibling sessions started afterward will not appear here. connectedFallback() below
+ * the origin that served this page — not whichever session the user has since switched to via
+ * the sidebar (connectLive(B.port) dials a different port over the WebSocket, but there is no
+ * cross-port equivalent for this HTTP poll without either a CORS change to accordion.ts,
+ * currently deliberately absent everywhere, or routing discovery over the WS itself). If the
+ * serving session's pi process exits, this tab's polling goes permanently silent — new sibling
+ * sessions started afterward will not appear here; only a page reload from a still-live
+ * session's own `/accordion` URL restores full discovery. connectedFallback() below at least
  * keeps the CURRENTLY connected session visible/reconnectable regardless, so the sidebar never
- * lies about "no live sessions" while one is plainly connected — but recovering full discovery
- * still requires reloading the page from a still-live session's own `/accordion` URL.
+ * lies about "no live sessions" while one is plainly connected.
  */
-import { discovery, sameSessions, DEMO_ID } from "./discovery.svelte";
-import { isLiveEntry, REGISTRY_PROTOCOL, type SessionEntry } from "./registry";
-import { disconnectLive, live as liveConn } from "./liveClient.svelte";
+import { discovery, publishSessions, DEMO_ID } from "./discovery.svelte";
+import { REGISTRY_PROTOCOL, type SessionEntry } from "./registry";
+import { live as liveConn } from "./liveClient.svelte";
 import { PROTOCOL_VERSION } from "./protocol";
 import { session } from "../session.svelte";
 
@@ -68,14 +68,14 @@ async function poll(): Promise<void> {
 	try {
 		let live: SessionEntry[] = [];
 		try {
-			const res = await fetch("/__accordion/sessions", { credentials: "same-origin" });
+			const res = await fetch("/__accordion/sessions");
 			if (res.ok) {
 				const ct = res.headers.get("content-type") ?? "";
 				if (ct.includes("application/json")) {
 					const body = (await res.json()) as { sessions?: unknown[] };
-					const raw = Array.isArray(body.sessions) ? body.sessions : [];
-					const now = Date.now();
-					live = raw.filter((e): e is SessionEntry => isLiveEntry(e, now));
+					// Trusted as-is: the server already applies isLiveEntry (staleness/shape) and
+					// reaps what fails it — see extension/accordion.ts's listLiveSessions().
+					live = Array.isArray(body.sessions) ? (body.sessions as SessionEntry[]) : [];
 				}
 			}
 		} catch {
@@ -85,12 +85,7 @@ async function poll(): Promise<void> {
 			const fallback = connectedFallback();
 			if (fallback) live.push(fallback);
 		}
-		if (!sameSessions(discovery.sessions, live)) discovery.sessions = live;
-		discovery.ready = true;
-		if (discovery.selected && discovery.selected !== DEMO_ID && !live.some((s) => s.sessionId === discovery.selected)) {
-			discovery.selected = null; // the live session we were looking at is gone
-			if (liveConn.status === "connected" || liveConn.status === "connecting") disconnectLive();
-		}
+		publishSessions(live);
 	} finally {
 		_polling = false;
 	}

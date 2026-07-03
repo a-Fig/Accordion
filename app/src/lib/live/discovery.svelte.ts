@@ -63,25 +63,7 @@ async function poll(): Promise<void> {
 			}
 		}
 		live.sort((a, b) => a.startedAt - b.startedAt);
-		// Only publish a new array when something the sidebar actually renders changed.
-		// `list_sessions` returns a fresh array every tick and heartbeats rewrite the
-		// descriptor every 5s, so an unconditional assign churned every reactive consumer
-		// once a second for zero visible change. (heartbeatAt/pid are excluded — they're
-		// diagnostics the sidebar never renders; a stale session instead drops out of `live`
-		// via isLiveEntry, changing the length, so liveness still propagates.)
-		if (!sameSessions(discovery.sessions, live)) discovery.sessions = live;
-		discovery.ready = true;
-		if (
-			discovery.selected &&
-			discovery.selected !== DEMO_ID &&
-			!live.some((s) => s.sessionId === discovery.selected)
-		) {
-			discovery.selected = null; // the live session we were looking at is gone
-				// The session we were attached to vanished (e.g. pi was SIGKILLed with no close
-				// frame) - tear down the orphaned socket so we do not show a live view for a
-				// dead session.
-				if (liveConn.status === "connected" || liveConn.status === "connecting") disconnectLive();
-		}
+		publishSessions(live);
 
 		// Consume any new focus request into the pending slot (replacing an older one).
 		const req = await invoke<FocusRequest | null>("take_focus_request");
@@ -121,6 +103,33 @@ export function stopDiscovery(): void {
 		_timer = null;
 	}
 	_onFocus = null;
+}
+
+/**
+ * Publish a freshly-fetched session list into the shared reactive state, and drop the
+ * current selection (tearing down its live socket) if the session it pointed at vanished.
+ * Shared by this module's poll() (desktop, Tauri invoke) and browserDiscovery.svelte.ts's
+ * poll() (browser-served, HTTP fetch) so the two discovery sources can't drift on the
+ * publish/reap-selection invariant. `live` must already be sorted the way the sidebar
+ * expects to render it.
+ *
+ * Only publishes a new array when something the sidebar actually renders changed.
+ * Both discovery sources return a fresh array every tick and heartbeats rewrite the
+ * descriptor every 5s, so an unconditional assign would churn every reactive consumer
+ * once a second for zero visible change. (heartbeatAt/pid are excluded — they're
+ * diagnostics the sidebar never renders; a stale session instead drops out of `live`
+ * entirely, changing the length, so liveness still propagates.)
+ */
+export function publishSessions(live: SessionEntry[]): void {
+	if (!sameSessions(discovery.sessions, live)) discovery.sessions = live;
+	discovery.ready = true;
+	if (discovery.selected && discovery.selected !== DEMO_ID && !live.some((s) => s.sessionId === discovery.selected)) {
+		discovery.selected = null; // the live session we were looking at is gone
+		// The session we were attached to vanished (e.g. pi was SIGKILLed with no close
+		// frame) - tear down the orphaned socket so we do not show a live view for a
+		// dead session.
+		if (liveConn.status === "connected" || liveConn.status === "connecting") disconnectLive();
+	}
 }
 
 /**
