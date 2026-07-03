@@ -138,9 +138,20 @@
 	// A page origin the extension's verifyWsUpgrade treats as loopback — dialed tokenless,
 	// so cross-session switching Just Works. Anything else (a LAN IP or a real hostname) is
 	// off-loopback: the WS upgrade then requires each session's OWN token, and we only hold
-	// the served session's. Mirrors isLoopbackPeer in extension/accordion.ts.
+	// the served session's. Mirrors isLoopbackPeer in extension/accordion.ts — including the
+	// IPv4-mapped prefix strip — but also unwraps the `[…]` brackets that location.hostname
+	// puts around an IPv6 literal and accepts the fully-expanded ::1 spelling, so an
+	// IPv6-loopback URL isn't mistaken for remote (which would falsely lock every sibling).
 	function isLoopbackHost(host: string): boolean {
-		return host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]";
+		let h = host.toLowerCase();
+		if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1); // [::1] → ::1
+		if (h.startsWith("::ffff:")) h = h.slice(7); // IPv4-mapped IPv6 → bare IPv4
+		return (
+			h === "localhost" ||
+			h === "127.0.0.1" ||
+			h === "::1" ||
+			h === "0:0:0:0:0:0:0:1"
+		);
 	}
 
 	// True when this browser-served page was reached over a NON-loopback origin. In that case
@@ -159,9 +170,9 @@
 	function selectAndConnect(s: SessionEntry): void {
 		if (discovery.selected === s.sessionId && live.status === "connected") return;
 		// Off-loopback, only the served session's token is valid (see crossSessionRemote). The
-		// sidebar already renders these rows as loopback-only/non-clickable; guard here too so
-		// no path (e.g. an /accordion focus request) can dial a session that would just be
-		// token-rejected and surface a misleading "could not reach pi" error.
+		// sidebar already renders these rows as loopback-only/non-clickable, so this is
+		// defense-in-depth for the click path: refuse the dial rather than let it fail with a
+		// misleading "could not reach pi" error if a locked row is ever activated anyway.
 		if (crossSessionRemote && s.sessionId !== servedSessionId) return;
 		session.readOnly = false; // a live pi session is steerable, not read-only
 		claudeDiscovery.selected = null;

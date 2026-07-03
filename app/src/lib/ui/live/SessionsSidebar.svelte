@@ -149,6 +149,7 @@
 						aria-label={canSteer ? label(s) : `${label(s)} (loopback-only)`}
 						onclick={() => { if (canSteer) onselect(s); }}
 						aria-disabled={!canSteer}
+						tabindex={canSteer ? undefined : -1}
 					>
 						{#if canSteer}
 							<span class="status-dot" class:on={isSel && connected} class:steering={isSel && connected && folding.enabled}></span>
@@ -271,6 +272,7 @@
 									class:locked={!canSteer}
 									onclick={() => { if (canSteer) onselect(s); }}
 									aria-disabled={!canSteer}
+									tabindex={canSteer ? undefined : -1}
 									title={canSteer ? s.cwd : LOCKED_TIP}
 								>
 									<span class="status-dot" class:on={isSel && connected} class:steering={isSel && connected && folding.enabled}></span>
