@@ -394,29 +394,36 @@
 	});
 
 	const k = (n: number) => { n = Math.round(n); return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`; };
+	/** Minimal hover tooltip for anything degraded (a folded block, a folded/drop
+	 *  group, a peeked group): kind, original token count, precise % remaining.
+	 *  Live blocks/groups keep their richer tooltip — this format only applies
+	 *  once there's something to report as "remaining". */
+	function minimalTip(kind: string, fullTokens: number, liveTokens: number): string {
+		return `${kind} · ${fullTokens.toLocaleString()} tok · ${remainingPct(fullTokens, liveTokens)}% remaining`;
+	}
 	function tip(b: Block, prot = false): string {
+		if (store.isFolded(b)) return minimalTip(b.kind, b.tokens, store.effTokens(b));
 		const tool = b.toolName ? ` ${b.toolName}` : "";
-		const folded = store.isFolded(b);
-		const f = folded ? ` · folded ${b.tokens}→${store.effTokens(b)} (${remainingPct(b.tokens, store.effTokens(b))}% remains)` : "";
 		// The hint mirrors what a double-click actually DOES — steerLocked makes it a no-op, else
 		// store.toggle gated by canFold — so the tile never advertises a fold the gate would refuse:
-		// a conductor lock, a live user/tool_call, a pin, or the protected tail. Unfold stays for a folded block.
+		// a conductor lock, a live user/tool_call, a pin, or the protected tail.
 		const action = steerLocked
 			? "click to inspect · folding locked by the conductor"
-			: folded
-				? "click to inspect · double-click to unfold"
-				: store.canFold(b)
-					? "click to inspect · double-click to fold"
-					: prot
-						? "click to inspect · protected — never folds"
-						: b.override === "pinned"
-							? "click to inspect · pinned — held live"
-							: "click to inspect · this kind never folds";
-		return `${b.kind}${tool} · ${b.tokens.toLocaleString()} tok${f}\n${action}`;
+			: store.canFold(b)
+				? "click to inspect · double-click to fold"
+				: prot
+					? "click to inspect · protected — never folds"
+					: b.override === "pinned"
+						? "click to inspect · pinned — held live"
+						: "click to inspect · this kind never folds";
+		return `${b.kind}${tool} · ${b.tokens.toLocaleString()} tok\n${action}`;
 	}
 	function groupTip(g: Group): string {
-		const members = store.groupMembers(g);
 		const full = store.groupFullTokens(g);
+		if (store.isDropGroup(g) || g.folded) {
+			return minimalTip(store.isDropGroup(g) ? "drop group" : "group", full, store.groupLiveTokens(g));
+		}
+		const members = store.groupMembers(g);
 		const saved = store.groupSavedTokens(g);
 		const strag = store.groupStragglerCount(g);
 		const turns = members.length > 0
@@ -424,9 +431,6 @@
 			: "";
 		const savedStr = saved > 0 ? ` · saves ${k(saved)} tok (${remainingPct(full, full - saved)}% remains)` : "";
 		const stragStr = strag > 0 ? ` · ${strag} kept live` : "";
-		if (store.isDropGroup(g)) {
-			return `drop group · ${members.length} blocks · ${k(saved)} tok removed${stragStr}\n${turns}\nThe agent does not see this block\nclick to inspect`;
-		}
 		return `group · ${members.length} blocks · ${k(full)} tok full${savedStr}${stragStr}\n${turns}\nclick to peek · double-click to collapse`;
 	}
 
@@ -436,7 +440,7 @@
 	 *  The dice face on the cocoa shows ITS size (the digest); the sliver beside it carries the
 	 *  original block's weight. */
 	function foldTip(b: Block): string {
-		return `folded · ${k(b.tokens)}→${k(store.effTokens(b))} tok · ${remainingPct(b.tokens, store.effTokens(b))}% remains · click to inspect · double-click to unfold`;
+		return minimalTip(b.kind, b.tokens, store.effTokens(b));
 	}
 
 	// ---- range selection state (local — for creating groups) ----------------
@@ -1160,8 +1164,10 @@
 											class:sel={selectedId === g.id}
 											data-group={g.id}
 											title={store.isDropGroup(g)
-												? `drop group · ${seg.row.members.length} blocks · The agent does not see this block · double-click to collapse`
-												: `${live ? 'group (unfolded — live)' : 'group (peek — preview only)'} · ${seg.row.members.length} blocks · double-click to collapse`}
+												? minimalTip("drop group", store.groupFullTokens(g), store.groupLiveTokens(g))
+												: live
+													? `group (unfolded — live) · ${seg.row.members.length} blocks · double-click to collapse`
+													: minimalTip("group", store.groupFullTokens(g), store.groupLiveTokens(g))}
 										>
 											{#if !live}{@render erosionBorder(remainingBand(remainingPct(store.groupFullTokens(g), store.groupLiveTokens(g))))}{/if}
 										</div>
