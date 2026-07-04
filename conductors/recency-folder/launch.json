@@ -2,5 +2,6 @@
   "id": "recency-folder",
   "label": "Recency folder",
   "command": "node",
-  "args": ["recency-folder.js"]
+  "args": ["recency-folder.js"],
+  "portEnv": "RECENCY_PORT"
 }
