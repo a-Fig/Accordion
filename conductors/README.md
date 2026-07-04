@@ -145,6 +145,14 @@ endpoint that Accordion dials as a client; the `context/update` frame carries th
 heartbeat file at `~/.accordion/conductors/<id>.json` so the desktop app auto-discovers them;
 off-box ones are added by `ws://` URL in the header dropdown.
 
+Each out-of-process conductor also ships a `launch.json` manifest — `{ id, label, command,
+args, portEnv? }` — that lets a host spawn it directly (the desktop app's "launch" button and
+headless harnesses like bellows both use it). The optional `portEnv` names the environment
+variable the conductor reads its listen port from (e.g. `"THERMO_PORT"`); declaring it lets a
+harness assign a free port per run so several instances can coexist. A conductor without
+`portEnv` can only run one instance at a time. Conductors should also honor `ACCORDION_HOME`
+for the heartbeat directory — every conductor in this repo already does.
+
 The runnable wire example is [`recency-folder/`](recency-folder/) (Node.js). The full
 lifecycle and message reference is the second half of
 [`docs/conductor-protocol.md`](../docs/conductor-protocol.md).

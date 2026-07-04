@@ -119,7 +119,7 @@ The port and all tuning knobs can be overridden via environment variables. Defau
 - `scorer.mjs` — thin re-export shim: delegates to `../attention-folder/scorer.mjs` so the probe path is always correct regardless of invocation cwd.
 - `policy.test.mjs` — unit tests for the pure policy (`node --test`, no GPU, no Python, no WS).
 - `package.json` — `start` / `test` scripts; single dep: `ws`.
-- `launch.json` — VS Code launch config.
+- `launch.json` — launcher manifest (`{ id, label, command, args, portEnv }`) used by hosts to spawn thermocline directly.
 
 ## Governance
 

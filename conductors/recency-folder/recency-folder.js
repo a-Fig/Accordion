@@ -20,7 +20,7 @@ import { join } from "node:path";
 
 const ID = "recency-folder";
 const LABEL = "Recency folder";
-const PORT = 7700;
+const PORT = Number(process.env.RECENCY_PORT) || 7700;
 const URL = `ws://127.0.0.1:${PORT}`;
 
 // ── Auto-discovery: advertise a heartbeat file under ~/.accordion/conductors/ ──
