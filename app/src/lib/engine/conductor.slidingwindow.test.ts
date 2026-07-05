@@ -39,6 +39,7 @@ function vb(
 		folded: false,
 		protected: false,
 		grouped: false,
+		fresh: false,
 	};
 }
 

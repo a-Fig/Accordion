@@ -36,6 +36,7 @@ function call(toolName: string, args: Record<string, unknown>): ViewBlock {
 		folded: false,
 		protected: false,
 		grouped: false,
+		fresh: false,
 		text: `${toolName} ${JSON.stringify(args)}`,
 	};
 }
@@ -60,6 +61,7 @@ function result(
 		folded: false,
 		protected: false,
 		grouped: false,
+		fresh: false,
 		text: output,
 	};
 }
@@ -372,6 +374,7 @@ describe("classifyCodeRead — rejects non-code reads", () => {
 			folded: false,
 			protected: false,
 			grouped: false,
+			fresh: false,
 			text: TS_BODY,
 		};
 		expect(classifyCodeRead(block, new Map())).toBeNull();

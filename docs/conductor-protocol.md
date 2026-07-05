@@ -99,12 +99,14 @@ wire:
 | `folded`       | boolean  | currently rendered folded in the view                                            |
 | `protected`    | boolean  | inside the host's protected working tail                                         |
 | `grouped`      | boolean  | member of a folded group (the host owns it)                                      |
+| `fresh`        | boolean  | never yet part of a completed model call — you may fold/replace it despite `protected`, no lock required (the "birth-fold" exemption, ADR 0017). Also true for a block YOU birth-folded on a prior pass, for as long as it remains in the tail — you needn't track this yourself. |
 | `text`         | string?  | full content (in-process always; on the wire under `wants:"full"`)               |
 | `preview`      | string?  | one-line taste (on the wire under `wants:"shape"` / `"onDemand"`)                |
 
 The four booleans fold the host's policy into plain flags so you never call an engine
 helper: skip a block when `held`, `protected`, or `grouped`, and read `foldedTokens` for the
-saving a fold would buy.
+saving a fold would buy. `fresh` is the one exception worth checking FOR, not against: a
+`protected && fresh` block is fair game even without the `tail-size` lock.
 
 ## What you return — the command set
 
@@ -161,7 +163,7 @@ A **`ClampReport`** is `{ command, ids, reason, detail }`. `reason` is one of:
 | `human-override` | a human pin / manual fold / manual unfold owns the block — the human wins      |
 | `grouped`        | the block is inside a folded group; the group overlay owns it                  |
 | `invalid-group`  | a `group`'s ids were not a valid contiguous, ungrouped, ≥1-member run entirely outside the protected tail |
-| `protected`      | the block is inside the active protected working tail; the host refuses to fold it. Without `tail-size` this is the human's `protectTokens` tail; with `tail-size` it is the conductor's declared `tailTokens` tail (`tailTokens = 0` ⇒ no tail, no `protected` clamps). See ADR 0011 |
+| `protected`      | the block is inside the active protected working tail; the host refuses to fold it. Without `tail-size` this is the human's `protectTokens` tail; with `tail-size` it is the conductor's declared `tailTokens` tail (`tailTokens = 0` ⇒ no tail, no `protected` clamps). One narrow exemption: a `fresh` block (never yet sent to the model) may still be folded despite being protected, no lock required — see `fresh` in the `ViewBlock` table and ADR 0017. See ADR 0011 |
 | `not-foldable`   | the command targeted a kind the engine never folds/replaces (`user` or `tool_call`) |
 | `noop`           | the command was a no-op (e.g. restoring an already-live block)                 |
 

@@ -67,6 +67,11 @@ export interface ViewBlock {
 	folded: boolean; // currently rendered folded in the view
 	protected: boolean; // inside the protected working tail
 	grouped: boolean; // member of a folded group (host owns it)
+	/** Never yet part of a completed model call — a conductor may fold it even inside
+	 *  the protected tail (a "birth-fold"), without holding the tail-size lock (#43).
+	 *  A block birth-folded on a prior pass also reads true while it remains in the
+	 *  tail, so a conductor need not keep its own seen-set. */
+	fresh: boolean;
 	text?: string; // full content (in-process, or wire wants:"full")
 	preview?: string; // one-line taste (wire wants:"shape"/"onDemand")
 }

@@ -30,8 +30,9 @@
  *  - v4: group collapse ops (`GroupOp`, `PlanMessage.groups`).
  *  - v5: recall tool (`recallRequest` / `recallResult`) plus completion relay
  *        (`completeRequest` / `completeResult`) for out-of-band model completions.
+ *  - v6: `SyncMessage.planned` (ADR 0017) — the birth-fold exemption. Additive.
  */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi
@@ -133,6 +134,11 @@ export interface SyncMessage {
 	full: boolean;
 	blocks: WireBlock[];
 	contextWindow?: number | null;
+	/** True only on the pre-model-call `context` sync whose plan the extension will
+	 *  APPLY. Absent/false on view-only syncs (message_end / agent_end / model_select).
+	 *  The GUI advances its "sent" cursor only on a planned sync, so a fresh block stays
+	 *  birth-foldable until the model actually consumes it (#43). */
+	planned?: boolean;
 }
 
 /**

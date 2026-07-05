@@ -483,6 +483,7 @@ describe("ColdScoreConductor — two-pass hysteresis: re-folded blocks must not 
 			folded: false,
 			protected: opts.protected ?? false,
 			grouped: false,
+			fresh: false,
 			text: opts.text,
 		};
 	}

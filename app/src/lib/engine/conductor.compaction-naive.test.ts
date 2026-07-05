@@ -73,6 +73,7 @@ function vb(
 		folded: false,
 		protected: opts.protected ?? false,
 		grouped: opts.grouped ?? false,
+		fresh: false,
 		text: opts.text ?? `content of ${id}`,
 		toolName: opts.toolName,
 	};

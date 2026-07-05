@@ -131,6 +131,30 @@ export class AccordionStore {
 	 * tokens stay verbatim. Protection is absolute: manual folds are refused there too.
 	 */
 	protectTokens = $state(20_000);
+	/**
+	 * Cursor for the birth-fold exemption (#43, ADR 0017): the highest block `order` that has
+	 * actually been SENT to the model in an applied plan. A block with `order > sentThroughOrder`
+	 * is "fresh" — born inside the protected tail before the model ever saw it, so a conductor
+	 * may fold/replace it despite protection (see `birthFoldEligible`). Advanced only by
+	 * `markSent()`, which the live client calls after a PLANNED sync (one whose plan the
+	 * extension applies) — never by a view-only sync. Starts at -1 (a fresh session, or a
+	 * bulk-loaded transcript before `markAllSent()` runs) so every present block reads fresh
+	 * until proven otherwise.
+	 */
+	private sentThroughOrder = -1;
+	/**
+	 * Sticky exemption set for the birth-fold rule (#43, ADR 0017): block ids a conductor has
+	 * successfully folded/replaced WHILE they were both protected and fresh. Deliberately OUTSIDE
+	 * `clearConductorState`'s per-pass reset — commands are re-applied from the raw baseline every
+	 * pass (ADR 0007's "complete desired state" model), so a fresh-only exemption would let the
+	 * SAME block un-fold itself on pass 2 the instant `markSent()` advances the cursor past it
+	 * (it would no longer be `isFresh`, and it is still `isProtected` until it ages out of the
+	 * tail). Membership here keeps the exemption alive for exactly as long as the block remains
+	 * in the protected tail; `pruneBirthFolded` (called wherever `protectedFromIndex` is
+	 * consumed) drops an id the moment its block leaves the tail, so this can never leak a
+	 * permanent protection bypass onto old content.
+	 */
+	private birthFolded = new Set<string>();
 	log = $state<LogEntry[]>([]);
 	private logN = 0;
 	decisionJournal = $state<DecisionEvent[]>([]);
@@ -304,6 +328,10 @@ export class AccordionStore {
 		this.meta = parsed.meta;
 		this.blocks = parsed.blocks;
 		this.reindex();
+		// #43: a bulk load (parsed transcript) hands the constructor its blocks up front — those
+		// were already part of a completed conversation, so none of them is "fresh." A live
+		// session constructs empty and streams in via `appendBlocks`; this is a no-op for it.
+		this.markAllSent();
 		this.attachConductorHost(this.conductor);
 		this.refold();
 	}
@@ -894,6 +922,58 @@ export class AccordionStore {
 		return n;
 	});
 
+	// ---- birth-fold exemption (#43, ADR 0017) ------------------------------
+	/**
+	 * Has block `b` never yet been sent to the model in an applied plan? A block "arrives" at
+	 * `order > sentThroughOrder` — i.e. after the last order the live client confirmed via
+	 * `markSent()`. On a bulk-loaded (non-live) session `markAllSent()` runs once at
+	 * construction, so every loaded block is non-fresh from the start (issue #43 PM
+	 * correction — a read-only transcript's blocks were factually already sent).
+	 */
+	private isFresh(b: Block): boolean {
+		return b.order > this.sentThroughOrder;
+	}
+	/**
+	 * May a conductor fold/replace `b` despite it being protected? True for a block that is
+	 * either fresh (born this pass, inside the tail, never sent) or already carries the sticky
+	 * `birthFolded` exemption from an earlier pass (see the field doc). Kind-gated by the same
+	 * `wireFoldable` predicate as every other fold path — the exemption only ever widens WHERE
+	 * protection allows a fold, never WHAT kind is foldable.
+	 */
+	private birthFoldEligible(b: Block): boolean {
+		return wireFoldable(b) && (this.birthFolded.has(b.id) || this.isFresh(b));
+	}
+	/** Drop any `birthFolded` id whose block has aged out of the protected tail — the
+	 *  exemption only needs to survive WHILE the block is still protected; once it isn't,
+	 *  ordinary folding applies and the sticky entry would otherwise leak forever. */
+	private pruneBirthFolded(): void {
+		if (!this.birthFolded.size) return;
+		for (const id of this.birthFolded) {
+			if (!this.isProtected(this.get(id) ?? ({ id } as Block))) this.birthFolded.delete(id);
+		}
+	}
+	/**
+	 * Advance the "sent" cursor to the newest block currently in the store. Called by the live
+	 * client after a PLANNED sync (the one whose plan the extension actually applies) — the
+	 * model has now genuinely seen every block up to here, so nothing at or before this point
+	 * should still read `fresh`. Never called for a view-only sync (message_end/agent_end/
+	 * model_select) — those blocks have NOT yet crossed the wire (#43).
+	 */
+	markSent(): void {
+		if (this.blocks.length) this.sentThroughOrder = Math.max(this.sentThroughOrder, this.blocks[this.blocks.length - 1].order);
+	}
+	/**
+	 * Mark every block currently in the store as already sent. Called once, at construction,
+	 * for a BULK-LOADED session (a parsed transcript — CC browsing, the sample session, an
+	 * opened file) — those blocks were factually already part of a completed conversation, so
+	 * none of them should read `fresh`. A live session constructs with an EMPTY block array and
+	 * streams in via `appendBlocks`, so this is a no-op for it (nothing to mark yet); freshness
+	 * for a live stream is governed by `markSent()` alone, called per planned sync.
+	 */
+	private markAllSent(): void {
+		this.sentThroughOrder = this.blocks.length ? this.blocks[this.blocks.length - 1].order : -1;
+	}
+
 	// ---- the automatic folder ---------------------------------------------
 	/**
 	 * Dissolve any group that has come to reach into the protected tail (ADR 0006 watch
@@ -955,6 +1035,9 @@ export class AccordionStore {
 			// Compute the protected boundary once; folding never changes a block's full
 			// `tokens`, so this index is stable for the whole pass.
 			const protectedFrom = this.protectedFromIndex;
+			// Drop any birth-fold exemption whose block has aged out of the tail (#43) — the
+			// exemption is only meant to survive WHILE the block is still protected.
+			this.pruneBirthFolded();
 
 			// Engine invariant — protection is ABSOLUTE: a block in the working tail is never
 			// folded, by a conductor OR the user. Heal a manual fold the tail has grown over
@@ -1046,7 +1129,9 @@ export class AccordionStore {
 	 * `folded` = currently rendered folded, `protected` = inside the working tail, `grouped`
 	 * = member of a folded group, `foldedTokens` = the digest's token cost (or full `tokens`
 	 * for a non-foldable kind, which cannot shrink — so a conductor's `foldedTokens < tokens`
-	 * shrink test naturally skips `user`/`tool_call` and never proposes a fold the host clamps).
+	 * shrink test naturally skips `user`/`tool_call` and never proposes a fold the host clamps),
+	 * `fresh` = never yet sent to the model, so a conductor may birth-fold it despite protection
+	 * (#43) — also true for a block birth-folded on a PRIOR pass while it stays in the tail.
 	 */
 	private buildView(protectedFrom: number): ConductorView {
 		const blocks = this.blocks.map((b, i) => ({
@@ -1064,6 +1149,7 @@ export class AccordionStore {
 			folded: this.isFolded(b),
 			protected: i >= protectedFrom,
 			grouped: this.groupWire.has(b.id),
+			fresh: this.isFresh(b) || this.birthFolded.has(b.id),
 			text: b.text,
 		}));
 		return {
@@ -1121,9 +1207,14 @@ export class AccordionStore {
 		if (!b) return void reports.push(clamp(kind, [id], "unknown-id", `no block ${id}`));
 		if (b.override !== null) return void reports.push(clamp(kind, [id], "human-override", `${label(b)} is held by the human`));
 		if (this.groupWire.has(id)) return void reports.push(clamp(kind, [id], "grouped", `${label(b)} is inside a folded group`));
-		// Protection is ABSOLUTE: a block in the working tail is never folded, by a conductor
-		// OR the user. Refuse and report rather than violate the safety pillar.
-		if (this.isProtected(b)) return void reports.push(clamp(kind, [id], "protected", `${label(b)} is in the protected working tail`));
+		// Protection is ABSOLUTE, with one narrow exemption (#43, ADR 0017): a block that has
+		// NEVER yet been sent to the model — born this pass inside the tail — may still be
+		// folded/replaced by a conductor, because the model has not seen it whole yet; there is
+		// nothing to "protect" from. `birthFoldEligible` also keeps the exemption sticky across
+		// passes for a block this store already birth-folded (see `birthFolded`'s doc), since
+		// commands re-apply from a raw baseline every pass. Every OTHER protected block still
+		// refuses and reports, exactly as before.
+		if (this.isProtected(b) && !this.birthFoldEligible(b)) return void reports.push(clamp(kind, [id], "protected", `${label(b)} is in the protected working tail`));
 		// One foldability gate, shared with the wire (`wireFoldable`). A kind the wire would
 		// never fold — `user` (intent) or `tool_call` (folding it orphans its result) — is
 		// refused here and REPORTED, never silently applied. Without this a conductor's
@@ -1131,6 +1222,10 @@ export class AccordionStore {
 		// the saving) while `computeFoldOps` drops it on the wire — the agent gets the block
 		// whole. That is the exact divergence the host must make unrepresentable.
 		if (!wireFoldable(b)) return void reports.push(clamp(kind, [id], "not-foldable", `${label(b)} is a ${b.kind}; only text/thinking/tool_result fold on the wire`));
+		// A successful fold/replace of a currently-protected block is necessarily a birth-fold
+		// (the check above already refused any protected block that wasn't eligible) — record the
+		// exemption so it stays folded on later passes even after `markSent()` clears `isFresh`.
+		if (this.isProtected(b)) this.birthFolded.add(id);
 		b.autoFolded = true;
 		// An empty replacement can't be represented on the wire — a fold must leave a non-empty
 		// content part (`computeFoldOps` drops an empty digest), so `subst=""` would recess the
@@ -1399,6 +1494,7 @@ export class AccordionStore {
 		// The human is taking control: drop any conductor substitution so this folds to the
 		// engine digest (with its {#code FOLDED} recovery tag), not stale conductor text.
 		b.subst = undefined;
+		this.birthFolded.delete(id); // human now owns this block's fold state (#43)
 		this.emit(by, "folded", label(b));
 		this.recordDecision(by, "fold", [id], label(b));
 		this.refold();
@@ -1418,6 +1514,7 @@ export class AccordionStore {
 		b.override = "unfolded";
 		b.by = by;
 		b.subst = undefined; // human override clears conductor-owned content
+		this.birthFolded.delete(id); // human now owns this block's fold state (#43)
 		this.emit(by, "unfolded", label(b));
 		this.recordDecision(by, "unfold", [id], label(b));
 		this.refold();
@@ -1439,6 +1536,7 @@ export class AccordionStore {
 		b.override = "pinned";
 		b.by = "you";
 		b.subst = undefined; // human override clears conductor-owned content
+		this.birthFolded.delete(id); // human now owns this block's fold state (#43)
 		this.emit("you", "pinned", label(b));
 		this.recordDecision("you", "pin", [id], label(b));
 		this.refold();

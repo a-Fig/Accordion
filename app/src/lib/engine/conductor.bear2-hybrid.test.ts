@@ -385,6 +385,7 @@ describe("Bear2HybridConductor — hard-failure freeze on persistent Bear-2 erro
 				folded: false,
 				protected: false,
 				grouped: false,
+				fresh: false,
 			})),
 			budget: 40_000,
 			liveTokens: 45_000,
