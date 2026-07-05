@@ -19,6 +19,7 @@ import { NaiveCompactionConductor } from "./compaction-naive/compaction-naive";
 import { Bear2HybridConductor } from "./bear2-hybrid/bear2-hybrid";
 import { CodeSkeletonConductor } from "./code-skeleton/code-skeleton";
 import { KeelConductor } from "./keel/keel";
+import { HandoffConductor } from "./handoff/handoff";
 import type { Conductor, LockName } from "./contract";
 
 export { BuiltinConductor } from "./builtin/builtin";
@@ -30,6 +31,7 @@ export { NaiveCompactionConductor } from "./compaction-naive/compaction-naive";
 export { Bear2HybridConductor } from "./bear2-hybrid/bear2-hybrid";
 export { CodeSkeletonConductor } from "./code-skeleton/code-skeleton";
 export { KeelConductor } from "./keel/keel";
+export { HandoffConductor } from "./handoff/handoff";
 
 /**
  * A conductor compiled into the app (in-process).
@@ -66,6 +68,12 @@ export const IN_PROCESS_CONDUCTORS: InProcessConductor[] = [
   },
   { id: "code-skeleton", label: "Code skeleton", create: () => new CodeSkeletonConductor() },
   { id: "keel", label: "Keel", create: () => new KeelConductor() },
+  {
+    id: "handoff",
+    label: "Handoff (fresh start)",
+    locks: ["human-steering", "agent-unfold", "tail-size"],
+    create: () => new HandoffConductor(),
+  },
 ];
 
 /** Look up an in-process conductor by id (null if not one). */
