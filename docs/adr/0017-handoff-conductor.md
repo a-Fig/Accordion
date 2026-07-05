@@ -44,8 +44,8 @@ exactly the two things that make it a fresh-start rather than an in-place compac
 This is the mechanical heart of the ADR. The conductor declares
 `locks = ["human-steering", "agent-unfold", "tail-size"]` and `tailTokens = HANDOFF_TAIL_TOKENS`
 (8k). Under the `tail-size` lock (ADR 0011 §7) the host drives `protectedFromIndex` from the
-conductor's `tailTokens` instead of the human's `protectTokens`, so only the newest ~8k of
-tokens stay live and **everything older is foldable into the handoff**. Naive compaction
+conductor's `tailTokens` instead of the human's `protectTokens`, so only the newest whole
+block(s) targeting ~8k stay live and **everything older is foldable into the handoff**. Naive compaction
 pointedly does the opposite — it leaves `tail-size` unlocked so the human keeps a big ~20k
 verbatim tail. Here, owning a small tail is not a power grab; it *is* the simulation. Without
 it the human's 20k tail would defeat "fresh start" entirely and the two conductors would be
@@ -53,11 +53,15 @@ indistinguishable.
 
 Consequence: the visible window collapses hard at each handoff (nearly the whole conversation
 folds into one document) and rebuilds toward the high-water mark before the next handoff — a
-deep sawtooth, versus naive compaction's gentle curve. 8k is the "fresh agent's initial working
-room": small enough to feel like a reset, large enough that the agent has a concrete current
-turn to act on right after the handoff. `tailTokens = 0` was rejected — with no protected tail
-the newest block would fold instantly every pass, so nothing would ever stay live and the agent
-could not work.
+deep sawtooth, versus naive compaction's gentle curve. 8k is a *target*, not a guarantee: the
+host walk-back protects the newest **whole** blocks summing to ≥8k, stopping before it breaches
+a 25% overflow cap (10k) — so with large recent blocks the live tail can be as little as one
+block (e.g. a single 5–10k tool result), and never more than ~10k. That is the "fresh agent's
+initial working room": small enough to feel like a reset, large enough that the agent has a
+concrete current turn to act on right after the handoff. `tailTokens = 0` was rejected — with
+`target === 0` the walk-back protects nothing (`protectedFromIndex = blocks.length`), so the
+newest block is never held live and the conductor could fold it straight into the handoff,
+leaving the fresh agent no concrete current turn to work from.
 
 ### 2. The completion is a handoff document, not a compaction summary
 
@@ -91,7 +95,8 @@ inherits the conductor's 8k tail into the human's `protectTokens` so the boundar
   degrades *despite* best-effort preservation, not from weak prompting.
 - **First in-process `tail-size` user.** No shipped in-process conductor previously exercised
   the `tail-size` lock / `tailTokens` plumbing (only test doubles did). The end-to-end
-  AccordionStore test asserts the conductor owns an ~8k tail (not the human's 20k), that
+  AccordionStore test asserts the conductor owns a smaller tail than the human's 20k default —
+  differentially, on identical blocks, and at the exact walk-back boundary — that
   `setProtect` is inert while attached, and that no `protected` / `invalid-group` / `not-foldable`
   clamp fires on the happy path.
 - **Exclusive, so it gates.** Locking all three steering controls triggers the one-time ADR 0011

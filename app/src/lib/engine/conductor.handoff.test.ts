@@ -804,10 +804,13 @@ describe("HandoffConductor — AccordionStore integration", () => {
 		s.attach(new HandoffConductor());
 		await flushMicrotasks();
 
-		// The conductor owns the tail at ~HANDOFF_TAIL_TOKENS (8k), NOT the human's 20k default:
-		// only the newest block(s) summing to ~8k are protected, so the older blocks are foldable.
-		expect(s.protectedFromIndex).toBeGreaterThan(0);
-		expect(s.protectedFromIndex).toBeLessThan(blocks.length);
+		// The conductor owns the tail via the 8k tail-size lock, NOT the human's 20k default.
+		// Walk-back (target 8000, 25% cap = 10000): newest block m4=1000 < 8000, and adding
+		// m3=10000 would breach the 10000 cap → the boundary lands at index 4 (only m4 protected).
+		// A human 20k tail on these same blocks would protect down to index 2 (m2,m3,m4 ≈ 21000),
+		// so this exact index is the proof the conductor's 8k tail — not the 20k default — is live.
+		expect(s.protectedFromIndex).toBe(4);
+		expect(s.protectedTokens).toBe(1000); // only the newest block, per the cap
 
 		// One conductor-owned, folded group carrying the handoff verbatim (no drop group).
 		expect(s.groups.length).toBe(1);
@@ -830,6 +833,38 @@ describe("HandoffConductor — AccordionStore integration", () => {
 		const before = s.protectedFromIndex;
 		s.setProtect(200_000);
 		expect(s.protectedFromIndex).toBe(before);
+	});
+
+	it("owns a demonstrably SMALLER tail than a human 20k tail on the same session (the fresh-start claim)", async () => {
+		// The whole justification for a separate conductor is that it discards more of the working
+		// tail than in-place compaction. Prove it differentially on identical blocks: six 5k blocks.
+		//   Human 20k tail:  walk-back protects newest 4 (5+5+5+5=20000) → protectedFromIndex 2.
+		//   Handoff 8k tail: walk-back protects newest 2 (5+5=10000, ≤ 10000 cap) → index 4.
+		const mk = () => [
+			blk(0, "user", 5000, { text: "ask" }),
+			blk(1, "text", 5000, { text: "a" }),
+			blk(2, "text", 5000, { text: "b" }),
+			blk(3, "text", 5000, { text: "c" }),
+			blk(4, "text", 5000, { text: "d" }),
+			blk(5, "text", 5000, { text: "e" }),
+		];
+
+		// Human baseline: no conductor (default collaborative), explicit 20k tail.
+		const sHuman = makeStore(mk());
+		sHuman.setProtect(20_000);
+		expect(sHuman.protectedFromIndex).toBe(2);
+
+		// Handoff: 8k tail-size lock owns the tail.
+		const sHandoff = makeStore(mk());
+		sHandoff.setBudget(20_000);
+		sHandoff.completer = async () => ({ text: "H", model: "test-model" });
+		sHandoff.attach(new HandoffConductor());
+		await flushMicrotasks();
+
+		expect(sHandoff.protectedFromIndex).toBe(4);
+		// Strictly fewer blocks kept live → strictly more of the session folded into the handoff.
+		expect(sHandoff.protectedFromIndex).toBeGreaterThan(sHuman.protectedFromIndex);
+		expect(sHandoff.protectedTokens).toBeLessThan(sHuman.protectedTokens);
 	});
 
 	it("re-handoffs recursively when new blocks age in over the high-water mark", async () => {

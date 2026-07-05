@@ -29,7 +29,9 @@ tokens — verbatim, and only summarizes the aged prefix. A fresh start throws t
 **away**: when you `/clear` and reseed, you carry over only what the handoff author wrote down,
 not your last 20k of live tool output and reasoning.
 
-So this conductor **owns a deliberately small tail** (`HANDOFF_TAIL_TOKENS`, ~8k — the "fresh
+So this conductor **owns a deliberately small tail** (`HANDOFF_TAIL_TOKENS` targets ~8k — the
+host walk-back keeps the newest whole block(s) up to a 25% overflow cap, so the live tail is one
+block at minimum and never more than ~10k; the "fresh
 agent's initial working room") by holding the **`tail-size`** involvement lock (ADR 0011), and
 folds nearly the *whole* conversation into the single handoff. The visible window collapses hard
 at each handoff and rebuilds — a deep sawtooth, not naive compaction's gentle curve. Locking
