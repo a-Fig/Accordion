@@ -132,7 +132,8 @@ result. See the `group` row below and ADR 0006 §drop-addendum.
 | `fold`    | `{ kind:"fold", ids, digest? }`      | Collapse blocks to a digest. No `digest` → the host's per-kind digest + the `{#code FOLDED}` agent-recovery tag. A `digest` string → exactly that text is shown and the agent receives it. |
 | `replace` | `{ kind:"replace", id, content }`    | Substitute a block's content with arbitrary text. The block stays in place (pairing intact). `content: ""` means "shrink to nothing": an empty content part can't be sent on the wire, so the host folds the block to its `{#code FOLDED}` digest (the smallest wire-safe form), so the view matches what the agent receives. Only `text`/`thinking`/`tool_result` fold. |
 | `group`   | `{ kind:"group", ids, digest? }`     | Collapse a **contiguous** run (≥1 member) into an entry. The group covers the run from the **first to the last** named id, snapped outward to whole messages — blocks *between* the first and last are swept in even if unnamed. For a non-contiguous set, issue one `group` per run, or empty/replace blocks individually. `digest` controls what replaces the run: **`undefined`** → the host's default deterministic recap + `{#code FOLDED}` tag (unchanged behavior); **`null` or `""`** → **DROP**: the run is removed from the wire and NO replacement is inserted — the agent never sees those blocks, `recall`/`unfold` cannot recover them (they are gone by design); **a non-empty string** → that exact text is the summary verbatim (like `FoldCommand.digest`, no tag added). DROP is the second deliberate exception to "content substitution, never structural removal" (see ADR 0006 §drop-addendum); like the existing group→summary exception it is whole-message and pair-balanced. |
-| `restore` | `{ kind:"restore", ids }`            | Return blocks to full, live content (undo a fold/replace). No-op on a human-held block. |
+| `restore` | `{ kind:"restore", ids }`            | Return blocks to full, live content (undo a fold/replace). No-op on a human-held block. Also **releases any active `recall`** for these ids — the explicit opt-out (see `recall`). |
+| `recall`  | `{ kind:"recall", ids }`             | Surface a **folded** block's original full text at the tail WITHOUT unfolding it (the conductor analog of the agent's `recall` tool, ADR 0018). The block **stays folded** (its digest keeps costing only the digest); the host ALSO appends the full text as one synthetic user message at a **frozen anchor** near the tail — cache-safe, where an unfold would force a prompt-cache miss. **Sticky**, the ONE exception to the full-state reset model: a recall persists until the block is unfolded/leaves the store OR you issue `restore` for it — merely omitting it from a later batch does NOT drop it (dropping the injection would mutate the prefix and cost the cache miss). Recallable = folded + a foldable kind + a durable id + not grouped; else `not-recallable` (or `unknown-id`). Re-recall is a silent no-op (anchor unchanged). |
 | `pin`     | `{ kind:"pin", ids }`                | Assert blocks stay live and open — e.g. force live a block an earlier command in the same batch folded. Never overrides a *human* pin. |
 
 ## Guardrails the host enforces (and reports)
@@ -165,6 +166,7 @@ A **`ClampReport`** is `{ command, ids, reason, detail }`. `reason` is one of:
 | `invalid-group`  | a `group`'s ids were not a valid contiguous, ungrouped, ≥1-member run entirely outside the protected tail |
 | `protected`      | the block is inside the active protected working tail; the host refuses to fold it. Without `tail-size` this is the human's `protectTokens` tail; with `tail-size` it is the conductor's declared `tailTokens` tail (`tailTokens = 0` ⇒ no tail, no `protected` clamps). One narrow exemption: a `fresh` block (never yet sent to the model) may still be folded despite being protected, no lock required — see `fresh` in the `ViewBlock` table and ADR 0017. See ADR 0011 |
 | `not-foldable`   | the command targeted a kind the engine never folds/replaces (`user` or `tool_call`) |
+| `not-recallable` | a `recall` targeted a block that exists but is not currently folded on the wire (a live block, a non-foldable kind, a non-durable id, or a grouped member) — nothing to recall. A nonexistent id clamps `unknown-id` instead. See ADR 0018 |
 | `noop`           | the command was a no-op (e.g. restoring an already-live block)                 |
 
 In-process, `conduct()` returns and the host applies synchronously; the clamp reports are
@@ -315,8 +317,8 @@ reverted by host healing). Each `block` is a `ViewBlock` — its `text` is prese
 ```
 
 `reason` is one of the `ClampReason`s tabled in Part 1 (`unknown-id`, `human-override`,
-`grouped`, `invalid-group`, `protected`, `not-foldable`, `noop`). Commands are never silently dropped — every
-clamp is reported.
+`grouped`, `invalid-group`, `protected`, `not-foldable`, `not-recallable`, `noop`). Commands are never silently
+dropped — every clamp is reported.
 
 **`cap/result`** — answer to a `cap/request` you sent (same `reqId`).
 

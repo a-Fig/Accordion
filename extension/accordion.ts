@@ -49,10 +49,10 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { linearize, applyPlan, type PiMessage } from "../app/src/lib/live/mapping";
-import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type RecallOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
 
 /** The GUI's reply to a sync: in-place fold ops + group-collapse ops (ADR 0006). */
-type Plan = { ops: FoldOp[]; groups: GroupOp[] };
+type Plan = { ops: FoldOp[]; groups: GroupOp[]; recalls: RecallOp[] };
 import {
 	REGISTRY_PROTOCOL,
 	REGISTRY_DIR,
@@ -847,7 +847,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 					const resolve = pending.get(msg.reqId);
 					if (resolve) {
 						pending.delete(msg.reqId);
-						resolve({ ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [] });
+						resolve({ ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [], recalls: Array.isArray(msg.recalls) ? msg.recalls : [] });
 					}
 				}
 				if (msg?.type === "unfoldResult" && typeof msg.reqId === "number") {
@@ -975,7 +975,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			const timer = setTimeout(() => {
 				if (pending.has(reqId)) {
 					pending.delete(reqId);
-					resolve({ ops: [], groups: [] }); // delivered but no reply in time → passthrough
+					resolve({ ops: [], groups: [], recalls: [] }); // delivered but no reply in time → passthrough
 				}
 			}, REQUEST_TIMEOUT_MS);
 			pending.set(reqId, (plan) => {
@@ -1125,9 +1125,9 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		if (plan === null) return; // couldn't deliver → pass through, don't advance
 		if (epoch !== myEpoch) return; // GUI reconnected mid-flight → don't apply/advance
 		sentCount = Math.max(sentCount, all.length); // advance cursor; never rewind (a message_end during the await may have advanced it further)
-		if (plan.ops.length === 0 && plan.groups.length === 0) return; // empty plan → pass through
+		if (plan.ops.length === 0 && plan.groups.length === 0 && (plan.recalls?.length ?? 0) === 0) return; // empty plan → pass through
 
-		return { messages: applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups) as unknown as AgentMessage[] };
+		return { messages: applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups, plan.recalls) as unknown as AgentMessage[] };
 	});
 
 	// ── model swap: keep the GUI's context window (and budget) in lockstep ───────

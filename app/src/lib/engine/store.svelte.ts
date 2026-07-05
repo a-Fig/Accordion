@@ -12,7 +12,7 @@
  * intent. Deterministic and explainable; the smarts come later.
  */
 import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
-import { digest, digestTokens, foldTag, groupDigest, groupDigestTokens, substTokens, wireFoldable } from "./digest";
+import { digest, digestTokens, foldCode, foldTag, groupDigest, groupDigestTokens, substTokens, wireFoldable } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { isDurableId } from "../live/mapping";
 import type { Conductor, ConductorView, Command, ClampReport, ClampReason, LockName, ConductorHost, CompletionRequest, CompletionResult, JSONValue } from "$conductors/contract";
@@ -155,6 +155,19 @@ export class AccordionStore {
 	 * permanent protection bypass onto old content.
 	 */
 	private birthFolded = new Set<string>();
+	/**
+	 * Active conductor recalls (ADR 0018): folded block id → the FROZEN anchor id after whose
+	 * message the block's original full text is injected as one synthetic user message on the wire.
+	 * Deliberately OUTSIDE `clearConductorState`'s per-pass reset (like `birthFolded`): a recall is
+	 * the ONE command exempt from the full-state model, because dropping a tail injection would
+	 * mutate the prefix and force a prompt-cache miss — the very thing recall exists to avoid. So a
+	 * recall persists until it is EXPLICITLY released (`restore`, or the block is unfolded/leaves
+	 * the store), not merely by being omitted from a later batch. The anchor id is frozen at record
+	 * time and never re-chosen, so the injection point stays byte-stable. The injected text is read
+	 * LIVE from `get(id).text` at emission time (Block.text is never mutated), so nothing is copied
+	 * here — only the anchor. `$state` so `recalledTokens` / `isRecalled` are reactive.
+	 */
+	private recalled = $state(new Map<string, { anchorId: string }>());
 	log = $state<LogEntry[]>([]);
 	private logN = 0;
 	decisionJournal = $state<DecisionEvent[]>([]);
@@ -359,6 +372,7 @@ export class AccordionStore {
 		this.syncLocks();
 		this.lastCmds = [];
 		this.lastReports = [];
+		this.clearRecalled(); // the prior conductor's tail injections leave with it (ADR 0018)
 		// Release human/agent holds in the domains the NEW conductor locks. Pass `c?.locks`
 		// explicitly; the `activeLocks` snapshot was just synced above so `isLocked` already agrees.
 		this.releaseLockedDomains(c?.locks ?? []);
@@ -394,6 +408,7 @@ export class AccordionStore {
 		this.syncLocks();
 		this.lastCmds = [];
 		this.lastReports = [];
+		this.clearRecalled(); // detach drops recalls — a one-time cache miss, like freezing folds (ADR 0018)
 		this.refold();
 	}
 
@@ -690,6 +705,24 @@ export class AccordionStore {
 	liveTokens = $derived.by(() => {
 		let n = 0;
 		for (const b of this.blocks) n += this.effTokens(b);
+		// A conductor recall keeps the block folded (its digest already counted in effTokens above)
+		// but ALSO injects its full text at the tail — so the wire truly sends both. Charge the
+		// injection on top so the budget readout is honest (ADR 0018).
+		return n + this.recalledTokens;
+	});
+	/**
+	 * Tokens the active conductor recalls add on top of the folded view (ADR 0018): the sum of each
+	 * recalled block's ORIGINAL full-text injection (read live from the block, labeled + tagged the
+	 * same way the wire emits it — see `computeRecallOps` / `plan.ts`). Zero when nothing is recalled,
+	 * so the golden/raw path is unchanged.
+	 */
+	recalledTokens = $derived.by(() => {
+		if (!this.recalled.size) return 0;
+		let n = 0;
+		for (const id of this.recalled.keys()) {
+			const b = this.get(id);
+			if (b) n += substTokens(recallInjection(b));
+		}
 		return n;
 	});
 	/** What the context would cost with nothing folded. (Only changes when blocks change.) */
@@ -1077,6 +1110,11 @@ export class AccordionStore {
 				this.recordDecision(by, "clamp", r.ids, r.detail, r.reason);
 			}
 			this.recordConductorTransitions(before, beforeGroups);
+			// Fold state has now settled — release any recall whose block ended this pass live on the
+			// wire (human/agent unfold, or the conductor stopped folding it), or that left the store.
+			// A recall persists across passes by design; this is the ONLY place one is dropped short
+			// of an explicit `restore` (ADR 0018).
+			this.pruneRecalled();
 		} finally {
 			this.conducting = false;
 		}
@@ -1185,8 +1223,16 @@ export class AccordionStore {
 					this.substOne(c.id, c.content, by, "replace", reports, c.recoverable ?? false);
 					break;
 				case "restore":
+					// `restore` is also the conductor's explicit opt-out of a recall (ADR 0018):
+					// release any active recall for these ids BEFORE returning the block to live.
+					for (const id of c.ids) this.releaseRecall(id);
+					for (const id of c.ids) this.liveOne(id, by, c.kind, reports);
+					break;
 				case "pin":
 					for (const id of c.ids) this.liveOne(id, by, c.kind, reports);
+					break;
+				case "recall":
+					for (const id of c.ids) this.recallOne(id, reports);
 					break;
 				case "group":
 					this.groupCmd(c.ids, by, reports, c.digest);
@@ -1194,6 +1240,91 @@ export class AccordionStore {
 			}
 		}
 		return reports;
+	}
+
+	/**
+	 * Record a conductor recall of one folded block (ADR 0018): the block STAYS folded, and its
+	 * original full text is injected at a frozen tail anchor on the wire (`computeRecallOps`). The
+	 * anchor is the newest NON-grouped, durable-id block at this instant — the closest a conductor
+	 * command can get to "just before the working tail," and durable so `applyPlan` can re-resolve
+	 * it. Idempotent: a block already recalled keeps its original frozen anchor (no re-anchoring).
+	 *
+	 * Recallability mirrors `resolveRecall` / `computeFoldOps` EXACTLY: a block is recallable iff it
+	 * is currently folded, a wire-foldable kind, and durably identified — i.e. its digest actually
+	 * rides the wire, so there is a real, agent-visible `{#code FOLDED}` handle to expand. Anything
+	 * else clamps: unknown id ⇒ `unknown-id`; a live block, a non-foldable kind, a non-durable id,
+	 * or a member of a folded GROUP (owned by the group, not independently on the wire) ⇒
+	 * `not-recallable`.
+	 */
+	private recallOne(id: string, reports: ClampReport[]): void {
+		const b = this.get(id);
+		if (!b) return void reports.push(clamp("recall", [id], "unknown-id", `no block ${id}`));
+		if (this.recalled.has(id)) return; // already recalled: keep the frozen anchor, silent no-op
+		// A recall only makes sense for a block whose folded digest is actually on the wire: folded,
+		// a foldable kind, a durable id, and NOT swallowed by a folded group (the group owns it).
+		if (!this.isFolded(b) || !wireFoldable(b) || !isDurableId(b.id) || this.groupWire.has(id)) {
+			return void reports.push(clamp("recall", [id], "not-recallable", `${label(b)} is not currently folded on the wire`));
+		}
+		const anchorId = this.newestRecallAnchor();
+		if (anchorId === null) return void reports.push(clamp("recall", [id], "not-recallable", `${label(b)} has no anchor to recall to`));
+		this.recalled.set(id, { anchorId });
+		this.recalled = new Map(this.recalled); // new ref so $derived re-tracks
+	}
+
+	/** Release one active recall (the explicit `restore` opt-out, ADR 0018). No-op if not recalled. */
+	private releaseRecall(id: string): void {
+		if (this.recalled.delete(id)) this.recalled = new Map(this.recalled);
+	}
+
+	/** Drop ALL active recalls (ADR 0018). Called on conductor swap/detach/reset — the recalling
+	 *  conductor is gone or its authorship is being cleared, so its tail injections go with it. This
+	 *  is a one-time prompt-cache miss (the injected messages leave the prefix), the same cost detach
+	 *  pays for freezing folds; acceptable because these are deliberate, human-driven transitions. */
+	private clearRecalled(): void {
+		if (this.recalled.size) this.recalled = new Map();
+	}
+
+	/** Is this block currently recalled to the tail by the conductor (ADR 0018)? The minimal read
+	 *  the UI needs to render a "recalled to tail" badge. Reactive on `recalled`. */
+	isRecalled(id: string): boolean {
+		return this.recalled.has(id);
+	}
+	/** The frozen anchor id an active recall injects after, or null if not recalled (ADR 0018).
+	 *  The wire (`computeRecallOps`) reads this to emit the `RecallOp.afterId`. */
+	recallAnchorOf(id: string): string | null {
+		return this.recalled.get(id)?.anchorId ?? null;
+	}
+
+	/** The newest non-grouped, durable-id block id — the frozen anchor a fresh recall injects
+	 *  after. Durable so `applyPlan` can re-resolve it; non-grouped so the injection point is a
+	 *  real surviving message, not one collapsed into a group summary. Null if none qualifies. */
+	private newestRecallAnchor(): string | null {
+		for (let i = this.blocks.length - 1; i >= 0; i--) {
+			const b = this.blocks[i];
+			if (isDurableId(b.id) && !this.groupWire.has(b.id)) return b.id;
+		}
+		return null;
+	}
+
+	/**
+	 * Drop any recall whose block is no longer folded on the wire, or has left the store (ADR 0018).
+	 * A recall's whole purpose is to surface a FOLDED block's content; once the block is live (human
+	 * unfold, agent unfold, or the conductor simply stopped folding it so it settled live after a
+	 * pass) the tail injection would duplicate content already standing in place — so release it.
+	 * Called at the END of each conductor pass, after fold state has settled, so `isFolded` reflects
+	 * the final view. Never re-anchors a surviving recall.
+	 */
+	private pruneRecalled(): void {
+		if (!this.recalled.size) return;
+		let changed = false;
+		for (const id of [...this.recalled.keys()]) {
+			const b = this.get(id);
+			if (!b || !this.isFolded(b) || this.groupWire.has(id)) {
+				this.recalled.delete(id);
+				changed = true;
+			}
+		}
+		if (changed) this.recalled = new Map(this.recalled);
 	}
 
 	/**
@@ -1580,6 +1711,7 @@ export class AccordionStore {
 		// group — including a detach-frozen view whose inherited 0-tail leaves no protected tail to
 		// prune it — would survive reset still folded, silently contradicting "all blocks to auto".
 		if (this.groups.length) this.groups = [];
+		this.clearRecalled(); // "pure budget view" — no conductor tail injection survives either (ADR 0018)
 		this.emit("you", "reset", "all blocks to auto");
 		this.recordDecision("you", "reset", [], "all blocks to auto");
 		this.refold();
@@ -1756,6 +1888,17 @@ export class AccordionStore {
 function label(b: Block): string {
 	const where = b.turn > 0 ? `turn ${b.turn}` : "preamble";
 	return b.toolName ? `${b.kind} ${b.toolName} · ${where}` : `${b.kind} · ${where}`;
+}
+
+/**
+ * The labeled, tagged full-text injection a conductor recall appends to the tail (ADR 0018).
+ * ONE source of truth for BOTH the token accounting (`recalledTokens`) and the wire op
+ * (`computeRecallOps` in `plan.ts`), so the budget readout can never diverge from what the agent
+ * actually receives. Mirrors the AGENT recall tool's label format in `extension/accordion.ts`
+ * (`[recalled <label> (#<code>)]\n<text>`) so a conductor recall and an agent recall read the same.
+ */
+export function recallInjection(b: Block): string {
+	return `[recalled ${label(b)} (#${foldCode(b.id)})]\n${b.text}`;
 }
 
 /** Build a ClampReport (host clamped a command to the validity floor instead of dropping it). */

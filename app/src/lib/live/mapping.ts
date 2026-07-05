@@ -16,7 +16,7 @@
  * Fallback (missing anchor): `m<i>:u`, `m<i>:p<j>`, `m<i>:r`, `m<i>:s` (position-based,
  * same as the old scheme) — so nothing crashes on malformed messages.
  */
-import type { WireBlock, FoldOp, GroupOp } from "./protocol";
+import type { WireBlock, FoldOp, GroupOp, RecallOp } from "./protocol";
 import type { Block } from "../engine/types";
 import { estTokens, BLOCK_OVERHEAD } from "../engine/tokens";
 
@@ -296,12 +296,18 @@ function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () =>
  *     Each maximal run of same-group removable messages becomes one message (role = the
  *     run's first message's role, mapped to user/assistant; content = the summary text).
  *
+ *   • `RecallOp` — TAIL INJECTION (ADR 0018): insert ONE synthetic user message carrying a folded
+ *     block's full text AFTER its frozen anchor message, WITHOUT unfolding the block (its digest
+ *     stays in place). Additive — it only appends a message; it never removes or edits an existing
+ *     one, so tool pairing is untouched. Group-swallowed / dropped / unknown anchors fall back to
+ *     the last surviving message before the gap, else the very end (see `RecallOp`).
+ *
  * On ANY doubt a message passes through untouched; the output is never structurally invalid
  * (no orphaned tool pair, no emptied message). Safe because this output feeds the model only
  * — the GUI's block sync/cursor run off the un-collapsed `linearize`, so removals never
  * desync the view (ADR 0006 §4).
  */
-export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[] = []): PiMessage[] {
+export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[] = [], recalls: RecallOp[] = []): PiMessage[] {
 	// Defense in depth (matches the GUI's `computeFoldOps`/`computeGroupOps`): refuse any op
 	// whose id is NOT durable or whose digest is empty, and any group with no summary/members.
 	// This is the shared safety boundary on the path that feeds the real model, so it cannot
@@ -322,7 +328,13 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 			g.memberIds.every((m) => typeof m === "string") &&
 			(g.summaryText === null || (typeof g.summaryText === "string" && g.summaryText.trim())),
 	);
-	if (!safeOps.length && !safeGroups.length) return messages;
+	// A recall is valid only if its anchor id and injected text are non-empty strings. `id` is
+	// carried for correlation only — the wire keys the insertion on `afterId` — so a bad `id`
+	// alone doesn't invalidate it, but `afterId`/`text` must be sound or there is nothing to insert.
+	const safeRecalls = (recalls ?? []).filter(
+		(r) => r && typeof r.afterId === "string" && r.afterId && typeof r.text === "string" && r.text,
+	);
+	if (!safeOps.length && !safeGroups.length && !safeRecalls.length) return messages;
 
 	const byId = new Map(safeOps.map((o) => [o.id, o] as const));
 
@@ -377,6 +389,12 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 		changed = true;
 	};
 	const out: PiMessage[] = [];
+	// For the recall pass: the output position (an index into `out`) attributable to each SOURCE
+	// message index. A surviving/folded message maps to its own slot; every source message in a
+	// collapsed run maps to that run's summary slot (or, for a drop run, stays -1 — so a recall
+	// anchored inside it falls back to the last surviving message before the gap). Used ONLY to
+	// resolve recall anchors below; it does not affect the fold/group output.
+	const outPosOf = new Array<number>(messages.length).fill(-1);
 	for (let i = 0; i < messages.length; ) {
 		const g = owner[i];
 		if (g) {
@@ -386,18 +404,60 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 			while (j < messages.length && owner[j] === g) j++;
 			if (g.summaryText === null) {
 				// DROP: consume the run and push nothing — the agent never sees these messages.
+				// outPosOf stays -1 for the run: a recall anchored here falls back below.
 				changed = true;
 			} else {
 				// REPLACE: insert ONE synthetic summary message (existing behavior).
 				const role = messages[i].role === "assistant" ? "assistant" : "user";
 				out.push({ role, content: [{ type: "text", text: g.summaryText }] } as PiMessage);
+				for (let k = i; k < j; k++) outPosOf[k] = out.length - 1; // every collapsed src → the summary slot
 				changed = true;
 			}
 			i = j;
 			continue;
 		}
 		out.push(foldOne(messages[i], i, byId, mark));
+		outPosOf[i] = out.length - 1;
 		i++;
+	}
+
+	// ── Recall pass: inject each recalled block's full text as ONE synthetic user message ────
+	// Insert AFTER the message that emits `afterId`. The anchor is frozen GUI-side
+	// (computeRecallOps); re-resolving it here is a wire-safety re-derivation — never trusting the
+	// peer's shape. Never touches tool messages, so tool_call/result pairing stays balanced.
+	if (safeRecalls.length) {
+		// durable id → its source message index (mirrors linearize's id assignment).
+		const srcOf = new Map<string, number>();
+		messages.forEach((m, i) => {
+			for (const id of messageInfo(m, i).ids) if (!srcOf.has(id)) srcOf.set(id, i);
+		});
+		// Resolve a recall's anchor to an output position, applying the group-swallow fallback:
+		// walk back from the anchor's source index to the nearest source message that survived to
+		// an output slot. -1 (anchor unknown, or every message up to it was dropped) ⇒ append at end.
+		const resolveAfterPos = (afterId: string): number => {
+			const src = srcOf.get(afterId);
+			if (src === undefined) return -1;
+			for (let i = src; i >= 0; i--) if (outPosOf[i] >= 0) return outPosOf[i];
+			return -1;
+		};
+		// Group injections by insertion position, preserving recall order within a shared position.
+		const injections = new Map<number, PiMessage[]>();
+		for (const r of safeRecalls) {
+			const pos = resolveAfterPos(r.afterId);
+			const msg = { role: "user", content: [{ type: "text", text: r.text }] } as PiMessage;
+			const arr = injections.get(pos);
+			if (arr) arr.push(msg);
+			else injections.set(pos, [msg]);
+		}
+		if (injections.size) {
+			changed = true;
+			const appended = injections.get(-1) ?? []; // pos === -1 ⇒ append after the last output message
+			// Splice interior insertions from the LAST position backward so earlier splices don't
+			// shift the indices of later ones.
+			const positions = [...injections.keys()].filter((p) => p >= 0).sort((a, b) => b - a);
+			for (const pos of positions) out.splice(pos + 1, 0, ...injections.get(pos)!);
+			out.push(...appended);
+		}
 	}
 	return changed ? out : messages;
 }

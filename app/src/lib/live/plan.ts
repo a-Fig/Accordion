@@ -24,8 +24,9 @@
  */
 import type { AccordionStore } from "../engine/store.svelte";
 import type { Block } from "../engine/types";
-import type { FoldOp, GroupOp, UnfoldRestored, RecallContent } from "./protocol";
+import type { FoldOp, GroupOp, RecallOp, UnfoldRestored, RecallContent } from "./protocol";
 import { isDurableId } from "./mapping";
+import { recallInjection } from "../engine/store.svelte";
 import { foldCode, wireFoldable } from "../engine/digest";
 
 /**
@@ -72,6 +73,30 @@ export function computeGroupOps(store: AccordionStore): GroupOp[] {
 		// Only skip a non-drop group whose summary is empty/whitespace (defensive; shouldn't happen).
 		if (summaryText !== null && !summaryText.trim()) continue;
 		out.push({ id: g.id, memberIds, summaryText });
+	}
+	return out;
+}
+
+/**
+ * Compute the recall ops for the current store state (ADR 0018): one `RecallOp` per ACTIVE recall
+ * whose block is STILL folded on the wire. The block stays folded (its `FoldOp` still rides); the
+ * op tells the extension to ALSO inject the block's ORIGINAL full text as one synthetic user
+ * message after the frozen `afterId` anchor. `text` is the labeled/tagged injection
+ * (`recallInjection`), the SAME string the store token-accounts (`recalledTokens`) so the view and
+ * the wire agree exactly. A recall whose block ended up live (unfolded / stopped folding) is
+ * dropped by the store's `pruneRecalled`, so it never reaches here; we re-guard on `isFolded`
+ * anyway for defense in depth. Pure read; the store is never mutated.
+ */
+export function computeRecallOps(store: AccordionStore): RecallOp[] {
+	const out: RecallOp[] = [];
+	for (const b of store.blocks) {
+		if (!store.isRecalled(b.id)) continue;
+		// Only inject for a block whose folded digest is genuinely on the wire (mirrors computeFoldOps).
+		if (!store.isFolded(b) || store.groupOf(b)?.folded) continue;
+		if (!wireFoldable(b) || !isDurableId(b.id)) continue;
+		const anchorId = store.recallAnchorOf(b.id);
+		if (!anchorId) continue;
+		out.push({ id: b.id, afterId: anchorId, text: recallInjection(b) });
 	}
 	return out;
 }

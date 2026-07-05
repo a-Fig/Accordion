@@ -13,10 +13,10 @@
 import { session, cancelPendingLoad } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import { wireToBlock } from "./mapping";
-import { computeFoldOps, computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
+import { computeFoldOps, computeGroupOps, computeRecallOps, resolveUnfold, resolveRecall } from "./plan";
 import { folding } from "./folding.svelte";
 import { activeRemoteRunner } from "./conductorClient.svelte";
-import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage } from "./protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type RecallOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import type { CompletionRequest, CompletionResult } from "$conductors/contract";
 
@@ -70,9 +70,9 @@ export const live = $state<{ status: "idle" | "connecting" | "connected" | "erro
  *
  * This is the one place the GUI can alter a real model call; keep it a pure read.
  */
-function computePlan(): { ops: FoldOp[]; groups: GroupOp[] } {
-	if (!folding.enabled || !session.store) return { ops: [], groups: [] };
-	return { ops: computeFoldOps(session.store), groups: computeGroupOps(session.store) };
+function computePlan(): { ops: FoldOp[]; groups: GroupOp[]; recalls: RecallOp[] } {
+	if (!folding.enabled || !session.store) return { ops: [], groups: [], recalls: [] };
+	return { ops: computeFoldOps(session.store), groups: computeGroupOps(session.store), recalls: computeRecallOps(session.store) };
 }
 
 /**
@@ -302,7 +302,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// Invariant: a ghost is only removed, never converted to a block.
 			session.store.appendBlocks(msg.blocks.map(wireToBlock));
 			const plan = computePlan();
-			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups };
+			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups, recalls: plan.recalls };
 			try {
 				ws.send(JSON.stringify(reply));
 			} catch {

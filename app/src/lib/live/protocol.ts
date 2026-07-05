@@ -31,8 +31,10 @@
  *  - v5: recall tool (`recallRequest` / `recallResult`) plus completion relay
  *        (`completeRequest` / `completeResult`) for out-of-band model completions.
  *  - v6: `SyncMessage.planned` (ADR 0017) — the birth-fold exemption. Additive.
+ *  - v7: `PlanMessage.recalls` (`RecallOp`, ADR 0018) — conductor recall injects a folded
+ *        block's full text at a stable tail anchor without unfolding it. Additive.
  */
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi
@@ -109,6 +111,33 @@ export interface GroupOp {
 	memberIds: string[];
 	/** `null` = drop (remove the run, insert no message); non-null string = the summary text. */
 	summaryText: string | null;
+}
+
+/**
+ * One recall instruction (ADR 0018) — the conductor analog of the agent's `recall` tool. The
+ * folded block `id` STAYS folded on the wire (its `{#code FOLDED}` digest is untouched); instead
+ * `applyPlan` inserts ONE synthetic user-role message `{ role:"user", content:[{type:"text",
+ * text}] }` immediately AFTER the message that emits `afterId`. That anchor is FROZEN when the
+ * recall is first issued, so the prefix up to it never shifts on later passes — the injection is
+ * cache-SAFE (unlike an unfold, which mutates history in place and forces a cache miss).
+ *
+ * `text` is the block's ORIGINAL full content, already labeled by the GUI (so the extension
+ * substitutes it opaquely, exactly like `FoldOp.digestText`). `id` is carried for
+ * correlation/dedup only — the wire keys the insertion on `afterId`, not `id`.
+ *
+ * GROUP-SWALLOW FALLBACK: if a `GroupOp` in the same plan collapsed the anchor message,
+ * `applyPlan` inserts after that group's summary message instead; if the run was dropped with no
+ * summary, after the last surviving message before the gap; if the anchor cannot be resolved at
+ * all, it appends at the very end. A malformed op is skipped. It never throws and never touches
+ * tool messages, so tool_call/result pairing stays balanced.
+ */
+export interface RecallOp {
+	/** The folded block being recalled (for correlation/dedup; not the insertion key). */
+	id: string;
+	/** Durable id of the frozen anchor block; the synthetic message is inserted after its message. */
+	afterId: string;
+	/** The block's original full content, already labeled — substituted opaquely on the wire. */
+	text: string;
 }
 
 // ── Server → client (extension → GUI) ────────────────────────────────────────
@@ -235,6 +264,8 @@ export interface PlanMessage {
 	ops: FoldOp[];
 	/** Group-collapse ops (ADR 0006). Optional/additive — omitted ⇒ no group collapse. */
 	groups?: GroupOp[];
+	/** Conductor recall ops (ADR 0018). Optional/additive — omitted ⇒ no tail injections. */
+	recalls?: RecallOp[];
 }
 
 /**
