@@ -52,7 +52,9 @@ Same single-`group`-over-the-aged-run mechanism, same visible-window hysteresis,
 
 2. **The completion is a handoff document**, not a compaction summary. The system prompt
    addresses the model as the *author* of a briefing for a successor that will have nothing but
-   this document, with handoff-shaped sections:
+   this document. It mirrors the local `handoff` skill's document conventions, but outputs the
+   document inline instead of creating a `mktemp` file, and tells the author to reference existing
+   artifacts (PRDs, plans, ADRs, issues, commits, diffs) rather than duplicating them. Sections:
 
    - `## Original request` — every user message reproduced **verbatim** (the human's real ask
      must survive every handoff; only assistant reasoning degrades)
@@ -61,6 +63,7 @@ Same single-`group`-over-the-aged-run mechanism, same visible-window hysteresis,
    - `## Next steps`
    - `## Key files & locations`
    - `## Gotchas & constraints`
+   - `## Suggested skills` — exact skills the next session should load, if any
    - `## How to resume / verify`
 
 **Trigger — visible-window hysteresis.** `view.liveTokens` is the RAW, fully-unfolded size (the

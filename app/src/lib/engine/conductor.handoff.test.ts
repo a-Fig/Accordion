@@ -604,7 +604,12 @@ describe("HandoffConductor — prompt construction", () => {
 		expect(system).toContain("## Next steps");
 		expect(system).toContain("## Key files");
 		expect(system).toContain("## Gotchas");
+		expect(system).toContain("## Suggested skills");
 		expect(system).toContain("## How to resume");
+		// Handoff-skill conventions adapted to inline conductor output.
+		expect(system).toMatch(/DO NOT create, save, read, or write any file/i);
+		expect(system).toMatch(/Do NOT mention\s+\\?mktemp/i);
+		expect(system).toMatch(/Do not duplicate content already captured in other artifacts/i);
 		// The sacred rule: original request reproduced verbatim.
 		expect(system).toMatch(/VERBATIM/i);
 	});

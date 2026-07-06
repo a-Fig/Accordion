@@ -98,11 +98,12 @@ const MAX_HANDOFF_TOKENS = 8000;
  * That framing (vs. naive compaction's "summarize aged history that will sit above live
  * context") is what makes the output a handoff rather than a compaction summary.
  *
- * Structure mirrors a good hand-written engineering handoff — Original request (verbatim),
- * Task, Current state, Next steps, Key files, Gotchas, How to resume — rather than the
- * compaction template's Goal/Progress/Key decisions/Critical context/Relevant files. The one
- * rule shared with `/compact`: user messages reproduced VERBATIM, so the human's actual ask
- * survives every handoff intact.
+ * Structure mirrors the local handoff skill's document shape but WITHOUT creating a file:
+ * Original request (verbatim), Task, Current state, Next steps, Key files, Gotchas, Suggested
+ * skills, How to resume. It also inherits the skill's artifact discipline: reference existing
+ * PRDs/plans/ADRs/issues/commits/diffs by path or URL instead of duplicating them. The one rule
+ * shared with `/compact`: user messages reproduced VERBATIM, so the human's actual ask survives
+ * every handoff intact.
  */
 export const HANDOFF_SYSTEM = `\
 You are writing a HANDOFF DOCUMENT for a fresh AI coding agent that will continue this work \
@@ -116,6 +117,14 @@ the handoff document.
 Write it as if briefing a competent colleague who is smart but has zero context. Be concrete: \
 real file paths, real function/command names, real error messages. Assume nothing carries over \
 except what you write here.
+
+Mimic a handoff-skill document, but DO NOT create, save, read, or write any file. Do NOT mention \
+mktemp. Output the handoff document inline only; it will be inserted directly into the fresh \
+agent's context.
+
+Do not duplicate content already captured in other artifacts (PRDs, plans, ADRs, issues, commits, \
+diffs, design docs, or generated files). Reference those artifacts by path, commit hash, issue/PR \
+number, or URL, and summarize only the minimum needed to orient the fresh agent.
 
 ORIGINAL REQUEST IS SACRED. Reproduce EVERY user message VERBATIM, in order, exactly as \
 originally written, in the "## Original request" section. Do not paraphrase, abbreviate, \
@@ -150,12 +159,17 @@ Non-obvious things that will bite a fresh agent: environment quirks, invariants,
 limits, failed approaches not to repeat, API-key PATTERNS (never actual secret values). Err on \
 the side of including anything surprising to lose.
 
+## Suggested skills
+Skills the fresh agent should load, if any, and why. Use exact skill names when known. If none \
+are useful, write "(none)".
+
 ## How to resume / verify
 How the fresh agent should re-orient and confirm the current state before continuing (commands \
 to run, what "working" looks like).
 
 Be terse everywhere EXCEPT the verbatim original request, which must be complete. Omit \
-pleasantries and meta-commentary. The output goes directly into the fresh agent's context.`;
+pleasantries and meta-commentary. The output goes directly into the fresh agent's context; it is \
+not saved to a separate file.`;
 
 export class HandoffConductor implements Conductor {
 	readonly id = "handoff";
@@ -524,7 +538,7 @@ export class HandoffConductor implements Conductor {
 				conversation,
 				"</conversation>",
 				"",
-				"Update the handoff in <previous-handoff> to account for the new work in <conversation>. PRESERVE all still-relevant details from the previous handoff; drop what is now stale or done; fold in the new facts. Move finished work into \"Current state\" and revise \"Next steps\" accordingly. Keep exact file paths, function names, and error messages. Carry forward every verbatim user message from the previous handoff and append the new user messages from the conversation — all still reproduced word-for-word in \"## Original request\".",
+				"Update the handoff in <previous-handoff> to account for the new work in <conversation>. PRESERVE all still-relevant details from the previous handoff; drop what is now stale or done; fold in the new facts. Move finished work into \"Current state\" and revise \"Next steps\" accordingly. Keep exact file paths, function names, error messages, artifact references, and suggested skills. Carry forward every verbatim user message from the previous handoff and append the new user messages from the conversation — all still reproduced word-for-word in \"## Original request\". Do not create or reference a new handoff file; output the updated handoff inline only.",
 			].join("\n");
 		}
 

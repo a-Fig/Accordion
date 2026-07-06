@@ -62,12 +62,15 @@ session, which is not the workflow this conductor is meant to simulate.
 
 Same `host.complete` mechanism, different voice. `HANDOFF_SYSTEM` addresses the model as the
 *author* of a briefing for a successor that will have nothing but this document ("a fresh AI
-coding agent … has NO memory … will see ONLY this document"). The sections are handoff-shaped —
-`## Original request` (verbatim), `## Task`, `## Current state`, `## Next steps`,
-`## Key files & locations`, `## Gotchas & constraints`, `## How to resume / verify` — rather
-than the compaction template's Goal/Progress/Key decisions/Critical context/Relevant files. As
-in `/compact`, **user messages are reproduced verbatim** so the human's real ask survives every
-handoff; only assistant reasoning degrades.
+coding agent … has NO memory … will see ONLY this document"). It mirrors the local `handoff`
+skill's document conventions, but outputs inline instead of creating a `mktemp` file, asks for
+suggested skills for the next session, and tells the author to reference existing artifacts
+(PRDs, plans, ADRs, issues, commits, diffs) rather than duplicating them. The sections are
+handoff-shaped — `## Original request` (verbatim), `## Task`, `## Current state`, `## Next
+steps`, `## Key files & locations`, `## Gotchas & constraints`, `## Suggested skills`, `## How
+to resume / verify` — rather than the compaction template's Goal/Progress/Key decisions/Critical
+context/Relevant files. As in `/compact`, **user messages are reproduced verbatim** so the
+human's real ask survives every handoff; only assistant reasoning degrades.
 
 ### 3. Everything else is inherited from naive compaction
 
