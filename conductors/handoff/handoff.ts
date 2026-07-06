@@ -1,67 +1,29 @@
 /*
  * handoff.ts — the "Handoff (fresh start)" conductor.
  *
- * PURPOSE: This conductor simulates the OTHER thing a developer does when a coding session
- * runs long — not `/compact` (see the naive-compaction conductor for that foil), but the
- * hard reset: write a HANDOFF DOCUMENT, `/clear` the session, and paste the handoff into a
- * BRAND-NEW agent that has NO memory of the conversation. The fresh agent continues from the
- * handoff and NOTHING ELSE.
+ * PURPOSE: automatically simulate the user's manual handoff workflow:
+ *   1. Ask the current agent to write a handoff document.
+ *   2. Kill / clear the current session.
+ *   3. Start a new session that receives only that handoff document.
  *
- * That "and nothing else" is the whole point, and it is what makes this a DISTINCT strategy
- * rather than a re-skin of naive compaction:
+ * The conductor does that without writing a file. It calls the live model out-of-band with a
+ * prompt that mirrors the local `handoff` skill (except the mktemp/save-to-file clause is
+ * replaced with inline output), then replaces the whole current session with the returned
+ * handoff document. The successor context is the handoff plus future post-handoff turns — no
+ * verbatim old-session tail.
  *
- *   - Naive compaction keeps a LARGE rolling working tail (the human's protected tail,
- *     ~20k tokens) verbatim and only summarizes the aged PREFIX. The agent always has plenty
- *     of recent raw context PLUS a summary of old stuff.
+ * MECHANICS: this is implemented as one folded `group` whose digest is the handoff text. The
+ * group is intentionally non-recoverable from the agent's perspective (no `{#code FOLDED}` tag),
+ * because a fresh session cannot unfold the killed session's transcript. The human can still
+ * DETACH in Accordion to recover full history; that is the UI escape hatch, not part of the
+ * simulated agent workflow.
  *
- *   - A fresh start throws the working tail AWAY. When you `/clear` and reseed, you do NOT
- *     carry over your last 20k of live tool output and reasoning — you carry over ONLY what
- *     the handoff author chose to write down. So this conductor OWNS a ZERO inherited tail
- *     (`HANDOFF_TAIL_TOKENS = 0`) and folds the WHOLE current conversation into ONE handoff
- *     document. The visible window collapses to the handoff itself and then rebuilds with new
- *     post-handoff turns — a hard-reset sawtooth, not naive compaction's gentle curve.
- *
- * To disable the inherited tail the conductor must hold the `tail-size` lock (ADR 0011) with
- * `tailTokens = 0`; that is the essential mechanical difference from naive compaction,
- * which deliberately leaves `tail-size` UNLOCKED so the human keeps a big verbatim tail.
- * Locking `tail-size` here is not a power grab — it IS the simulation. Without it the human's
- * 20k tail would defeat the "fresh start" entirely and this conductor would be indistinguishable
- * from naive compaction.
- *
- * LOSSY AND RECURSIVE, exactly like the naive-compaction foil — and for the same honest
- * reasons, because a real handoff chain has the same failure modes:
- *   - Lossy: the folded blocks collapse into ONE group whose digest is the handoff. There is
- *     no `{#code FOLDED}` tag, so the agent cannot `unfold` to recover the originals — a fresh
- *     agent genuinely does not have them. (The human can always DETACH to recover full history;
- *     that asymmetry is Accordion being Accordion.)
- *   - Recursive: each subsequent handoff is written from the PRIOR handoff + only the new work
- *     since — never the originals already discarded. Successive handoffs compound loss the same
- *     way successive `/compact`s do, because a real fresh-start chain also only ever sees the
- *     last handoff, never the raw sessions behind it. This compounding is the point of the foil.
- *
- * SHAPE — a close cousin of the naive-compaction conductor (which is itself a cousin of
- * sliding-window). Same single-`group`-over-the-aged-run mechanism, same visible-window
- * hysteresis, same in-flight / stale-completion / attempt-key guards. Two things differ:
- *   1. It holds the `tail-size` lock with `tailTokens = 0` (naive compaction holds neither).
- *   2. The completion prompt is a HANDOFF DOCUMENT for a cold successor agent, not a
- *      compaction summary appended to live context (see `HANDOFF_SYSTEM`).
- *
- * TRIGGER — the same visible-window hysteresis naive compaction uses. `view.liveTokens` is the
- * RAW, fully-unfolded size (the host clears conductor folds every pass), so it only grows; a
- * naive `liveTokens >= 90%` test would re-trigger forever once first crossed. Instead the
- * conductor tracks the token saving its handoff group provides and triggers on the VISIBLE
- * window: `visible = liveTokens − (Σ survivor tokens − handoff token cost)`. When
- * `visible >= 90%` of budget AND there are newly-aged blocks to fold in, it re-writes the
- * handoff; otherwise it HOLDS, re-emitting the existing handoff group.
- *
- * USER MESSAGES ARE PRESERVED VERBATIM inside the handoff (Claude-Code `/compact` and every
- * good hand-written handoff do this): the system prompt reproduces every user message
- * word-for-word in an "## Original request" section, so the task the human actually asked for
- * survives every handoff intact. Only assistant reasoning degrades across the chain.
+ * `tail-size` is locked with `tailTokens = 0` so the host protects no old-session blocks from
+ * the handoff. Subsequent handoffs are written from the prior handoff plus new work only, just
+ * like a real chain of handoff documents.
  *
  * No Svelte, no $state, no engine imports. Types only from ../contract.
  */
-
 import type {
 	Conductor,
 	ConductorHost,
@@ -78,98 +40,33 @@ const TRIGGER = 0.9;
  * start keeps NONE of the old session verbatim: the successor agent receives the handoff
  * document and only future post-handoff turns. `0` makes the host's protected boundary land at
  * `blocks.length`, so every current block is eligible to be folded into the handoff group.
- * This is the load-bearing difference from naive compaction (which rides the human's ~20k tail).
  */
 export const HANDOFF_TAIL_TOKENS = 0;
 
 /**
- * Soft cap on handoff output tokens. Sized like naive compaction's summary cap: a handoff
- * compacts roughly 20k–200k tokens of history at a time and must retain enough to let a cold
- * agent continue, so 8k gives room for a genuinely useful briefing while still being a large
- * reduction (~2.5x at 20k of input, ~25x at 200k). The host clamps the request to the model's
- * own max-output ceiling; over-long output is truncated (finish-reason "length") and used
- * as-is — acceptable for a lossy foil.
+ * Soft cap on handoff output tokens. A handoff may need to brief a fresh agent on a long coding
+ * session, so 8k gives room for a useful document while still replacing a much larger transcript.
+ * The host clamps the request to the model's own max-output ceiling; over-long output is
+ * truncated (finish-reason "length") and used as-is.
  */
 const MAX_HANDOFF_TOKENS = 8000;
 
 /**
- * System prompt for the handoff completion. This is the FRESH-START voice: it addresses the
- * model as the AUTHOR of a handoff for a successor that will have NOTHING but this document.
- * That framing (vs. naive compaction's "summarize aged history that will sit above live
- * context") is what makes the output a handoff rather than a compaction summary.
- *
- * Structure mirrors the local handoff skill's document shape but WITHOUT creating a file:
- * Original request (verbatim), Task, Current state, Next steps, Key files, Gotchas, Suggested
- * skills, How to resume. It also inherits the skill's artifact discipline: reference existing
- * PRDs/plans/ADRs/issues/commits/diffs by path or URL instead of duplicating them. The one rule
- * shared with `/compact`: user messages reproduced VERBATIM, so the human's actual ask survives
- * every handoff intact.
+ * System prompt for the handoff completion. It intentionally mirrors the local `handoff` skill's
+ * prompt as closely as possible, with only the file-writing clause adapted away: the conductor
+ * needs inline text to insert into the next context, not a path from `mktemp`.
  */
 export const HANDOFF_SYSTEM = `\
-You are writing a HANDOFF DOCUMENT for a fresh AI coding agent that will continue this work \
-in a NEW session. The new agent has NO memory of the conversation so far and will see ONLY \
-this document — the original messages are gone. Write everything it needs to pick up exactly \
-where this session left off, and nothing it does not.
+Write a handoff document summarising the current conversation so a fresh agent can continue the \
+work. Do not save it to a file; output the handoff document inline only.
 
-Do NOT continue the conversation. Do NOT answer any question in the conversation. ONLY output \
-the handoff document.
-
-Write it as if briefing a competent colleague who is smart but has zero context. Be concrete: \
-real file paths, real function/command names, real error messages. Assume nothing carries over \
-except what you write here.
-
-Mimic a handoff-skill document, but DO NOT create, save, read, or write any file. Do NOT mention \
-mktemp. Output the handoff document inline only; it will be inserted directly into the fresh \
-agent's context.
+Suggest the skills to be used, if any, by the next session.
 
 Do not duplicate content already captured in other artifacts (PRDs, plans, ADRs, issues, commits, \
-diffs, design docs, or generated files). Reference those artifacts by path, commit hash, issue/PR \
-number, or URL, and summarize only the minimum needed to orient the fresh agent.
+diffs). Reference them by path or URL instead.
 
-ORIGINAL REQUEST IS SACRED. Reproduce EVERY user message VERBATIM, in order, exactly as \
-originally written, in the "## Original request" section. Do not paraphrase, abbreviate, \
-summarize, or omit a single user message — the fresh agent must see the human's real ask \
-word-for-word. (Assistant text, thinking, tool calls, and tool results ARE synthesized; only \
-user messages are preserved verbatim.)
-
-Produce your output in EXACTLY this structure — no prose outside the sections. Keep every \
-section even when empty; write "(none)" where nothing applies:
-
-## Original request
-Every user message from the session so far, reproduced verbatim, in order, each clearly \
-separated. If there are no user messages, write "(none)".
-
-## Task
-One or two sentences: what is the overall objective the fresh agent is being handed?
-
-## Current state
-What is DONE and known-good so far — files changed, commands run, results verified, decisions \
-made and WHY. Be specific enough that the fresh agent trusts it without re-deriving it.
-
-## Next steps
-The concrete actions the fresh agent should take next, in order. Start with the very next thing \
-to do.
-
-## Key files & locations
-- {path}: why it matters / what is in it. List files read, written, or central to the task. \
-Write "(none)" if none.
-
-## Gotchas & constraints
-Non-obvious things that will bite a fresh agent: environment quirks, invariants, hard scope \
-limits, failed approaches not to repeat, API-key PATTERNS (never actual secret values). Err on \
-the side of including anything surprising to lose.
-
-## Suggested skills
-Skills the fresh agent should load, if any, and why. Use exact skill names when known. If none \
-are useful, write "(none)".
-
-## How to resume / verify
-How the fresh agent should re-orient and confirm the current state before continuing (commands \
-to run, what "working" looks like).
-
-Be terse everywhere EXCEPT the verbatim original request, which must be complete. Omit \
-pleasantries and meta-commentary. The output goes directly into the fresh agent's context; it is \
-not saved to a separate file.`;
+If the user passed arguments, treat them as a description of what the next session will focus on \
+and tailor the doc accordingly.`;
 
 export class HandoffConductor implements Conductor {
 	readonly id = "handoff";
@@ -178,13 +75,11 @@ export class HandoffConductor implements Conductor {
 	/**
 	 * Involvement locks (ADR 0011). This conductor is EXCLUSIVE over all three steering
 	 * controls:
-	 *   - `human-steering` + `agent-unfold` — same rationale as naive compaction: the human's
-	 *     hand overrides and the agent's `unfold` cannot fight the handoff group while it is
-	 *     being rewritten, and `human-steering` keeps the aged region CONTIGUOUS so the single
-	 *     `group` command covering it is always valid.
-	 *   - `tail-size` — REQUIRED here (naive compaction pointedly omits it). Owning the tail is
-	 *     the simulation: a fresh start keeps no verbatim tail from the killed session, unlike
-	 *     the human's ~20k.
+	 *   - `human-steering` + `agent-unfold` — the human's hand overrides and the agent's `unfold`
+	 *     cannot fight the handoff group while it is being rewritten, and `human-steering` keeps
+	 *     the aged region CONTIGUOUS so the single `group` command covering it is always valid.
+	 *   - `tail-size` — REQUIRED here. Owning the tail is the simulation: a fresh start keeps no
+	 *     verbatim tail from the killed session, unlike the human's normal protected tail.
 	 *     Under this lock the host drives `protectedFromIndex` from `tailTokens` below, so the
 	 *     conductor folds the whole current conversation into the handoff.
 	 *
@@ -288,7 +183,8 @@ export class HandoffConductor implements Conductor {
 		// VISIBLE window = raw baseline minus the token saving the handoff group provides.
 		// `view.liveTokens` is the RAW size (host clears conductor folds each pass), so without
 		// subtracting the saving the 90% trigger would fire every pass once first crossed. Same
-		// hysteresis computation as naive compaction / sliding-window.
+		// hysteresis computation: after one handoff, wait until enough new work accumulates before
+		// asking the model for another handoff.
 		const savedTokens = this.handoff !== null
 			? Math.max(0, sumTokens(survivors) - this.handoffTokenCost())
 			: 0;
@@ -484,7 +380,7 @@ export class HandoffConductor implements Conductor {
 				// even if blocks shift, vanish, or re-home across the protected boundary.
 				this.inflight = null;
 				this.handoff =
-					`[Handoff from a previous session — ${count} earlier message${count === 1 ? "" : "s"} compacted into this briefing]\n\n` +
+					`[Handoff from a previous session — ${count} earlier message${count === 1 ? "" : "s"} captured in this briefing]\n\n` +
 					text;
 				this.handedOffIds = launchedAgedIds;
 				// Re-run conduct() now so the handoff group takes effect immediately.
@@ -512,11 +408,11 @@ export class HandoffConductor implements Conductor {
 	 *
 	 * RECURSIVE handoff (handoff != null): `<previous-handoff>` + `<conversation>` (new blocks
 	 * only) + merge instructions. The originals already folded into the prior handoff are
-	 * DELIBERATELY NOT re-read — this is the recursive amnesia the foil demonstrates: a real
-	 * fresh-start chain only ever carries the last handoff forward, never the raw sessions behind
-	 * it. The merge instructions are not a mitigation of that structural loss (the originals are
+	 * DELIBERATELY NOT re-read: a real fresh-start chain only ever carries the last handoff
+	 * forward, never the raw sessions behind it. The merge instructions are not a mitigation of
+	 * that structural loss (the originals are
 	 * gone, unfixable by any prompt); they only stop the model from silently dropping the prior
-	 * handoff, and keep every verbatim user message carried forward.
+	 * handoff, artifact references, and skill suggestions.
 	 */
 	private buildPrompt(newlyAged: ViewBlock[]): string {
 		const conversation = newlyAged
@@ -538,7 +434,7 @@ export class HandoffConductor implements Conductor {
 				conversation,
 				"</conversation>",
 				"",
-				"Update the handoff in <previous-handoff> to account for the new work in <conversation>. PRESERVE all still-relevant details from the previous handoff; drop what is now stale or done; fold in the new facts. Move finished work into \"Current state\" and revise \"Next steps\" accordingly. Keep exact file paths, function names, error messages, artifact references, and suggested skills. Carry forward every verbatim user message from the previous handoff and append the new user messages from the conversation — all still reproduced word-for-word in \"## Original request\". Do not create or reference a new handoff file; output the updated handoff inline only.",
+				"Update the handoff in <previous-handoff> to account for the new work in <conversation>. Preserve still-relevant details from the previous handoff, drop what is stale, fold in the new facts, keep useful artifact references, and keep or revise suggested skills for the next session. Do not create or reference a new handoff file; output the updated handoff inline only.",
 			].join("\n");
 		}
 

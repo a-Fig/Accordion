@@ -1,13 +1,12 @@
 /*
  * conductor.handoff.test.ts — state-machine tests for HandoffConductor.
  *
- * The handoff conductor is a close cousin of NaiveCompactionConductor: same single-`group`-
- * over-the-aged-run shape with an LLM digest, same visible-window hysteresis, same in-flight /
- * stale-completion / attempt-key guards. Two things differ and are pinned here:
+ * The handoff conductor automatically simulates the manual handoff workflow: ask the current
+ * agent for a handoff document, clear the session, and continue from that document only. These
+ * tests pin the two load-bearing parts:
  *   1. It holds the `tail-size` lock with `tailTokens = 0` (HANDOFF_TAIL_TOKENS) — it OWNS
  *      no protected old-session tail so the handoff absorbs the whole current conversation.
- *   2. The completion prompt/system is a HANDOFF DOCUMENT for a cold successor agent, not a
- *      compaction summary.
+ *   2. The completion prompt mirrors the local handoff skill, adapted for inline output.
  *
  * Most tests are pure unit-level via a MockHost (promises resolved/rejected manually for
  * determinism); the tail-size lock and the end-to-end group are exercised THROUGH AccordionStore
@@ -374,9 +373,9 @@ describe("HandoffConductor — hysteresis (visible-window band)", () => {
 	});
 });
 
-// ── 5. Recursive / amnesiac prompt ────────────────────────────────────────────
+// ── 5. Recursive handoff prompt ───────────────────────────────────────────────
 
-describe("HandoffConductor — recursive handoff (amnesia)", () => {
+describe("HandoffConductor — recursive handoff", () => {
 	it("second handoff prompt contains prior handoff + newly aged text but NOT the original first-batch text", async () => {
 		const c = new HandoffConductor();
 		const host = new MockHost();
@@ -418,8 +417,10 @@ describe("HandoffConductor — recursive handoff (amnesia)", () => {
 		expect(p2).toContain("<previous-handoff>");
 		expect(p2).toContain("</previous-handoff>");
 		expect(p2).toContain("<conversation>");
-		expect(p2).toContain("PRESERVE");
-		expect(p2).toMatch(/verbatim/i);
+		expect(p2).toMatch(/preserve/i);
+		expect(p2).toMatch(/suggested skills/i);
+		expect(p2).toMatch(/artifact references/i);
+		expect(p2).toMatch(/inline only/i);
 	});
 });
 
@@ -585,7 +586,7 @@ describe("HandoffConductor — prompt construction", () => {
 		expect(prompt).toContain("assistant reply text");
 	});
 
-	it("system prompt is the handoff template: fresh agent framing, verbatim original request, handoff sections", () => {
+	it("system prompt mirrors the local handoff skill, adapted for inline output", () => {
 		const c = new HandoffConductor();
 		const host = new MockHost();
 		c.attach(host);
@@ -593,25 +594,14 @@ describe("HandoffConductor — prompt construction", () => {
 		c.conduct(makeView([vb("a0")], [vb("tail0")], 100_000, 96_000));
 		const { system } = host.completeCalls[0];
 		expect(system).toBeDefined();
-		// Fresh-agent framing (distinct from the compaction template).
-		expect(system).toMatch(/fresh AI coding agent/i);
-		expect(system).toMatch(/NO memory/i);
-		expect(system).toMatch(/do NOT continue the conversation/i);
-		// Handoff-shaped sections.
-		expect(system).toContain("## Original request");
-		expect(system).toContain("## Task");
-		expect(system).toContain("## Current state");
-		expect(system).toContain("## Next steps");
-		expect(system).toContain("## Key files");
-		expect(system).toContain("## Gotchas");
-		expect(system).toContain("## Suggested skills");
-		expect(system).toContain("## How to resume");
-		// Handoff-skill conventions adapted to inline conductor output.
-		expect(system).toMatch(/DO NOT create, save, read, or write any file/i);
-		expect(system).toMatch(/Do NOT mention\s+\\?mktemp/i);
-		expect(system).toMatch(/Do not duplicate content already captured in other artifacts/i);
-		// The sacred rule: original request reproduced verbatim.
-		expect(system).toMatch(/VERBATIM/i);
+		expect(system).toContain("Write a handoff document summarising the current conversation so a fresh agent can continue the work");
+		expect(system).toContain("Suggest the skills to be used, if any, by the next session");
+		expect(system).toContain("Do not duplicate content already captured in other artifacts");
+		expect(system).toContain("Reference them by path or URL instead");
+		expect(system).toContain("If the user passed arguments");
+		// The conductor adapts only the skill's file-writing clause: it needs inline text, not mktemp.
+		expect(system).toContain("Do not save it to a file; output the handoff document inline only");
+		expect(system).not.toContain("mktemp");
 	});
 
 	it("maxOutputTokens is a positive number and an AbortSignal is passed", () => {
