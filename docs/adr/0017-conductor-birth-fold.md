@@ -106,18 +106,24 @@ serious context-management strategy.
 
 ## Known, accepted limitation
 
-**First planned sync after a live attach:** on the very first `context` hook after the GUI
-connects (or reconnects to a resumed session), the entire pre-existing history streams in as
-one `full` sync. `appendBlocks` commits it, but `sentThroughOrder` is still -1 until that
-sync's plan is applied and `markSent()` runs — so for the ONE pass that builds the view for
-that first sync, every pre-existing history block briefly reads `fresh`, not just the
-genuinely-never-sent tail. This is bounded (one pass, self-corrects the instant `markSent()`
-runs) and deliberately not engineered around: doing so would mean threading "was this
-particular block part of history-at-attach" through the wire, for a window that closes itself
-one pass later. A conductor's fold decisions during that one pass may therefore be slightly
-more permissive than ideal; this is judged acceptable because the alternative (protecting
-already-seen history from a fresh attach) is the ORIGINAL problem this ADR fixes, just
-relocated.
+**First full sync after a live attach/reconnect is conservatively marked sent:** on the very
+first `context` hook after the GUI connects (or reconnects to a resumed session), the entire
+pre-existing history streams in as one `full` sync into a freshly-built EMPTY store
+(`sentThroughOrder` = -1). Without correction, every replayed block would read `fresh`
+(`order > -1`) and a birth-folding conductor could fold the already-seen protected tail during
+the very pass the append triggers — recording those ids in the sticky `birthFolded` set, which
+the later `markSent()` does not undo. That is a protection BYPASS on content the model has
+genuinely seen, the exact thing protection exists to prevent. So the live client passes
+`appendBlocks(blocks, { sent: true })` for any `full: true` sync, advancing `sentThroughOrder`
+past the incoming blocks' max order BEFORE the internal conduct pass runs — history replay is
+never mistaken for newly-born content. The cost: genuinely-new blocks that happen to arrive in
+that same full sync (e.g. a huge tool_result completing right at attach time) are ALSO marked
+sent, losing birth-foldability for that one call. This is deliberate — conservative rather
+than permissive: over-protecting one block for one call is the mild, self-correcting failure
+(it ages out of the tail normally), whereas the permissive alternative silently folds
+already-seen protected content and sticks. Distinguishing "replayed history" from
+"new-in-this-full-sync" precisely would mean threading per-block sent state through the wire,
+disproportionate to a single-call window.
 
 **The protected-tail walk-back keeps using FULL tokens, not folded tokens.** A birth-folded
 block's boundary math is untouched by this ADR: `protectedFromIndex` still walks back by each
@@ -159,6 +165,7 @@ reads. The boundary must not breathe in response to the folds it itself causes.
 - **A fresh-only (non-sticky) exemption.** Rejected: breaks on the very next conductor pass
   once `markSent()` advances, since commands re-apply from a raw baseline every time (see
   Decision §3) — a bug that would look like folding is randomly unstable.
-- **Thread "was this block part of history-at-attach" through the wire to close the
-  first-sync limitation.** Rejected as disproportionate to a one-pass, self-correcting window;
-  documented instead (see Known limitation above).
+- **Thread per-block "was this part of history-at-attach" state through the wire so
+  genuinely-new blocks in a first full sync keep their birth-foldability.** Rejected as
+  disproportionate to a single-call window; the full sync is conservatively marked sent
+  instead (see Known limitation above).

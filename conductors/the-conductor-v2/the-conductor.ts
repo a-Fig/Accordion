@@ -63,8 +63,9 @@ import {
 } from "./adapter.ts";
 import { buildCommands, planSignature } from "./commands.ts";
 
-// Mirrors CONDUCTOR_PROTOCOL_VERSION in conductors/contract/protocol.ts (v3 = locks + complete).
-const CONDUCTOR_PROTOCOL_VERSION = 3;
+// Mirrors CONDUCTOR_PROTOCOL_VERSION in conductors/contract/protocol.ts — keep in lockstep
+// (v4 = RecallCommand in the Command union, ADR 0018; the app's hello gate is a strict !==).
+const CONDUCTOR_PROTOCOL_VERSION = 4;
 
 const ID = "the-conductor-v2";
 const LABEL = "The Conductor v2";

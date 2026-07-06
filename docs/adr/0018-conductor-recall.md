@@ -58,10 +58,13 @@ per-pass reset (like `birthFolded` in ADR 0017). Only the **anchor** is stored �
 is read **live** from `get(id).text` at emission time (`Block.text` is never mutated), so nothing
 is copied or can go stale.
 
-The anchor is chosen once, at record time: the **newest non-grouped, durable-id block** at that
-instant — the closest a command can get to "just before the working tail," and durable so
-`applyPlan` can re-resolve it on the wire. It is never re-chosen while the recall is active, so the
-injection point stays byte-stable across passes (cache-safe).
+The anchor is chosen once, at record time: the **newest non-grouped, durable-id, non-`tool_call`
+block** at that instant — the closest a command can get to "just before the working tail," and
+durable so `applyPlan` can re-resolve it on the wire. `tool_call` is excluded because anchoring on
+a call whose paired result has not yet streamed in would insert the synthetic user message BETWEEN
+the call and its result — provider-invalid for providers that require a tool result to immediately
+follow its call. It is never re-chosen while the recall is active, so the injection point stays
+byte-stable across passes (cache-safe).
 
 **Recallability** mirrors `resolveRecall`/`computeFoldOps` exactly: a block is recallable iff it is
 currently folded, a wire-foldable kind, durably identified, and NOT swallowed by a folded group
@@ -71,6 +74,10 @@ a live block / non-foldable kind / non-durable id / grouped member ⇒ the new *
 
 `pruneRecalled()` runs at the END of each `runConductor()` pass (after fold state settles) and
 drops any recall whose block ended the pass live or has left the store — case (a)/(b) above.
+
+Every recall lifecycle transition is observable like any other conductor action: recording emits
+"recalled to tail", an explicit `restore` release emits "recall released", and an auto-prune emits
+"recall dropped" — each to both the activity feed and the decision journal (action `"recall"`).
 
 ### 4. Accounting stays honest
 

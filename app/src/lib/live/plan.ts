@@ -94,6 +94,10 @@ export function computeRecallOps(store: AccordionStore): RecallOp[] {
 		// Only inject for a block whose folded digest is genuinely on the wire (mirrors computeFoldOps).
 		if (!store.isFolded(b) || store.groupOf(b)?.folded) continue;
 		if (!wireFoldable(b) || !isDurableId(b.id)) continue;
+		// Same non-empty-digest guard as computeFoldOps: an empty digest means the FOLD op for
+		// this block was dropped (the block rides the wire WHOLE), so injecting its full text
+		// at the tail too would duplicate content the agent already has in place.
+		if (!store.digestOf(b)) continue;
 		const anchorId = store.recallAnchorOf(b.id);
 		if (!anchorId) continue;
 		out.push({ id: b.id, afterId: anchorId, text: recallInjection(b) });

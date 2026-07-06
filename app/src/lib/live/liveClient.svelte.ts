@@ -300,7 +300,15 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			}
 			// Committed blocks arrive HERE (the appendBlocks path), NEVER from ghost state.
 			// Invariant: a ghost is only removed, never converted to a block.
-			session.store.appendBlocks(msg.blocks.map(wireToBlock));
+			// `sent: msg.full` (#43/ADR 0017 protection-bypass fix): a `full:true` sync is a
+			// backlog/reconcile REPLAY of history the model has already genuinely seen — including
+			// the very first sync after a fresh GUI attach/reconnect, which rebuilds an EMPTY store
+			// (see the `hello`/structural-reset paths above) and replays the WHOLE prior history in
+			// one shot. Marking that replay as already-sent BEFORE the conduct pass it triggers
+			// keeps a birth-folding conductor from folding already-seen protected-tail content and
+			// sticking it in the sticky `birthFolded` exemption forever. A normal incremental append
+			// (`full:false`) omits the flag, so genuinely new blocks stay birth-foldable as before.
+			session.store.appendBlocks(msg.blocks.map(wireToBlock), { sent: msg.full });
 			const plan = computePlan();
 			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups, recalls: plan.recalls };
 			try {

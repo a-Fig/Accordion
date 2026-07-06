@@ -276,3 +276,54 @@ describe("recall — kind gate", () => {
 		expect(s.lastReports.some((r) => r.command === "recall" && r.ids.includes("u:1") && r.reason === "not-recallable")).toBe(true);
 	});
 });
+
+// ── recalledTokens skips a not-currently-folded block (no mid-pass double count) ─
+
+describe("recall — recalledTokens gates on isFolded", () => {
+	it("a view built mid-lifecycle does not double-count full block + injection", () => {
+		// The window: `clearConductorState` momentarily un-folds every conductor-owned block
+		// before the conductor re-issues its folds, but the sticky `recalled` map survives the
+		// reset (ADR 0018 §2). The view handed to `conduct()` is built in exactly that instant —
+		// without the isFolded gate its `liveTokens` baseline would charge the FULL live block
+		// PLUS the still-registered recall injection of the same content.
+		const s = makeStore(session());
+		s.setProtect(0);
+		const c = new StubConductor();
+		c.cmds = [{ kind: "fold", ids: ["r:c1"] }, { kind: "recall", ids: ["r:c1"] }];
+		s.attach(c);
+		expect(s.isRecalled("r:c1")).toBe(true);
+
+		// Pass 2: the recall is still registered when the baseline view is built (all blocks
+		// momentarily live) — its liveTokens must be the plain raw sum, injection NOT added.
+		s.refold();
+		expect(c.lastView!.liveTokens).toBe(s.fullTokens);
+
+		// And at rest (block folded again) the injection is charged exactly once, as before.
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true);
+		expect(s.recalledTokens).toBe(substTokens(recallInjection(s.get("r:c1")!)));
+	});
+});
+
+// ── the anchor never splits a tool_call/tool_result pair ─────────────────────
+
+describe("recall — anchor skips tool_call blocks", () => {
+	it("resolves to an earlier non-tool_call block when the newest durable block is a tool_call", () => {
+		// Newest block is an UNRESOLVED tool_call (its result has not streamed in yet) —
+		// anchoring there would inject the synthetic user message BETWEEN call and result,
+		// provider-invalid for providers that require the result to immediately follow.
+		const blocks = [
+			...session(),
+			blk("a:r2:p1", "tool_call", 2, 6, 100, { callId: "c2" }),
+		];
+		const s = makeStore(blocks);
+		s.setProtect(0);
+		const c = new StubConductor();
+		c.cmds = [{ kind: "fold", ids: ["r:c1"] }, { kind: "recall", ids: ["r:c1"] }];
+		s.attach(c);
+
+		expect(s.isRecalled("r:c1")).toBe(true);
+		const ops = computeRecallOps(s);
+		expect(ops.length).toBe(1);
+		expect(ops[0].afterId).toBe("a:r2:p0"); // the newest NON-tool_call durable block, not a:r2:p1
+	});
+});

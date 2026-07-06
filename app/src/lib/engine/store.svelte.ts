@@ -89,7 +89,8 @@ export type DecisionAction =
 	| "fold-group"
 	| "unfold-group"
 	| "clamp"
-	| "reset";
+	| "reset"
+	| "recall";
 
 export interface DecisionEvent {
 	n: number;
@@ -135,11 +136,13 @@ export class AccordionStore {
 	 * Cursor for the birth-fold exemption (#43, ADR 0017): the highest block `order` that has
 	 * actually been SENT to the model in an applied plan. A block with `order > sentThroughOrder`
 	 * is "fresh" — born inside the protected tail before the model ever saw it, so a conductor
-	 * may fold/replace it despite protection (see `birthFoldEligible`). Advanced only by
-	 * `markSent()`, which the live client calls after a PLANNED sync (one whose plan the
-	 * extension applies) — never by a view-only sync. Starts at -1 (a fresh session, or a
-	 * bulk-loaded transcript before `markAllSent()` runs) so every present block reads fresh
-	 * until proven otherwise.
+	 * may fold/replace it despite protection (see `birthFoldEligible`). Advanced by `markSent()`,
+	 * which the live client calls after a PLANNED sync (one whose plan the extension applies) —
+	 * never by a view-only sync — AND by `appendBlocks(blocks, { sent: true })`, which the live
+	 * client uses for a `full:true` backlog/reconcile sync so a history REPLAY is never mistaken
+	 * for newly-born content (see `appendBlocks`'s doc — this closes the reconnect protection-
+	 * bypass window). Starts at -1 (a fresh session, or a bulk-loaded transcript before
+	 * `markAllSent()` runs) so every present block reads fresh until proven otherwise.
 	 */
 	private sentThroughOrder = -1;
 	/**
@@ -715,13 +718,22 @@ export class AccordionStore {
 	 * recalled block's ORIGINAL full-text injection (read live from the block, labeled + tagged the
 	 * same way the wire emits it — see `computeRecallOps` / `plan.ts`). Zero when nothing is recalled,
 	 * so the golden/raw path is unchanged.
+	 *
+	 * Skips any id whose block is not CURRENTLY folded. `recalled` is intentionally sticky across a
+	 * pass (it lives outside `clearConductorState`'s reset — ADR 0018 §2), but `clearConductorState`
+	 * momentarily un-folds every conductor-owned block before the conductor re-issues its `fold` +
+	 * `recall` commands for this pass. A `liveTokens`/view snapshot taken in that in-between instant
+	 * would otherwise double-count: the full live block PLUS the still-registered recall injection of
+	 * the same content. Gating on `isFolded` keeps the sum honest at every instant, not just at
+	 * pass-end (`pruneRecalled` already drops a recall whose block SETTLES live at the end of a pass —
+	 * this is the narrower, mid-pass companion to that).
 	 */
 	recalledTokens = $derived.by(() => {
 		if (!this.recalled.size) return 0;
 		let n = 0;
 		for (const id of this.recalled.keys()) {
 			const b = this.get(id);
-			if (b) n += substTokens(recallInjection(b));
+			if (b && this.isFolded(b)) n += substTokens(recallInjection(b));
 		}
 		return n;
 	});
@@ -1225,14 +1237,14 @@ export class AccordionStore {
 				case "restore":
 					// `restore` is also the conductor's explicit opt-out of a recall (ADR 0018):
 					// release any active recall for these ids BEFORE returning the block to live.
-					for (const id of c.ids) this.releaseRecall(id);
+					for (const id of c.ids) this.releaseRecall(id, by);
 					for (const id of c.ids) this.liveOne(id, by, c.kind, reports);
 					break;
 				case "pin":
 					for (const id of c.ids) this.liveOne(id, by, c.kind, reports);
 					break;
 				case "recall":
-					for (const id of c.ids) this.recallOne(id, reports);
+					for (const id of c.ids) this.recallOne(id, by, reports);
 					break;
 				case "group":
 					this.groupCmd(c.ids, by, reports, c.digest);
@@ -1256,7 +1268,7 @@ export class AccordionStore {
 	 * or a member of a folded GROUP (owned by the group, not independently on the wire) ⇒
 	 * `not-recallable`.
 	 */
-	private recallOne(id: string, reports: ClampReport[]): void {
+	private recallOne(id: string, by: Actor, reports: ClampReport[]): void {
 		const b = this.get(id);
 		if (!b) return void reports.push(clamp("recall", [id], "unknown-id", `no block ${id}`));
 		if (this.recalled.has(id)) return; // already recalled: keep the frozen anchor, silent no-op
@@ -1269,11 +1281,19 @@ export class AccordionStore {
 		if (anchorId === null) return void reports.push(clamp("recall", [id], "not-recallable", `${label(b)} has no anchor to recall to`));
 		this.recalled.set(id, { anchorId });
 		this.recalled = new Map(this.recalled); // new ref so $derived re-tracks
+		// Observability, same idiom as every other conductor action (fold/restore/group).
+		this.emit(by, "recalled to tail", label(b));
+		this.recordDecision(by, "recall", [id], label(b));
 	}
 
-	/** Release one active recall (the explicit `restore` opt-out, ADR 0018). No-op if not recalled. */
-	private releaseRecall(id: string): void {
-		if (this.recalled.delete(id)) this.recalled = new Map(this.recalled);
+	/** Release one active recall (the explicit `restore` opt-out, ADR 0018). No-op if not recalled.
+	 *  `by` attributes the release for the activity log — the same actor that issued the `restore`. */
+	private releaseRecall(id: string, by: Actor): void {
+		if (!this.recalled.delete(id)) return;
+		this.recalled = new Map(this.recalled);
+		const b = this.get(id);
+		this.emit(by, "recall released", b ? label(b) : id);
+		this.recordDecision(by, "recall", [id], "recall released (restore)");
 	}
 
 	/** Drop ALL active recalls (ADR 0018). Called on conductor swap/detach/reset — the recalling
@@ -1295,12 +1315,20 @@ export class AccordionStore {
 		return this.recalled.get(id)?.anchorId ?? null;
 	}
 
-	/** The newest non-grouped, durable-id block id — the frozen anchor a fresh recall injects
-	 *  after. Durable so `applyPlan` can re-resolve it; non-grouped so the injection point is a
-	 *  real surviving message, not one collapsed into a group summary. Null if none qualifies. */
+	/** The newest non-grouped, durable-id, non-`tool_call` block id — the frozen anchor a fresh
+	 *  recall injects after. Durable so `applyPlan` can re-resolve it; non-grouped so the injection
+	 *  point is a real surviving message, not one collapsed into a group summary. `tool_call` is
+	 *  excluded: `applyPlan`'s recall injection is an ADDITIVE synthetic user-role message inserted
+	 *  immediately AFTER the anchor's message, and a `tool_call` is never resolved until its paired
+	 *  `tool_result` arrives — anchoring on a call whose result has not yet streamed in would insert
+	 *  a user message BETWEEN the call and its result, which is provider-invalid (some providers
+	 *  require the tool result to immediately follow its call). Skipping `tool_call` here always
+	 *  falls back to an earlier block; the newest durable id being a `tool_call` never blocks a
+	 *  recall outright. Null if none qualifies. */
 	private newestRecallAnchor(): string | null {
 		for (let i = this.blocks.length - 1; i >= 0; i--) {
 			const b = this.blocks[i];
+			if (b.kind === "tool_call") continue;
 			if (isDurableId(b.id) && !this.groupWire.has(b.id)) return b.id;
 		}
 		return null;
@@ -1322,6 +1350,11 @@ export class AccordionStore {
 			if (!b || !this.isFolded(b) || this.groupWire.has(id)) {
 				this.recalled.delete(id);
 				changed = true;
+				// Observability: this is an AUTO drop (unfolded or left the store), not an explicit
+				// `restore` — attribute it to "auto" like every other conductor-pass-settled state
+				// change (`clamped · …`, `unfolded (protected)`).
+				this.emit("auto", "recall dropped", b ? `${label(b)} settled live` : `${id} left the store`);
+				this.recordDecision("auto", "recall", [id], b ? `${label(b)} settled live` : `${id} left the store`);
 			}
 		}
 		if (changed) this.recalled = new Map(this.recalled);
@@ -1432,8 +1465,20 @@ export class AccordionStore {
 	 * that block is preserved (we never touch a block that is already present). The
 	 * source of truth therefore never holds two blocks with the same id — including
 	 * a duplicate id within a single batch.
+	 *
+	 * `sent` (#43/ADR 0017 protection-bypass fix): pass `true` for a `full:true` backlog/
+	 * reconcile sync — a replay of history the model has already genuinely seen, not newly
+	 * "born" content. Without this, a GUI reconnect builds an EMPTY store (`sentThroughOrder`
+	 * starts at -1) and the extension immediately replays the WHOLE history in one full sync;
+	 * every replayed block would read `order > -1` (fresh) and a birth-folding conductor could
+	 * fold already-seen protected-tail content on the very first pass, sticking those ids in
+	 * `birthFolded` forever (markSent() afterwards does not undo an already-recorded exemption).
+	 * `sent: true` advances `sentThroughOrder` past the incoming blocks' max order BEFORE the
+	 * internal `refold()` runs, so the conduct pass sees them as already-sent — conservative,
+	 * not permissive. A normal live incremental append (`full:false`) omits the flag and stays
+	 * fresh exactly as before.
 	 */
-	appendBlocks(blocks: Block[]): void {
+	appendBlocks(blocks: Block[], opts: { sent?: boolean } = {}): void {
 		if (!blocks.length) return;
 		const fresh: Block[] = [];
 		for (const b of blocks) {
@@ -1443,6 +1488,12 @@ export class AccordionStore {
 		}
 		if (!fresh.length) return;
 		this.blocks.push(...fresh);
+		if (opts.sent) {
+			// Advance BEFORE refold(), so the conduct pass this triggers never sees these as fresh.
+			let maxOrder = this.sentThroughOrder;
+			for (const b of fresh) if (b.order > maxOrder) maxOrder = b.order;
+			this.sentThroughOrder = maxOrder;
+		}
 		this.refold();
 	}
 

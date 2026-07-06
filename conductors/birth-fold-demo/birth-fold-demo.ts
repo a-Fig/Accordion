@@ -22,7 +22,12 @@ export class BirthFoldDemoConductor implements Conductor {
 
 	conduct(view: ConductorView): Command[] {
 		const ids = view.blocks
-			.filter((b) => b.fresh && b.protected && b.kind === "tool_result" && b.tokens > FRESH_FOLD_THRESHOLD)
+			// `!b.held`: skip a block the human has already touched (pin / manual fold / manual
+			// unfold). Without this, re-issuing `fold` on a human-held block every pass is a
+			// harmless no-op to the wire (the host's human-override clamp always wins), but it
+			// spams a "clamped · human-override" report on every single refold — recurring log
+			// noise for a state that will never change.
+			.filter((b) => b.fresh && b.protected && !b.held && b.kind === "tool_result" && b.tokens > FRESH_FOLD_THRESHOLD)
 			.map((b) => b.id);
 		return ids.length ? [{ kind: "fold", ids }] : [];
 	}

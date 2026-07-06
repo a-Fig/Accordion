@@ -14,6 +14,10 @@
  *
  * Collaborative (no locks) — a human pin/unfold still wins; unfolding a recalled block drops its
  * recall automatically (the tail injection would then duplicate content already standing in place).
+ *
+ * Note: in a live session recalls ACCUMULATE monotonically — recalls are sticky (ADR 0018 §2) and
+ * this demo never issues `restore`, so each new "most recent fold" adds a recall without releasing
+ * the prior one. Intentional for a demo; a real strategy would `restore` recalls it is done with.
  */
 import type { Conductor, ConductorView, Command } from "../contract";
 

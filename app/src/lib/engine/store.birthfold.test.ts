@@ -308,6 +308,61 @@ describe("birth-fold — bulk-loaded sessions are never fresh", () => {
 	});
 });
 
+// ── (i) full-sync replay marked sent: appendBlocks(backlog, { sent: true }) ────
+
+describe("birth-fold — a full-sync backlog replay is never fresh (reconnect protection bypass)", () => {
+	it("appendBlocks(backlog, { sent: true }) on an empty store → nothing fresh, tail fold clamps protected", () => {
+		// Mirror the GUI reconnect path exactly: a fresh EMPTY store (sentThroughOrder = -1),
+		// a birth-folding conductor already attached, then the extension replays the WHOLE
+		// history in one full:true sync — the appendBlocks call below runs the conduct pass
+		// DURING the append, the exact window the bypass lived in.
+		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks: [], lineCount: 0, skipped: 0 };
+		const s = new AccordionStore(parsed);
+		s.setProtect(20_000); // whole small session will sit in the protected tail
+		const conductor = new StubConductor();
+		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }];
+		s.attach(conductor);
+
+		s.appendBlocks(sessionWithFreshResult(8000), { sent: true });
+
+		// The replayed history was marked sent BEFORE the conduct pass: nothing reads fresh...
+		const view = conductor.lastView!;
+		for (const b of view.blocks) expect(b.fresh).toBe(false);
+		// ...so the fold inside the tail clamps "protected" — no birth-fold, no sticky exemption.
+		expect(s.isFolded(s.get("r:c1")!)).toBe(false);
+		expect(s.lastReports.some((r) => r.ids.includes("r:c1") && r.reason === "protected")).toBe(true);
+
+		// birthFolded stayed empty (assert indirectly — it's private): re-running the pass
+		// still clamps protected; a sticky exemption would have let the fold through.
+		s.refold();
+		expect(s.isFolded(s.get("r:c1")!)).toBe(false);
+		expect(s.lastReports.some((r) => r.ids.includes("r:c1") && r.reason === "protected")).toBe(true);
+	});
+
+	it("a subsequent plain appendBlocks (no flag) is fresh and birth-foldable as before", () => {
+		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks: [], lineCount: 0, skipped: 0 };
+		const s = new AccordionStore(parsed);
+		s.setProtect(20_000);
+		const conductor = new StubConductor();
+		conductor.cmds = [{ kind: "fold", ids: ["r:c2"] }];
+		s.attach(conductor);
+		s.appendBlocks(sessionWithFreshResult(8000), { sent: true }); // the reconnect backlog
+
+		// A genuinely NEW oversized tool_result streams in afterwards — normal incremental sync.
+		s.appendBlocks([
+			blk("a:r2:p0", "tool_call", 2, 4, 200, { callId: "c2" }),
+			blk("r:c2", "tool_result", 2, 5, 8000, { callId: "c2" }),
+		]);
+
+		// It reads fresh and the conductor birth-folds it despite protection.
+		const view = conductor.lastView!;
+		expect(view.blocks.find((b) => b.id === "r:c2")!.fresh).toBe(true);
+		expect(s.isProtected(s.get("r:c2")!)).toBe(true);
+		expect(s.isFolded(s.get("r:c2")!)).toBe(true);
+		expect(s.lastReports.some((r) => r.ids.includes("r:c2") && r.reason === "protected")).toBe(false);
+	});
+});
+
 // ── golden must stay green — sanity check that birth-fold plumbing is inert by default ──
 
 describe("birth-fold — no behavior change when nothing is fresh (regression guard)", () => {

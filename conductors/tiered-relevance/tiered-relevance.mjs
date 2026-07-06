@@ -49,7 +49,7 @@ import { buildFoldUnits } from "./units.mjs";
 // older Node an import of a .ts file throws ERR_UNKNOWN_FILE_EXTENSION at load. The peer
 // conductors (recency-folder, attention-folder) inline it the same way. Keep in lockstep with
 // the contract on any protocol bump.
-const CONDUCTOR_PROTOCOL_VERSION = 3;
+const CONDUCTOR_PROTOCOL_VERSION = 4;
 
 const ID = "tiered-relevance";
 const LABEL = "Tiered relevance";
