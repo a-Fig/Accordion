@@ -4,8 +4,8 @@
  * The handoff conductor is a close cousin of NaiveCompactionConductor: same single-`group`-
  * over-the-aged-run shape with an LLM digest, same visible-window hysteresis, same in-flight /
  * stale-completion / attempt-key guards. Two things differ and are pinned here:
- *   1. It holds the `tail-size` lock with a small `tailTokens` (HANDOFF_TAIL_TOKENS) — it OWNS
- *      a deliberately small protected tail so the handoff absorbs nearly the whole conversation.
+ *   1. It holds the `tail-size` lock with `tailTokens = 0` (HANDOFF_TAIL_TOKENS) — it OWNS
+ *      no protected old-session tail so the handoff absorbs the whole current conversation.
  *   2. The completion prompt/system is a HANDOFF DOCUMENT for a cold successor agent, not a
  *      compaction summary.
  *
@@ -775,21 +775,19 @@ describe("HandoffConductor — vanished handed-off blocks", () => {
 // ── 14. Lock declaration ───────────────────────────────────────────────────────
 
 describe("HandoffConductor — lock declaration", () => {
-	it("declares all three steering locks and a small positive tailTokens", () => {
+	it("declares all three steering locks and a zero inherited tail", () => {
 		const c = new HandoffConductor();
 		expect(c.locks).toEqual(["human-steering", "agent-unfold", "tail-size"]);
 		expect(c.tailTokens).toBe(HANDOFF_TAIL_TOKENS);
-		expect(c.tailTokens).toBeGreaterThan(0);
-		// Distinctly smaller than the human's default ~20k tail — that is the "fresh start".
-		expect(c.tailTokens).toBeLessThan(20_000);
+		expect(c.tailTokens).toBe(0);
 	});
 });
 
 // ── 15. AccordionStore integration ─────────────────────────────────────────────
 
 describe("HandoffConductor — AccordionStore integration", () => {
-	it("delivers the handoff as a single folded group, owns a small tail, and gates the human's tail dial", async () => {
-		// ~32k of aged history + a small newest tail. Budget tight so liveTokens >= 90%.
+	it("delivers the handoff as a single folded group over the whole current session and gates the human's tail dial", async () => {
+		// Whole current session should be handed off. Budget tight so liveTokens >= 90%.
 		const blocks = [
 			blk(0, "user", 2000, { text: "opening user request" }),
 			blk(1, "text", 10000, { text: "assistant work one" }),
@@ -804,13 +802,10 @@ describe("HandoffConductor — AccordionStore integration", () => {
 		s.attach(new HandoffConductor());
 		await flushMicrotasks();
 
-		// The conductor owns the tail via the 8k tail-size lock, NOT the human's 20k default.
-		// Walk-back (target 8000, 25% cap = 10000): newest block m4=1000 < 8000, and adding
-		// m3=10000 would breach the 10000 cap → the boundary lands at index 4 (only m4 protected).
-		// A human 20k tail on these same blocks would protect down to index 2 (m2,m3,m4 ≈ 21000),
-		// so this exact index is the proof the conductor's 8k tail — not the 20k default — is live.
-		expect(s.protectedFromIndex).toBe(4);
-		expect(s.protectedTokens).toBe(1000); // only the newest block, per the cap
+		// The conductor owns the tail via a zero-token tail-size lock: unlike the human's default
+		// ~20k tail, no old-session block is protected from the handoff.
+		expect(s.protectedFromIndex).toBe(blocks.length);
+		expect(s.protectedTokens).toBe(0);
 
 		// One conductor-owned, folded group carrying the handoff verbatim (no drop group).
 		expect(s.groups.length).toBe(1);
@@ -820,9 +815,10 @@ describe("HandoffConductor — AccordionStore integration", () => {
 		expect(s.isDropGroup(g)).toBe(false);
 		expect(s.groupSummary(g)).toContain("FRESH-START HANDOFF DOC");
 
-		// The group covers the oldest blocks (incl. the user block) but NOT the newest tail block.
+		// The group covers the whole current session (including the newest block), because a real
+		// fresh session receives only the handoff document and no verbatim old-session tail.
 		expect(g.memberIds).toContain("m0:p0");
-		expect(g.memberIds).not.toContain("m4:p0");
+		expect(g.memberIds).toContain("m4:p0");
 
 		// Happy path: no invalid-group / not-foldable / protected clamp fired.
 		expect(s.lastReports.some((r) => r.reason === "invalid-group")).toBe(false);
@@ -835,11 +831,11 @@ describe("HandoffConductor — AccordionStore integration", () => {
 		expect(s.protectedFromIndex).toBe(before);
 	});
 
-	it("owns a demonstrably SMALLER tail than a human 20k tail on the same session (the fresh-start claim)", async () => {
-		// The whole justification for a separate conductor is that it discards more of the working
-		// tail than in-place compaction. Prove it differentially on identical blocks: six 5k blocks.
+	it("owns no inherited tail versus a human 20k tail on the same session (the fresh-start claim)", async () => {
+		// The whole justification for a separate conductor is that it discards the old-session
+		// working tail entirely. Prove it differentially on identical blocks: six 5k blocks.
 		//   Human 20k tail:  walk-back protects newest 4 (5+5+5+5=20000) → protectedFromIndex 2.
-		//   Handoff 8k tail: walk-back protects newest 2 (5+5=10000, ≤ 10000 cap) → index 4.
+		//   Handoff 0 tail: target 0 protects nothing → protectedFromIndex 6.
 		const mk = () => [
 			blk(0, "user", 5000, { text: "ask" }),
 			blk(1, "text", 5000, { text: "a" }),
@@ -854,14 +850,14 @@ describe("HandoffConductor — AccordionStore integration", () => {
 		sHuman.setProtect(20_000);
 		expect(sHuman.protectedFromIndex).toBe(2);
 
-		// Handoff: 8k tail-size lock owns the tail.
+		// Handoff: zero tail-size lock owns the tail.
 		const sHandoff = makeStore(mk());
 		sHandoff.setBudget(20_000);
 		sHandoff.completer = async () => ({ text: "H", model: "test-model" });
 		sHandoff.attach(new HandoffConductor());
 		await flushMicrotasks();
 
-		expect(sHandoff.protectedFromIndex).toBe(4);
+		expect(sHandoff.protectedFromIndex).toBe(6);
 		// Strictly fewer blocks kept live → strictly more of the session folded into the handoff.
 		expect(sHandoff.protectedFromIndex).toBeGreaterThan(sHuman.protectedFromIndex);
 		expect(sHandoff.protectedTokens).toBeLessThan(sHuman.protectedTokens);
@@ -899,15 +895,11 @@ describe("HandoffConductor — AccordionStore integration", () => {
 		expect(s.groups[0].memberIds).toContain("m3:p0");
 	});
 
-	it("boundary straggler: a multi-part message split by the small 8k tail refuses the group that pass, then self-heals", async () => {
-		// The host's tail walk-back is block-by-block and can land the 8k boundary INSIDE one
-		// multi-part assistant message. The small tail makes this more reachable than naive
-		// compaction's 20k tail, so pin it: the tail-straddling group is refused `invalid-group`
-		// (blocks stay live, no data loss), and it heals the moment a newer block pushes the
-		// split message fully below the tail.
-		//
-		// Message "m2" is three ~4k parts. Walk-back (target 8000, 25% cap = 10000): protects
-		// m2:p2 (4000) + m2:p1 (4000) = 8000 ≥ target, so m2:p0 is left aged — splitting m2.
+	it("zero tail includes the newest multi-part message in the handoff instead of stranding it", async () => {
+		// A literal fresh start has no protected old-session tail, so even the newest multi-part
+		// assistant message is snapped wholly into the handoff group. This is the strict-fidelity
+		// counterpart to the previous boundary-straggler case: there is no tail boundary to
+		// split m2, so the group applies immediately without an invalid-group clamp.
 		const blocks = [
 			blk(0, "user", 5000, { id: "m0:p0", text: "the ask" }),
 			blk(1, "text", 20000, { id: "m1:p0", text: "big old work" }),
@@ -922,20 +914,10 @@ describe("HandoffConductor — AccordionStore integration", () => {
 		s.attach(new HandoffConductor());
 		await flushMicrotasks();
 
-		// The handoff committed internally, but the group [m0:p0 .. m2:p0] snaps outward to the
-		// whole m2 message (m2:p1/m2:p2 are protected) → reaches into the tail → refused.
-		expect(s.lastReports.some((r) => r.reason === "invalid-group")).toBe(true);
-		expect(s.groups.length).toBe(0);
-
-		// A newer message ages in and pushes all of m2 below the 8k tail → the group is now a
-		// valid whole-message run and applies (self-heal). No stranding.
-		s.appendBlocks([blk(5, "text", 8000, { id: "m3:p0", text: "new tail" })]);
-		await flushMicrotasks();
-
 		expect(s.groups.length).toBe(1);
 		const g = s.groups[0];
 		expect(s.groupSummary(g)).toContain("STRADDLE HANDOFF");
-		// The whole split message is now inside the group (snap swept its siblings in).
+		// The whole newest multi-part message is inside the handoff.
 		expect(g.memberIds).toContain("m2:p0");
 		expect(g.memberIds).toContain("m2:p1");
 		expect(g.memberIds).toContain("m2:p2");

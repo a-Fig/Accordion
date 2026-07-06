@@ -39,29 +39,24 @@ Ship a first-party in-process conductor, `conductors/handoff/handoff.ts` (`Hando
 label "Handoff (fresh start)"), that reuses naive compaction's proven state machine and changes
 exactly the two things that make it a fresh-start rather than an in-place compaction.
 
-### 1. It owns a deliberately small tail via the `tail-size` lock
+### 1. It owns a zero inherited tail via the `tail-size` lock
 
 This is the mechanical heart of the ADR. The conductor declares
 `locks = ["human-steering", "agent-unfold", "tail-size"]` and `tailTokens = HANDOFF_TAIL_TOKENS`
-(8k). Under the `tail-size` lock (ADR 0011 §7) the host drives `protectedFromIndex` from the
-conductor's `tailTokens` instead of the human's `protectTokens`, so only the newest whole
-block(s) targeting ~8k stay live and **everything older is foldable into the handoff**. Naive compaction
-pointedly does the opposite — it leaves `tail-size` unlocked so the human keeps a big ~20k
-verbatim tail. Here, owning a small tail is not a power grab; it *is* the simulation. Without
-it the human's 20k tail would defeat "fresh start" entirely and the two conductors would be
+(`0`). Under the `tail-size` lock (ADR 0011 §7) the host drives `protectedFromIndex` from the
+conductor's `tailTokens` instead of the human's `protectTokens`. With `target === 0`, the host
+protects nothing (`protectedFromIndex = blocks.length`), so **the whole current conversation is
+foldable into the handoff**. Naive compaction pointedly does the opposite — it leaves
+`tail-size` unlocked so the human keeps a big ~20k verbatim tail. Here, owning a zero tail is
+not a power grab; it *is* the simulation. Without it the human's 20k tail would leak verbatim
+old-session context into the supposed fresh start and the two conductors would be
 indistinguishable.
 
-Consequence: the visible window collapses hard at each handoff (nearly the whole conversation
-folds into one document) and rebuilds toward the high-water mark before the next handoff — a
-deep sawtooth, versus naive compaction's gentle curve. 8k is a *target*, not a guarantee: the
-host walk-back protects the newest **whole** blocks summing to ≥8k, stopping before it breaches
-a 25% overflow cap (10k) — so with large recent blocks the live tail can be as little as one
-block (e.g. a single 5–10k tool result), and never more than ~10k. That is the "fresh agent's
-initial working room": small enough to feel like a reset, large enough that the agent has a
-concrete current turn to act on right after the handoff. `tailTokens = 0` was rejected — with
-`target === 0` the walk-back protects nothing (`protectedFromIndex = blocks.length`), so the
-newest block is never held live and the conductor could fold it straight into the handoff,
-leaving the fresh agent no concrete current turn to work from.
+Consequence: the visible window collapses to the handoff document itself after each handoff,
+then rebuilds only with new post-handoff turns before the next reset — a hard-reset sawtooth,
+versus naive compaction's gentle curve. `tailTokens > 0` was rejected for fidelity: even a small
+8k tail means the continuing agent sees the handoff plus raw recent context from the killed
+session, which is not the workflow this conductor is meant to simulate.
 
 ### 2. The completion is a handoff document, not a compaction summary
 
@@ -77,14 +72,14 @@ handoff; only assistant reasoning degrades.
 ### 3. Everything else is inherited from naive compaction
 
 The single-`group(digest: handoff)`-over-the-aged-run shape (ADR 0014 §4), the visible-window
-90% hysteresis (§2), the aged region = all-kinds-older-than-the-tail (§3), the recursive
-amnesiac prompt built from `<previous-handoff>` + only the newly-aged blocks (§5), the in-flight
-/ stale-completion / attempt-key guards (§6), and the "wait visibly, no deterministic fallback"
-degrade path when `can("complete")` is false (§7) are all reproduced. The handoff is
-**non-recoverable** (no `{#code FOLDED}` tag) for the same honest reason: a fresh agent genuinely
-does not have the originals. The human's recourse remains **detach**, which freezes the view and
-inherits the conductor's 8k tail into the human's `protectTokens` so the boundary is stable
-(ADR 0011 §6).
+90% hysteresis (§2), the aged region = all unprotected blocks (the whole current session while
+`tailTokens = 0`) (§3), the recursive amnesiac prompt built from `<previous-handoff>` + only the
+newly-aged blocks (§5), the in-flight / stale-completion / attempt-key guards (§6), and the
+"wait visibly, no deterministic fallback" degrade path when `can("complete")` is false (§7) are
+all reproduced. The handoff is **non-recoverable** (no `{#code FOLDED}` tag) for the same honest
+reason: a fresh agent genuinely does not have the originals. The human's recourse remains
+**detach**, which freezes the view and inherits the conductor's zero tail into the human's
+`protectTokens` so the boundary is stable (ADR 0011 §6).
 
 ## Consequences
 
@@ -95,10 +90,10 @@ inherits the conductor's 8k tail into the human's `protectTokens` so the boundar
   degrades *despite* best-effort preservation, not from weak prompting.
 - **First in-process `tail-size` user.** No shipped in-process conductor previously exercised
   the `tail-size` lock / `tailTokens` plumbing (only test doubles did). The end-to-end
-  AccordionStore test asserts the conductor owns a smaller tail than the human's 20k default —
-  differentially, on identical blocks, and at the exact walk-back boundary — that
-  `setProtect` is inert while attached, and that no `protected` / `invalid-group` / `not-foldable`
-  clamp fires on the happy path.
+  AccordionStore test asserts the conductor owns no inherited tail while the human baseline
+  would keep a 20k tail — differentially, on identical blocks — that `setProtect` is inert
+  while attached, and that no `protected` / `invalid-group` / `not-foldable` clamp fires on
+  the happy path.
 - **Exclusive, so it gates.** Locking all three steering controls triggers the one-time ADR 0011
   consent dialog (which already renders `tail-size` generically — no UI change needed). Some
   users will find the consent + tail-dial takeover heavier than naive compaction's; that is the
@@ -114,5 +109,5 @@ inherits the conductor's 8k tail into the human's `protectTokens` so the boundar
   "LLM-summary conductor" base is a possible later refactor, not a prerequisite.
 - No model-spend accounting (`inputTokens`/`outputTokens` are ignored) — a baseline, not a
   production system.
-- `tailTokens` is a fixed constant (8k), not yet user-configurable; a future header control could
-  expose it if the sawtooth depth wants tuning.
+- `tailTokens` is intentionally fixed at `0` for fidelity. A non-zero tuning knob would
+  simulate a different, small-tail handoff approximation rather than a literal fresh start.

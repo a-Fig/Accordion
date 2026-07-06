@@ -29,15 +29,13 @@ tokens — verbatim, and only summarizes the aged prefix. A fresh start throws t
 **away**: when you `/clear` and reseed, you carry over only what the handoff author wrote down,
 not your last 20k of live tool output and reasoning.
 
-So this conductor **owns a deliberately small tail** (`HANDOFF_TAIL_TOKENS` targets ~8k — the
-host walk-back keeps the newest whole block(s) up to a 25% overflow cap, so the live tail is one
-block at minimum and never more than ~10k; the "fresh
-agent's initial working room") by holding the **`tail-size`** involvement lock (ADR 0011), and
-folds nearly the *whole* conversation into the single handoff. The visible window collapses hard
-at each handoff and rebuilds — a deep sawtooth, not naive compaction's gentle curve. Locking
-`tail-size` is not a power grab: it **is** the simulation. Without it, the human's 20k tail
-would defeat the "fresh start" entirely and this conductor would be indistinguishable from
-naive compaction (which pointedly leaves `tail-size` unlocked).
+So this conductor holds the **`tail-size`** involvement lock (ADR 0011) with
+`HANDOFF_TAIL_TOKENS = 0`. That disables the inherited protected tail: every block in the
+current session is eligible to be folded into the handoff, and the continuing agent sees the
+handoff document plus only future post-handoff turns. Locking `tail-size` is not a power grab:
+it **is** the simulation. Without it, the human's 20k tail would leak verbatim old-session
+context into the supposed fresh start and make this conductor indistinguishable from naive
+compaction (which pointedly leaves `tail-size` unlocked).
 
 ## How it works
 
@@ -47,9 +45,10 @@ Same single-`group`-over-the-aged-run mechanism, same visible-window hysteresis,
 
 1. **It holds all three steering locks** — `human-steering` + `agent-unfold` (same rationale as
    naive compaction: keep the aged region contiguous and un-fought-over while the handoff is
-   rewritten) **and `tail-size`** with `tailTokens ≈ 8k`. Being exclusive over all three
+   rewritten) **and `tail-size`** with `tailTokens = 0`. Being exclusive over all three
    triggers the one-time ADR 0011 consent gate; the human's recourse is always **detach**, which
-   freezes the current view and inherits this conductor's tail into the human's `protectTokens`.
+   freezes the current view and inherits this conductor's zero tail into the human's
+   `protectTokens`.
 
 2. **The completion is a handoff document**, not a compaction summary. The system prompt
    addresses the model as the *author* of a briefing for a successor that will have nothing but
@@ -102,5 +101,5 @@ Selection is global — it applies to whatever session is currently active.
   blocks stay live that pass (the same boundary straggler caveat sliding-window documents).
 - The conductor is **exclusive over all three locks**, so the consent gate and detach
   freeze/kill-switch apply. `human-steering` keeps the aged region contiguous (one handoff tile);
-  `tail-size` hands it the small owned tail; the human's tail dial is inert while attached.
+  `tail-size` disables any inherited old-session tail; the human's tail dial is inert while attached.
 - It **does not track its own model spend** — this is a baseline, not a production system.

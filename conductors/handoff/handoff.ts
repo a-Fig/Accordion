@@ -16,13 +16,13 @@
  *
  *   - A fresh start throws the working tail AWAY. When you `/clear` and reseed, you do NOT
  *     carry over your last 20k of live tool output and reasoning — you carry over ONLY what
- *     the handoff author chose to write down. So this conductor OWNS a DELIBERATELY SMALL
- *     tail (`HANDOFF_TAIL_TOKENS`, the "fresh agent's initial working room") and folds nearly
- *     the WHOLE conversation into ONE handoff document. The visible window collapses hard at
- *     each handoff and rebuilds — a deep sawtooth, not naive compaction's gentle curve.
+ *     the handoff author chose to write down. So this conductor OWNS a ZERO inherited tail
+ *     (`HANDOFF_TAIL_TOKENS = 0`) and folds the WHOLE current conversation into ONE handoff
+ *     document. The visible window collapses to the handoff itself and then rebuilds with new
+ *     post-handoff turns — a hard-reset sawtooth, not naive compaction's gentle curve.
  *
- * To own that small tail the conductor must hold the `tail-size` lock (ADR 0011) with a
- * small `tailTokens`; that is the essential mechanical difference from naive compaction,
+ * To disable the inherited tail the conductor must hold the `tail-size` lock (ADR 0011) with
+ * `tailTokens = 0`; that is the essential mechanical difference from naive compaction,
  * which deliberately leaves `tail-size` UNLOCKED so the human keeps a big verbatim tail.
  * Locking `tail-size` here is not a power grab — it IS the simulation. Without it the human's
  * 20k tail would defeat the "fresh start" entirely and this conductor would be indistinguishable
@@ -42,7 +42,7 @@
  * SHAPE — a close cousin of the naive-compaction conductor (which is itself a cousin of
  * sliding-window). Same single-`group`-over-the-aged-run mechanism, same visible-window
  * hysteresis, same in-flight / stale-completion / attempt-key guards. Two things differ:
- *   1. It holds the `tail-size` lock with a small `tailTokens` (naive compaction holds neither).
+ *   1. It holds the `tail-size` lock with `tailTokens = 0` (naive compaction holds neither).
  *   2. The completion prompt is a HANDOFF DOCUMENT for a cold successor agent, not a
  *      compaction summary appended to live context (see `HANDOFF_SYSTEM`).
  *
@@ -74,15 +74,13 @@ import type {
 const TRIGGER = 0.9;
 
 /**
- * The protected tail the conductor OWNS via the `tail-size` lock — the "fresh agent's initial
- * working room" that survives a handoff verbatim. Deliberately small: a real fresh start keeps
- * almost nothing live, only the immediate current turn. This is the load-bearing difference
- * from naive compaction (which rides the human's ~20k tail). The newest ~8k of tokens stay
- * live so the agent has something concrete to act on right after a handoff; everything older
- * collapses into the handoff document. Folds inside this tail are refused `protected` by the
- * host (the conductor reads the boundary from `view.protectedFromIndex` and never targets it).
+ * The inherited old-session tail this conductor OWNS via the `tail-size` lock. A literal fresh
+ * start keeps NONE of the old session verbatim: the successor agent receives the handoff
+ * document and only future post-handoff turns. `0` makes the host's protected boundary land at
+ * `blocks.length`, so every current block is eligible to be folded into the handoff group.
+ * This is the load-bearing difference from naive compaction (which rides the human's ~20k tail).
  */
-export const HANDOFF_TAIL_TOKENS = 8000;
+export const HANDOFF_TAIL_TOKENS = 0;
 
 /**
  * Soft cap on handoff output tokens. Sized like naive compaction's summary cap: a handoff
@@ -171,9 +169,10 @@ export class HandoffConductor implements Conductor {
 	 *     being rewritten, and `human-steering` keeps the aged region CONTIGUOUS so the single
 	 *     `group` command covering it is always valid.
 	 *   - `tail-size` — REQUIRED here (naive compaction pointedly omits it). Owning the tail is
-	 *     the simulation: a fresh start keeps only a tiny working tail, not the human's ~20k.
+	 *     the simulation: a fresh start keeps no verbatim tail from the killed session, unlike
+	 *     the human's ~20k.
 	 *     Under this lock the host drives `protectedFromIndex` from `tailTokens` below, so the
-	 *     conductor folds nearly the whole conversation into the handoff.
+	 *     conductor folds the whole current conversation into the handoff.
 	 *
 	 * Being exclusive over all three triggers the one-time consent gate (ADR 0011); the human's
 	 * recourse is always DETACH, which freezes the current view and inherits this conductor's
@@ -182,10 +181,10 @@ export class HandoffConductor implements Conductor {
 	readonly locks = ["human-steering", "agent-unfold", "tail-size"] as const;
 
 	/**
-	 * The small protected tail this conductor declares while holding `tail-size` (ADR 0011).
-	 * The host's walk-back protects the newest ~`HANDOFF_TAIL_TOKENS` tokens; everything older
-	 * is foldable into the handoff. This is the mechanical heart of the "fresh start": a small
-	 * tail ⇒ a big handoff ⇒ a deep sawtooth.
+	 * The protected tail this conductor declares while holding `tail-size` (ADR 0011). It is
+	 * deliberately ZERO: the host protects nothing from the old session, so the whole current
+	 * conversation is foldable into the handoff. This is the mechanical heart of the "fresh
+	 * start": no inherited tail ⇒ one handoff-only context ⇒ a hard-reset sawtooth.
 	 */
 	readonly tailTokens = HANDOFF_TAIL_TOKENS;
 
@@ -252,9 +251,10 @@ export class HandoffConductor implements Conductor {
 		// Cannot operate without a host (e.g. headless test without attach).
 		if (!this.host) return null;
 
-		// AGED REGION: every block older than the (small, conductor-owned) protected tail that
-		// is not human-held and not already inside a group. ALL kinds are included — the single
-		// handoff group swallows the whole region and the host's whole-message snap +
+		// AGED REGION: every block older than the conductor-owned protected boundary that is not
+		// human-held and not already inside a group. With `tailTokens = 0`, that boundary is the
+		// end of the session, so the first handoff can swallow the whole current conversation.
+		// ALL kinds are included — the single handoff group and the host's whole-message snap +
 		// pair-balance keeps the result wire-valid (a tool_call is never orphaned from its result).
 		const aged = this.agedRegion(view);
 
@@ -333,9 +333,11 @@ export class HandoffConductor implements Conductor {
 	// ── helpers ───────────────────────────────────────────────────────────────
 
 	/**
-	 * The aged region: every block older than the conductor's small protected tail that is not
-	 * human-held and not already inside a group. All kinds included (the single handoff group
-	 * swallows the region; the host pair-balances tool calls/results).
+	 * The aged region: every block older than the conductor-owned protected boundary that is not
+	 * human-held and not already inside a group. For this conductor's zero tail that is the whole
+	 * current session; later, after a handoff exists, it is the prior handoff plus new work.
+	 * All kinds included (the single handoff group swallows the region; the host pair-balances
+	 * tool calls/results).
 	 */
 	private agedRegion(view: ConductorView): ViewBlock[] {
 		const aged: ViewBlock[] = [];
