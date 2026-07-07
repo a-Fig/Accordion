@@ -78,7 +78,7 @@ export function computeGroupOps(store: AccordionStore): GroupOp[] {
 }
 
 /**
- * Compute the recall ops for the current store state (ADR 0018): one `RecallOp` per ACTIVE recall
+ * Compute the recall ops for the current store state (ADR 0019): one `RecallOp` per ACTIVE recall
  * whose block is STILL folded on the wire. The block stays folded (its `FoldOp` still rides); the
  * op tells the extension to ALSO inject the block's ORIGINAL full text as one synthetic user
  * message after the frozen `afterId` anchor. `text` is the labeled/tagged injection

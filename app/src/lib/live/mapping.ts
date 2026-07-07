@@ -296,7 +296,7 @@ function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () =>
  *     Each maximal run of same-group removable messages becomes one message (role = the
  *     run's first message's role, mapped to user/assistant; content = the summary text).
  *
- *   • `RecallOp` — TAIL INJECTION (ADR 0018): insert ONE synthetic user message carrying a folded
+ *   • `RecallOp` — TAIL INJECTION (ADR 0019): insert ONE synthetic user message carrying a folded
  *     block's full text AFTER its frozen anchor message, WITHOUT unfolding the block (its digest
  *     stays in place). Additive — it only appends a message; it never removes or edits an existing
  *     one, so tool pairing is untouched. Group-swallowed / dropped / unknown anchors fall back to

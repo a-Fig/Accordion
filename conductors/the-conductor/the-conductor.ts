@@ -61,7 +61,7 @@ import {
 import { buildCommands, planSignature } from "./commands.ts";
 
 // Mirrors CONDUCTOR_PROTOCOL_VERSION in conductors/contract/protocol.ts — keep in lockstep
-// (v4 = RecallCommand in the Command union, ADR 0018; the app's hello gate is a strict !==).
+// (v4 = RecallCommand in the Command union, ADR 0019; the app's hello gate is a strict !==).
 const CONDUCTOR_PROTOCOL_VERSION = 4;
 
 const ID = "the-conductor";

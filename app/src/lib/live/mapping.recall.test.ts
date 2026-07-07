@@ -3,7 +3,7 @@ import { applyPlan, type PiMessage } from "./mapping";
 import type { GroupOp, RecallOp } from "./protocol";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// applyPlan RECALL INJECTION (ADR 0018).
+// applyPlan RECALL INJECTION (ADR 0019).
 //
 // A recall inserts ONE synthetic user message carrying a folded block's full text AFTER its
 // frozen anchor message, WITHOUT unfolding the block. It is additive — it never removes or

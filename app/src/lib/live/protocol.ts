@@ -30,8 +30,8 @@
  *  - v4: group collapse ops (`GroupOp`, `PlanMessage.groups`).
  *  - v5: recall tool (`recallRequest` / `recallResult`) plus completion relay
  *        (`completeRequest` / `completeResult`) for out-of-band model completions.
- *  - v6: `SyncMessage.planned` (ADR 0017) — the birth-fold exemption. Additive.
- *  - v7: `PlanMessage.recalls` (`RecallOp`, ADR 0018) — conductor recall injects a folded
+ *  - v6: `SyncMessage.planned` (ADR 0018) — the birth-fold exemption. Additive.
+ *  - v7: `PlanMessage.recalls` (`RecallOp`, ADR 0019) — conductor recall injects a folded
  *        block's full text at a stable tail anchor without unfolding it. Additive.
  */
 export const PROTOCOL_VERSION = 7;
@@ -114,7 +114,7 @@ export interface GroupOp {
 }
 
 /**
- * One recall instruction (ADR 0018) — the conductor analog of the agent's `recall` tool. The
+ * One recall instruction (ADR 0019) — the conductor analog of the agent's `recall` tool. The
  * folded block `id` STAYS folded on the wire (its `{#code FOLDED}` digest is untouched); instead
  * `applyPlan` inserts ONE synthetic user-role message `{ role:"user", content:[{type:"text",
  * text}] }` immediately AFTER the message that emits `afterId`. That anchor is FROZEN when the
@@ -268,7 +268,7 @@ export interface PlanMessage {
 	ops: FoldOp[];
 	/** Group-collapse ops (ADR 0006). Optional/additive — omitted ⇒ no group collapse. */
 	groups?: GroupOp[];
-	/** Conductor recall ops (ADR 0018). Optional/additive — omitted ⇒ no tail injections. */
+	/** Conductor recall ops (ADR 0019). Optional/additive — omitted ⇒ no tail injections. */
 	recalls?: RecallOp[];
 }
 

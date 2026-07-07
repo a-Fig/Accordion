@@ -1,5 +1,5 @@
 /*
- * store.recall.test.ts — behavioural tests for the conductor `recall` command (ADR 0018).
+ * store.recall.test.ts — behavioural tests for the conductor `recall` command (ADR 0019).
  *
  * A recall keeps a block FOLDED (its digest keeps costing only the digest) but injects the block's
  * ORIGINAL full text at a stable tail anchor on the wire — the conductor analog of the agent's
@@ -283,7 +283,7 @@ describe("recall — recalledTokens gates on isFolded", () => {
 	it("a view built mid-lifecycle does not double-count full block + injection", () => {
 		// The window: `clearConductorState` momentarily un-folds every conductor-owned block
 		// before the conductor re-issues its folds, but the sticky `recalled` map survives the
-		// reset (ADR 0018 §2). The view handed to `conduct()` is built in exactly that instant —
+		// reset (ADR 0019 §2). The view handed to `conduct()` is built in exactly that instant —
 		// without the isFolded gate its `liveTokens` baseline would charge the FULL live block
 		// PLUS the still-registered recall injection of the same content.
 		const s = makeStore(session());

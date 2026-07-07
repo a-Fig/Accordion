@@ -965,7 +965,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 * `planned: true` — this is the ONE sync site whose reply is actually APPLIED to a model
 	 * call (the `context` hook below). The GUI advances its birth-fold "sent" cursor only on a
 	 * `planned` sync, so a fresh block born inside the protected tail stays birth-foldable until
-	 * the model has genuinely consumed it (#43, ADR 0017). Every other sync site in this file is
+	 * the model has genuinely consumed it (#43, ADR 0018). Every other sync site in this file is
 	 * VIEW-ONLY and must NOT set this flag.
 	 */
 	function requestPlan(reqId: number, full: boolean, blocks: ReturnType<typeof linearize>): Promise<Plan | null> {

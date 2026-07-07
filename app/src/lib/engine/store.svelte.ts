@@ -133,7 +133,7 @@ export class AccordionStore {
 	 */
 	protectTokens = $state(20_000);
 	/**
-	 * Cursor for the birth-fold exemption (#43, ADR 0017): the highest block `order` that has
+	 * Cursor for the birth-fold exemption (#43, ADR 0018): the highest block `order` that has
 	 * actually been SENT to the model in an applied plan. A block with `order > sentThroughOrder`
 	 * is "fresh" — born inside the protected tail before the model ever saw it, so a conductor
 	 * may fold/replace it despite protection (see `birthFoldEligible`). Advanced by `markSent()`,
@@ -146,7 +146,7 @@ export class AccordionStore {
 	 */
 	private sentThroughOrder = -1;
 	/**
-	 * Sticky exemption set for the birth-fold rule (#43, ADR 0017): block ids a conductor has
+	 * Sticky exemption set for the birth-fold rule (#43, ADR 0018): block ids a conductor has
 	 * successfully folded/replaced WHILE they were both protected and fresh. Deliberately OUTSIDE
 	 * `clearConductorState`'s per-pass reset — commands are re-applied from the raw baseline every
 	 * pass (ADR 0007's "complete desired state" model), so a fresh-only exemption would let the
@@ -164,7 +164,7 @@ export class AccordionStore {
 	 */
 	private birthFolded = new Set<string>();
 	/**
-	 * Active conductor recalls (ADR 0018): folded block id → the FROZEN anchor id after whose
+	 * Active conductor recalls (ADR 0019): folded block id → the FROZEN anchor id after whose
 	 * message the block's original full text is injected as one synthetic user message on the wire.
 	 * Deliberately OUTSIDE `clearConductorState`'s per-pass reset (like `birthFolded`): a recall is
 	 * the ONE command exempt from the full-state model, because dropping a tail injection would
@@ -380,7 +380,7 @@ export class AccordionStore {
 		this.syncLocks();
 		this.lastCmds = [];
 		this.lastReports = [];
-		this.clearRecalled(); // the prior conductor's tail injections leave with it (ADR 0018)
+		this.clearRecalled(); // the prior conductor's tail injections leave with it (ADR 0019)
 		// Release human/agent holds in the domains the NEW conductor locks. Pass `c?.locks`
 		// explicitly; the `activeLocks` snapshot was just synced above so `isLocked` already agrees.
 		this.releaseLockedDomains(c?.locks ?? []);
@@ -416,7 +416,7 @@ export class AccordionStore {
 		this.syncLocks();
 		this.lastCmds = [];
 		this.lastReports = [];
-		this.clearRecalled(); // detach drops recalls — a one-time cache miss, like freezing folds (ADR 0018)
+		this.clearRecalled(); // detach drops recalls — a one-time cache miss, like freezing folds (ADR 0019)
 		this.refold();
 	}
 
@@ -718,17 +718,17 @@ export class AccordionStore {
 		for (const b of this.blocks) n += this.effTokens(b);
 		// A conductor recall keeps the block folded (its digest already counted in effTokens above)
 		// but ALSO injects its full text at the tail — so the wire truly sends both. Charge the
-		// injection on top so the budget readout is honest (ADR 0018).
+		// injection on top so the budget readout is honest (ADR 0019).
 		return n + this.recalledTokens;
 	});
 	/**
-	 * Tokens the active conductor recalls add on top of the folded view (ADR 0018): the sum of each
+	 * Tokens the active conductor recalls add on top of the folded view (ADR 0019): the sum of each
 	 * recalled block's ORIGINAL full-text injection (read live from the block, labeled + tagged the
 	 * same way the wire emits it — see `computeRecallOps` / `plan.ts`). Zero when nothing is recalled,
 	 * so the golden/raw path is unchanged.
 	 *
 	 * Skips any id whose block is not CURRENTLY folded. `recalled` is intentionally sticky across a
-	 * pass (it lives outside `clearConductorState`'s reset — ADR 0018 §2), but `clearConductorState`
+	 * pass (it lives outside `clearConductorState`'s reset — ADR 0019 §2), but `clearConductorState`
 	 * momentarily un-folds every conductor-owned block before the conductor re-issues its `fold` +
 	 * `recall` commands for this pass. A `liveTokens`/view snapshot taken in that in-between instant
 	 * would otherwise double-count: the full live block PLUS the still-registered recall injection of
@@ -975,7 +975,7 @@ export class AccordionStore {
 		return n;
 	});
 
-	// ---- birth-fold exemption (#43, ADR 0017) ------------------------------
+	// ---- birth-fold exemption (#43, ADR 0018) ------------------------------
 	/**
 	 * Has block `b` never yet been sent to the model in an applied plan? A block "arrives" at
 	 * `order > sentThroughOrder` — i.e. after the last order the live client confirmed via
@@ -1157,7 +1157,7 @@ export class AccordionStore {
 			// Fold state has now settled — release any recall whose block ended this pass live on the
 			// wire (human/agent unfold, or the conductor stopped folding it), or that left the store.
 			// A recall persists across passes by design; this is the ONLY place one is dropped short
-			// of an explicit `restore` (ADR 0018).
+			// of an explicit `restore` (ADR 0019).
 			this.pruneRecalled();
 		} finally {
 			this.conducting = false;
@@ -1275,7 +1275,7 @@ export class AccordionStore {
 					this.substOne(c.id, c.content, by, "replace", reports, c.recoverable ?? false);
 					break;
 				case "restore":
-					// `restore` is also the conductor's explicit opt-out of a recall (ADR 0018):
+					// `restore` is also the conductor's explicit opt-out of a recall (ADR 0019):
 					// release any active recall for these ids BEFORE returning the block to live.
 					for (const id of c.ids) this.releaseRecall(id, by);
 					for (const id of c.ids) this.liveOne(id, by, c.kind, reports);
@@ -1295,7 +1295,7 @@ export class AccordionStore {
 	}
 
 	/**
-	 * Record a conductor recall of one folded block (ADR 0018): the block STAYS folded, and its
+	 * Record a conductor recall of one folded block (ADR 0019): the block STAYS folded, and its
 	 * original full text is injected at a frozen tail anchor on the wire (`computeRecallOps`). The
 	 * anchor is the newest NON-grouped, durable-id block at this instant — the closest a conductor
 	 * command can get to "just before the working tail," and durable so `applyPlan` can re-resolve
@@ -1326,7 +1326,7 @@ export class AccordionStore {
 		this.recordDecision(by, "recall", [id], label(b));
 	}
 
-	/** Release one active recall (the explicit `restore` opt-out, ADR 0018). No-op if not recalled.
+	/** Release one active recall (the explicit `restore` opt-out, ADR 0019). No-op if not recalled.
 	 *  `by` attributes the release for the activity log — the same actor that issued the `restore`. */
 	private releaseRecall(id: string, by: Actor): void {
 		if (!this.recalled.delete(id)) return;
@@ -1336,7 +1336,7 @@ export class AccordionStore {
 		this.recordDecision(by, "recall", [id], "recall released (restore)");
 	}
 
-	/** Drop ALL active recalls (ADR 0018). Called on conductor swap/detach/reset — the recalling
+	/** Drop ALL active recalls (ADR 0019). Called on conductor swap/detach/reset — the recalling
 	 *  conductor is gone or its authorship is being cleared, so its tail injections go with it. This
 	 *  is a one-time prompt-cache miss (the injected messages leave the prefix), the same cost detach
 	 *  pays for freezing folds; acceptable because these are deliberate, human-driven transitions. */
@@ -1344,12 +1344,12 @@ export class AccordionStore {
 		if (this.recalled.size) this.recalled = new Map();
 	}
 
-	/** Is this block currently recalled to the tail by the conductor (ADR 0018)? The minimal read
+	/** Is this block currently recalled to the tail by the conductor (ADR 0019)? The minimal read
 	 *  the UI needs to render a "recalled to tail" badge. Reactive on `recalled`. */
 	isRecalled(id: string): boolean {
 		return this.recalled.has(id);
 	}
-	/** The frozen anchor id an active recall injects after, or null if not recalled (ADR 0018).
+	/** The frozen anchor id an active recall injects after, or null if not recalled (ADR 0019).
 	 *  The wire (`computeRecallOps`) reads this to emit the `RecallOp.afterId`. */
 	recallAnchorOf(id: string): string | null {
 		return this.recalled.get(id)?.anchorId ?? null;
@@ -1396,7 +1396,7 @@ export class AccordionStore {
 	}
 
 	/**
-	 * Drop any recall whose block is no longer folded on the wire, or has left the store (ADR 0018).
+	 * Drop any recall whose block is no longer folded on the wire, or has left the store (ADR 0019).
 	 * A recall's whole purpose is to surface a FOLDED block's content; once the block is live (human
 	 * unfold, agent unfold, or the conductor simply stopped folding it so it settled live after a
 	 * pass) the tail injection would duplicate content already standing in place — so release it.
@@ -1432,7 +1432,7 @@ export class AccordionStore {
 		if (!b) return void reports.push(clamp(kind, [id], "unknown-id", `no block ${id}`));
 		if (b.override !== null) return void reports.push(clamp(kind, [id], "human-override", `${label(b)} is held by the human`));
 		if (this.groupWire.has(id)) return void reports.push(clamp(kind, [id], "grouped", `${label(b)} is inside a folded group`));
-		// Protection is ABSOLUTE, with one narrow exemption (#43, ADR 0017): a block that has
+		// Protection is ABSOLUTE, with one narrow exemption (#43, ADR 0018): a block that has
 		// NEVER yet been sent to the model — born this pass inside the tail — may still be
 		// folded/replaced by a conductor, because the model has not seen it whole yet; there is
 		// nothing to "protect" from. `birthFoldEligible` also keeps the exemption sticky across
@@ -1527,7 +1527,7 @@ export class AccordionStore {
 	 * source of truth therefore never holds two blocks with the same id — including
 	 * a duplicate id within a single batch.
 	 *
-	 * `sent` (#43/ADR 0017 protection-bypass fix): pass `true` for a `full:true` backlog/
+	 * `sent` (#43/ADR 0018 protection-bypass fix): pass `true` for a `full:true` backlog/
 	 * reconcile sync — a replay of history the model has already genuinely seen, not newly
 	 * "born" content. Without this, a GUI reconnect builds an EMPTY store (`sentThroughOrder`
 	 * starts at -1) and the extension immediately replays the WHOLE history in one full sync;
@@ -1823,7 +1823,7 @@ export class AccordionStore {
 		// group — including a detach-frozen view whose inherited 0-tail leaves no protected tail to
 		// prune it — would survive reset still folded, silently contradicting "all blocks to auto".
 		if (this.groups.length) this.groups = [];
-		this.clearRecalled(); // "pure budget view" — no conductor tail injection survives either (ADR 0018)
+		this.clearRecalled(); // "pure budget view" — no conductor tail injection survives either (ADR 0019)
 		this.emit("you", "reset", "all blocks to auto");
 		this.recordDecision("you", "reset", [], "all blocks to auto");
 		this.refold();
@@ -2003,7 +2003,7 @@ function label(b: Block): string {
 }
 
 /**
- * The labeled, tagged full-text injection a conductor recall appends to the tail (ADR 0018).
+ * The labeled, tagged full-text injection a conductor recall appends to the tail (ADR 0019).
  * ONE source of truth for BOTH the token accounting (`recalledTokens`) and the wire op
  * (`computeRecallOps` in `plan.ts`), so the budget readout can never diverge from what the agent
  * actually receives. Mirrors the AGENT recall tool's label format in `extension/accordion.ts`

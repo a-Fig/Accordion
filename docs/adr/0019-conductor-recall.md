@@ -1,4 +1,4 @@
-# ADR 0018 — Conductor `recall`: surfacing folded content without a prompt-cache miss
+# ADR 0019 — Conductor `recall`: surfacing folded content without a prompt-cache miss
 
 **Status:** accepted
 **Date:** 2026-07-05
@@ -54,7 +54,7 @@ on `RecallCommand` and in the `recalled` field in the store.
 ### 3. Host state: `recalled`, frozen anchor, live text
 
 `AccordionStore.recalled: Map<blockId, { anchorId }>` lives **outside** `clearConductorState`'s
-per-pass reset (like `birthFolded` in ADR 0017). Only the **anchor** is stored — the injected text
+per-pass reset (like `birthFolded` in ADR 0018). Only the **anchor** is stored — the injected text
 is read **live** from `get(id).text` at emission time (`Block.text` is never mutated), so nothing
 is copied or can go stale.
 

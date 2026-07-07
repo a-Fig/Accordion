@@ -1,5 +1,5 @@
 /*
- * birth-fold-demo.ts — minimal demonstration of the birth-fold exemption (#43, ADR 0017).
+ * birth-fold-demo.ts — minimal demonstration of the birth-fold exemption (#43, ADR 0018).
  *
  * Without the exemption, a huge `tool_result` that streams in while it is already inside the
  * protected working tail is UNFOLDABLE on its first model call — no conductor without the

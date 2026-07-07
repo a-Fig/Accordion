@@ -1,5 +1,5 @@
 /*
- * store.birthfold.test.ts — behavioural tests for the birth-fold exemption (#43, ADR 0017).
+ * store.birthfold.test.ts — behavioural tests for the birth-fold exemption (#43, ADR 0018).
  *
  * A fresh, oversized `tool_result` is born INSIDE the protected working tail the instant it
  * streams in (the tail is a token-target walk-back from the newest block, so a huge new block

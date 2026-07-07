@@ -300,7 +300,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			}
 			// Committed blocks arrive HERE (the appendBlocks path), NEVER from ghost state.
 			// Invariant: a ghost is only removed, never converted to a block.
-			// `sent: msg.full` (#43/ADR 0017 protection-bypass fix): a `full:true` sync is a
+			// `sent: msg.full` (#43/ADR 0018 protection-bypass fix): a `full:true` sync is a
 			// backlog/reconcile REPLAY of history the model has already genuinely seen — including
 			// the very first sync after a fresh GUI attach/reconnect, which rebuilds an EMPTY store
 			// (see the `hello`/structural-reset paths above) and replays the WHOLE prior history in
@@ -316,7 +316,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			} catch {
 				/* socket gone — extension will time out and pass through */
 			}
-			// #43/ADR 0017: only a PLANNED sync's reply is actually applied to a model call — the
+			// #43/ADR 0018: only a PLANNED sync's reply is actually applied to a model call — the
 			// extension marks exactly one sync site this way (the `context` hook). Advance the
 			// birth-fold "sent" cursor only here, so a fresh block stays birth-foldable until the
 			// model has genuinely consumed it. A view-only sync (message_end/agent_end/model_select)

@@ -35,7 +35,7 @@
 	// Protected working tail — never folded (the safety pillar). The Fold control is
 	// disabled here so the guarantee is visible, not just enforced silently.
 	const protect = $derived(block ? store.isProtected(block) : false);
-	// Recalled to the tail by the conductor (ADR 0018): the block stays folded but its full text
+	// Recalled to the tail by the conductor (ADR 0019): the block stays folded but its full text
 	// is also injected near the tail, so the agent sees the detail without a prompt-cache miss.
 	// A producible steering state — rendered identically in preview/read-only (the RULE).
 	const recalled = $derived(block ? store.isRecalled(block.id) : false);

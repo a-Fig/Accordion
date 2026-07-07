@@ -1,4 +1,4 @@
-# ADR 0017 — The birth-fold exemption: letting a conductor fold a block before it is ever sent
+# ADR 0018 — The birth-fold exemption: letting a conductor fold a block before it is ever sent
 
 **Status:** accepted
 **Date:** 2026-07-05
