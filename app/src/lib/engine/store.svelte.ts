@@ -153,9 +153,14 @@ export class AccordionStore {
 	 * SAME block un-fold itself on pass 2 the instant `markSent()` advances the cursor past it
 	 * (it would no longer be `isFresh`, and it is still `isProtected` until it ages out of the
 	 * tail). Membership here keeps the exemption alive for exactly as long as the block remains
-	 * in the protected tail; `pruneBirthFolded` (called wherever `protectedFromIndex` is
-	 * consumed) drops an id the moment its block leaves the tail, so this can never leak a
-	 * permanent protection bypass onto old content.
+	 * in the protected tail AND the model has never seen it whole. Two prunes maintain that truth:
+	 * `pruneBirthFolded` (called wherever `protectedFromIndex` is consumed) drops an id the moment
+	 * its block leaves the tail, and `markSent` drops any id whose block was LIVE on an applied
+	 * plan (settled live → sent whole → the exemption would be a genuine protection bypass from
+	 * then on — adversarial review). Because the set is truthful, it is deliberately NOT cleared
+	 * on `attach`/`detach`/`resetAll` (unlike `clearRecalled`): a never-seen-whole tail block is
+	 * legitimately birth-foldable by whichever conductor is attached, and surviving `detach` is
+	 * what lets `freezeForDetach`'s frozen birth-folds stay folded (see `healProtected`).
 	 */
 	private birthFolded = new Set<string>();
 	/**
@@ -505,7 +510,10 @@ export class AccordionStore {
 	 * new `protectTokens`. Because `protectedFromIndex` uses the same walk-back algorithm for
 	 * both the locked and unlocked path, the boundary is IDENTICAL before and after detach —
 	 * no block newly enters the protected tail, so `healProtected` never fires on the detach
-	 * refold, and the budget is not re-blown. The human's prior `protectTokens` is overwritten;
+	 * refold. The one fold that legitimately LIVES inside the tail — an active birth-fold
+	 * (#43) — is frozen like any other and survives the heal via its `birthFolded` exemption
+	 * (see `healProtected`), so the budget is not re-blown there either (adversarial review).
+	 * The human's prior `protectTokens` is overwritten;
 	 * a subsequently attached collaborative conductor runs with the inherited value until the
 	 * human re-drags the slider. If the conductor did not hold `tail-size`, `protectTokens` is
 	 * left untouched.
@@ -1005,7 +1013,22 @@ export class AccordionStore {
 	 * model_select) — those blocks have NOT yet crossed the wire (#43).
 	 */
 	markSent(): void {
-		if (this.blocks.length) this.sentThroughOrder = Math.max(this.sentThroughOrder, this.blocks[this.blocks.length - 1].order);
+		if (!this.blocks.length) return;
+		// TRUTH MAINTENANCE for the sticky exemption (adversarial review): a planned sync means
+		// the plan for THIS model call was applied, so any birth-folded block that is NOT folded
+		// right now (the conductor stopped folding it and it settled live) just crossed the wire
+		// WHOLE — the model has seen it, and keeping the exemption would let a later pass fold
+		// already-seen protected content (the exact bypass protection forbids). A block that IS
+		// folded rode the wire as its digest — still never seen whole — so its exemption survives.
+		// This also stops stale entries from leaking a bypass across conductor swaps: `attach()`
+		// deliberately does NOT clear `birthFolded` (unlike `clearRecalled`), because with this
+		// prune the set is truthful — "in the tail AND never sent whole" — and folding such a
+		// block is legitimate birth-fold behavior for WHICHEVER conductor is attached.
+		for (const id of this.birthFolded) {
+			const b = this.get(id);
+			if (!b || !this.isFolded(b)) this.birthFolded.delete(id);
+		}
+		this.sentThroughOrder = Math.max(this.sentThroughOrder, this.blocks[this.blocks.length - 1].order);
 	}
 	/**
 	 * Mark every block currently in the store as already sent. Called once, at construction,
@@ -1132,10 +1155,18 @@ export class AccordionStore {
 		}
 	}
 
-	/** Engine invariant: force-unfold any manual fold that now sits in the protected tail. */
+	/** Engine invariant: force-unfold any manual fold that now sits in the protected tail.
+	 *  EXEMPTION: a block still carrying the `birthFolded` exemption is skipped — the model has
+	 *  never seen it whole, so a fold on it is legal in the tail by the same reasoning as the
+	 *  conductor's birth-fold itself. This is what lets `freezeForDetach` stamp an active
+	 *  birth-fold as a human-owned fold WITHOUT the next refold's heal popping the oversized
+	 *  block back to full (re-blowing the budget detach exists to protect — adversarial review).
+	 *  The exemption ends when the block ages out of the tail (`pruneBirthFolded`) — at which
+	 *  point the fold is outside the heal range anyway — or when a planned sync sends the block
+	 *  whole (`markSent` prune), after which any fold in the tail heals here as usual. */
 	private healProtected(protectedFrom: number): void {
 		this.blocks.forEach((b, i) => {
-			if (i >= protectedFrom && b.override === "folded") {
+			if (i >= protectedFrom && b.override === "folded" && !this.birthFolded.has(b.id)) {
 				// Protection is absolute, but do not silently erase the user intent — log the
 				// forced unfold so the activity feed shows what happened.
 				this.emit(b.by ?? "auto", "unfolded (protected)", label(b));
@@ -1315,23 +1346,44 @@ export class AccordionStore {
 		return this.recalled.get(id)?.anchorId ?? null;
 	}
 
-	/** The newest non-grouped, durable-id, non-`tool_call` block id — the frozen anchor a fresh
-	 *  recall injects after. Durable so `applyPlan` can re-resolve it; non-grouped so the injection
-	 *  point is a real surviving message, not one collapsed into a group summary. `tool_call` is
-	 *  excluded: `applyPlan`'s recall injection is an ADDITIVE synthetic user-role message inserted
-	 *  immediately AFTER the anchor's message, and a `tool_call` is never resolved until its paired
-	 *  `tool_result` arrives — anchoring on a call whose result has not yet streamed in would insert
-	 *  a user message BETWEEN the call and its result, which is provider-invalid (some providers
-	 *  require the tool result to immediately follow its call). Skipping `tool_call` here always
-	 *  falls back to an earlier block; the newest durable id being a `tool_call` never blocks a
-	 *  recall outright. Null if none qualifies. */
+	/** The newest non-grouped, durable-id block id whose MESSAGE emits no `tool_call` — the frozen
+	 *  anchor a fresh recall injects after. Durable so `applyPlan` can re-resolve it; non-grouped so
+	 *  the injection point is a real surviving message, not one collapsed into a group summary.
+	 *  Any block of a tool-calling message is excluded — not just the `tool_call` block itself:
+	 *  `applyPlan`'s recall injection is an ADDITIVE synthetic user-role message inserted
+	 *  immediately AFTER the anchor's MESSAGE, and a `text`/`thinking` SIBLING of a `tool_call`
+	 *  lives in that same assistant message — anchoring on the sibling would insert a user message
+	 *  BETWEEN the call's message and its `tool_result`, which is provider-invalid (the tool result
+	 *  must immediately follow its call). That sibling is exactly what a naive newest-first walk
+	 *  finds when a conduct pass runs on a view-only `message_end` sync mid-tool-loop, before the
+	 *  result has streamed in (adversarial review, HIGH). Skipping the whole message always falls
+	 *  back to an earlier block (`user` / `tool_result` / call-free assistant message); a
+	 *  tool-calling message at the tail never blocks a recall outright. Null if none qualifies. */
 	private newestRecallAnchor(): string | null {
 		for (let i = this.blocks.length - 1; i >= 0; i--) {
 			const b = this.blocks[i];
 			if (b.kind === "tool_call") continue;
+			if (this.messageEmitsToolCall(i)) continue;
 			if (isDurableId(b.id) && !this.groupWire.has(b.id)) return b.id;
 		}
 		return null;
+	}
+
+	/** Does the message that block `this.blocks[i]` belongs to also emit a `tool_call`? Blocks of
+	 *  one message are contiguous and share a `messageKey`, so scan the contiguous run of same-key
+	 *  neighbors in both directions. Only `text`/`thinking` can share an assistant message with a
+	 *  `tool_call`, so other kinds short-circuit false. */
+	private messageEmitsToolCall(i: number): boolean {
+		const b = this.blocks[i];
+		if (b.kind !== "text" && b.kind !== "thinking") return false;
+		const key = messageKey(b.id);
+		for (let j = i + 1; j < this.blocks.length && messageKey(this.blocks[j].id) === key; j++) {
+			if (this.blocks[j].kind === "tool_call") return true;
+		}
+		for (let j = i - 1; j >= 0 && messageKey(this.blocks[j].id) === key; j--) {
+			if (this.blocks[j].kind === "tool_call") return true;
+		}
+		return false;
 	}
 
 	/**

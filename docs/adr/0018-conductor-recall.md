@@ -58,13 +58,19 @@ per-pass reset (like `birthFolded` in ADR 0017). Only the **anchor** is stored �
 is read **live** from `get(id).text` at emission time (`Block.text` is never mutated), so nothing
 is copied or can go stale.
 
-The anchor is chosen once, at record time: the **newest non-grouped, durable-id, non-`tool_call`
-block** at that instant — the closest a command can get to "just before the working tail," and
-durable so `applyPlan` can re-resolve it on the wire. `tool_call` is excluded because anchoring on
-a call whose paired result has not yet streamed in would insert the synthetic user message BETWEEN
-the call and its result — provider-invalid for providers that require a tool result to immediately
-follow its call. It is never re-chosen while the recall is active, so the injection point stays
-byte-stable across passes (cache-safe).
+The anchor is chosen once, at record time: the **newest non-grouped, durable-id block whose
+message emits no `tool_call`** at that instant — the closest a command can get to "just before
+the working tail," and durable so `applyPlan` can re-resolve it on the wire. Every block of a
+tool-calling message is excluded — not just the `tool_call` block itself: the injection lands
+after the anchor's **message**, and a `text`/`thinking` sibling of a `tool_call` lives in that
+same assistant message, so anchoring on the sibling would insert the synthetic user message
+BETWEEN the call's message and its result — provider-invalid for providers that require a tool
+result to immediately follow its call. (The sibling case is exactly what a newest-first walk
+finds when a conduct pass runs on a view-only `message_end` sync mid-tool-loop, before the
+result streams in.) As a wire-side backstop, `applyPlan` additionally slides any interior
+insertion forward past tool_result message(s) — covering the group-swallow walk-back, which can
+land on a tool-calling message the GUI-side picker never chose. The anchor is never re-chosen
+while the recall is active, so the injection point stays byte-stable across passes (cache-safe).
 
 **Recallability** mirrors `resolveRecall`/`computeFoldOps` exactly: a block is recallable iff it is
 currently folded, a wire-foldable kind, durably identified, and NOT swallowed by a folded group

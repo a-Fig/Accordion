@@ -139,3 +139,43 @@ describe("applyPlan — recall injection", () => {
 		expect(toolBalance(out)).toBe(true);
 	});
 });
+
+// ── pairing backstop: an interior insertion never lands between a call and its result ──
+
+describe("applyPlan — recall never splits a tool_call/tool_result pair", () => {
+	/** Stronger than toolBalance: every assistant message with toolCalls must be IMMEDIATELY
+	 *  followed by the toolResult messages answering them (providers require adjacency, not
+	 *  mere presence — an insertion between a pair breaks it without orphaning anything). */
+	function pairsAdjacent(arr: PiMessage[]): boolean {
+		for (let i = 0; i < arr.length; i++) {
+			const m = arr[i];
+			if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+			const calls = (m.content as any[]).filter((p) => p?.type === "toolCall").map((p) => p.id);
+			if (!calls.length) continue;
+			const answered = new Set<string>();
+			for (let j = i + 1; j < arr.length && arr[j].role === "toolResult"; j++) answered.add(arr[j].toolCallId!);
+			if (!calls.every((c) => answered.has(c))) return false;
+		}
+		return true;
+	}
+
+	it("an anchor on a tool-calling message's text sibling slides past the tool_result", () => {
+		// a:resp_b:p0 is the text part of m4, whose message also emits call_2 (answered by m5).
+		// A naive insertion at "after m4" would land BETWEEN the call and its result — the
+		// backstop must slide it past m5 so the pair stays adjacent (adversarial review, HIGH).
+		const recalls: RecallOp[] = [{ id: "r:call_1", afterId: "a:resp_b:p0", text: REC }];
+		const out = applyPlan(msgs(), [], [], recalls);
+		expect(out.length).toBe(9);
+		const idx = out.findIndex((m) => textOf(m) === REC);
+		expect(idx).toBeGreaterThan(-1);
+		expect(textOf(out[idx - 1])).toBe("done editing"); // after the result, not before it
+		expect(pairsAdjacent(out)).toBe(true);
+		expect(toolBalance(out)).toBe(true);
+	});
+
+	it("the sanity fixture itself satisfies adjacency, and a normal recall preserves it", () => {
+		expect(pairsAdjacent(msgs())).toBe(true);
+		const recalls: RecallOp[] = [{ id: "r:call_1", afterId: "r:call_2", text: REC }];
+		expect(pairsAdjacent(applyPlan(msgs(), [], [], recalls))).toBe(true);
+	});
+});

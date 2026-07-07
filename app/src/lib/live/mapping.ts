@@ -434,10 +434,20 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 		// Resolve a recall's anchor to an output position, applying the group-swallow fallback:
 		// walk back from the anchor's source index to the nearest source message that survived to
 		// an output slot. -1 (anchor unknown, or every message up to it was dropped) ⇒ append at end.
+		// PAIRING BACKSTOP: never insert immediately before a tool_result message — that would
+		// split it from its tool_call (providers require the result to directly follow the call).
+		// The GUI's anchor picker already avoids tool-calling messages, but the group-swallow
+		// walk-back above can land on one, and this side never trusts the peer's shape anyway —
+		// slide forward past any tool_result(s) so the injection lands after the completed pair.
 		const resolveAfterPos = (afterId: string): number => {
 			const src = srcOf.get(afterId);
 			if (src === undefined) return -1;
-			for (let i = src; i >= 0; i--) if (outPosOf[i] >= 0) return outPosOf[i];
+			for (let i = src; i >= 0; i--)
+				if (outPosOf[i] >= 0) {
+					let pos = outPosOf[i];
+					while (pos + 1 < out.length && out[pos + 1].role === "toolResult") pos++;
+					return pos;
+				}
 			return -1;
 		};
 		// Group injections by insertion position, preserving recall order within a shared position.

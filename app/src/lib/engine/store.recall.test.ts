@@ -306,11 +306,14 @@ describe("recall — recalledTokens gates on isFolded", () => {
 
 // ── the anchor never splits a tool_call/tool_result pair ─────────────────────
 
-describe("recall — anchor skips tool_call blocks", () => {
-	it("resolves to an earlier non-tool_call block when the newest durable block is a tool_call", () => {
-		// Newest block is an UNRESOLVED tool_call (its result has not streamed in yet) —
-		// anchoring there would inject the synthetic user message BETWEEN call and result,
-		// provider-invalid for providers that require the result to immediately follow.
+describe("recall — anchor skips the whole tool-calling message", () => {
+	it("skips the tool_call AND its text sibling; anchors on the previous safe message", () => {
+		// Newest message is an assistant [text, tool_call] whose result has not streamed in yet
+		// (the exact state a conduct pass sees on a view-only message_end sync mid-tool-loop).
+		// Anchoring on EITHER part would inject the synthetic user message BETWEEN the call's
+		// message and its result — provider-invalid for providers that require the result to
+		// immediately follow. The text sibling (a:r2:p0) shares the message with the call
+		// (a:r2:p1), so it must be skipped too (adversarial review, HIGH), landing on u:2.
 		const blocks = [
 			...session(),
 			blk("a:r2:p1", "tool_call", 2, 6, 100, { callId: "c2" }),
@@ -324,6 +327,20 @@ describe("recall — anchor skips tool_call blocks", () => {
 		expect(s.isRecalled("r:c1")).toBe(true);
 		const ops = computeRecallOps(s);
 		expect(ops.length).toBe(1);
-		expect(ops[0].afterId).toBe("a:r2:p0"); // the newest NON-tool_call durable block, not a:r2:p1
+		expect(ops[0].afterId).toBe("u:2"); // NOT a:r2:p0 — that text is a sibling of the call
+	});
+
+	it("a call-free assistant text remains a valid anchor (the gate is per-message, not per-kind)", () => {
+		// Base session(): the newest block is a:r2:p0, an assistant text whose message emits no
+		// tool_call — it must still anchor there (regression guard for over-wide skipping).
+		const s = makeStore(session());
+		s.setProtect(0);
+		const c = new StubConductor();
+		c.cmds = [{ kind: "fold", ids: ["r:c1"] }, { kind: "recall", ids: ["r:c1"] }];
+		s.attach(c);
+
+		const ops = computeRecallOps(s);
+		expect(ops.length).toBe(1);
+		expect(ops[0].afterId).toBe("a:r2:p0");
 	});
 });

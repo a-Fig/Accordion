@@ -371,3 +371,76 @@ describe("birth-fold — no behavior change when nothing is fresh (regression gu
 		expect(s.foldedCount).toBe(0);
 	});
 });
+
+// ── (j) settling live across an applied plan drops the exemption (truth prune) ─
+
+describe("birth-fold — sent whole once, protected again forever", () => {
+	it("a block that settled LIVE across a planned sync can no longer be re-folded while protected", () => {
+		const s = makeLiveStore(sessionWithFreshResult(8000));
+		s.setProtect(20_000);
+		const conductor = new StubConductor();
+		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }];
+		s.attach(conductor);
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true);
+		s.markSent(); // pass 1 applied: r:c1 rode the wire FOLDED — exemption survives
+
+		conductor.cmds = []; // pass 2: the conductor stops folding it — it settles live
+		s.refold();
+		expect(s.isFolded(s.get("r:c1")!)).toBe(false);
+		s.markSent(); // pass 2 applied: r:c1 crossed the wire WHOLE — the model has seen it
+
+		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }]; // pass 3: try to re-fold
+		s.refold();
+		// The stale exemption is gone: protection clamps like for any other seen block.
+		expect(s.isFolded(s.get("r:c1")!)).toBe(false);
+		expect(s.lastReports.some((r) => r.ids.includes("r:c1") && r.reason === "protected")).toBe(true);
+	});
+});
+
+// ── (k) detach freezes an active birth-fold in place (no heal, no budget re-blow) ─
+
+describe("birth-fold — detach freezes the fold instead of popping it open", () => {
+	it("the oversized block stays folded through detach and subsequent refolds", () => {
+		const s = makeLiveStore(sessionWithFreshResult(8000));
+		s.setProtect(20_000);
+		const conductor = new StubConductor();
+		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }];
+		s.attach(conductor);
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true);
+		const before = s.liveTokens;
+
+		s.detach();
+
+		const b = s.get("r:c1")!;
+		expect(s.isFolded(b)).toBe(true); // frozen human-owned, NOT healed back to full
+		expect(b.override).toBe("folded");
+		expect(b.by).toBe("you");
+		expect(s.liveTokens).toBe(before); // the budget detach protects did not re-blow
+		expect(s.log.some((e) => e.action === "unfolded (protected)")).toBe(false);
+
+		// And the frozen view is stable across further conductor-less passes.
+		s.refold();
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true);
+	});
+});
+
+// ── (l) the exemption belongs to the block's wire history, not to one conductor ─
+
+describe("birth-fold — exemption survives a conductor swap while never seen whole", () => {
+	it("a different conductor may keep folding a block the model has never seen whole", () => {
+		const s = makeLiveStore(sessionWithFreshResult(8000));
+		s.setProtect(20_000);
+		const a = new StubConductor();
+		a.cmds = [{ kind: "fold", ids: ["r:c1"] }];
+		s.attach(a);
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true);
+		s.markSent(); // applied FOLDED — the model has still never seen it whole
+
+		const b = new StubConductor();
+		b.cmds = [{ kind: "fold", ids: ["r:c1"] }];
+		s.attach(b); // swap conductors — the exemption is the block's, not A's
+
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true);
+		expect(s.lastReports.some((r) => r.ids.includes("r:c1") && r.reason === "protected")).toBe(false);
+	});
+});

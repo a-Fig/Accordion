@@ -68,22 +68,42 @@ the block remains in the tail. `substOne` adds an id to the set the moment it ap
 fold/replace to a block that is protected (which, given the eligibility gate, is necessarily a
 birth-fold). The set lives **outside** `clearConductorState`'s per-pass reset on purpose.
 
-Pruning: `pruneBirthFolded()` (called every `runConductor()` pass, alongside the existing
-`pruneProtectedGroups()`) drops an id the moment its block is no longer `isProtected` — once a
-block ages out of the tail, ordinary (non-birth) fold rules already cover it, so the sticky
-entry would otherwise leak forever as dead weight.
+Pruning — two prunes keep the set **truthful** ("in the tail AND never sent whole"):
+
+- `pruneBirthFolded()` (called every `runConductor()` pass, alongside the existing
+  `pruneProtectedGroups()`) drops an id the moment its block is no longer `isProtected` — once a
+  block ages out of the tail, ordinary (non-birth) fold rules already cover it, so the sticky
+  entry would otherwise leak forever as dead weight.
+- `markSent()` drops any id whose block is **not folded** at the instant a planned sync is
+  confirmed — the conductor stopped folding it and it settled live, so it just crossed the wire
+  **whole**; the model has now seen it, and a surviving exemption would let a later pass (or a
+  different conductor after a swap) fold already-seen protected content — the exact bypass
+  protection forbids (adversarial review). A block that is folded at that instant rode the wire
+  as its digest and keeps its exemption.
+
+Because the two prunes make membership truthful, the set is deliberately **not** cleared on
+`attach`/`detach`/`resetAll` (contrast `clearRecalled`): a never-seen-whole tail block is
+legitimately birth-foldable by *whichever* conductor is attached — the exemption belongs to the
+block's wire history, not to the conductor that first folded it. (This is also load-bearing for
+detach; see §4.)
 
 A human mutator (`fold`, `unfold`, `pin`) deletes the id from `birthFolded` — the human now
 owns that block's fold state outright, and the pre-existing human-override clamp in `substOne`
 already refuses a conductor's competing fold regardless.
 
-### 4. `healProtected` is unchanged, and that is correct
+### 4. `healProtected` skips the exemption — the detach interaction
 
-`healProtected` only force-reverts a HUMAN override (`b.override === "folded"`) that the tail
-has grown over. A birth-folded block has `override === null` (it is conductor-owned — `subst`
-+ `autoFolded`, exactly like an ordinary conductor fold) — so `healProtected` was already
-inert against it, no new gate was needed. Confirmed by test
-(`store.birthfold.test.ts`, case (g)).
+`healProtected` force-reverts a HUMAN override (`b.override === "folded"`) that sits in the
+tail. While a conductor is attached this is inert against a birth-fold (`override === null`,
+conductor-owned — confirmed by `store.birthfold.test.ts` case (g)). But **detach** converts
+every conductor fold into a human-owned fold (`freezeForDetach` stamps `override:"folded"`,
+`by:"you"`), and an active birth-fold is the one fold that legitimately lives *inside* the
+tail — without a gate, the detach refold's heal would immediately pop the oversized block back
+to full, re-blowing the budget detach exists to protect (adversarial review). So
+`healProtected` skips any block still carrying the `birthFolded` exemption: the model has never
+seen it whole, which is the same reasoning that legalized the fold in the first place. The
+exemption (and thus the skip) ends when the block ages out of the tail — at which point the
+frozen fold is outside the heal range anyway — or when a planned sync sends it whole.
 
 ### 5. Bulk-loaded (non-live) sessions are never fresh
 
