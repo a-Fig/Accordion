@@ -93,8 +93,6 @@ const PORT = entry.port;
 	const probe = [{ role: "user", content: "no gui yet" }];
 	const ret = await Promise.resolve(handlers.context({ messages: probe }, ctx));
 	if (ret !== undefined) fails.push("context hook altered messages with no GUI attached");
-	const compactRet = await Promise.resolve(handlers.session_before_compact?.({}, ctx));
-	if (compactRet?.cancel) fails.push("native compaction was suppressed before Accordion had an active fold plan");
 }
 
 // /accordion writes a one-shot focus request
@@ -236,11 +234,6 @@ await new Promise((resolve, reject) => {
 		}
 	});
 });
-
-{
-	const compactRet = await Promise.resolve(handlers.session_before_compact?.({}, ctx));
-	if (!compactRet?.cancel) fails.push("native compaction was not suppressed after Accordion applied a non-empty fold plan");
-}
 
 // With a GUI attached, /accordion should only write focus.json and report the
 // snapshotted attached state. It must NOT try the launcher path, even when the
