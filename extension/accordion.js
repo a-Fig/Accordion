@@ -920,10 +920,11 @@ function accordionLive(pi) {
     send(ws, { type: "sync", reqId, full, blocks: all.slice(viewSentCount) });
     viewSentCount = all.length;
   });
-  pi.on("session_before_compact", (_event, ctx) => {
-    if (attached() && lastAppliedPlanHadFolds && planSentCount > 0) {
+  pi.on("session_before_compact", (event, ctx) => {
+    const reason = typeof event?.reason === "string" ? event.reason : "";
+    if (reason === "threshold" && attached() && lastAppliedPlanHadFolds && planSentCount > 0) {
       try {
-        ctx.ui.notify("Accordion is actively folding context \u2014 native compaction suppressed.", "info");
+        ctx.ui.notify("Accordion is actively folding context \u2014 native threshold compaction suppressed.", "info");
       } catch {
       }
       return { cancel: true };
