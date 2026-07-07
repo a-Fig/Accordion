@@ -320,8 +320,11 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// extension marks exactly one sync site this way (the `context` hook). Advance the
 			// birth-fold "sent" cursor only here, so a fresh block stays birth-foldable until the
 			// model has genuinely consumed it. A view-only sync (message_end/agent_end/model_select)
-			// never carries `planned: true` and must not advance the cursor.
-			if (msg.planned) session.store.markSent();
+			// never carries `planned: true` and must not advance the cursor. `rawWire`: disarmed
+			// folding replied with an EMPTY plan above, so this call's wire was raw — every block
+			// crossed whole, and the store must drop birth-fold exemptions accordingly (else a
+			// disarmed-era exemption leaks into a later armed run).
+			if (msg.planned) session.store.markSent({ rawWire: !folding.enabled });
 		} else if (msg.type === "unfoldRequest") {
 			// The live agent asked (via the `unfold` tool) to restore folded blocks it saw
 			// tagged `{#<code> FOLDED}`. Resolve each code to its folded block(s) and hold

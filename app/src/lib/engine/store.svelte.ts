@@ -1012,7 +1012,7 @@ export class AccordionStore {
 	 * should still read `fresh`. Never called for a view-only sync (message_end/agent_end/
 	 * model_select) — those blocks have NOT yet crossed the wire (#43).
 	 */
-	markSent(): void {
+	markSent(opts: { rawWire?: boolean } = {}): void {
 		if (!this.blocks.length) return;
 		// TRUTH MAINTENANCE for the sticky exemption (adversarial review): a planned sync means
 		// the plan for THIS model call was applied, so any birth-folded block that is NOT folded
@@ -1024,9 +1024,18 @@ export class AccordionStore {
 		// deliberately does NOT clear `birthFolded` (unlike `clearRecalled`), because with this
 		// prune the set is truthful — "in the tail AND never sent whole" — and folding such a
 		// block is legitimate birth-fold behavior for WHICHEVER conductor is attached.
-		for (const id of this.birthFolded) {
-			const b = this.get(id);
-			if (!b || !this.isFolded(b)) this.birthFolded.delete(id);
+		//
+		// `rawWire` (folding DISARMED — the caller replied with an EMPTY plan): view-folds had no
+		// wire effect, so EVERY block on this call crossed whole, folded-looking ones included.
+		// Drop the whole set; otherwise a disarmed-era exemption would survive into a later ARMED
+		// run and fold protected content the model has factually seen (the disarm→arm leak).
+		if (opts.rawWire) {
+			this.birthFolded.clear();
+		} else {
+			for (const id of this.birthFolded) {
+				const b = this.get(id);
+				if (!b || !this.isFolded(b)) this.birthFolded.delete(id);
+			}
 		}
 		this.sentThroughOrder = Math.max(this.sentThroughOrder, this.blocks[this.blocks.length - 1].order);
 	}

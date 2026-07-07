@@ -444,3 +444,26 @@ describe("birth-fold — exemption survives a conductor swap while never seen wh
 		expect(s.lastReports.some((r) => r.ids.includes("r:c1") && r.reason === "protected")).toBe(false);
 	});
 });
+
+// ── (m) disarmed folding: a raw-wire planned sync drops ALL exemptions ─────────
+
+describe("birth-fold — rawWire markSent (folding disarmed) clears the exemption", () => {
+	it("a view-folded block whose call rode a RAW wire cannot be re-folded once protected", () => {
+		const s = makeLiveStore(sessionWithFreshResult(8000));
+		s.setProtect(20_000);
+		const conductor = new StubConductor();
+		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }];
+		s.attach(conductor);
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true); // view-folded…
+
+		// …but folding is DISARMED: the client replied with an EMPTY plan, so the model call
+		// carried r:c1 WHOLE. The exemption must die with that call, even though the view
+		// still renders the fold at this instant (the disarm→arm leak, adversarial review).
+		s.markSent({ rawWire: true });
+
+		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }];
+		s.refold();
+		expect(s.isFolded(s.get("r:c1")!)).toBe(false); // protection clamps like any seen block
+		expect(s.lastReports.some((r) => r.ids.includes("r:c1") && r.reason === "protected")).toBe(true);
+	});
+});
