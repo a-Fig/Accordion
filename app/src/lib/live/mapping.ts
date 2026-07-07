@@ -466,7 +466,22 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 			// shift the indices of later ones.
 			const positions = [...injections.keys()].filter((p) => p >= 0).sort((a, b) => b - a);
 			for (const pos of positions) out.splice(pos + 1, 0, ...injections.get(pos)!);
-			out.push(...appended);
+			// Same pairing rule for the APPEND path (the slide above only guards interior
+			// insertions): if the array's tail is an assistant message emitting a tool_call with
+			// no answering toolResult anywhere in the array, appending after it would split the
+			// pair — land the injection just BEFORE that trailing unpaired call instead. At the
+			// context hook the tail is never an unpaired call, so this is pure shape defense.
+			if (appended.length) {
+				const answered = new Set<string>();
+				for (const m of out) for (const c of messageInfo(m, 0).results) answered.add(c);
+				let end = out.length;
+				while (end > 0) {
+					const calls = messageInfo(out[end - 1], 0).calls;
+					if (!calls.length || calls.every((c) => answered.has(c))) break;
+					end--;
+				}
+				out.splice(end, 0, ...appended);
+			}
 		}
 	}
 	return changed ? out : messages;

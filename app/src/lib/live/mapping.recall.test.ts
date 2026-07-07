@@ -178,4 +178,27 @@ describe("applyPlan — recall never splits a tool_call/tool_result pair", () =>
 		const recalls: RecallOp[] = [{ id: "r:call_1", afterId: "r:call_2", text: REC }];
 		expect(pairsAdjacent(applyPlan(msgs(), [], [], recalls))).toBe(true);
 	});
+
+	it("an unresolvable anchor appends BEFORE a trailing unpaired tool_call, never after it", () => {
+		// Unknown afterId ⇒ the -1 append path. The array's tail is an assistant message whose
+		// tool_call has no result in this array — appending after it would split the pair.
+		const src: PiMessage[] = [
+			...msgs(),
+			{
+				role: "assistant",
+				responseId: "resp_d",
+				timestamp: 4001,
+				content: [{ type: "toolCall", id: "call_9", name: "run", arguments: {} }],
+			},
+		];
+		const recalls: RecallOp[] = [{ id: "r:call_1", afterId: "a:nonexistent:p0", text: REC }];
+		const out = applyPlan(src, [], [], recalls);
+		const recIdx = out.findIndex((m) => textOf(m) === REC);
+		expect(recIdx).toBeGreaterThan(-1);
+		// The unpaired trailing call is still the LAST message; the injection sits before it.
+		const last = out[out.length - 1] as any;
+		expect(last.role).toBe("assistant");
+		expect(last.content[0].id).toBe("call_9");
+		expect(recIdx).toBe(out.length - 2);
+	});
 });

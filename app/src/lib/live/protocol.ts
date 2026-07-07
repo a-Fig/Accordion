@@ -129,10 +129,11 @@ export interface GroupOp {
  * `applyPlan` inserts after that group's summary message instead; if the run was dropped with no
  * summary, after the last surviving message before the gap; if the anchor cannot be resolved at
  * all, it appends at the very end. A malformed op is skipped. It never throws, and it keeps
- * tool_call/result pairing balanced two ways: the GUI never anchors on any block of a
- * tool-calling message, and `applyPlan` itself slides an interior insertion forward past any
- * tool_result message(s) so the synthetic user message can never land between a call and its
- * result (an INSERTION between a pair breaks it without touching either message).
+ * tool_call/result pairing balanced on every path: the GUI never anchors on any block of a
+ * tool-calling message; `applyPlan` slides an interior insertion forward past any tool_result
+ * message(s); and the append-at-end fallback lands BEFORE a trailing unpaired tool_call if the
+ * tail ever holds one. The synthetic user message can never sit between a call and its result
+ * (an INSERTION between a pair breaks it without touching either message).
  */
 export interface RecallOp {
 	/** The folded block being recalled (for correlation/dedup; not the insertion key). */
