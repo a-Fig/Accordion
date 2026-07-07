@@ -49,10 +49,10 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { linearize, applyPlan, type PiMessage } from "../app/src/lib/live/mapping";
-import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type RecallOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
 
 /** The GUI's reply to a sync: in-place fold ops + group-collapse ops (ADR 0006). */
-type Plan = { ops: FoldOp[]; groups: GroupOp[] };
+type Plan = { ops: FoldOp[]; groups: GroupOp[]; recalls: RecallOp[] };
 import {
 	REGISTRY_PROTOCOL,
 	REGISTRY_DIR,
@@ -847,7 +847,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 					const resolve = pending.get(msg.reqId);
 					if (resolve) {
 						pending.delete(msg.reqId);
-						resolve({ ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [] });
+						resolve({ ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [], recalls: Array.isArray(msg.recalls) ? msg.recalls : [] });
 					}
 				}
 				if (msg?.type === "unfoldResult" && typeof msg.reqId === "number") {
@@ -959,7 +959,15 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		});
 	}
 
-	/** Send a sync and await the GUI's plan; resolves an empty plan on timeout, null if unsent. */
+	/**
+	 * Send a sync and await the GUI's plan; resolves an empty plan on timeout, null if unsent.
+	 *
+	 * `planned: true` — this is the ONE sync site whose reply is actually APPLIED to a model
+	 * call (the `context` hook below). The GUI advances its birth-fold "sent" cursor only on a
+	 * `planned` sync, so a fresh block born inside the protected tail stays birth-foldable until
+	 * the model has genuinely consumed it (#43, ADR 0018). Every other sync site in this file is
+	 * VIEW-ONLY and must NOT set this flag.
+	 */
 	function requestPlan(reqId: number, full: boolean, blocks: ReturnType<typeof linearize>): Promise<Plan | null> {
 		return new Promise((resolve) => {
 			const ws = client;
@@ -967,14 +975,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			const timer = setTimeout(() => {
 				if (pending.has(reqId)) {
 					pending.delete(reqId);
-					resolve({ ops: [], groups: [] }); // delivered but no reply in time → passthrough
+					resolve({ ops: [], groups: [], recalls: [] }); // delivered but no reply in time → passthrough
 				}
 			}, REQUEST_TIMEOUT_MS);
 			pending.set(reqId, (plan) => {
 				clearTimeout(timer);
 				resolve(plan);
 			});
-			send(ws, { type: "sync", reqId, full, blocks, contextWindow });
+			send(ws, { type: "sync", reqId, full, blocks, contextWindow, planned: true });
 		});
 	}
 
@@ -1117,9 +1125,9 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		if (plan === null) return; // couldn't deliver → pass through, don't advance
 		if (epoch !== myEpoch) return; // GUI reconnected mid-flight → don't apply/advance
 		sentCount = Math.max(sentCount, all.length); // advance cursor; never rewind (a message_end during the await may have advanced it further)
-		if (plan.ops.length === 0 && plan.groups.length === 0) return; // empty plan → pass through
+		if (plan.ops.length === 0 && plan.groups.length === 0 && (plan.recalls?.length ?? 0) === 0) return; // empty plan → pass through
 
-		return { messages: applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups) as unknown as AgentMessage[] };
+		return { messages: applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups, plan.recalls) as unknown as AgentMessage[] };
 	});
 
 	// ── model swap: keep the GUI's context window (and budget) in lockstep ───────

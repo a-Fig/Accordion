@@ -67,6 +67,11 @@ export interface ViewBlock {
 	folded: boolean; // currently rendered folded in the view
 	protected: boolean; // inside the protected working tail
 	grouped: boolean; // member of a folded group (host owns it)
+	/** Never yet part of a completed model call — a conductor may fold it even inside
+	 *  the protected tail (a "birth-fold"), without holding the tail-size lock (#43).
+	 *  A block birth-folded on a prior pass also reads true while it remains in the
+	 *  tail, so a conductor need not keep its own seen-set. */
+	fresh: boolean;
 	text?: string; // full content (in-process, or wire wants:"full")
 	preview?: string; // one-line taste (wire wants:"shape"/"onDemand")
 }
@@ -113,6 +118,7 @@ export type Command =
 	| ReplaceCommand
 	| GroupCommand
 	| RestoreCommand
+	| RecallCommand
 	| PinCommand;
 
 /**
@@ -178,9 +184,44 @@ export interface GroupCommand {
 	digest?: string | null;
 }
 
-/** Return blocks to full, live content (undo a fold/replace). No-op on human-held blocks. */
+/**
+ * Return blocks to full, live content (undo a fold/replace). No-op on human-held blocks.
+ * ALSO releases any active `recall` for those ids (see `RecallCommand`) — a `restore` is the
+ * conductor's one explicit way to opt a recall out.
+ */
 export interface RestoreCommand {
 	kind: "restore";
+	ids: string[];
+}
+
+/**
+ * Recall a FOLDED block to the tail WITHOUT unfolding it — the conductor analog of the agent's
+ * `recall` tool. Unfolding a block substitutes its full text back in place mid-history, which
+ * changes the prefix and forces a prompt-cache MISS on the next call; recall avoids that. The
+ * named blocks STAY folded (their `{#code FOLDED}` digests stay exactly where they are), and the
+ * host appends each block's ORIGINAL full text as ONE synthetic user-role message at a STABLE
+ * anchor near the tail. The anchor is frozen the moment the recall is first issued, so the prefix
+ * up to it never shifts on later passes — the recall is cache-SAFE.
+ *
+ * STICKY SEMANTICS (the ONE exception to full-state reset). Every other command is re-derived
+ * from the raw baseline each pass, so omitting it drops it. A recall does NOT drop when omitted:
+ * dropping an appended injection would mutate the prefix and cost the very cache miss recall
+ * exists to avoid. A recall therefore persists by HOST policy until one of:
+ *   (a) the block is UNFOLDED (human hand-unfold, agent `unfold` tool, or the conductor simply
+ *       stops folding it so it settles live on the wire) — the full text is now standing in
+ *       place, so the tail injection would be a redundant duplicate and is dropped; OR
+ *   (b) the block leaves the store (structural reset); OR
+ *   (c) the conductor issues `restore` for that id — the explicit opt-out (`restore` releases the
+ *       recall in addition to its normal "return to live" meaning).
+ * Merely leaving a recall out of a later `Command[]` batch keeps it alive. To release one, name
+ * it in a `restore`.
+ *
+ * CLAMPS: an id that does not exist ⇒ `unknown-id`; an id that exists but is not currently
+ * folded (nothing to recall — its full text is already on the wire) ⇒ `not-recallable`. A block
+ * already recalled is a silent no-op (its frozen anchor is kept).
+ */
+export interface RecallCommand {
+	kind: "recall";
 	ids: string[];
 }
 
@@ -229,6 +270,12 @@ export type ClampReason =
 	 * (which would let the view show a fold the agent never actually receives).
 	 */
 	| "not-foldable"
+	/**
+	 * A `recall` targeted a block that exists but is NOT currently folded, so there is nothing
+	 * to recall — its full content is already on the wire. (A nonexistent id clamps `unknown-id`
+	 * as usual.)
+	 */
+	| "not-recallable"
 	/** The op was a no-op (e.g. restoring an already-live block). */
 	| "noop";
 

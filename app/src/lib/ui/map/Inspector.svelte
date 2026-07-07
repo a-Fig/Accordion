@@ -35,6 +35,10 @@
 	// Protected working tail — never folded (the safety pillar). The Fold control is
 	// disabled here so the guarantee is visible, not just enforced silently.
 	const protect = $derived(block ? store.isProtected(block) : false);
+	// Recalled to the tail by the conductor (ADR 0019): the block stays folded but its full text
+	// is also injected near the tail, so the agent sees the detail without a prompt-cache miss.
+	// A producible steering state — rendered identically in preview/read-only (the RULE).
+	const recalled = $derived(block ? store.isRecalled(block.id) : false);
 
 	// Involvement locks (ADR 0011): under `human-steering` the human's fold / unfold / pin /
 	// group / reset controls are the conductor's, so they show disabled — the honest mirror of
@@ -263,6 +267,12 @@
 						<span class="pill pill-accent" title="In the protected working tail — never folded">
 							<Icon name="lock" size={10} stroke={2} />
 							protected
+						</span>
+					{/if}
+					{#if recalled}
+						<span class="pill pill-accent" title="Recalled to the tail — stays folded here, full text injected near the tail (cache-safe)">
+							<Icon name="corner-down-right" size={10} stroke={2} />
+							recalled to tail
 						</span>
 					{/if}
 				</div>

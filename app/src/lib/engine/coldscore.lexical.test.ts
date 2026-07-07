@@ -23,6 +23,7 @@ function makeViewBlock(id: string, text: string | undefined): ViewBlock {
 		folded: false,
 		protected: false,
 		grouped: false,
+		fresh: false,
 		text,
 	};
 }

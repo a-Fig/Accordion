@@ -28,8 +28,11 @@ import type { Command, ClampReport, ViewBlock, LockName, JSONValue } from "./con
  *  - v2: initial conductor protocol (ConductorView, Command vocab, cap/request).
  *  - v3: conductor lock declarations in `conductor/hello` (ADR 0011) plus the
  *        "complete" capability for out-of-band model completions over the wire.
+ *  - v4: `RecallCommand` added to the `Command` union (ADR 0019). It rides the existing
+ *        `ConductorCommandsMessage.commands` array unchanged — no new message shape — so the
+ *        only wire-visible change is a new command `kind` a v3 host would not recognise.
  */
-export const CONDUCTOR_PROTOCOL_VERSION = 3;
+export const CONDUCTOR_PROTOCOL_VERSION = 4;
 
 /**
  * How much of each block's content a conductor wants to receive (declared in

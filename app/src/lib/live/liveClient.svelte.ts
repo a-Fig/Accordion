@@ -13,10 +13,10 @@
 import { session, cancelPendingLoad } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import { wireToBlock } from "./mapping";
-import { computeFoldOps, computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
+import { computeFoldOps, computeGroupOps, computeRecallOps, resolveUnfold, resolveRecall } from "./plan";
 import { folding } from "./folding.svelte";
 import { activeRemoteRunner } from "./conductorClient.svelte";
-import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage } from "./protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type RecallOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import type { CompletionRequest, CompletionResult } from "$conductors/contract";
 
@@ -70,9 +70,9 @@ export const live = $state<{ status: "idle" | "connecting" | "connected" | "erro
  *
  * This is the one place the GUI can alter a real model call; keep it a pure read.
  */
-function computePlan(): { ops: FoldOp[]; groups: GroupOp[] } {
-	if (!folding.enabled || !session.store) return { ops: [], groups: [] };
-	return { ops: computeFoldOps(session.store), groups: computeGroupOps(session.store) };
+function computePlan(): { ops: FoldOp[]; groups: GroupOp[]; recalls: RecallOp[] } {
+	if (!folding.enabled || !session.store) return { ops: [], groups: [], recalls: [] };
+	return { ops: computeFoldOps(session.store), groups: computeGroupOps(session.store), recalls: computeRecallOps(session.store) };
 }
 
 /**
@@ -300,14 +300,31 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			}
 			// Committed blocks arrive HERE (the appendBlocks path), NEVER from ghost state.
 			// Invariant: a ghost is only removed, never converted to a block.
-			session.store.appendBlocks(msg.blocks.map(wireToBlock));
+			// `sent: msg.full` (#43/ADR 0018 protection-bypass fix): a `full:true` sync is a
+			// backlog/reconcile REPLAY of history the model has already genuinely seen — including
+			// the very first sync after a fresh GUI attach/reconnect, which rebuilds an EMPTY store
+			// (see the `hello`/structural-reset paths above) and replays the WHOLE prior history in
+			// one shot. Marking that replay as already-sent BEFORE the conduct pass it triggers
+			// keeps a birth-folding conductor from folding already-seen protected-tail content and
+			// sticking it in the sticky `birthFolded` exemption forever. A normal incremental append
+			// (`full:false`) omits the flag, so genuinely new blocks stay birth-foldable as before.
+			session.store.appendBlocks(msg.blocks.map(wireToBlock), { sent: msg.full });
 			const plan = computePlan();
-			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups };
+			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups, recalls: plan.recalls };
 			try {
 				ws.send(JSON.stringify(reply));
 			} catch {
 				/* socket gone — extension will time out and pass through */
 			}
+			// #43/ADR 0018: only a PLANNED sync's reply is actually applied to a model call — the
+			// extension marks exactly one sync site this way (the `context` hook). Advance the
+			// birth-fold "sent" cursor only here, so a fresh block stays birth-foldable until the
+			// model has genuinely consumed it. A view-only sync (message_end/agent_end/model_select)
+			// never carries `planned: true` and must not advance the cursor. `rawWire`: disarmed
+			// folding replied with an EMPTY plan above, so this call's wire was raw — every block
+			// crossed whole, and the store must drop birth-fold exemptions accordingly (else a
+			// disarmed-era exemption leaks into a later armed run).
+			if (msg.planned) session.store.markSent({ rawWire: !folding.enabled });
 		} else if (msg.type === "unfoldRequest") {
 			// The live agent asked (via the `unfold` tool) to restore folded blocks it saw
 			// tagged `{#<code> FOLDED}`. Resolve each code to its folded block(s) and hold
