@@ -3,6 +3,7 @@ import { connectLive, disconnectLive, setArmed, live } from "./liveClient.svelte
 import { folding } from "./folding.svelte";
 import { session } from "../session.svelte";
 import { PROTOCOL_VERSION } from "./protocol";
+import type { Conductor, ConductorView, Command } from "$conductors/contract";
 
 /*
  * liveClient armed-over-wire coverage. The live client is a WebSocket CLIENT, so we drive it
@@ -261,5 +262,61 @@ describe("liveClient — passthrough ack handling (issue #60)", () => {
 		ws.emit({ type: "passthrough", reqId: 30, cause: "applied", ops: 1, groups: 0, recalls: 0 });
 		ws.emit({ type: "passthrough", reqId: 30, cause: "empty-plan", ops: 0, groups: 0, recalls: 0 });
 		expect(spy).not.toHaveBeenCalled();
+	});
+
+	/**
+	 * The whole reconciliation scheme rests on FIFO wire ordering: the extension sends the
+	 * `passthrough` ack for reqId N strictly AFTER the planned sync it answers and strictly
+	 * BEFORE the next sync — so reconciliation can never race a block that arrives later. If
+	 * that ordering were violated (ack processed after newer blocks already landed), `markSent`'s
+	 * `Math.max` against the store's then-current last block would advance `sentThroughOrder`
+	 * past those newer blocks too, wrongly marking a never-sent block as already sent (it would
+	 * read `fresh:false` and lose birth-fold eligibility, see store.svelte.ts `isFresh`/
+	 * `birthFoldEligible`, ADR 0018/#43).
+	 *
+	 * `sentThroughOrder`/`birthFolded` are private to `AccordionStore`, so this asserts the
+	 * sharpest available public equivalent: attach a stub conductor (same pattern as
+	 * store.birthfold.test.ts) purely to observe `ConductorView.fresh` — a block the store still
+	 * considers un-sent reads `fresh:true` regardless of protection or fold state.
+	 */
+	it("a passthrough ack for reqId N does not swallow a block that arrives in a LATER sync (FIFO ordering)", () => {
+		connectAndHello();
+		const ws = FakeWebSocket.last!;
+		expect(session.store).not.toBeNull();
+
+		class StubConductor implements Conductor {
+			readonly id = "stub";
+			readonly label = "Stub";
+			lastView: ConductorView | null = null;
+			conduct(view: ConductorView): Command[] | null {
+				this.lastView = view;
+				return []; // no fold decisions — this conductor exists only to capture the view
+			}
+		}
+		const conductor = new StubConductor();
+		session.store!.attach(conductor);
+
+		// (a) planned sync reqId=5 — client replies, sets lastPlannedReqId=5, and (folding
+		// disarmed by default in this suite) optimistically calls markSent({rawWire:true}).
+		ws.emit(plannedSyncFrame(5));
+
+		// (b) the extension's passthrough ack for that SAME reqId — reconciliation fires and
+		// calls markSent({rawWire:true}) again (idempotent).
+		ws.emit({ type: "passthrough", reqId: 5, cause: "timeout-raw", ops: 0, groups: 0, recalls: 0 });
+
+		// (c) a VIEW-ONLY sync (no `planned`) carrying a brand-new block, arriving strictly
+		// AFTER the reconciliation above.
+		ws.emit({
+			type: "sync",
+			reqId: 6,
+			full: false,
+			blocks: [{ id: "u:6", kind: "user", turn: 2, order: 1, text: "later", tokens: 5 }],
+			contextWindow: 1000,
+			planned: false,
+		});
+
+		const newBlock = conductor.lastView!.blocks.find((b) => b.id === "u:6");
+		expect(newBlock).toBeDefined();
+		expect(newBlock!.fresh).toBe(true); // never marked sent — FIFO ordering preserved
 	});
 });

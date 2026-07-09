@@ -492,8 +492,13 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// 0020). Two jobs: tally the counter for the "wire N/M" readout, and — for the two
 			// causes that mean the GUI's OWN fresh plan did not ride the wire — reconcile
 			// birth-fold bookkeeping.
-			live.planOutcomes[msg.cause]++;
-			live.planOutcomes.total++;
+			// `msg.cause` comes off the wire untyped — a malformed/unknown cause must not add a
+			// spurious key (e.g. NaN-poisoning via prototype/array quirks) or bump `total` for an
+			// outcome we can't attribute. Only tally a cause we actually have a bucket for.
+			if (msg.cause in live.planOutcomes) {
+				live.planOutcomes[msg.cause]++;
+				live.planOutcomes.total++;
+			}
 
 			// Birth-fold reconciliation (the correctness half, not just the counter). A
 			// `"timeout-stale"`/`"timeout-raw"` ack means the plan THIS client sent for
