@@ -14,9 +14,9 @@ import { session, cancelPendingLoad } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import { wireToBlock } from "./mapping";
 import { computeFoldOps, computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
-import { folding } from "./folding.svelte";
+import { folding, setFolding } from "./folding.svelte";
 import { activeRemoteRunner } from "./conductorClient.svelte";
-import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage } from "./protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage, type ArmedMessage } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import type { CompletionRequest, CompletionResult } from "$conductors/contract";
 
@@ -179,6 +179,36 @@ async function sendCompletion(req: CompletionRequest): Promise<CompletionResult>
 	});
 }
 
+/**
+ * Tell the extension whether this client is ARMED (guarded send). Armed, the extension
+ * blocks each `context` hook on the plan up to the hard deadline instead of racing past it
+ * at the short fast-path timeout (see `ArmedMessage` in protocol.ts). No-op when the socket
+ * is not OPEN — the state is re-synced on every attach from the hello handler, so a send
+ * that can't land now is never lost.
+ */
+function sendArmed(on: boolean): void {
+	const ws = socket;
+	if (!ws || ws.readyState !== WebSocket.OPEN) return;
+	const msg: ArmedMessage = { type: "armed", armed: on };
+	try {
+		ws.send(JSON.stringify(msg));
+	} catch {
+		/* socket gone — the next attach re-syncs armed state */
+	}
+}
+
+/**
+ * Arm / disarm folding for the live session — the SINGLE source of truth behind the GUI's
+ * arm toggle. Flips the local `folding.enabled` (drives the on-screen preview and, armed,
+ * the fold plan actually applied) AND declares the armed state to the extension over the
+ * wire so its plan-wait blocking follows the same switch. Replaces the old benchmark-only
+ * `ACCORDION_STEERING` env flag with one steering concept shared by GUI and headless host.
+ */
+export function setArmed(on: boolean): void {
+	setFolding(on);
+	sendArmed(on);
+}
+
 export function connectLive(port: number = DEFAULT_PORT): void {
 	if (typeof window === "undefined" || typeof WebSocket === "undefined") return;
 	cancelPendingLoad(); // invalidate any pending file/CC load that would otherwise clobber the live store
@@ -231,6 +261,10 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			// Safety (review Q5b): every new live attach starts DISARMED - folding is
 			// opt-in per session, never silently carried from a previously armed agent.
 			folding.enabled = false;
+			// Explicitly re-sync the disarmed state to the extension on every attach, so a fresh
+			// (or reconnected) extension learns this client's armed state over the wire from turn
+			// zero rather than inferring it. The socket is OPEN here (we are handling its hello).
+			sendArmed(false);
 			// Structural reset: clear all ghosts — no ghost survives a session reconnect.
 			ghostClearAll();
 			budgetLive = false;

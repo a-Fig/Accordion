@@ -30,6 +30,18 @@
  *  - v4: group collapse ops (`GroupOp`, `PlanMessage.groups`).
  *  - v5: recall tool (`recallRequest` / `recallResult`) plus completion relay
  *        (`completeRequest` / `completeResult`) for out-of-band model completions.
+ *  - (still v5, additive) `armed` / `armedAck`: the attached client declares its
+ *    ARMED state over the wire (client→server `armed`), and the extension replies
+ *    `armedAck` whenever it processes one. PROTOCOL_VERSION is DELIBERATELY NOT
+ *    bumped here. Both live peers that carry the pi wire — the GUI (liveClient's
+ *    hello handler) AND the bellows headless host — reject on a STRICT
+ *    `protocolVersion !== PROTOCOL_VERSION` mismatch, not `>=`. A bump would break
+ *    every mixed-version pairing (old GUI/host ↔ new extension, and vice versa) even
+ *    though these two messages are purely additive: an old peer simply drops an
+ *    unknown message type without error, degrading gracefully to the non-blocking
+ *    fast path. Capability is detected out-of-band via `armedAck` — a new client
+ *    that sends `armed` and gets no ack back knows it is talking to an old extension
+ *    (and can scream) — so the version number buys nothing a bump would cost.
  */
 export const PROTOCOL_VERSION = 5;
 
@@ -218,7 +230,22 @@ export interface CompleteResultMessage {
 	error?: string;
 }
 
-export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage | CompleteResultMessage;
+/**
+ * Sent by the extension whenever it processes an `armed` message from the attached client
+ * (additive on protocol v5 — see the PROTOCOL_VERSION history note). It echoes the armed
+ * state the extension now holds. Its whole purpose is capability detection for a headless
+ * client (e.g. the bellows benchmark host): a client that sends `armed` and never receives
+ * an `armedAck` is talking to an OLD extension that silently dropped the unknown type, so it
+ * knows its blocking benchmark would run non-blocking and can fail loudly. The GUI may ignore
+ * acks entirely — `isServerMessage` recognizes the type, but the client's message pump simply
+ * has no branch for it, so it is dropped harmlessly.
+ */
+export interface ArmedAckMessage {
+	type: "armedAck";
+	armed: boolean;
+}
+
+export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage | CompleteResultMessage | ArmedAckMessage;
 
 // ── Client → server (GUI → extension) ────────────────────────────────────────
 
@@ -314,12 +341,29 @@ export interface RecallResultMessage {
 	missing: string[];
 }
 
-export type ClientMessage = PlanMessage | UnfoldResultMessage | RecallResultMessage | CompleteRequestMessage;
+/**
+ * Client → extension: declare the client's ARMED state (additive on protocol v5). Armed, the
+ * extension switches its per-request plan wait from the short fast-path timeout
+ * (`ACCORDION_PLAN_TIMEOUT_MS`, default 250ms) to a hard deadline (`ACCORDION_PLAN_DEADLINE_MS`,
+ * default 10000ms), so a blocking session (interactive steering, or a benchmark that must hold
+ * its budget) actually waits for the plan instead of racing past it. Disarmed (the default on
+ * every fresh attach), a missed plan falls back fast and never blocks a model call.
+ *
+ * For the interactive GUI this is the wire form of the arm toggle (`folding.enabled`): a single
+ * source of truth for "is this client steering?" replacing the old benchmark-only
+ * `ACCORDION_STEERING` env flag. The extension answers every `armed` with an `armedAck`.
+ */
+export interface ArmedMessage {
+	type: "armed";
+	armed: boolean;
+}
+
+export type ClientMessage = PlanMessage | UnfoldResultMessage | RecallResultMessage | CompleteRequestMessage | ArmedMessage;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 export function isServerMessage(v: unknown): v is ServerMessage {
 	if (!v || typeof v !== "object" || !("type" in v)) return false;
 	const t = (v as any).type;
-	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult";
+	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult" || t === "armedAck";
 }

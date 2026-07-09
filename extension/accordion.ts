@@ -33,13 +33,13 @@
  *
  * Env configuration (read once at module init):
  *   • ACCORDION_PLAN_TIMEOUT_MS  — how long a `context` hook waits on the GUI's plan
- *     before falling back (positive int, default 250).
- *   • ACCORDION_STEERING         — truthy ("1"/"true", case-insensitive) switches the
- *     plan wait to a hard DEADLINE (ACCORDION_PLAN_DEADLINE_MS) instead of the short
- *     timeout, so a benchmark harness actually enforces its cap. A missed deadline is
- *     logged loudly and still falls back to the last known plan (or passthrough). It
- *     never blocks when no GUI is attached, and a mid-wait disconnect resolves at once.
- *   • ACCORDION_PLAN_DEADLINE_MS — steering-mode deadline (positive int, default 10000).
+ *     before falling back when the attached client is DISARMED (positive int, default 250).
+ *   • ACCORDION_PLAN_DEADLINE_MS — the plan wait used when the attached client declares
+ *     itself ARMED (over the wire — see the `armed` message): a hard DEADLINE instead of
+ *     the short timeout, so a blocking session (interactive steering, or a benchmark that
+ *     must hold its cap) actually waits for the plan. A missed deadline is logged loudly and
+ *     still falls back to the last known plan (or passthrough). It never blocks when no GUI
+ *     is attached, and a mid-wait disconnect resolves at once. (positive int, default 10000).
  *   Parsed with `Number()`, then required to be a positive integer. Invalid values
  *   (missing / NaN / ≤0 / non-integer, e.g. "250.5") fall back to the default. Note
  *   `Number()` accepts more than plain decimal — scientific notation ("1e3") and hex
@@ -79,10 +79,13 @@ type Plan = { ops: FoldOp[]; groups: GroupOp[] };
  * through UNFOLDED and silently. This discriminates them:
  *   • "plan"    — the GUI delivered a plan (possibly genuinely empty).
  *   • "timeout" — the wait elapsed with no reply → fall back to the last known plan.
+ *                 `waitedMs` is the GOVERNING wait for this request (the armed deadline or
+ *                 the disarmed timeout), carried out so the caller logs the duration it was
+ *                 supposed to honor without re-deriving which knob applied.
  *   • "unsent"  — nothing was delivered (no GUI at call time, or the socket dropped /
  *                 was superseded mid-wait via flushPending) → passthrough, don't advance.
  */
-type PlanResult = { kind: "plan"; plan: Plan } | { kind: "timeout" } | { kind: "unsent" };
+type PlanResult = { kind: "plan"; plan: Plan } | { kind: "timeout"; waitedMs: number } | { kind: "unsent" };
 import {
 	REGISTRY_PROTOCOL,
 	REGISTRY_DIR,
@@ -101,25 +104,17 @@ function envPositiveInt(name: string, fallback: number): number {
 	const n = Number(raw.trim());
 	return Number.isInteger(n) && n > 0 ? n : fallback;
 }
-// Truthy env flag: "1" or "true" (case-insensitive). Everything else is false.
-function envTruthy(name: string): boolean {
-	const raw = process.env[name];
-	if (typeof raw !== "string") return false;
-	const v = raw.trim().toLowerCase();
-	return v === "1" || v === "true";
-}
 
-// How long a `context` hook waits on the GUI before falling back (issue #58). This
-// used to be a silent 250ms passthrough; it is now configurable and the fallback is
-// no longer silent (stale plan + log — see the `context` hook).
+// How long a `context` hook waits on the GUI before falling back when the attached client
+// is DISARMED (issue #58). This used to be a silent 250ms passthrough; it is now configurable
+// and the fallback is no longer silent (stale plan + log — see the `context` hook).
 const PLAN_TIMEOUT_MS = envPositiveInt("ACCORDION_PLAN_TIMEOUT_MS", 250);
-// Steering (blocking) mode: enforce the budget by waiting a hard DEADLINE for the plan
-// instead of the short timeout, so a benchmark run whose cap must hold actually holds it.
-const STEERING = envTruthy("ACCORDION_STEERING");
+// The plan wait used when the attached client declares itself ARMED over the wire (the
+// `armed` message): a hard DEADLINE instead of the short timeout, so a blocking session
+// (interactive steering, or a benchmark whose cap must hold) actually waits for the plan.
+// Either way a missed wait falls back (stale plan / passthrough). Which of the two applies
+// is decided PER REQUEST from the armed flag snapshotted in the `context` hook, not here.
 const PLAN_DEADLINE_MS = envPositiveInt("ACCORDION_PLAN_DEADLINE_MS", 10_000);
-// The wait a `context` plan request actually uses: the long deadline under steering,
-// the short timeout otherwise. Either way a missed wait falls back (stale plan / passthrough).
-const PLAN_WAIT_MS = STEERING ? PLAN_DEADLINE_MS : PLAN_TIMEOUT_MS;
 // Unfold replies arrive during the agent's OWN turn (not on the model-call critical
 // path), so a generous wait is fine — the user's next message isn't blocked.
 const UNFOLD_TIMEOUT_MS = 2000;
@@ -293,6 +288,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// whole conversation unfolded. Reset wherever the cursor/epoch resets (session_start +
 	// GUI (re)connect): a plan from a superseded view must never apply to a fresh sync.
 	let lastPlan: Plan | null = null;
+	// Whether the attached client has declared itself ARMED over the wire (the `armed`
+	// message — the single source of truth for "is this client steering?", replacing the old
+	// ACCORDION_STEERING env flag). Armed, each `context` hook waits the hard PLAN_DEADLINE_MS
+	// for the plan instead of the short PLAN_TIMEOUT_MS. Reset to false wherever the client
+	// context resets — new connection, session_start, and the drop closure — so a stale armed
+	// state can never carry into a fresh attach and silently block (or a benchmark can never
+	// inherit a prior session's arming). Snapshotted per request in the `context` hook.
+	let armed = false;
 	// Most recent plan round-trip time (ms), stashed by `context` and consumed by
 	// `message_end` to stamp `usage.rttMs` on the assistant message this request produced.
 	// null = no context RTT to attribute (e.g. no GUI attached this turn) → no field stamped.
@@ -693,6 +696,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			sentCount = 0; // re-sync the whole context to the freshly-connected GUI
 			reqSeq = 0;
 			lastPlan = null; // a new view starts with no known plan; never apply the old one to it
+			armed = false; // a fresh client is DISARMED until it declares otherwise over the wire
 			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, meta });
 
 			// Flush existing history IMMEDIATELY on attach. Without this, a session that
@@ -733,6 +737,17 @@ export default function accordionLive(pi: ExtensionAPI): void {
 						// is honored as "no folds" and cached, not mistaken for a slow/absent GUI.
 						resolve({ kind: "plan", plan: { ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [] } });
 					}
+				}
+				if (msg?.type === "armed" && typeof msg.armed === "boolean") {
+					// The attached client declared its ARMED state (the single steering switch —
+					// interactive arm toggle or a headless benchmark host). Adopt it for subsequent
+					// `context` waits, and ACK so a headless client can confirm this extension
+					// understood the message (an old extension would silently drop the unknown type,
+					// leaving a "blocking" benchmark actually non-blocking). The snapshot semantics
+					// live in the `context` hook: an in-flight wait keeps its value; the next request
+					// picks up this one.
+					armed = msg.armed;
+					send(ws, { type: "armedAck", armed });
 				}
 				if (msg?.type === "unfoldResult" && typeof msg.reqId === "number") {
 					const resolve = pendingUnfold.get(msg.reqId);
@@ -831,10 +846,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			const drop = () => {
 				if (client === ws) {
 					client = null;
+					armed = false; // defense-in-depth: a dropped client is no longer steering anything
 					// The active GUI dropped mid-flight: resolve any in-flight plan/unfold/recall
 					// waits at once instead of letting them run out their timers. This matters most
-					// in steering mode, where the plan wait is a multi-second deadline — without this
-					// a disconnect would stall the model call until that deadline elapsed.
+					// when armed, where the plan wait is a multi-second deadline — without this a
+					// disconnect would stall the model call until that deadline elapsed.
 					flushPending();
 				}
 			};
@@ -853,22 +869,25 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	/**
 	 * Send a sync and await the GUI's plan. Resolves a discriminated PlanResult:
 	 *   • "unsent"  — no GUI attached at call time (nothing sent).
-	 *   • "timeout" — sent, but no reply within PLAN_WAIT_MS (the caller falls back to
-	 *                 the last known plan). The wait is PLAN_DEADLINE_MS under steering.
+	 *   • "timeout" — sent, but no reply within the governing wait (the caller falls back to
+	 *                 the last known plan). `waitedMs` is that wait: PLAN_DEADLINE_MS when the
+	 *                 caller passes `armedNow`, PLAN_TIMEOUT_MS otherwise. Snapshotted by the
+	 *                 caller (the `context` hook) so an in-flight wait keeps its value.
 	 *   • "plan"    — the GUI replied (delivered via the pending resolver / flushPending).
 	 * The pending resolver is also driven by flushPending() (→ "unsent") on a superseded /
 	 * dropped / shutting-down GUI, so a mid-wait disconnect never runs out the full timer.
 	 */
-	function requestPlan(reqId: number, full: boolean, blocks: ReturnType<typeof linearize>): Promise<PlanResult> {
+	function requestPlan(reqId: number, full: boolean, blocks: ReturnType<typeof linearize>, armedNow: boolean): Promise<PlanResult> {
+		const waitMs = armedNow ? PLAN_DEADLINE_MS : PLAN_TIMEOUT_MS;
 		return new Promise((resolve) => {
 			const ws = client;
 			if (!ws || ws.readyState !== 1) return resolve({ kind: "unsent" });
 			const timer = setTimeout(() => {
 				if (pending.has(reqId)) {
 					pending.delete(reqId);
-					resolve({ kind: "timeout" }); // delivered but no reply in time → caller applies last known plan
+					resolve({ kind: "timeout", waitedMs: waitMs }); // delivered but no reply in time → caller applies last known plan
 				}
-			}, PLAN_WAIT_MS);
+			}, waitMs);
 			pending.set(reqId, (r) => {
 				clearTimeout(timer);
 				resolve(r);
@@ -926,6 +945,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		sessionId = `s-${process.pid}-${Date.now()}`;
 		sentCount = 0;
 		lastPlan = null; // fresh session → no known plan yet (cursor also resets here)
+		armed = false; // fresh session → disarmed until the (re)attached client declares otherwise
 		lastPlanRttMs = null;
 		pendingSince = [];
 		// Seed the cache from the session itself. For a fresh session this is []; for a
@@ -1011,6 +1031,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		lastPlanRttMs = null;
 		latestCtx = ctx;
 		const myEpoch = epoch;
+		// Snapshot the armed flag SYNCHRONOUSLY with myEpoch, BEFORE the await below. Mid-toggle
+		// semantics: an in-flight `context` wait keeps the value it started with; the NEXT request
+		// picks up a value the client changed meanwhile. This governs whether requestPlan waits the
+		// hard deadline (armed) or the short timeout (disarmed), and which log fires on a miss.
+		const myArmed = armed;
 		// Refresh model/usage in memory only — NO disk I/O on the model-call critical
 		// path. The 5s heartbeat persists these to the registry for the sidebar.
 		refreshFromCtx(ctx);
@@ -1031,7 +1056,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		// outcome — the assistant message this request produces waited this long, whatever
 		// the result (applied / stale-fallback / timeout).
 		const t0 = Date.now();
-		const result = await requestPlan(reqId, full, fresh);
+		const result = await requestPlan(reqId, full, fresh, myArmed);
 		lastPlanRttMs = Date.now() - t0;
 
 		if (epoch !== myEpoch) return; // GUI reconnected mid-flight → don't apply/advance
@@ -1054,9 +1079,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				: lastPlan
 					? "cached plan is empty (no folds) — passing through unfolded"
 					: "no cached plan — passing through unfolded";
-			if (STEERING) {
-				// Steering promised to hold the budget and didn't: shout, don't whisper.
-				console.error(`[accordion] STEERING deadline missed: plan reqId=${reqId} did not arrive within ${PLAN_WAIT_MS}ms (waited ${elapsed}ms) — ${detail}`);
+			if (myArmed) {
+				// Armed promised to hold the budget and didn't: shout, don't whisper. `result.waitedMs`
+				// is the deadline this request was supposed to honor (carried out of requestPlan).
+				console.error(`[accordion] armed deadline missed: plan reqId=${reqId} did not arrive within ${result.waitedMs}ms (waited ${elapsed}ms) — ${detail}`);
 			} else {
 				console.warn(`[accordion] plan timeout: reqId=${reqId} after ${elapsed}ms — ${detail}`);
 			}
