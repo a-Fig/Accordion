@@ -1030,6 +1030,190 @@ if (!recallTool) {
 	await new Promise((resolve) => { wsr.on("close", resolve); wsr.close(); });
 }
 
+// ── issue #58: stale-plan fallback + empty-plan cache + rttMs stamp ───────────
+// Feature A (stale-plan fallback) and Feature C (rttMs) run against the DEFAULT env
+// (250ms timeout). Feature B (steering deadline + env parsing) is module-init env
+// dependent and lives in smoke-config.mjs (spawned children). Here we drive the
+// `context`/`message_end` hooks through a fresh GUI whose reply behavior we switch
+// per scenario: reply-with-fold, reply-with-empty, or withhold (force timeout).
+
+// Mirrors pi's real `message_end` contract (MessageEndEventResult, see
+// node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts): the
+// runner's emitMessageEnd does `if (!handlerResult?.message) continue;` — a handler's
+// return only takes effect wrapped as `{ message }`; a bare message is silently
+// dropped. Applying that same gate to the raw handler return (rather than reading
+// `.usage` straight off it) is what makes rttVal below actually depend on the
+// extension returning the correct `{ message }` shape.
+function unwrapMessageEnd(result) {
+	if (!result?.message) return undefined;
+	return result.message;
+}
+const stale = { primedFold: null, staleFold: null, emptyPass: undefined, afterEmptyPass: undefined, rtt: null, rtt2: null };
+{
+	const gui = new WebSocket(`ws://127.0.0.1:${PORT}`);
+	let mode = "ignore"; // "fold" | "empty" | "drop" | "ignore"
+	gui.on("message", (data) => {
+		let m;
+		try { m = JSON.parse(data.toString()); } catch { return; }
+		if (m.type !== "sync") return;
+		if (mode === "fold") gui.send(JSON.stringify({ type: "plan", reqId: m.reqId, ops: [{ id: "a:resp-abc:p0", digestText: "STALEFOLD" }], groups: [] }));
+		else if (mode === "empty") gui.send(JSON.stringify({ type: "plan", reqId: m.reqId, ops: [], groups: [] }));
+		// "drop"/"ignore" → deliberately no reply (the attach flush is an "ignore" sync)
+	});
+	await new Promise((res, rej) => { gui.on("open", res); gui.on("error", rej); });
+	await new Promise((r) => setTimeout(r, 100)); // let the view-only attach flush settle
+
+	// 1) Prime the cache: the GUI delivers a NON-EMPTY plan → lastPlan cached + applied.
+	mode = "fold";
+	stale.primedFold = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+
+	// 2) TIMEOUT → the extension must re-apply the LAST KNOWN plan, not pass through
+	//    unfolded. The GUI withholds its reply; after the 250ms default wait the
+	//    context hook falls back to the cached STALEFOLD plan.
+	mode = "drop";
+	stale.staleFold = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+
+	// 3) A delivered EMPTY plan (conductor wants no folds) must REPLACE the cached
+	//    non-empty plan — a later timeout must then pass through unfolded, never
+	//    resurrect the old fold.
+	mode = "empty";
+	stale.emptyPass = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+	mode = "drop";
+	stale.afterEmptyPass = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+
+	// 4) rttMs stamp: a context wait stashes an RTT that the NEXT assistant message_end
+	//    stamps onto usage.rttMs; a following assistant message with no preceding context
+	//    wait gets NO field (the stash was consumed+cleared).
+	mode = "fold";
+	await Promise.resolve(handlers.context({ messages: sample }, ctx)); // stashes an RTT
+	stale.rtt = await Promise.resolve(handlers.message_end({ message: { role: "assistant", content: [{ type: "text", text: "RTT REPLY" }], responseId: "resp-rtt", timestamp: T0 + 5000 } }, ctx));
+	stale.rtt2 = await Promise.resolve(handlers.message_end({ message: { role: "assistant", content: [{ type: "text", text: "SECOND REPLY" }], responseId: "resp-rtt2", timestamp: T0 + 5001 } }, ctx));
+
+	gui.close();
+	await new Promise((r) => setTimeout(r, 50));
+}
+// Feature A: primed non-empty plan applied (resp-abc → STALEFOLD).
+if (stale.primedFold?.messages?.[1]?.content?.[0]?.text !== "STALEFOLD")
+	fails.push(`stale-fallback: primed plan did not fold resp-abc (got ${JSON.stringify(stale.primedFold?.messages?.[1]?.content?.[0]?.text)})`);
+// Feature A: on timeout the STALE plan is re-applied instead of passthrough.
+if (!stale.staleFold?.messages) fails.push("stale-fallback: timeout passed through unfolded instead of applying the last known plan");
+else if (stale.staleFold.messages[1]?.content?.[0]?.text !== "STALEFOLD")
+	fails.push(`stale-fallback: timeout did not re-apply the cached fold (got ${JSON.stringify(stale.staleFold.messages[1]?.content?.[0]?.text)})`);
+// Feature A: a delivered empty plan passes through AND is cached (not overridden by the older plan).
+if (stale.emptyPass !== undefined) fails.push("stale-fallback: delivered empty plan did not pass through");
+if (stale.afterEmptyPass !== undefined)
+	fails.push("stale-fallback: a timeout after a delivered EMPTY plan wrongly resurrected the older non-empty plan");
+// Feature C: rttMs stamped on the assistant message following a context wait.
+// Unwrapped via the runner's `{ message }` contract (see unwrapMessageEnd above) — a
+// regression to the pre-fix bare-message return makes this undefined, failing the test.
+const rttMessage = unwrapMessageEnd(stale.rtt);
+const rttVal = rttMessage?.usage?.rttMs;
+if (!(typeof rttVal === "number" && Number.isInteger(rttVal) && rttVal >= 0))
+	fails.push(`rttMs: assistant message_end did not carry an integer usage.rttMs (got ${JSON.stringify(rttVal)})`);
+if (rttMessage?.role !== "assistant") fails.push("rttMs: injected message must keep role assistant");
+// Feature C: no preceding context wait → the stash was cleared → no rttMs field leaks.
+const rtt2Message = unwrapMessageEnd(stale.rtt2);
+if (rtt2Message && rtt2Message.usage && typeof rtt2Message.usage.rttMs === "number")
+	fails.push("rttMs: a message with no preceding context RTT wrongly received a rttMs field (stale stash leaked)");
+
+// ── armed-over-wire: ARMED state (learned over the wire) drives blocking ──────
+// The client sends {type:"armed", armed:bool}; the extension acks and switches its
+// per-request plan wait between the short timeout (disarmed) and the hard deadline
+// (armed). This replaces the old ACCORDION_STEERING env flag. Default env here:
+// PLAN_TIMEOUT_MS=250, PLAN_DEADLINE_MS=10000. We never actually wait out the 10s
+// deadline — we deliver the plan to unblock — but we DO prove an armed request blocks
+// well past the 250ms short timeout that a disarmed request falls back at.
+const armedSmoke = { ackTrue: null, ackFalse: null, disarmedMs: null, armedMs: null, inflightPendingPastTimeout: null, nextDisarmedMs: null };
+{
+	const gui = new WebSocket(`ws://127.0.0.1:${PORT}`);
+	let lastAck = null;
+	let lastSyncReqId = null;
+	let replyMode = "ignore"; // "ignore" = withhold plan; "fold" = reply (optionally delayed)
+	let planReplyDelayMs = 0;
+	gui.on("message", (data) => {
+		let m;
+		try { m = JSON.parse(data.toString()); } catch { return; }
+		if (m.type === "armedAck") { lastAck = m; return; }
+		if (m.type !== "sync") return;
+		lastSyncReqId = m.reqId;
+		if (replyMode === "fold") {
+			const deliver = () => { try { gui.send(JSON.stringify({ type: "plan", reqId: m.reqId, ops: [], groups: [] })); } catch { /* closed */ } };
+			if (planReplyDelayMs > 0) setTimeout(deliver, planReplyDelayMs); else deliver();
+		}
+		// "ignore" → withhold (forces the fallback path / keeps the wait blocking)
+	});
+	await new Promise((res, rej) => { gui.on("open", res); gui.on("error", rej); });
+	await new Promise((r) => setTimeout(r, 100)); // settle the view-only attach flush
+
+	// 1) DISARMED (fresh connection defaults to disarmed): a withheld reply falls back at
+	//    the SHORT timeout (~250ms). No armed message has been sent yet.
+	replyMode = "ignore";
+	let t0 = Date.now();
+	await Promise.resolve(handlers.context({ messages: sample }, ctx));
+	armedSmoke.disarmedMs = Date.now() - t0;
+
+	// 2) Arm over the wire — the extension must ACK armed:true.
+	gui.send(JSON.stringify({ type: "armed", armed: true }));
+	await waitFor(() => lastAck?.armed === true, 1000, "armedAck(true)").catch(() => {});
+	armedSmoke.ackTrue = lastAck;
+
+	// 3) ARMED: a delayed reply (600ms — past the 250ms short timeout) must be WAITED for,
+	//    proving the wait is deadline-scale and did not fall back at the short timeout.
+	replyMode = "fold";
+	planReplyDelayMs = 600;
+	t0 = Date.now();
+	await Promise.resolve(handlers.context({ messages: sample }, ctx));
+	armedSmoke.armedMs = Date.now() - t0;
+
+	// 4) Mid-toggle snapshot: a request that STARTS armed keeps blocking even if the client
+	//    disarms mid-flight; only the NEXT request picks up the new (disarmed) value.
+	//    Start an armed request with the reply withheld so it blocks on the deadline.
+	replyMode = "ignore";
+	planReplyDelayMs = 0;
+	lastAck = null;
+	let inflightResolved = false;
+	const inflight = Promise.resolve(handlers.context({ messages: sample }, ctx)).then((r) => { inflightResolved = true; return r; });
+	await new Promise((r) => setTimeout(r, 60)); // let the sync go out + the request register
+
+	// Disarm mid-flight; wait for the ack so the module-level `armed` is now false.
+	gui.send(JSON.stringify({ type: "armed", armed: false }));
+	await waitFor(() => lastAck?.armed === false, 1000, "armedAck(false)").catch(() => {});
+	armedSmoke.ackFalse = lastAck;
+
+	// The in-flight request snapshotted armed=true, so it must STILL be blocking — NOT fallen
+	// back at the 250ms short timeout. Assert it is unresolved comfortably past that window.
+	await new Promise((r) => setTimeout(r, 350));
+	armedSmoke.inflightPendingPastTimeout = !inflightResolved;
+
+	// Unblock the in-flight request by answering its sync, so we don't wait the full deadline.
+	if (lastSyncReqId !== null) gui.send(JSON.stringify({ type: "plan", reqId: lastSyncReqId, ops: [], groups: [] }));
+	await inflight;
+
+	// 5) The NEXT request snapshots armed=false → falls back at the SHORT timeout again.
+	replyMode = "ignore";
+	t0 = Date.now();
+	await Promise.resolve(handlers.context({ messages: sample }, ctx));
+	armedSmoke.nextDisarmedMs = Date.now() - t0;
+
+	gui.close();
+	await new Promise((r) => setTimeout(r, 50));
+}
+// armedAck round-trips.
+if (!armedSmoke.ackTrue || armedSmoke.ackTrue.armed !== true) fails.push("armed: extension did not ack armed:true");
+if (!armedSmoke.ackFalse || armedSmoke.ackFalse.armed !== false) fails.push("armed: extension did not ack armed:false");
+// Disarmed default → short timeout (well under a second).
+if (!(armedSmoke.disarmedMs !== null && armedSmoke.disarmedMs < 900))
+	fails.push(`armed: disarmed wait ${armedSmoke.disarmedMs}ms did not fall back at the short timeout`);
+// Armed → blocked past the short timeout for the 600ms delayed plan (deadline-scale).
+if (!(armedSmoke.armedMs !== null && armedSmoke.armedMs >= 450))
+	fails.push(`armed: armed wait ${armedSmoke.armedMs}ms fell back at the short timeout instead of blocking (deadline-scale expected)`);
+// Mid-toggle: the in-flight armed request kept blocking despite a mid-flight disarm.
+if (armedSmoke.inflightPendingPastTimeout !== true)
+	fails.push("armed: in-flight request fell back at the short timeout after a mid-flight disarm (snapshot not honored)");
+// Mid-toggle: the NEXT request picked up the disarmed value → short timeout again.
+if (!(armedSmoke.nextDisarmedMs !== null && armedSmoke.nextDisarmedMs < 900))
+	fails.push(`armed: request after disarm did not use the short timeout (${armedSmoke.nextDisarmedMs}ms)`);
+
 // ── assertions ───────────────────────────────────────────────────────────────
 if (!seen.hello) fails.push("never received hello");
 if (!seen.flushOnAttach) fails.push("GUI received no history flush on attach (would stay empty until first message — the bug)");
@@ -1078,6 +1262,8 @@ console.log(
 			`resumed-session attach-flush ✓  getBranch fallback ✓  ` +
 				`anchor-less positional-id round-trip ✓  applyPlan guard (positional + empty-digest refused) ✓  ` +
 					`unfold tool (no-ids / detached guards, attached round-trip) ✓  ` +
-					`recall tool (no-ids / detached guards, content-echo round-trip) ✓  skill discovery ✓`,
+					`recall tool (no-ids / detached guards, content-echo round-trip) ✓  skill discovery ✓  ` +
+					`stale-plan fallback (timeout re-applies last plan, empty plan not overridden) ✓  rttMs stamp ✓  ` +
+						`armed-over-wire (ack, disarmed=short / armed=deadline, mid-toggle snapshot) ✓`,
 );
 process.exit(0);

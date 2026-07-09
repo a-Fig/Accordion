@@ -5,8 +5,8 @@
 	import EditableNumber from "$lib/ui/EditableNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import ConductorMenu from "./ConductorMenu.svelte";
-	import { folding, setFolding } from "$lib/live/folding.svelte";
-	import { live } from "$lib/live/liveClient.svelte";
+	import { folding } from "$lib/live/folding.svelte";
+	import { live, setArmed } from "$lib/live/liveClient.svelte";
 	import { conductorStatus } from "$lib/live/conductorClient.svelte";
 	import type { JSONValue } from "$conductors/contract";
 
@@ -197,7 +197,7 @@
 					title={folding.enabled
 						? "Accordion is applying folds to the live agent's context. Takes effect on the agent's next turn."
 						: "Folds are previewed in the view only. The agent's context is unchanged."}
-					onclick={() => setFolding(!folding.enabled)}
+					onclick={() => setArmed(!folding.enabled)}
 				>
 					<span class="fold-arm-dot" aria-hidden="true"></span>
 					<span class="fold-arm-eyebrow mono">FOLDING</span>

@@ -10,7 +10,7 @@
     "build:client": "node ./build-client.mjs",
     "build": "npm run build:app && npm run build:client && npm run build:extension",
     "prepack": "npm run build && npm run smoke",
-    "smoke": "node smoke.mjs"
+    "smoke": "node smoke.mjs && node smoke-config.mjs"
   },
   "pi": {
     "extensions": ["./accordion.js"]
