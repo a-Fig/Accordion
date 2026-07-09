@@ -30,9 +30,12 @@
  *     yet, pass through as before — but always log the timeout (never silent). Note:
  *     on a timeout-with-stale-fallback turn, what the GUI is showing can diverge for
  *     that one turn from what the extension actually sent the model (the stale plan
- *     may be missing folds/unfolds the GUI has since queued) — the fold alarm has no
- *     visibility into this, since it never receives the applied plan back. The next
- *     plan the GUI delivers resyncs both sides.
+ *     may be missing folds/unfolds the GUI has since queued) — the next plan the GUI
+ *     delivers resyncs both sides. Unlike before #60, this divergence is no longer
+ *     invisible: every `context` hook outcome (including this one) is counted and, when
+ *     a client is reachable, acked back as a `passthrough` message (issue #60, ADR 0020)
+ *     — see `recordPlanOutcome` below — so the GUI's birth-fold bookkeeping and the
+ *     bellows bench rig can both observe it instead of assuming the fresh plan rode.
  *   • pi's native /compact is suppressed ONLY while the GUI is attached.
  *   • The shared mapping (linearize/applyPlan) carries the provider-safety rules
  *     (durable-id + kind checks); the engine is the single foldability gate and
@@ -377,6 +380,88 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// `message_end` to stamp `usage.rttMs` on the assistant message this request produced.
 	// null = no context RTT to attribute (e.g. no GUI attached this turn) → no field stamped.
 	let lastPlanRttMs: number | null = null;
+
+	// ── plan-outcome observability (issue #60, ADR 0020) ────────────────────────────
+	// Every `context` hook resolves to EXACTLY one of these causes — the full taxonomy of
+	// what happened to a model call's context, including the two that used to be totally
+	// silent (`no-gui`, `epoch-mismatch`) and the pre-existing-but-unobservable timeout
+	// fallbacks. `no-gui`/`unsent` have no reachable client to ack (see `recordPlanOutcome`),
+	// so they are counter-only; the other five are also acked to the GUI as a `passthrough`
+	// message (`PassthroughCause` in protocol.ts is this type minus those two).
+	type PlanOutcomeCause = "applied" | "empty-plan" | "timeout-stale" | "timeout-raw" | "no-gui" | "epoch-mismatch" | "unsent";
+	// Per-extension-lifetime counters (plain in-memory state, mirrors `sentCount`'s pattern).
+	// Deliberately NOT reset on `session_start` — a session swap doesn't invalidate the
+	// observability value of a running total, unlike `sentCount`/`epoch`/`lastPlan`, which
+	// genuinely describe THIS session's cursor and must not leak across a swap. Never
+	// persisted (the context hook must stay disk-I/O-free — see the header Safety note).
+	const planOutcomeCounts: Record<PlanOutcomeCause, number> = {
+		applied: 0,
+		"empty-plan": 0,
+		"timeout-stale": 0,
+		"timeout-raw": 0,
+		"no-gui": 0,
+		"epoch-mismatch": 0,
+		unsent: 0,
+	};
+	let contextHookCount = 0; // total `context` hook invocations this extension lifetime
+	// Previous outcome cause — used ONLY to log a TRANSITION into a silent-passthrough state
+	// (not every call: every session legitimately starts unattached, so per-turn no-gui
+	// logging would be pure noise). null until the first `context` hook ever resolves.
+	let lastOutcomeCause: PlanOutcomeCause | null = null;
+	const SILENT_CAUSES: ReadonlySet<PlanOutcomeCause> = new Set(["no-gui", "unsent", "epoch-mismatch"]);
+
+	/**
+	 * Record the outcome of ONE `context` hook resolution (issue #60). Called exactly once
+	 * per hook invocation, on every exit path — including the success path — so every
+	 * `context` call increments exactly one counter.
+	 *
+	 * Side effects, in order:
+	 *   1. Bump `planOutcomeCounts[cause]` and `contextHookCount`.
+	 *   2. `console.warn` iff this call is entering a SILENT state (no-gui/unsent/
+	 *      epoch-mismatch) from a non-silent ("healthy") one — e.g. the first no-gui call
+	 *      after having been attached, or the first unsent/epoch-mismatch after a healthy
+	 *      run. Never warns on the very first call ever (nothing to transition FROM), and
+	 *      never warns silent→silent (already noisy enough at the transition). The
+	 *      already-logged timeout branches (`timeout-stale`/`timeout-raw`) are untouched —
+	 *      they log every call via `console.warn`/`console.error` at their call sites.
+	 *   3. Fire-and-forget a `passthrough` ack to `ackTarget` iff it is non-null and OPEN.
+	 *      `ackTarget` is null for `no-gui`/`unsent` (no reachable client — counter-only per
+	 *      spec) and the CURRENT client for every other cause, including `epoch-mismatch`
+	 *      (whose `reqId` belongs to the superseded view — the current client can still
+	 *      count it, it just can't correlate the id to anything it itself sent).
+	 *
+	 * NEVER awaited by the caller — `send()` is itself fire-and-forget (try/catch, no
+	 * return value), so this can never delay or block the `context` hook's own return.
+	 */
+	function recordPlanOutcome(
+		cause: PlanOutcomeCause,
+		reqId: number | null,
+		applied: { ops: number; groups: number; recalls: number },
+		ackTarget: WebSocket | null,
+	): void {
+		planOutcomeCounts[cause]++;
+		contextHookCount++;
+		if (SILENT_CAUSES.has(cause) && lastOutcomeCause !== null && !SILENT_CAUSES.has(lastOutcomeCause)) {
+			console.warn(
+				`[accordion] context hook: silent passthrough (${cause})${reqId != null ? ` reqId=${reqId}` : ""} — previous outcome was '${lastOutcomeCause}'`,
+			);
+		}
+		lastOutcomeCause = cause;
+		if (ackTarget && ackTarget.readyState === 1 /* OPEN */) {
+			// Cast: `no-gui`/`unsent` never reach here with a non-null ackTarget (every call
+			// site below passes `null` for those two causes), so `cause` is always one of
+			// protocol.ts's narrower `PassthroughCause` at runtime despite the wider static type.
+			send(ackTarget, {
+				type: "passthrough",
+				reqId: reqId ?? -1,
+				cause: cause as Exclude<PlanOutcomeCause, "no-gui" | "unsent">,
+				ops: applied.ops,
+				groups: applied.groups,
+				recalls: applied.recalls,
+			});
+		}
+	}
+
 	// Unfold requests: keyed by reqId, resolved when the GUI replies (or null on flush).
 	// Deliberately NOT reset on reconnect (unlike reqSeq): a late reply from a superseded
 	// GUI can never alias a fresh request's reqId, and flushPending() drains the map anyway.
@@ -700,7 +785,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// any other origin because we set no CORS headers.
 			if (u.pathname === "/__accordion/meta") {
 				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION }));
+				// `planOutcomes` (issue #60, ADR 0020): per-cause counts of every `context` hook
+				// resolution this extension has ever resolved, plus `total` (= `contextHookCount`,
+				// the total invocation count) — what the bellows bench rig polls to see how much
+				// of a session actually rode the GUI's plan vs. a silent/fallback passthrough.
+				res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION, planOutcomes: { ...planOutcomeCounts, total: contextHookCount } }));
 				return;
 			}
 
@@ -1250,7 +1339,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		lastMessages = event.messages as unknown as PiMessage[];
 		pendingSince = [];
 		const all = linearize(lastMessages);
-		if (!attached()) return; // no GUI → pass through untouched
+		if (!attached()) {
+			recordPlanOutcome("no-gui", null, { ops: 0, groups: 0, recalls: 0 }, null);
+			return; // no GUI → pass through untouched
+		}
 
 		const fresh = all.slice(sentCount);
 		const reqId = ++reqSeq;
@@ -1262,8 +1354,17 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		const result = await requestPlan(reqId, full, fresh, myArmed);
 		lastPlanRttMs = Date.now() - t0;
 
-		if (epoch !== myEpoch) return; // GUI reconnected mid-flight → don't apply/advance
-		if (result.kind === "unsent") return; // couldn't deliver (no GUI / dropped) → pass through, don't advance
+		if (epoch !== myEpoch) {
+			// A new client attached mid-wait, superseding the view this request was sent to.
+			// Ack the CURRENT client anyway (it can still count the outcome) — its `reqId`
+			// belongs to the superseded view, not to anything the current client itself sent.
+			recordPlanOutcome("epoch-mismatch", reqId, { ops: 0, groups: 0, recalls: 0 }, client);
+			return; // GUI reconnected mid-flight → don't apply/advance
+		}
+		if (result.kind === "unsent") {
+			recordPlanOutcome("unsent", reqId, { ops: 0, groups: 0, recalls: 0 }, null);
+			return; // couldn't deliver (no GUI / dropped) → pass through, don't advance
+		}
 
 		if (result.kind === "timeout") {
 			// Issue #58: the plan missed the wait. Blocks WERE delivered, so advance the cursor
@@ -1291,11 +1392,21 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			}
 			// Recalls replay with the rest of the stale plan: a recall op is "keep this text
 			// injected for this call" desired state, exactly like a fold op, and applyPlan's
-			// anchor fallback keeps a stale anchor safe. Known gap (pre-existing on both parents,
-			// issue #60): the GUI cannot observe this fallback, so its birth-fold markSent()
-			// assumed the plan IT sent was applied — a fresh plan's fold that the stale plan
-			// lacks rode the wire whole while the exemption survives.
-			if (hasStale) return { messages: applyPlan(event.messages as unknown as PiMessage[], lastPlan!.ops, lastPlan!.groups, lastPlan!.recalls) as unknown as AgentMessage[] };
+			// anchor fallback keeps a stale anchor safe. Issue #60 (fixed): the GUI's own fresh
+			// plan for this reqId did NOT ride the wire, so its birth-fold markSent() cannot
+			// assume it did. `recordPlanOutcome` below acks `timeout-stale`/`timeout-raw` to the
+			// GUI so it can reconcile — see `liveClient.svelte.ts`'s passthrough handling and
+			// ADR 0020.
+			if (hasStale) {
+				recordPlanOutcome(
+					"timeout-stale",
+					reqId,
+					{ ops: lastPlan!.ops.length, groups: lastPlan!.groups.length, recalls: lastPlan!.recalls.length },
+					client,
+				);
+				return { messages: applyPlan(event.messages as unknown as PiMessage[], lastPlan!.ops, lastPlan!.groups, lastPlan!.recalls) as unknown as AgentMessage[] };
+			}
+			recordPlanOutcome("timeout-raw", reqId, { ops: 0, groups: 0, recalls: 0 }, client);
 			return;
 		}
 
@@ -1305,8 +1416,13 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		const plan = result.plan;
 		lastPlan = plan;
 		sentCount = Math.max(sentCount, all.length); // advance cursor; never rewind (a message_end during the await may have advanced it further)
-		if (plan.ops.length === 0 && plan.groups.length === 0 && (plan.recalls?.length ?? 0) === 0) return; // empty plan → pass through
+		const recallCount = plan.recalls?.length ?? 0;
+		if (plan.ops.length === 0 && plan.groups.length === 0 && recallCount === 0) {
+			recordPlanOutcome("empty-plan", reqId, { ops: 0, groups: 0, recalls: 0 }, client);
+			return; // empty plan → pass through
+		}
 
+		recordPlanOutcome("applied", reqId, { ops: plan.ops.length, groups: plan.groups.length, recalls: recallCount }, client);
 		return { messages: applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups, plan.recalls) as unknown as AgentMessage[] };
 	});
 

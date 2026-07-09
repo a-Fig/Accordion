@@ -102,6 +102,21 @@
 	// What "Revert to auto" will clear: every block carrying a manual/agent override.
 	const editCount = $derived(store.blocks.filter((b) => b.override !== null).length);
 
+	// ── Wire outcome readout (issue #60, ADR 0020): "applied" acked model calls seen this
+	// connection out of the total acked. Failure causes (timeout-stale/timeout-raw/
+	// epoch-mismatch) make the numerator fall behind the denominator; an empty-plan reply
+	// counts as a SUCCESS (the GUI intentionally asked for no folds, same as applying one).
+	const wireTotal = $derived(live.planOutcomes.total);
+	const wireApplied = $derived(live.planOutcomes.applied + live.planOutcomes["empty-plan"]);
+	const wireTip = $derived(
+		`Model calls this connection: ${wireTotal}\n` +
+			`applied: ${live.planOutcomes.applied}\n` +
+			`empty-plan (intentional, no folds): ${live.planOutcomes["empty-plan"]}\n` +
+			`timeout-stale (fell back to last known plan): ${live.planOutcomes["timeout-stale"]}\n` +
+			`timeout-raw (no plan to fall back to): ${live.planOutcomes["timeout-raw"]}\n` +
+			`epoch-mismatch (view superseded mid-wait): ${live.planOutcomes["epoch-mismatch"]}`,
+	);
+
 	// ── Involvement locks (ADR 0011) — the honest mirror of the engine's gating. A locked
 	// control LOOKS locked in every mode (preview/demo/read-only included), driven purely off
 	// `store.isLocked(...)`. The engine already no-ops the underlying action; this is the UI
@@ -203,6 +218,22 @@
 					<span class="fold-arm-eyebrow mono">FOLDING</span>
 					<span class="fold-arm-state">{folding.enabled ? "steering" : "preview"}</span>
 				</button>
+			{/if}
+
+			<!-- Wire outcome readout (issue #60): hidden entirely until this connection has seen
+			     at least one acked model call — browsing/read-only/demo sessions have no wire, so
+			     they must show nothing (preview is NOT a more permissive mode). Neutral/mono only —
+			     #044EFF is reserved for the user block kind, never UI chrome. -->
+			{#if live.status === "connected" && wireTotal > 0}
+				<div class="ctl-field wire-read" title={wireTip}>
+					<span class="ctl-eyebrow mono">
+						<Icon name="activity" size={10} />
+						WIRE
+					</span>
+					<span class="ctl-value mono tnum" class:wire-partial={wireApplied < wireTotal}>
+						{wireApplied}/{wireTotal}
+					</span>
+				</div>
 			{/if}
 
 			<!-- Protect readout: eyebrow + editable mono value (the dial lives on the bar). -->
@@ -626,6 +657,16 @@
 	/* Protect readout (the dial lives on the bar) */
 	.protect-read {
 		cursor: default;
+	}
+
+	/* Wire outcome readout (issue #60) — quiet, monochrome; never the reserved user-block
+	   blue. A partial ratio (some calls fell back) dims to --muted rather than alarming red -
+	   a stale-plan fallback is a graceful degradation, not an error state. */
+	.wire-read {
+		cursor: default;
+	}
+	.wire-read .wire-partial {
+		color: var(--muted);
 	}
 
 	/* A control gated by an involvement lock (ADR 0011): greyed, reduced affordance. The

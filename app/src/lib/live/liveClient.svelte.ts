@@ -16,7 +16,7 @@ import { wireToBlock } from "./mapping";
 import { computeFoldOps, computeGroupOps, computeRecallOps, resolveUnfold, resolveRecall } from "./plan";
 import { folding, setFolding } from "./folding.svelte";
 import { activeRemoteRunner } from "./conductorClient.svelte";
-import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type RecallOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage, type ArmedMessage } from "./protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type RecallOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage, type ArmedMessage, type PassthroughCause } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import type { CompletionRequest, CompletionResult } from "$conductors/contract";
 
@@ -49,13 +49,41 @@ const pendingCompletions = new Map<number, { resolve: (r: CompletionResult) => v
 /** Monotonic counter for `completeRequest` reqIds. Starts at 1 to distinguish from unset/zero. */
 let completionReqId = 0;
 
-/** Live connection status, for the UI. */
-export const live = $state<{ status: "idle" | "connecting" | "connected" | "error"; detail: string; sessionId: string | null; port: number | null }>({
+/** A fresh, all-zero `planOutcomes` counter map (issue #60) — one connection's worth. */
+function freshPlanOutcomes(): Record<PassthroughCause, number> & { total: number } {
+	return { applied: 0, "empty-plan": 0, "timeout-stale": 0, "timeout-raw": 0, "epoch-mismatch": 0, total: 0 };
+}
+
+/**
+ * Live connection status, for the UI. `planOutcomes` (issue #60, ADR 0020) tallies every
+ * `passthrough` ack this connection has received — one bucket per `PassthroughCause`, plus
+ * `total` (acked model calls seen this connection). Reset to zero on every new connection
+ * (see `connectLive`) alongside `sessionId`/`port` — it describes THIS connection's wire
+ * history, not a running lifetime total (contrast the extension's own `/__accordion/meta`
+ * counters, which ARE lifetime totals).
+ */
+export const live = $state<{
+	status: "idle" | "connecting" | "connected" | "error";
+	detail: string;
+	sessionId: string | null;
+	port: number | null;
+	planOutcomes: Record<PassthroughCause, number> & { total: number };
+}>({
 	status: "idle",
 	detail: "",
 	sessionId: null,
 	port: null,
+	planOutcomes: freshPlanOutcomes(),
 });
+
+/**
+ * The reqId of the last PLANNED sync this client replied to (issue #60). Gates birth-fold
+ * reconciliation on a `passthrough` ack: an ack for an OLDER or unknown reqId means either a
+ * reconnect happened in between (the store is already fresh — see the `hello` handler's
+ * structural reset) or the ack is stray, so it must never retroactively reconcile a store
+ * that has moved on. Reset alongside the other per-connection state on every new connection.
+ */
+let lastPlannedReqId: number | null = null;
 
 /**
  * The fold plan the GUI returns for a sync — Milestone 2, "engine on."
@@ -226,6 +254,8 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 	live.detail = `ws://${host}:${port}`;
 	live.sessionId = null;
 	live.port = port;
+	live.planOutcomes = freshPlanOutcomes(); // issue #60: counters describe THIS connection only
+	lastPlannedReqId = null;
 	session.error = "";
 
 	let ws: WebSocket;
@@ -358,7 +388,12 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// folding replied with an EMPTY plan above, so this call's wire was raw — every block
 			// crossed whole, and the store must drop birth-fold exemptions accordingly (else a
 			// disarmed-era exemption leaks into a later armed run).
-			if (msg.planned) session.store.markSent({ rawWire: !folding.enabled });
+			if (msg.planned) {
+				// Issue #60: remember which reqId this reply answers, so a later `passthrough` ack
+				// for it can be told apart from a stray/superseded one (see the `passthrough` handler).
+				lastPlannedReqId = msg.reqId;
+				session.store.markSent({ rawWire: !folding.enabled });
+			}
 		} else if (msg.type === "unfoldRequest") {
 			// The live agent asked (via the `unfold` tool) to restore folded blocks it saw
 			// tagged `{#<code> FOLDED}`. Resolve each code to its folded block(s) and hold
@@ -451,6 +486,45 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 				}
 				// `pending.resolve/reject` already delete the entry via the `settle` wrapper
 				// in `sendCompletion`, so no explicit `pendingCompletions.delete` here.
+			}
+		} else if (msg.type === "passthrough") {
+			// The extension's per-outcome ack for a `context` hook resolution (issue #60, ADR
+			// 0020). Two jobs: tally the counter for the "wire N/M" readout, and — for the two
+			// causes that mean the GUI's OWN fresh plan did not ride the wire — reconcile
+			// birth-fold bookkeeping.
+			// `msg.cause` comes off the wire untyped — a malformed/unknown cause must not add a
+			// spurious key (e.g. NaN-poisoning via prototype/array quirks) or bump `total` for an
+			// outcome we can't attribute. Only tally a cause we actually have a bucket for.
+			if (msg.cause in live.planOutcomes) {
+				live.planOutcomes[msg.cause]++;
+				live.planOutcomes.total++;
+			}
+
+			// Birth-fold reconciliation (the correctness half, not just the counter). A
+			// `"timeout-stale"`/`"timeout-raw"` ack means the plan THIS client sent for
+			// `msg.reqId` missed the wait — the extension applied a stale cached plan (or
+			// nothing) instead, so the model may have seen ANY block from that call whole.
+			// Conservatively drop every birth-fold exemption exactly as a disarmed (`rawWire`)
+			// planned reply would; `markSent`'s cursor advance is a `Math.max`, so calling it
+			// again here is idempotent and safe even if it already ran for other reasons.
+			//
+			// Guard: only reconcile when this ack answers the reqId this client actually
+			// planned-synced LAST (`lastPlannedReqId`) — an ack for an unknown/older reqId means
+			// a reconnect happened in between (the store is already fresh) or the ack is stray.
+			// `"epoch-mismatch"` acks are for a SUPERSEDED view and are never reconciled (counted
+			// only) — matching the extension's own comment at that send site.
+			//
+			// Ordering assumption: WS delivery is FIFO and the extension sends this ack strictly
+			// AFTER the plan wait for `msg.reqId` resolves — i.e. after the sync it answers and
+			// before the NEXT planned sync — so this reconciliation always lands before this
+			// client's next `markSent()` call and can never race a later legitimate exemption.
+			if (
+				(msg.cause === "timeout-stale" || msg.cause === "timeout-raw") &&
+				session.store &&
+				lastPlannedReqId !== null &&
+				msg.reqId === lastPlannedReqId
+			) {
+				session.store.markSent({ rawWire: true });
 			}
 		}
 	};
