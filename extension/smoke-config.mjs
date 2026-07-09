@@ -1,10 +1,12 @@
 /*
  * smoke-config.mjs — Feature B coverage (issue #58): configurable plan timeout,
- * steering (blocking) mode, and defensive env parsing.
+ * armed (blocking) mode, and defensive env parsing.
  *
- * These knobs are read ONCE at module init (ACCORDION_PLAN_TIMEOUT_MS / ACCORDION_STEERING
- * / ACCORDION_PLAN_DEADLINE_MS), so each scenario must run in its OWN process with the
- * env pre-set. This file is both the orchestrator (no ACCORDION_SMOKE_SCENARIO → spawn a
+ * The timeout/deadline knobs are read ONCE at module init (ACCORDION_PLAN_TIMEOUT_MS /
+ * ACCORDION_PLAN_DEADLINE_MS), so each scenario must run in its OWN process with the env
+ * pre-set. Whether a request BLOCKS is no longer an env flag — it follows the client's
+ * ARMED state over the wire, so the armed scenario's driver sends {type:"armed",armed:true}
+ * after connecting. This file is both the orchestrator (no ACCORDION_SMOKE_SCENARIO → spawn a
  * child per scenario) and the driver (ACCORDION_SMOKE_SCENARIO set → run that one scenario
  * in-process and exit 0/1). It complements smoke.mjs, which covers the default-env paths.
  *
@@ -25,20 +27,22 @@ const SCENARIO = process.env.ACCORDION_SMOKE_SCENARIO;
 // enough for timer jitter, tight enough to catch a broken parse (NaN → setTimeout fires
 // at ~0ms) or the wrong wait being used (steering ignored / custom value dropped).
 const SCENARIOS = {
-	// Steering uses the long DEADLINE (600ms here), logs LOUDLY via console.error, and
-	// still falls back to the last known plan. 600ms is unmistakably past the 250 default,
-	// so hitting the band proves the deadline (not the short timeout) governed the wait.
+	// Armed (the client declares armed:true over the wire) uses the long DEADLINE (600ms here),
+	// logs LOUDLY via console.error, and still falls back to the last known plan. 600ms is
+	// unmistakably past the 250 default, so hitting the band proves the deadline (not the short
+	// timeout) governed the wait. `arm` tells the driver to send the armed message after connect.
 	steering: {
-		env: { ACCORDION_STEERING: "1", ACCORDION_PLAN_DEADLINE_MS: "600" },
+		env: { ACCORDION_PLAN_DEADLINE_MS: "600" },
+		arm: true,
 		band: [430, 4000],
 		wantError: true,
 		wantWarn: false,
 		wantStaleFold: true,
 	},
-	// Invalid values must fall back to the 250 default (NOT NaN → immediate fire), and the
-	// non-steering path logs via console.warn.
+	// Invalid values must fall back to the 250 default (NOT NaN → immediate fire). Disarmed
+	// (no armed message sent), so the short-timeout path logs via console.warn.
 	"env-defaults": {
-		env: { ACCORDION_PLAN_TIMEOUT_MS: "not-a-number", ACCORDION_PLAN_DEADLINE_MS: "-5", ACCORDION_STEERING: "nope" },
+		env: { ACCORDION_PLAN_TIMEOUT_MS: "not-a-number", ACCORDION_PLAN_DEADLINE_MS: "-5" },
 		band: [150, 400],
 		wantError: false,
 		wantWarn: true,
@@ -94,7 +98,7 @@ if (!SCENARIO) {
 		console.error("SMOKE-CONFIG FAIL");
 		process.exit(1);
 	}
-	console.log("SMOKE-CONFIG PASS — steering deadline ✓  env defaults (invalid → 250) ✓  custom timeout honored ✓");
+	console.log("SMOKE-CONFIG PASS — armed deadline (armed over the wire) ✓  env defaults (invalid → 250) ✓  custom timeout honored ✓");
 	process.exit(0);
 }
 
@@ -156,15 +160,23 @@ const sample = [
 
 const gui = new WebSocket(`ws://127.0.0.1:${PORT}`);
 let mode = "ignore"; // "fold" → reply once to prime the cache; "drop" → withhold (force fallback)
+let armedAcked = false;
 gui.on("message", (data) => {
 	let m;
 	try { m = JSON.parse(data.toString()); } catch { return; }
+	if (m.type === "armedAck") { armedAcked = true; return; }
 	if (m.type !== "sync") return;
 	if (mode === "fold") gui.send(JSON.stringify({ type: "plan", reqId: m.reqId, ops: [{ id: "a:resp-abc:p0", digestText: "STALEFOLD" }], groups: [] }));
 	// "drop"/"ignore" → no reply
 });
 await new Promise((res, rej) => { gui.on("open", res); gui.on("error", rej); });
 await new Promise((r) => setTimeout(r, 100)); // settle the view-only attach flush
+// Declare ARMED over the wire for the blocking scenario (replaces the old ACCORDION_STEERING
+// env flag). Wait for the ack so the extension has adopted it before the timed request below.
+if (spec.arm) {
+	gui.send(JSON.stringify({ type: "armed", armed: true }));
+	await waitFor(() => armedAcked, 1000, "armedAck");
+}
 
 // Prime the cache with a delivered fold, then withhold the next reply to force the
 // timeout/deadline fallback and measure how long the wait took.
@@ -182,8 +194,8 @@ try { fs.rmSync(HOME, { recursive: true, force: true }); } catch { /* ignore */ 
 const fails = [];
 if (elapsed < spec.band[0] || elapsed > spec.band[1])
 	fails.push(`plan wait ${elapsed}ms outside expected band [${spec.band[0]}, ${spec.band[1]}]`);
-if (spec.wantError && errN < 1) fails.push("expected a console.error (steering deadline miss) but none fired");
-if (!spec.wantError && errN > 0) fails.push(`unexpected console.error fired (${errN}) for a non-steering fallback`);
+if (spec.wantError && errN < 1) fails.push("expected a console.error (armed deadline miss) but none fired");
+if (!spec.wantError && errN > 0) fails.push(`unexpected console.error fired (${errN}) for a disarmed fallback`);
 if (spec.wantWarn && warnN < 1) fails.push("expected a console.warn (timeout fallback) but none fired");
 if (spec.wantStaleFold) {
 	const folded = ret?.messages?.[1]?.content?.[0]?.text;
