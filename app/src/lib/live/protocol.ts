@@ -18,8 +18,14 @@
  *   2. Extension sends `sync` with the blocks added since the last sync.
  *   3. GUI updates its live store, runs the engine, replies `plan { ops }`.
  *   4. Extension applies the ops to the real messages and returns them to pi.
- *      If no GUI is connected, or the reply times out, the extension passes the
- *      messages through UNMODIFIED (never corrupts context).
+ *      If no GUI is connected, the reply times out with no cached plan, or the
+ *      GUI's view was superseded mid-wait, the extension passes the messages
+ *      through UNMODIFIED (never corrupts context). A timeout WITH a cached plan
+ *      re-applies that last-known plan instead of shipping raw (issue #58). Every
+ *      one of these outcomes — including success — is counted and, where a client
+ *      is reachable, acked back as a `passthrough` message (issue #60, ADR 0020) so
+ *      the GUI (and the bellows bench rig polling `/__accordion/meta`) can see what
+ *      actually rode the wire instead of inferring it from silence.
  *
  * Milestone 1 deliberately ships an EMPTY plan (`ops: []`) from the GUI: the loop
  * is proven end-to-end while never altering a single model call.
@@ -45,6 +51,12 @@
  *    fast path. Capability is detected out-of-band via `armedAck` — a new client
  *    that sends `armed` and gets no ack back knows it is talking to an old extension
  *    (and can scream) — so the version number buys nothing a bump would cost.
+ *  - (no bump, additive) `passthrough`: the extension's per-outcome ack for every
+ *    `context` hook resolution (issue #60, ADR 0020) — `applied` / `empty-plan` /
+ *    `timeout-stale` / `timeout-raw` / `epoch-mismatch`. Purely informational (the
+ *    GUI never replies to it), so the same reasoning as `armed`/`armedAck` applies:
+ *    an old GUI simply drops the unknown message type and stays on the pre-#60
+ *    silent-passthrough behavior.
  */
 export const PROTOCOL_VERSION = 7;
 
@@ -284,7 +296,49 @@ export interface ArmedAckMessage {
 	armed: boolean;
 }
 
-export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage | CompleteResultMessage | ArmedAckMessage;
+/**
+ * The cause of one `context` hook resolution the extension is willing to ack over the
+ * wire (issue #60). The full server-side taxonomy also has `"no-gui"` and `"unsent"` —
+ * those two mean there is no reachable client to ack, so they never appear here; they
+ * are counter-only on the extension side (see `/__accordion/meta`'s `planOutcomes`).
+ *   • "applied"       — the GUI's plan (non-empty) was applied to the model call.
+ *   • "empty-plan"    — the GUI intentionally replied with no folds; the call rode raw.
+ *   • "timeout-stale" — the plan reply missed the wait; the LAST KNOWN plan was
+ *     re-applied instead (issue #58). The GUI's fresh plan for this `reqId` did NOT
+ *     ride the wire.
+ *   • "timeout-raw"   — the plan reply missed the wait and there was no usable cached
+ *     plan; the call rode raw, same as "empty-plan" but caused by a miss, not intent.
+ *   • "epoch-mismatch" — a new client attached mid-wait, superseding the view that sent
+ *     this request; acked to the CURRENT client (whoever that now is) purely so it can
+ *     count the outcome — `reqId` belongs to the superseded view, not to anything the
+ *     current client itself sent.
+ */
+export type PassthroughCause = "applied" | "empty-plan" | "timeout-stale" | "timeout-raw" | "epoch-mismatch";
+
+/**
+ * Sent by the extension after EVERY `context` hook resolution (issue #60, ADR 0020) —
+ * the observability fix for the silent-passthrough branches (`no-gui` excepted, which has
+ * no reachable client to ack). `ops`/`groups`/`recalls` are the counts ACTUALLY applied to
+ * the wire for this call (0 for every raw/empty cause); on `"applied"`/`"timeout-stale"`
+ * they reflect the plan that was really used (the fresh plan, or the stale fallback,
+ * respectively).
+ *
+ * This message is purely informational — the GUI never replies to it. Its two jobs on the
+ * receiving end: (1) tally `planOutcomes` for the UI's "wire N/M" readout, and (2) drive
+ * birth-fold reconciliation — a `"timeout-stale"`/`"timeout-raw"` ack means the GUI's OWN
+ * fresh plan for `reqId` did not ride the wire, so any birth-fold exemption it assumed on
+ * reply must be conservatively dropped (see `liveClient.svelte.ts`'s handling).
+ */
+export interface PassthroughMessage {
+	type: "passthrough";
+	reqId: number;
+	cause: PassthroughCause;
+	ops: number;
+	groups: number;
+	recalls: number;
+}
+
+export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage | CompleteResultMessage | ArmedAckMessage | PassthroughMessage;
 
 // ── Client → server (GUI → extension) ────────────────────────────────────────
 
@@ -406,5 +460,5 @@ export type ClientMessage = PlanMessage | UnfoldResultMessage | RecallResultMess
 export function isServerMessage(v: unknown): v is ServerMessage {
 	if (!v || typeof v !== "object" || !("type" in v)) return false;
 	const t = (v as any).type;
-	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult" || t === "armedAck";
+	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult" || t === "armedAck" || t === "passthrough";
 }

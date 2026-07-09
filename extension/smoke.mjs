@@ -1049,12 +1049,16 @@ function unwrapMessageEnd(result) {
 	return result.message;
 }
 const stale = { primedFold: null, staleFold: null, emptyPass: undefined, afterEmptyPass: undefined, rtt: null, rtt2: null };
+// issue #60: every `context` outcome below also acks a `passthrough` message to this same
+// GUI socket — collected here in delivery order so we can assert cause/counts per scenario.
+const passthroughs = [];
 {
 	const gui = new WebSocket(`ws://127.0.0.1:${PORT}`);
 	let mode = "ignore"; // "fold" | "empty" | "drop" | "ignore"
 	gui.on("message", (data) => {
 		let m;
 		try { m = JSON.parse(data.toString()); } catch { return; }
+		if (m.type === "passthrough") { passthroughs.push(m); return; }
 		if (m.type !== "sync") return;
 		if (mode === "fold") gui.send(JSON.stringify({ type: "plan", reqId: m.reqId, ops: [{ id: "a:resp-abc:p0", digestText: "STALEFOLD" }], groups: [] }));
 		else if (mode === "empty") gui.send(JSON.stringify({ type: "plan", reqId: m.reqId, ops: [], groups: [] }));
@@ -1064,22 +1068,30 @@ const stale = { primedFold: null, staleFold: null, emptyPass: undefined, afterEm
 	await new Promise((r) => setTimeout(r, 100)); // let the view-only attach flush settle
 
 	// 1) Prime the cache: the GUI delivers a NON-EMPTY plan → lastPlan cached + applied.
+	//    Outcome: passthrough #1, cause "applied".
 	mode = "fold";
 	stale.primedFold = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+	await waitFor(() => passthroughs.length >= 1, 1000, "passthrough ack #1 (applied)").catch(() => fails.push("passthrough: no ack received for the primed fold (applied)"));
 
 	// 2) TIMEOUT → the extension must re-apply the LAST KNOWN plan, not pass through
 	//    unfolded. The GUI withholds its reply; after the 250ms default wait the
 	//    context hook falls back to the cached STALEFOLD plan.
+	//    Outcome: passthrough #2, cause "timeout-stale".
 	mode = "drop";
 	stale.staleFold = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+	await waitFor(() => passthroughs.length >= 2, 1000, "passthrough ack #2 (timeout-stale)").catch(() => fails.push("passthrough: no ack received for the stale-plan fallback (timeout-stale)"));
 
 	// 3) A delivered EMPTY plan (conductor wants no folds) must REPLACE the cached
 	//    non-empty plan — a later timeout must then pass through unfolded, never
 	//    resurrect the old fold.
+	//    Outcome: passthrough #3, cause "empty-plan".
 	mode = "empty";
 	stale.emptyPass = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+	await waitFor(() => passthroughs.length >= 3, 1000, "passthrough ack #3 (empty-plan)").catch(() => fails.push("passthrough: no ack received for the delivered empty plan (empty-plan)"));
+	// Outcome: passthrough #4, cause "timeout-raw" (no cached plan survives the empty reply above).
 	mode = "drop";
 	stale.afterEmptyPass = await Promise.resolve(handlers.context({ messages: sample }, ctx));
+	await waitFor(() => passthroughs.length >= 4, 1000, "passthrough ack #4 (timeout-raw)").catch(() => fails.push("passthrough: no ack received for the raw timeout after an empty plan (timeout-raw)"));
 
 	// 4) rttMs stamp: a context wait stashes an RTT that the NEXT assistant message_end
 	//    stamps onto usage.rttMs; a following assistant message with no preceding context
@@ -1115,6 +1127,58 @@ if (rttMessage?.role !== "assistant") fails.push("rttMs: injected message must k
 const rtt2Message = unwrapMessageEnd(stale.rtt2);
 if (rtt2Message && rtt2Message.usage && typeof rtt2Message.usage.rttMs === "number")
 	fails.push("rttMs: a message with no preceding context RTT wrongly received a rttMs field (stale stash leaked)");
+
+// ── issue #60 / ADR 0020: passthrough acks for every outcome above ───────────
+// Four scenarios above each produced exactly one `context` hook resolution — assert the
+// GUI received a `passthrough` ack with the right cause and applied-op counts for each,
+// in delivery order (a 5th ack lands for the rtt-priming `context` call, "applied" again).
+if (passthroughs.length < 4) {
+	fails.push(`passthrough: expected at least 4 acks for the stale-fallback scenarios, got ${passthroughs.length}`);
+} else {
+	const [applied1, timeoutStale, emptyPlan, timeoutRaw] = passthroughs;
+	if (applied1.cause !== "applied") fails.push(`passthrough #1 expected cause 'applied', got '${applied1.cause}'`);
+	else if (!(applied1.ops >= 1)) fails.push(`passthrough #1 (applied) expected ops>=1 (the primed fold), got ${applied1.ops}`);
+
+	if (timeoutStale.cause !== "timeout-stale") fails.push(`passthrough #2 expected cause 'timeout-stale', got '${timeoutStale.cause}'`);
+	else if (!(timeoutStale.ops >= 1)) fails.push(`passthrough #2 (timeout-stale) expected ops>=1 (the re-applied stale plan), got ${timeoutStale.ops}`);
+
+	if (emptyPlan.cause !== "empty-plan") fails.push(`passthrough #3 expected cause 'empty-plan', got '${emptyPlan.cause}'`);
+	else if (emptyPlan.ops !== 0 || emptyPlan.groups !== 0 || emptyPlan.recalls !== 0)
+		fails.push(`passthrough #3 (empty-plan) expected all-zero counts, got ${JSON.stringify(emptyPlan)}`);
+
+	if (timeoutRaw.cause !== "timeout-raw") fails.push(`passthrough #4 expected cause 'timeout-raw', got '${timeoutRaw.cause}'`);
+	else if (timeoutRaw.ops !== 0 || timeoutRaw.groups !== 0 || timeoutRaw.recalls !== 0)
+		fails.push(`passthrough #4 (timeout-raw) expected all-zero counts, got ${JSON.stringify(timeoutRaw)}`);
+}
+
+// `/__accordion/meta` must expose the SAME outcomes as lifetime `planOutcomes` counters
+// (issue #60) — this is what the bellows bench rig polls. Counts are cumulative across the
+// WHOLE smoke run (earlier scenarios above already contributed some), so assert lower
+// bounds rather than exact equality.
+{
+	const metaRes = await new Promise((resolve, reject) => {
+		const r = http.get({ host: "127.0.0.1", port: PORT, path: "/__accordion/meta" }, (res) => {
+			let buf = "";
+			res.on("data", (d) => (buf += d));
+			res.on("end", () => resolve({ status: res.statusCode, body: buf }));
+		});
+		r.on("error", reject);
+	});
+	if (metaRes.status !== 200) fails.push(`/__accordion/meta (planOutcomes check) returned ${metaRes.status}, expected 200`);
+	else {
+		let parsed = null;
+		try { parsed = JSON.parse(metaRes.body); } catch { /* fall through */ }
+		const po = parsed?.planOutcomes;
+		if (!po) fails.push("/__accordion/meta did not carry a planOutcomes object");
+		else {
+			if (!(po.applied >= 2)) fails.push(`/__accordion/meta planOutcomes.applied expected >=2, got ${po.applied}`);
+			if (!(po["empty-plan"] >= 1)) fails.push(`/__accordion/meta planOutcomes["empty-plan"] expected >=1, got ${po["empty-plan"]}`);
+			if (!(po["timeout-stale"] >= 1)) fails.push(`/__accordion/meta planOutcomes["timeout-stale"] expected >=1, got ${po["timeout-stale"]}`);
+			if (!(po["timeout-raw"] >= 1)) fails.push(`/__accordion/meta planOutcomes["timeout-raw"] expected >=1, got ${po["timeout-raw"]}`);
+			if (!(typeof po.total === "number" && po.total >= 5)) fails.push(`/__accordion/meta planOutcomes.total expected >=5, got ${po.total}`);
+		}
+	}
+}
 
 // ── armed-over-wire: ARMED state (learned over the wire) drives blocking ──────
 // The client sends {type:"armed", armed:bool}; the extension acks and switches its
@@ -1264,6 +1328,7 @@ console.log(
 					`unfold tool (no-ids / detached guards, attached round-trip) ✓  ` +
 					`recall tool (no-ids / detached guards, content-echo round-trip) ✓  skill discovery ✓  ` +
 					`stale-plan fallback (timeout re-applies last plan, empty plan not overridden) ✓  rttMs stamp ✓  ` +
-						`armed-over-wire (ack, disarmed=short / armed=deadline, mid-toggle snapshot) ✓`,
+						`armed-over-wire (ack, disarmed=short / armed=deadline, mid-toggle snapshot) ✓  ` +
+							`passthrough acks (applied/empty-plan/timeout-stale/timeout-raw) ✓  /__accordion/meta planOutcomes ✓`,
 );
 process.exit(0);

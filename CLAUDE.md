@@ -100,7 +100,7 @@ README surfaces:
 
 **Invariants (don't break):**
 - Discovery I/O is best-effort; **never blocks or alters a model call**
-- No GUI / reply timeout / empty plan → messages pass through untouched
+- No GUI / empty plan → messages pass through untouched; a reply timeout falls back to the last known plan when one is cached, else passes through raw (issue #58). Every `context` hook outcome is counted and acked to the GUI as a `passthrough` message (issue #60, ADR 0020) — see `/__accordion/meta`'s `planOutcomes`
 - No disk I/O on the `context` (pre-model-call) hook
 - The completion relay (`completeRequest / completeResult`) runs out-of-band — **never on the `context` hook path** and never blocks the agent's own model call
 - Folding the live agent is OPT-IN and OFF by default (`folding.enabled`, a header toggle)

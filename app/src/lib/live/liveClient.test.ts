@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { connectLive, disconnectLive, setArmed, live } from "./liveClient.svelte";
 import { folding } from "./folding.svelte";
+import { session } from "../session.svelte";
 import { PROTOCOL_VERSION } from "./protocol";
 
 /*
@@ -138,5 +139,127 @@ describe("liveClient — armed over the wire", () => {
 		expect(folding.enabled).toBe(true);
 		// Nothing to assert on a socket; the point is it does not throw and does not require a socket.
 		expect(FakeWebSocket.last).toBeNull();
+	});
+});
+
+/*
+ * passthrough-ack handling (issue #60, ADR 0020). The extension acks every `context` hook
+ * outcome as a `passthrough` message; the live client (1) tallies `live.planOutcomes` for the
+ * "wire N/M" readout and (2) reconciles birth-fold bookkeeping when the ack reveals the GUI's
+ * own fresh plan did NOT ride the wire (`timeout-stale`/`timeout-raw`). Driven end-to-end
+ * through the FakeWebSocket harness (this file's existing pattern) rather than the store alone
+ * — the reconciliation GUARD (last-answered reqId, epoch-mismatch exemption) lives entirely in
+ * liveClient.svelte.ts, so a store-only test would miss it. The deeper mechanics of WHY dropping
+ * the exemption matters (a block un-refoldable once "protected") are covered end-to-end through
+ * the real store in store.birthfold.test.ts (case (n)).
+ */
+describe("liveClient — passthrough ack handling (issue #60)", () => {
+	/** A minimal PLANNED sync — enough for the client to append a block, reply with a plan,
+	 *  and record `reqId` as the last-answered planned sync. */
+	function plannedSyncFrame(reqId: number) {
+		return {
+			type: "sync",
+			reqId,
+			full: false,
+			blocks: [{ id: `u:${reqId}`, kind: "user", turn: 1, order: 0, text: "hi", tokens: 10 }],
+			contextWindow: 1000,
+			planned: true,
+		};
+	}
+
+	it("tallies planOutcomes counters per cause and a running total", () => {
+		connectAndHello();
+		const ws = FakeWebSocket.last!;
+		expect(live.planOutcomes.total).toBe(0);
+
+		ws.emit({ type: "passthrough", reqId: 1, cause: "applied", ops: 2, groups: 0, recalls: 0 });
+		ws.emit({ type: "passthrough", reqId: 2, cause: "empty-plan", ops: 0, groups: 0, recalls: 0 });
+		ws.emit({ type: "passthrough", reqId: 3, cause: "timeout-stale", ops: 1, groups: 0, recalls: 0 });
+		ws.emit({ type: "passthrough", reqId: 4, cause: "timeout-raw", ops: 0, groups: 0, recalls: 0 });
+		ws.emit({ type: "passthrough", reqId: 5, cause: "epoch-mismatch", ops: 0, groups: 0, recalls: 0 });
+
+		expect(live.planOutcomes).toEqual({
+			applied: 1,
+			"empty-plan": 1,
+			"timeout-stale": 1,
+			"timeout-raw": 1,
+			"epoch-mismatch": 1,
+			total: 5,
+		});
+	});
+
+	it("resets planOutcomes to zero on a fresh connection", () => {
+		connectAndHello();
+		FakeWebSocket.last!.emit({ type: "passthrough", reqId: 1, cause: "applied", ops: 0, groups: 0, recalls: 0 });
+		expect(live.planOutcomes.total).toBe(1);
+
+		connectAndHello(); // fresh connect — connectLive() drops the prior socket first
+		expect(live.planOutcomes.total).toBe(0);
+	});
+
+	it("a timeout-stale ack for the last-answered planned reqId reconciles via markSent({rawWire:true})", () => {
+		connectAndHello();
+		const ws = FakeWebSocket.last!;
+		expect(session.store).not.toBeNull();
+		const spy = vi.spyOn(session.store!, "markSent");
+
+		ws.emit(plannedSyncFrame(7)); // client replies, sets lastPlannedReqId=7, calls markSent() once
+		spy.mockClear(); // drop that call — assert only the ack-triggered one below
+
+		ws.emit({ type: "passthrough", reqId: 7, cause: "timeout-stale", ops: 0, groups: 0, recalls: 0 });
+		expect(spy).toHaveBeenCalledWith({ rawWire: true });
+	});
+
+	it("a timeout-raw ack for the last-answered planned reqId ALSO reconciles", () => {
+		connectAndHello();
+		const ws = FakeWebSocket.last!;
+		const spy = vi.spyOn(session.store!, "markSent");
+
+		ws.emit(plannedSyncFrame(9));
+		spy.mockClear();
+
+		ws.emit({ type: "passthrough", reqId: 9, cause: "timeout-raw", ops: 0, groups: 0, recalls: 0 });
+		expect(spy).toHaveBeenCalledWith({ rawWire: true });
+	});
+
+	it("an epoch-mismatch ack is counted but never triggers reconciliation (superseded view)", () => {
+		connectAndHello();
+		const ws = FakeWebSocket.last!;
+		const spy = vi.spyOn(session.store!, "markSent");
+
+		ws.emit(plannedSyncFrame(11));
+		spy.mockClear();
+
+		ws.emit({ type: "passthrough", reqId: 11, cause: "epoch-mismatch", ops: 0, groups: 0, recalls: 0 });
+		expect(spy).not.toHaveBeenCalled();
+		expect(live.planOutcomes["epoch-mismatch"]).toBe(1);
+	});
+
+	it("an ack for an unknown/older reqId (not the last-answered one) is ignored for reconciliation", () => {
+		connectAndHello();
+		const ws = FakeWebSocket.last!;
+		const spy = vi.spyOn(session.store!, "markSent");
+
+		ws.emit(plannedSyncFrame(20));
+		spy.mockClear();
+
+		// A stale ack for an OLDER reqId than the one this client last answered.
+		ws.emit({ type: "passthrough", reqId: 19, cause: "timeout-stale", ops: 0, groups: 0, recalls: 0 });
+		expect(spy).not.toHaveBeenCalled();
+		// The counter still counts it — only reconciliation is gated on the reqId match.
+		expect(live.planOutcomes["timeout-stale"]).toBe(1);
+	});
+
+	it("an applied/empty-plan ack never forces a redundant rawWire markSent call", () => {
+		connectAndHello();
+		const ws = FakeWebSocket.last!;
+		const spy = vi.spyOn(session.store!, "markSent");
+
+		ws.emit(plannedSyncFrame(30));
+		spy.mockClear();
+
+		ws.emit({ type: "passthrough", reqId: 30, cause: "applied", ops: 1, groups: 0, recalls: 0 });
+		ws.emit({ type: "passthrough", reqId: 30, cause: "empty-plan", ops: 0, groups: 0, recalls: 0 });
+		expect(spy).not.toHaveBeenCalled();
 	});
 });

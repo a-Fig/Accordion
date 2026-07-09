@@ -467,3 +467,37 @@ describe("birth-fold — rawWire markSent (folding disarmed) clears the exemptio
 		expect(s.lastReports.some((r) => r.ids.includes("r:c1") && r.reason === "protected")).toBe(true);
 	});
 });
+
+// ── (n) issue #60 / ADR 0020: a passthrough-ack reconciliation overrides an
+//        earlier OPTIMISTIC markSent — the GUI thought its fold rode the wire, a
+//        later `passthrough` ack says otherwise, and the exemption must still die ──
+
+describe("birth-fold — timeout-ack reconciliation clears an exemption markSent already OK'd", () => {
+	it("a view-folded block markSent() judged safe loses its exemption once a stale-plan/raw ack arrives for that call", () => {
+		const s = makeLiveStore(sessionWithFreshResult(8000));
+		s.setProtect(20_000);
+		const conductor = new StubConductor();
+		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }];
+		s.attach(conductor);
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true); // view-folded…
+
+		// The GUI replies to the planned sync believing its fold plan will ride the wire
+		// (folding armed → `rawWire: false`), so the ordinary birth-fold bookkeeping keeps
+		// the exemption alive (case (b)/(l) above).
+		s.markSent();
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true); // still exempt — the model hasn't seen it whole yet
+
+		// …but the extension's `passthrough` ack for THAT SAME reqId later reveals the plan
+		// wait actually timed out server-side (the reply arrived too late, or never landed) —
+		// the extension applied the STALE cached plan (or raw) instead of this fresh fold. The
+		// live client's reconciliation (liveClient.svelte.ts) responds by calling markSent
+		// again with `rawWire: true`, conservatively dropping every exemption because the
+		// model may have seen ANY block from that call whole.
+		s.markSent({ rawWire: true });
+
+		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }];
+		s.refold();
+		expect(s.isFolded(s.get("r:c1")!)).toBe(false); // protection clamps like any seen block
+		expect(s.lastReports.some((r) => r.ids.includes("r:c1") && r.reason === "protected")).toBe(true);
+	});
+});
