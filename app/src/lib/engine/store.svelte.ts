@@ -994,6 +994,18 @@ export class AccordionStore {
 	 * protection allows a fold, never WHAT kind is foldable.
 	 */
 	private birthFoldEligible(b: Block): boolean {
+		// DURABILITY gate (#43 wire-truth fix, PR #52 review): a positional/non-durable id
+		// (`m<i>:…`, emitted only for a malformed message missing its timestamp/responseId/
+		// toolCallId) is DROPPED by both `computeFoldOps` and `applyPlan` (each guards on
+		// `isDurableId`). Birth-folding such a block would recess the tile and count the saving in
+		// the view while the model still receives the block WHOLE — the exact view↔wire divergence
+		// the host must make unrepresentable. Deny the exemption so `substOne`'s protected clamp
+		// fires instead of granting a fold that can never ride the wire; this also keeps a
+		// non-durable id out of the sticky `birthFolded` set entirely (the set is recorded only
+		// AFTER this gate passes). NOTE the scope: this narrow durable-id check lives ONLY on the
+		// birth-fold / protected-tail path — PR #45 deliberately keeps durable-id OUT of the
+		// general (kind-only) foldability gate, so ordinary folds outside the tail are unchanged.
+		if (!isDurableId(b.id)) return false;
 		return wireFoldable(b) && (this.birthFolded.has(b.id) || this.isFresh(b));
 	}
 	/** Drop any `birthFolded` id whose block has aged out of the protected tail — the
@@ -1029,7 +1041,19 @@ export class AccordionStore {
 		// wire effect, so EVERY block on this call crossed whole, folded-looking ones included.
 		// Drop the whole set; otherwise a disarmed-era exemption would survive into a later ARMED
 		// run and fold protected content the model has factually seen (the disarm→arm leak).
+		// Detect a STALE protected fold: a block still rendered folded whose exemption is about to
+		// be dropped. Only the `rawWire` clear can strand one — it drops exemptions from currently-
+		// FOLDED blocks. The armed prune's `!isFolded` filter drops exemptions only for blocks that
+		// already settled LIVE, so it can never leave a fold behind.
+		let staleProtectedFold = false;
 		if (opts.rawWire) {
+			for (const id of this.birthFolded) {
+				const b = this.get(id);
+				if (b && this.isFolded(b)) {
+					staleProtectedFold = true;
+					break;
+				}
+			}
 			this.birthFolded.clear();
 		} else {
 			for (const id of this.birthFolded) {
@@ -1038,6 +1062,18 @@ export class AccordionStore {
 			}
 		}
 		this.sentThroughOrder = Math.max(this.sentThroughOrder, this.blocks[this.blocks.length - 1].order);
+		// HEAL now (PR #52 review — stale protected fold via zero-delta sync): re-run folding so a
+		// block that just lost its exemption springs back to live instead of lingering
+		// autoFolded+protected. After the cursor advance no block is `isFresh` and its id is out of
+		// `birthFolded`, so `substOne` re-clamps the fold as `protected` — that fold can no longer
+		// ride the wire, and the view must not keep showing it. Without this, a zero-delta planned
+		// sync (the extension sends `planned:true` with `fresh=[]`) skips `appendBlocks`' refold via
+		// its early return, and `computeFoldOps` would then emit a `FoldOp` for the stale fold —
+		// folding content the model already received WHOLE on the raw wire. Safe to refold here:
+		// `markSent` runs AFTER the reply is sent (liveClient's planned-sync handler and the
+		// passthrough-ack path), so this pass can never alter an in-flight reply. Gated on an actual
+		// stranded fold so the common armed call takes no redundant pass.
+		if (staleProtectedFold) this.refold();
 	}
 	/**
 	 * Mark every block currently in the store as already sent. Called once, at construction,

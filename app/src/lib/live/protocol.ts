@@ -51,14 +51,20 @@
  *    fast path. Capability is detected out-of-band via `armedAck` — a new client
  *    that sends `armed` and gets no ack back knows it is talking to an old extension
  *    (and can scream) — so the version number buys nothing a bump would cost.
- *  - (no bump, additive) `passthrough`: the extension's per-outcome ack for every
- *    `context` hook resolution (issue #60, ADR 0020) — `applied` / `empty-plan` /
- *    `timeout-stale` / `timeout-raw` / `epoch-mismatch`. Purely informational (the
- *    GUI never replies to it), so the same reasoning as `armed`/`armedAck` applies:
- *    an old GUI simply drops the unknown message type and stays on the pre-#60
- *    silent-passthrough behavior.
+ *  - v8: `passthrough`: the extension's per-outcome ack for every `context` hook resolution
+ *        (issue #60, ADR 0020) — `applied` / `empty-plan` / `timeout-stale` / `timeout-raw` /
+ *        `epoch-mismatch`. Unlike `armed`/`armedAck`, this is NOT purely informational: its
+ *        `timeout-stale`/`timeout-raw` cause is what lets the GUI learn its optimistic birth-fold
+ *        `markSent` assumed a plan that never rode the wire, and repair the exemption bookkeeping
+ *        (ADR 0018/0020). A v8 peer therefore MUST emit it — a silent v7-era extension paired with
+ *        a birth-folding GUI would leave a stale exemption that folds already-seen protected
+ *        content. It landed on the wire without a bump (v7 was never promoted past devmain); this
+ *        bump to v8 makes the correctness-critical ack part of the version contract, and `main`
+ *        (still v5 at the time of the devmain→main promotion) has to jump anyway, so the bump is
+ *        free. The strict `protocolVersion !== PROTOCOL_VERSION` check both peers do then refuses a
+ *        pre-ack peer instead of pairing silently.
  */
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi
@@ -323,11 +329,15 @@ export type PassthroughCause = "applied" | "empty-plan" | "timeout-stale" | "tim
  * they reflect the plan that was really used (the fresh plan, or the stale fallback,
  * respectively).
  *
- * This message is purely informational — the GUI never replies to it. Its two jobs on the
- * receiving end: (1) tally `planOutcomes` for the UI's "wire N/M" readout, and (2) drive
- * birth-fold reconciliation — a `"timeout-stale"`/`"timeout-raw"` ack means the GUI's OWN
- * fresh plan for `reqId` did not ride the wire, so any birth-fold exemption it assumed on
- * reply must be conservatively dropped (see `liveClient.svelte.ts`'s handling).
+ * The GUI never REPLIES to this message, but it is not merely informational: a v8 peer MUST
+ * emit it, because it is correctness-critical for birth-fold. Its two jobs on the receiving end:
+ * (1) tally `planOutcomes` for the UI's "wire N/M" readout, and (2) drive birth-fold
+ * reconciliation — a `"timeout-stale"`/`"timeout-raw"` ack means the GUI's OWN fresh plan for
+ * `reqId` did not ride the wire, so any birth-fold exemption it assumed on reply must be
+ * conservatively dropped (see `liveClient.svelte.ts`'s handling). A silent extension that skipped
+ * this ack would leave the GUI folding protected content the model has already seen whole — which
+ * is exactly why `passthrough` is now part of the version contract (bumped to v8), rather than an
+ * additive no-bump message like `armed`/`armedAck`.
  */
 export interface PassthroughMessage {
 	type: "passthrough";
