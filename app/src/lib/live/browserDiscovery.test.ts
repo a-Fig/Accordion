@@ -21,7 +21,7 @@ import { PROTOCOL_VERSION } from "./protocol";
  * pattern conductorDiscovery.test.ts and liveClient.test.ts use for their modules.
  */
 
-import { poll } from "./browserDiscovery.svelte";
+import { poll, __resetPollFailureStreakForTest } from "./browserDiscovery.svelte";
 import { discovery, publishSessions, DEMO_ID } from "./discovery.svelte";
 import { live } from "./liveClient.svelte";
 
@@ -72,6 +72,7 @@ beforeEach(() => {
 	live.status = "idle";
 	live.sessionId = null;
 	live.port = null;
+	__resetPollFailureStreakForTest();
 });
 
 afterEach(() => {
@@ -133,6 +134,83 @@ describe("poll() — hold last list on outright failure (finding #4)", () => {
 		await poll();
 
 		expect(discovery.sessions).toEqual([]);
+	});
+
+	it("malformed 200 JSON body (no sessions array): holds last list instead of publishing [] (finding #1)", async () => {
+		const last = [entry("s1", 100)];
+		publishSessions(last);
+		discovery.selected = "s1";
+
+		fetchImpl = async () => jsonResponse({ notSessions: "garbage" });
+		await poll();
+
+		expect(discovery.sessions).toEqual(last); // untouched
+		expect(discovery.selected).toBe("s1");
+	});
+});
+
+describe("poll() — sustained-failure threshold (finding #2)", () => {
+	it("9 consecutive failures still hold the last list", async () => {
+		const last = [entry("s1", 100)];
+		publishSessions(last);
+		discovery.selected = "s1";
+
+		fetchImpl = async () => {
+			throw new TypeError("network error");
+		};
+		for (let i = 0; i < 9; i++) {
+			await poll();
+		}
+
+		expect(discovery.sessions).toEqual(last);
+		expect(discovery.selected).toBe("s1");
+	});
+
+	it("the 10th consecutive failure publishes [] once, letting the reap proceed", async () => {
+		const last = [entry("s1", 100)];
+		publishSessions(last);
+		discovery.selected = "s1";
+
+		fetchImpl = async () => {
+			throw new TypeError("network error");
+		};
+		for (let i = 0; i < 10; i++) {
+			await poll();
+		}
+
+		expect(discovery.sessions).toEqual([]);
+		expect(discovery.selected).toBeNull(); // reaped, same as a genuine empty response
+	});
+
+	it("a success mid-streak resets the counter, so the threshold doesn't trip early", async () => {
+		const last = [entry("s1", 100)];
+		publishSessions(last);
+		discovery.selected = "s1";
+
+		fetchImpl = async () => {
+			throw new TypeError("network error");
+		};
+		for (let i = 0; i < 9; i++) {
+			await poll();
+		}
+		expect(discovery.selected).toBe("s1"); // still held, one short of the threshold
+
+		// A single successful poll resets the streak to 0.
+		fetchImpl = async () => jsonResponse({ sessions: [entry("s1", 100)] });
+		await poll();
+		expect(discovery.selected).toBe("s1");
+
+		// Another 9 failures should still just hold — if the counter hadn't reset, this would be
+		// cumulative failures #10-18 and would have already tripped the threshold.
+		fetchImpl = async () => {
+			throw new TypeError("network error");
+		};
+		for (let i = 0; i < 9; i++) {
+			await poll();
+		}
+
+		expect(discovery.sessions).not.toEqual([]);
+		expect(discovery.selected).toBe("s1");
 	});
 });
 

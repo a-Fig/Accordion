@@ -29,14 +29,25 @@
  *
  * Poll-failure handling (PR #52 review findings #4/#5): a poll that fails outright — network
  * error, non-ok status (403/500 — the deterministic cookie-collision case fixed on another
- * branch is exactly this), or a non-JSON body — must NOT publish `[]`. Publishing an empty list
- * on a transient failure feeds straight into discovery.svelte.ts's publishSessions() reap-guard,
- * which drops `discovery.selected` and tears down the live socket (disconnectLive()) whenever
- * the selected session goes missing from the published list AND status is "connected" OR
- * "connecting" — including an in-flight session switch that has nothing to do with the poll
- * itself. So on any poll failure we simply hold the last published list instead (see `poll()`).
- * A poll that succeeds and genuinely reports zero sessions still publishes `[]` — only the
- * *fetch* failing is special-cased, not an empty-but-valid response.
+ * branch is exactly this), a non-JSON body, or a well-formed 200 JSON body that lacks a
+ * `sessions` array — must NOT publish `[]`. Publishing an empty list on a transient failure
+ * feeds straight into discovery.svelte.ts's publishSessions() reap-guard, which drops
+ * `discovery.selected` and tears down the live socket (disconnectLive()) whenever the selected
+ * session goes missing from the published list AND status is "connected" OR "connecting" —
+ * including an in-flight session switch that has nothing to do with the poll itself. So on any
+ * poll failure (fetch failure OR malformed body shape) we simply hold the last published list
+ * instead (see `poll()`). A poll that succeeds and genuinely reports zero sessions still
+ * publishes `[]` — only a failed/malformed response is special-cased, not an empty-but-valid one.
+ *
+ * Threshold death (follow-up review on this same branch): holding forever means a permanently
+ * dead extension process would freeze the sidebar list and never clear `discovery.selected` —
+ * the old code self-healed via its over-aggressive coerce-to-`[]`, which this fix deliberately
+ * removed for the transient case. So a run of MAX_CONSECUTIVE_FAILURES back-to-back failed polls
+ * (network/status/shape, all counted the same) gives up holding and publishes `[]` once, letting
+ * the normal reap/disconnect path run same as a genuine empty response. Any successful poll
+ * resets the streak to 0. The connecting/connected placeholder guard (`localFallback()`) still
+ * runs on that publish, so an active handshake is not torn down by the threshold unless the dial
+ * itself has actually failed (status no longer "connecting"/"connected").
  */
 import { discovery, publishSessions, DEMO_ID } from "./discovery.svelte";
 import { REGISTRY_PROTOCOL, type SessionEntry } from "./registry";
@@ -46,8 +57,13 @@ import { session } from "../session.svelte";
 
 const POLL_MS = 1000;
 
+// After this many consecutive failed polls (~10s at POLL_MS=1000), stop holding the last list
+// and treat the server as gone — see "Threshold death" in the banner comment above.
+const MAX_CONSECUTIVE_FAILURES = 10;
+
 let _timer: ReturnType<typeof setInterval> | null = null;
 let _polling = false;
+let _consecutiveFailures = 0;
 
 /**
  * Read the per-session token the page was opened with (`/?token=...` — see +page.svelte's
@@ -119,9 +135,10 @@ export async function poll(): Promise<void> {
 	if (_polling) return;
 	_polling = true;
 	try {
-		// null = the fetch itself failed (network error, non-ok status, non-JSON body) — hold
-		// the last published list rather than publish `[]`. A real empty list from a
-		// successful, well-formed response is a distinct outcome and still publishes.
+		// null = the fetch itself failed (network error, non-ok status, non-JSON body, or a
+		// well-formed 200 JSON body missing a `sessions` array) — hold the last published list
+		// rather than publish `[]`. A real empty list from a successful, well-formed response is
+		// a distinct outcome and still publishes.
 		let live: SessionEntry[] | null = null;
 		try {
 			const token = urlToken();
@@ -132,14 +149,30 @@ export async function poll(): Promise<void> {
 				if (ct.includes("application/json")) {
 					const body = (await res.json()) as { sessions?: unknown[] };
 					// Trusted as-is: the server already applies isLiveEntry (staleness/shape) and
-					// reaps what fails it — see extension/accordion.ts's listLiveSessions().
-					live = Array.isArray(body.sessions) ? (body.sessions as SessionEntry[]) : [];
+					// reaps what fails it — see extension/accordion.ts's listLiveSessions(). But the
+					// shape of `body` itself is NOT trusted: a malformed body (missing or non-array
+					// `sessions`) is a fetch-failure equivalent, not a genuine empty list — publishing
+					// `[]` for it would reap discovery.selected on garbage input (review finding #1).
+					if (Array.isArray(body.sessions)) {
+						live = body.sessions as SessionEntry[];
+					}
 				}
 			}
 		} catch {
 			/* network error / endpoint absent (older extension) / serving session exited */
 		}
-		if (live === null) return; // poll failed outright — hold the last published list
+
+		if (live === null) {
+			_consecutiveFailures++;
+			if (_consecutiveFailures < MAX_CONSECUTIVE_FAILURES) {
+				return; // still within the hold-on-transient-failure window
+			}
+			// Sustained failure (review finding #2): stop holding and let the real reap path run,
+			// same as a genuine empty response. The placeholder guard below still applies.
+			live = [];
+		} else {
+			_consecutiveFailures = 0;
+		}
 
 		// Only "connected" and "connecting" ever need a synthesized entry (see localFallback);
 		// any other status (idle/error) falls through to null and the real reap-on-vanish
@@ -169,4 +202,10 @@ export function stopBrowserDiscovery(): void {
 		clearInterval(_timer);
 		_timer = null;
 	}
+}
+
+/** Test-only: reset the consecutive-failure streak between test cases (module state persists
+ * across tests in the same file otherwise). Not used by production code paths. */
+export function __resetPollFailureStreakForTest(): void {
+	_consecutiveFailures = 0;
 }
