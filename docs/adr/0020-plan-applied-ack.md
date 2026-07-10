@@ -58,8 +58,9 @@ union minus those two).
 `PassthroughMessage { type: "passthrough", reqId, cause, ops, groups, recalls }` — sent
 fire-and-forget from `recordPlanOutcome` (never awaited; `send()` itself is try/catch-and-forget,
 matching every other push in this file). `ops`/`groups`/`recalls` are the counts **actually
-applied to the wire** for that call (0 for every raw/empty cause; the real plan's counts for
-`applied`; the stale plan's counts for `timeout-stale`).
+applied to the wire** for that call (0 for every raw/empty cause; for `applied` and
+`timeout-stale`, the counts after applyPlan filtering of unmatched ids and straggler-demoted
+groups; recalls = safe recalls only).
 
 Follows the `armed`/`armedAck` precedent (protocol.ts's version-history comment): purely additive,
 **no `PROTOCOL_VERSION` bump**. An old GUI simply drops the unknown message type and silently
