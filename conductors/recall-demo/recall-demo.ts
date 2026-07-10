@@ -18,6 +18,11 @@
  * Note: in a live session recalls ACCUMULATE monotonically — recalls are sticky (ADR 0019 §2) and
  * this demo never issues `restore`, so each new "most recent fold" adds a recall without releasing
  * the prior one. Intentional for a demo; a real strategy would `restore` recalls it is done with.
+ *
+ * No-ops by design on parsed transcripts (the bundled sample, Claude Code sessions): those blocks
+ * carry event-style ids (`<eid>:r`, `<eid>:0`, `<eid>:u`) that never match `isDurableId`'s
+ * `u:`/`a:`/`r:`/`s:` prefixes, so the host clamps every recall as not-recallable. This conductor
+ * only demonstrates recall on a live session.
  */
 import type { Conductor, ConductorView, Command } from "../contract";
 

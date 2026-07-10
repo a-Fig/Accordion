@@ -175,12 +175,16 @@ heartbeat file at `~/.accordion/conductors/<id>.json` so the desktop app auto-di
 off-box ones are added by `ws://` URL in the header dropdown.
 
 Each out-of-process conductor also ships a `launch.json` manifest — `{ id, label, command,
-args, portEnv? }` — that lets a host spawn it directly (the desktop app's "launch" button and
-headless harnesses like bellows both use it). The optional `portEnv` names the environment
-variable the conductor reads its listen port from (e.g. `"THERMO_PORT"`); declaring it lets a
-harness assign a free port per run so several instances can coexist. A conductor without
-`portEnv` can only run one instance at a time. Conductors should also honor `ACCORDION_HOME`
-for the heartbeat directory — every conductor in this repo already does.
+args, portEnv? }` — that lets a host spawn it directly (the desktop app's "launch" button reads
+`command`/`args` from it; external spawning hosts, like the bellows bench harness, can too). The
+optional `portEnv` names the environment variable the conductor reads its listen port from (e.g.
+`"THERMO_PORT"`); an external harness that sets it can assign a free port per run so several
+instances coexist. The desktop launch button (`app/src-tauri/src/lib.rs → launch_conductor`)
+currently does **not** set `portEnv` — it spawns with only `command`/`args`, so desktop-launched
+instances fall back to whatever port the conductor's own code defaults to, and multiple
+desktop-launched instances of the same conductor cannot coexist via `portEnv`. Conductors should
+also honor `ACCORDION_HOME` for the heartbeat directory — every conductor in this repo already
+does.
 
 The runnable wire example is [`recency-folder/`](recency-folder/) (Node.js). The full
 lifecycle and message reference is the second half of
