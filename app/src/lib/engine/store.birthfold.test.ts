@@ -457,12 +457,14 @@ describe("birth-fold — rawWire markSent (folding disarmed) clears the exemptio
 		expect(s.isFolded(s.get("r:c1")!)).toBe(true); // view-folded…
 
 		// …but folding is DISARMED: the client replied with an EMPTY plan, so the model call
-		// carried r:c1 WHOLE. The exemption must die with that call, even though the view
-		// still renders the fold at this instant (the disarm→arm leak, adversarial review).
+		// carried r:c1 WHOLE. The exemption must die with that call AND the stale fold must heal
+		// RIGHT NOW, inside markSent itself (PR #52 review): production has no manual refold after
+		// markSent, and a zero-delta planned sync would otherwise skip appendBlocks' refold and let
+		// computeFoldOps ship a fold of already-seen content.
 		s.markSent({ rawWire: true });
 
-		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }];
-		s.refold();
+		// Healed with NO manual refold: markSent re-ran the conductor (still asking to fold r:c1)
+		// and clamped it, because r:c1 is now protected, non-fresh, and un-exempt.
 		expect(s.isFolded(s.get("r:c1")!)).toBe(false); // protection clamps like any seen block
 		expect(s.lastReports.some((r) => r.ids.includes("r:c1") && r.reason === "protected")).toBe(true);
 	});
@@ -495,9 +497,66 @@ describe("birth-fold — timeout-ack reconciliation clears an exemption markSent
 		// model may have seen ANY block from that call whole.
 		s.markSent({ rawWire: true });
 
-		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }];
-		s.refold();
+		// Healed inside markSent (PR #52 review) — no manual refold. The reconciliation drops the
+		// exemption AND springs the stale fold back to live, so a following zero-delta plan can't
+		// ship it.
 		expect(s.isFolded(s.get("r:c1")!)).toBe(false); // protection clamps like any seen block
 		expect(s.lastReports.some((r) => r.ids.includes("r:c1") && r.reason === "protected")).toBe(true);
+	});
+});
+
+// ── (o) zero-delta planned sync: markSent heals with no follow-up refold ───────
+//        The exact production window PR #52 review flagged: after a raw-wire markSent clears an
+//        exemption, the NEXT planned sync can be zero-delta (extension sends planned:true with
+//        fresh=[]) — appendBlocks early-returns WITHOUT refolding, then computePlan runs. If the
+//        stale fold were still standing, computeFoldOps would emit a FoldOp for content the model
+//        already received whole. markSent must therefore heal the fold itself, in-band.
+
+describe("birth-fold — zero-delta planned sync sees no stale protected fold", () => {
+	it("markSent({rawWire:true}) heals the fold and computeFoldOps emits nothing for it — no manual refold", () => {
+		const s = makeLiveStore(sessionWithFreshResult(8000));
+		s.setProtect(20_000);
+		const conductor = new StubConductor();
+		conductor.cmds = [{ kind: "fold", ids: ["r:c1"] }];
+		s.attach(conductor);
+		expect(s.isFolded(s.get("r:c1")!)).toBe(true);
+		// While the exemption stands, the wire genuinely carries the folded form.
+		expect(computeFoldOps(s).some((o) => o.id === "r:c1")).toBe(true);
+
+		// A disarmed/raw planned sync clears the exemption. NO manual refold follows — this mirrors
+		// a zero-delta next sync where appendBlocks([]) skips its refold and computePlan runs raw.
+		s.markSent({ rawWire: true });
+
+		expect(s.isFolded(s.get("r:c1")!)).toBe(false); // view already shows it live…
+		expect(computeFoldOps(s).some((o) => o.id === "r:c1")).toBe(false); // …and the wire plan is empty for it
+	});
+});
+
+// ── (p) a non-durable (positional-id) fresh block is NEVER birth-foldable ──────
+//        A malformed message emits a positional id (m<i>:…). Both computeFoldOps and applyPlan
+//        drop non-durable ids on the wire, so a birth-fold of one would recess the view tile and
+//        count the saving while the model still receives the block WHOLE — the view↔wire
+//        divergence the host must make unrepresentable. The birth-fold path must refuse it
+//        (PR #52 review) even though it is fresh + protected + a foldable kind.
+
+describe("birth-fold — non-durable id is never birth-folded (wire-truth)", () => {
+	it("a fresh, protected, oversized block with a POSITIONAL id clamps protected — not exempt", () => {
+		const s = makeLiveStore([
+			blk("u:1", "user", 1, 0, 500),
+			blk("m1:r", "tool_result", 1, 1, 8000), // non-durable positional id, fresh + oversized
+		]);
+		s.setProtect(20_000);
+		expect(s.isProtected(s.get("m1:r")!)).toBe(true);
+
+		const conductor = new StubConductor();
+		conductor.cmds = [{ kind: "fold", ids: ["m1:r"] }];
+		s.attach(conductor);
+
+		// Not birth-folded: clamped protected exactly like a non-fresh protected block, because the
+		// fold could never ride the wire (isDurableId false).
+		expect(s.isFolded(s.get("m1:r")!)).toBe(false);
+		expect(s.lastReports.some((r) => r.ids.includes("m1:r") && r.reason === "protected")).toBe(true);
+		// Nothing rides the wire for it either — no view↔wire divergence.
+		expect(computeFoldOps(s).some((o) => o.id === "m1:r")).toBe(false);
 	});
 });

@@ -8,6 +8,18 @@ a timeout re-applies the last known plan instead of shipping raw) and its follow
 (steering mode + plan RTT), which is where the observability gap below was first named but
 deliberately left open.
 
+> **Update (PR #52 review, birth-fold wire-truth):** section 2 and the Rejected-alternatives note
+> below shipped `passthrough` *without* a `PROTOCOL_VERSION` bump, by analogy to `armed`/`armedAck`.
+> That analogy is now judged wrong for this message: `passthrough`'s `timeout-stale`/`timeout-raw`
+> ack is **correctness-critical**, not informational — it is the only signal that repairs the GUI's
+> optimistic birth-fold `markSent` when its plan did not ride the wire (section 4). A silent v7-era
+> extension paired with a birth-folding GUI would leave a stale exemption that folds already-seen
+> protected content. `passthrough` was therefore promoted into the version contract: **`PROTOCOL_VERSION`
+> is bumped 7 → 8**, so the strict `protocolVersion !== PROTOCOL_VERSION` check both peers already do
+> refuses a pre-ack peer rather than pairing silently. The bump is free in practice — `main` was
+> still v5 when devmain (v7) was promoted, so a jump was forced regardless, and v7 never shipped
+> past devmain. Read "no bump" in sections 2 and Rejected-alternatives as superseded by this note.
+
 ## Context
 
 `extension/accordion.ts`'s `context` hook has always had more outcomes than "apply the GUI's
