@@ -138,6 +138,12 @@ const RECALL_TIMEOUT_MS = 2000;
 // unauthenticated loopback peer stream ~100 MiB per message straight into JSON.parse. Real
 // plans/backlogs are kilobytes; 8 MiB is a comfortable ceiling far below the default.
 const MAX_WS_PAYLOAD_BYTES = 8 * 1024 * 1024;
+// Maximum time/body accepted while proving that a loopback browser Origin is another live
+// Accordion server (the browser multi-session A→B path). This is upgrade-time I/O only, never
+// on the model context hook; the bounds prevent a dead/unrelated local port from hanging auth.
+const SIBLING_ORIGIN_PROBE_MS = 750;
+const SIBLING_ORIGIN_META_MAX_BYTES = 16 * 1024;
+const MAX_PENDING_SIBLING_ORIGIN_PROBES = 8;
 // Cap on concurrently in-flight paid provider completions (`completeRequest`). Each accepted
 // request launches a real, billable model call; without a ceiling a client (or a hijacked
 // socket) can fan out unbounded spend. The legitimate handoff/compaction path issues one at a
@@ -437,13 +443,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// build of the Accordion app on the same ephemeral port (feat/browser-served-extension).
 	// One server per pi session; closed alongside `wss` at shutdown.
 	let httpServer: http.Server | null = null;
-	// Per-session token gating the HTTP static-file surface AND (when bound off-loopback)
-	// the WS upgrade for non-loopback peers. Generated once when the server starts.
-	// A loopback peer (the desktop Tauri app, or a same-machine browser) dials tokenless
-	// and keeps working unchanged; a NON-loopback peer — only reachable when the bind host
-	// is 0.0.0.0 or a specific interface — must present this token on the upgrade. The
-	// browser-served page already carries it in its URL (?token=…), so the real user never
-	// types it; the gate keeps a network port-scanner from steering the agent's context.
+	// Per-session token gating the HTTP surface and browser WS upgrades. Generated once when
+	// the server starts. Trusted native/Tauri loopback clients remain tokenless; browser clients
+	// present the token explicitly or via a same-origin cookie. The sole browser exception is a
+	// loopback Origin currently serving Accordion's `/__accordion/meta` contract, enabling the
+	// local session switcher without trusting arbitrary or stale ports. Every off-loopback browser
+	// requires the token.
 	let webToken = "";
 	let client: WebSocket | null = null; // the GUI (one driver at a time in M1)
 	let sessionId = "";
@@ -453,10 +458,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	let reqSeq = 0;
 	let epoch = 0; // bumped on every new GUI connection; invalidates in-flight requests
 	const pending = new Map<number, (r: PlanResult) => void>();
-	// reqIds of paid completions currently in flight (admission control — see the completeRequest
-	// handler). Bounds concurrent billable model calls and rejects duplicate reqIds. Cleared on a
-	// fresh GUI connection (a superseded client's completions are discarded by the reply guard).
-	const inFlightCompletions = new Set<number>();
+	// Globally active paid provider calls. Each admission gets a unique token which stays here until
+	// THAT exact call settles. This is deliberately independent of the active GUI connection: a
+	// reconnect suppresses the old reply but does not cancel the upstream provider work, so clearing
+	// this set on reconnect would make the advertised concurrency ceiling bypassable.
+	const activeCompletionCalls = new Set<symbol>();
+	let pendingSiblingOriginProbes = 0;
 	// Last plan the GUI DELIVERED (issue #58). Cached — including a genuinely empty plan
 	// (empty = "conductor wants no folds", so caching it prevents wrongly re-applying an
 	// older non-empty plan) — so a timed-out `context` can apply it instead of shipping the
@@ -1035,13 +1042,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Gate the WS upgrade by peer address. A loopback peer (the desktop app, or a
-	 * same-machine browser) connects tokenless — unchanged from the original design.
-	 * A NON-loopback peer — only reachable when the bind host is 0.0.0.0 or a specific
-	 * interface — must present the per-session `webToken`, which the browser-served page
-	 * already carries in its URL (?token=…) and forwards on the upgrade. This keeps
-	 * remote reachability safe by default: the token the user already has unlocks
-	 * steering for them, while a port-scanner on the network is refused.
+	 * Gate the WS upgrade by peer address, Origin, and authentication source. Trusted native/
+	 * Tauri loopback clients may connect tokenless. Browser clients present the per-session
+	 * `webToken` explicitly, or through a cookie accepted only for the exact served Origin.
+	 * Off-loopback peers always require one of those browser-authenticated paths.
 	 */
 	// The static-file surface (isWebAuthed) accepts the token via query OR the
 	// port-qualified accordion cookie (see accordionCookieName). The WS upgrade must accept
@@ -1055,15 +1059,120 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			&& cookie.split(";").some((c) => c.trim() === `${accordionCookieName()}=${webToken}`);
 	}
 
-	// Same-origin upgrade: the browser-served UI steering its OWN session. Its Origin's
-	// host:port equals the Host header it was served from. A cross-site attacker's page has a
-	// different origin, so it can never match. (The served UI also carries the token/cookie, so
-	// this is belt-and-suspenders — but it keeps the served flow working even if the cookie is
-	// briefly absent.)
-	function isSameOriginUpgrade(req: http.IncomingMessage, origin: string): boolean {
+	/**
+	 * Cookie authentication is ambient browser authority, unlike an explicit `?token=` bearer.
+	 * Accept it only when the page Origin exactly matches the upgrade Host. Cookies are host-scoped,
+	 * NOT port-scoped: without this check, a hostile page on 127.0.0.1:3000 automatically carries
+	 * Accordion's HttpOnly cookie when it opens 127.0.0.1:<accordion-port>.
+	 *
+	 * On a loopback peer, additionally require a literal loopback hostname. Merely comparing two
+	 * attacker-controlled strings (`Origin.host === Host`) is vulnerable to DNS rebinding: an
+	 * attacker can serve evil.example:<port>, rebind it to 127.0.0.1, and keep matching headers.
+	 */
+	function isCookieAuthorizedUpgrade(req: http.IncomingMessage, origin: string, loopbackPeer: boolean): boolean {
 		const host = req.headers["host"];
 		if (typeof host !== "string" || host === "") return false;
-		try { return new URL(origin).host === host; } catch { return false; }
+		try {
+			const u = new URL(origin);
+			if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+			if (u.host.toLowerCase() !== host.trim().toLowerCase()) return false;
+			if (!loopbackPeer) return true;
+			const hostname = u.hostname.toLowerCase();
+			return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Browser-served loopback mode intentionally lets a page served by session A switch to
+	 * sibling session B. It cannot possess B's per-session token, and its Origin port is A rather
+	 * than B, so ordinary same-origin cookie auth cannot authorize that dial. Preserve the feature
+	 * without reopening arbitrary cross-port CSWSH: accept only a literal loopback Origin whose
+	 * server currently answers Accordion's loopback-only `/__accordion/meta` contract. A live probe
+	 * proves current port ownership, unlike a registry heartbeat which can be stale or refer to the
+	 * same numeric port on another bind interface. A public DNS-rebound hostname fails before I/O.
+	 */
+	function isKnownAccordionLoopbackOrigin(origin: string): Promise<boolean> {
+		let u: URL;
+		try { u = new URL(origin); } catch { return Promise.resolve(false); }
+		// The extension serves plain HTTP. HTTPS loopback Origins belong to a reverse proxy and
+		// must use the explicit bearer/cookie path rather than this tokenless sibling exception.
+		if (u.protocol !== "http:") return Promise.resolve(false);
+		const hostname = u.hostname.toLowerCase();
+		if (hostname !== "localhost" && hostname !== "127.0.0.1" && hostname !== "[::1]") return Promise.resolve(false);
+		const originPort = Number(u.port || 80);
+		if (!Number.isSafeInteger(originPort) || originPort <= 0 || originPort > 65535) return Promise.resolve(false);
+		if (pendingSiblingOriginProbes >= MAX_PENDING_SIBLING_ORIGIN_PROBES) return Promise.resolve(false);
+		const requestHost = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+		pendingSiblingOriginProbes++;
+
+		return new Promise((resolve) => {
+			let settled = false;
+			let request: http.ClientRequest | null = null;
+			let deadline: ReturnType<typeof setTimeout> | null = null;
+			const finish = (ok: boolean): void => {
+				if (settled) return;
+				settled = true;
+				pendingSiblingOriginProbes--;
+				if (deadline) clearTimeout(deadline);
+				resolve(ok);
+			};
+			deadline = setTimeout(() => {
+				request?.destroy();
+				finish(false);
+			}, SIBLING_ORIGIN_PROBE_MS);
+			request = http.get(
+				{ hostname: requestHost, port: originPort, path: "/__accordion/meta" },
+				(response) => {
+					if (response.statusCode !== 200) {
+						// Authentication is already decided; do not drain an attacker-controlled endless
+						// body after clearing our deadline. Tear the response/socket down immediately.
+						response.destroy();
+						finish(false);
+						return;
+					}
+					const chunks: Buffer[] = [];
+					let bodyBytes = 0;
+					response.on("data", (chunk: Buffer) => {
+						bodyBytes += chunk.length;
+						if (bodyBytes > SIBLING_ORIGIN_META_MAX_BYTES) {
+							response.destroy();
+							finish(false);
+							return;
+						}
+						chunks.push(chunk);
+					});
+					response.on("end", () => {
+						if (settled) return;
+						try {
+							const meta = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+								served?: unknown;
+								sessionId?: unknown;
+								protocolVersion?: unknown;
+							};
+							if (meta.served !== true || typeof meta.sessionId !== "string" || meta.protocolVersion !== PROTOCOL_VERSION) {
+								finish(false);
+								return;
+							}
+							// The live response is a current-ownership proof; the matching live registry entry
+							// prevents an unrelated local HTTP service from authorizing itself by imitating the
+							// public JSON shape. Same-user native malware can read/write this registry, but that
+							// actor is already inside the intentional no-Origin native trust boundary.
+							void listLiveSessions().then(
+								(sessions) => finish(sessions.some((s) => s.sessionId === meta.sessionId && s.port === originPort)),
+								() => finish(false),
+							);
+						} catch {
+							finish(false);
+						}
+					});
+					response.on("aborted", () => finish(false));
+					response.on("error", () => finish(false));
+				},
+			);
+			request.on("error", () => finish(false));
+		});
 	}
 
 	function verifyWsUpgrade(info: { req: http.IncomingMessage }, cb: (res: boolean, code?: number, message?: string) => void): void {
@@ -1082,50 +1191,59 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			cb(false, 400, "bad request target");
 			return;
 		}
-		const hasToken = !!webToken && (token === webToken || hasAccordionCookie(req));
+		// Keep explicit bearer and ambient-cookie authority separate. Possession of the query token
+		// may authorize any Origin; a cookie is accepted only from the served origin below.
+		const hasQueryToken = !!webToken && token === webToken;
+		const hasCookie = !!webToken && hasAccordionCookie(req);
 		const origin = req.headers["origin"];
+		const loopbackPeer = isLoopbackPeer(peer);
+		const cookieAuthorized =
+			typeof origin === "string" && origin !== "" && hasCookie && isCookieAuthorizedUpgrade(req, origin, loopbackPeer);
 
-		if (isLoopbackPeer(peer)) {
+		if (loopbackPeer) {
 			// CSWSH defense. WebSockets are NOT subject to CORS, so a malicious web page in the
 			// user's browser could open ws://127.0.0.1:<port>, receive the session backlog, become
 			// the active client, submit plans, toggle armed state, and trigger paid completions.
 			// Loopback therefore stays tokenless ONLY for:
 			//   • native clients that send NO browser Origin, and
-			//   • the trusted Tauri webview / same-origin served UI (their Origin is fixed / matches
-			//     the served Host — a cross-site attacker cannot forge either).
-			// Any OTHER browser Origin must present the token (which a CSWSH attacker cannot read).
+			//   • the trusted Tauri webview.
+			// A browser-served UI must present its explicit query token or a same-origin cookie.
 			if (typeof origin !== "string" || origin === "") { cb(true); return; } // native, no Origin
-			if (isTrustedNativeWebviewOrigin(origin) || isSameOriginUpgrade(req, origin)) { cb(true); return; }
-			if (hasToken) { cb(true); return; }
-			cb(false, 403, "cross-origin WebSocket blocked — open Accordion via the /accordion Browser link (it carries the session token)");
+			if (isTrustedNativeWebviewOrigin(origin)) { cb(true); return; }
+			if (hasQueryToken || cookieAuthorized) { cb(true); return; }
+			// Cross-session browser switch: authorize only another live Accordion loopback Origin.
+			void isKnownAccordionLoopbackOrigin(origin).then(
+				(ok) => cb(
+					ok,
+					ok ? undefined : 403,
+					ok ? undefined : "cross-origin WebSocket blocked — open Accordion via the /accordion Browser link (it carries the session token)",
+				),
+				() => cb(false, 403, "cross-origin WebSocket blocked — session origin could not be verified"),
+			);
 			return;
 		}
 
 		// Off-loopback peer: require the per-session token. The browser-served page forwards it on
 		// the upgrade URL (?token=…) on first load; on a later reload without ?token=… the browser
-		// still sends the HttpOnly accordion_token cookie, accepted above via hasAccordionCookie.
-		if (hasToken) { cb(true); return; }
+		// still sends the HttpOnly accordion_token cookie, accepted only for its exact served Origin.
+		if (hasQueryToken || cookieAuthorized) { cb(true); return; }
 		cb(false, 401, "unauthorized — open Accordion via the /accordion Browser link (it carries the session token)");
 	}
 
 	function startServer(): void {
 		if (wss || httpServer) return;
 		bindError = null; // fresh attempt — clear any failure a prior call recorded
-		// Per-session token for the HTTP static surface AND (when bound off-loopback) the
-		// WS upgrade for non-loopback peers — see verifyWsUpgrade for the auth split: a
-		// loopback peer (the desktop app, or a same-machine browser) dials tokenless and
-		// must keep working; a NON-loopback peer — only reachable when the bind host is
-		// 0.0.0.0 or a specific interface — must present this token, which the browser-
-		// served page already carries in its URL (?token=…). Without it anyone on the
-		// network could connect to the steering WS and fold/unfold/pin the agent's context.
+		// Per-session token for the HTTP surface and browser WS upgrades. Native/Tauri loopback
+		// clients and verified live sibling Accordion Origins are the only tokenless paths;
+		// ordinary browsers authenticate explicitly or with an exact-origin cookie.
 		webToken = crypto.randomBytes(16).toString("hex");
 		const bindHost = resolveBindHost(pi);
 		const bindPort = resolveBindPort(pi);
 		try {
 			// One HTTP server hosts BOTH halves on the SAME port:
 			//   • HTTP GETs → handleHttp (the browser build, token-gated)
-			//   • WS upgrades → the WebSocketServer below (loopback tokenless;
-			//     off-loopback token-gated via verifyWsUpgrade)
+			//   • WS upgrades → the WebSocketServer below (native/Tauri + verified sibling
+			//     Origins tokenless; other browser origins token/cookie-gated via verifyWsUpgrade)
 			// port 0 ⇒ OS assigns a free ephemeral port (one server per pi session).
 			httpServer = http.createServer(handleHttp);
 			// Attach the WS server to the HTTP server (NOT { port: 0 }) so the upgrade
@@ -1171,12 +1289,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			return;
 		}
 		wss.on("connection", (ws: WebSocket) => {
+			// Duplicate request ids are scoped to one connection generation. The global spend bound
+			// above is separate because superseded provider calls continue until they actually settle.
+			const connectionCompletionIds = new Set<number>();
 			flushPending(); // supersede any prior GUI: its in-flight requests pass through
 			client = ws;
 			epoch++;
 			sentCount = 0; // re-sync the whole context to the freshly-connected GUI
 			reqSeq = 0;
-			inFlightCompletions.clear(); // a superseded client's completions are discarded (reply guard)
 			lastPlan = null; // a new view starts with no known plan; never apply the old one to it
 			armed = false; // a fresh client is DISARMED until it declares otherwise over the wire
 			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, meta });
@@ -1251,7 +1371,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 						});
 					}
 				}
-				if (msg?.type === "completeRequest" && typeof msg.reqId === "number") {
+				if (msg?.type === "completeRequest" && Number.isSafeInteger(msg.reqId) && msg.reqId >= 0) {
 					// Out-of-band: fire async and NEVER block the message handler or any hook.
 					// Dynamic import so the module is resolved lazily — at pi load time pi's jiti
 					// alias table maps "@earendil-works/pi-ai" to its bundled copy; the smoke test
@@ -1263,6 +1383,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 							// Only send if this GUI is still the active client (reconnect guard).
 							if (capturedWs === client && capturedWs.readyState === 1) send(capturedWs, r);
 						};
+						// An exact in-flight duplicate on this connection is a replay, not a second request.
+						// Ignore it and let the original eventual result settle the one GUI promise keyed by
+						// reqId. Sending an error with the same id would reject/delete the ORIGINAL promise
+						// while its paid provider call continued in the background.
+						if (connectionCompletionIds.has(req.reqId)) return;
 						// Validate prompt before doing any async work.
 						if (typeof req.prompt !== "string" || req.prompt.length === 0) {
 							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "missing or empty prompt" });
@@ -1270,17 +1395,15 @@ export default function accordionLive(pi: ExtensionAPI): void {
 						}
 						// Admission control (unbounded paid completions). These checks run synchronously
 						// before the first `await`, so back-to-back completeRequest events cannot race past
-						// the caps. Reject a reqId already in flight (dedupe retries/replays) and any request
-						// beyond the concurrency ceiling; each accepted request is a billable model call.
-						if (inFlightCompletions.has(req.reqId)) {
-							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "duplicate completion request already in flight" });
-							return;
-						}
-						if (inFlightCompletions.size >= MAX_CONCURRENT_COMPLETIONS) {
+						// the cap. It is GLOBAL across reconnects because superseding a socket does not stop
+						// the billable upstream work. Each accepted request owns a unique cleanup token.
+						if (activeCompletionCalls.size >= MAX_CONCURRENT_COMPLETIONS) {
 							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: `too many concurrent completions in flight (max ${MAX_CONCURRENT_COMPLETIONS})` });
 							return;
 						}
-						inFlightCompletions.add(req.reqId);
+						const callToken = Symbol(`completion:${req.reqId}`);
+						activeCompletionCalls.add(callToken);
+						connectionCompletionIds.add(req.reqId);
 						try {
 							const ctx = latestCtx;
 							const m = latestModel ?? ctx?.model;
@@ -1335,9 +1458,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 							const errMsg = err instanceof Error ? err.message : String(err);
 							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: errMsg });
 						} finally {
-							// Always release the concurrency slot — success, provider error, or a client that
-							// dropped mid-flight (its reply is discarded by the guard, but the slot must free).
-							inFlightCompletions.delete(req.reqId);
+							// Release exactly THIS call's global token. A reconnect/new call may reuse reqId;
+							// deleting by numeric id would let an old completion erase the new call's slot.
+							activeCompletionCalls.delete(callToken);
+							connectionCompletionIds.delete(req.reqId);
 						}
 					})();
 				}

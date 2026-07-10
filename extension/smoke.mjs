@@ -1488,10 +1488,10 @@ if (!(armedSmoke.nextDisarmedMs !== null && armedSmoke.nextDisarmedMs < 900))
 // ── WS auth hardening (private security review of the devmain promotion) ─────
 // Covers the three fixes:
 //   A. a malformed WS upgrade target is rejected 400 (not an uncaught crash)
-//   B. loopback CSWSH defense: a browser Origin with no token is rejected, while a
-//      tokenless dial with NO Origin (native/Tauri path) and a trusted Tauri Origin pass
+//   B. loopback CSWSH defense: hostile, DNS-rebound, and cross-port-cookie Origins are
+//      rejected, while native/Tauri and explicitly authenticated served-UI paths pass
 //   C. an oversized inbound frame is rejected (maxPayload), and paid completions are
-//      bounded (duplicate reqId + concurrency ceiling both refused)
+//      bounded globally across reconnects (duplicates are coalesced onto the original)
 let wsHardeningOk = true;
 {
 	const browserLine2 = notifications.map((n) => n.message).reverse().find((m) => m.includes("Browser: http"));
@@ -1503,12 +1503,14 @@ let wsHardeningOk = true;
 	// `new URL()` throw. `ws`'s verifyClient does NOT catch a synchronous throw, so without the
 	// fix this is an uncaught exception that kills the process (this smoke run runs the server
 	// IN-PROCESS, so a regression would crash the whole run rather than just fail an assert).
-	const rawUpgrade = (requestTarget) =>
+	const rawUpgrade = (requestTarget, { host = `127.0.0.1:${PORT}`, origin = null, cookie = null } = {}) =>
 		new Promise((resolve) => {
 			const s = net.connect(PORT, "127.0.0.1", () => {
 				s.write(
 					`GET ${requestTarget} HTTP/1.1\r\n` +
-						`Host: 127.0.0.1:${PORT}\r\n` +
+						`Host: ${host}\r\n` +
+						(origin ? `Origin: ${origin}\r\n` : "") +
+						(cookie ? `Cookie: ${cookie}\r\n` : "") +
 						`Upgrade: websocket\r\nConnection: Upgrade\r\n` +
 						`Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`,
 				);
@@ -1551,6 +1553,92 @@ let wsHardeningOk = true;
 	if (!tauriOrigin.open)
 		{ fails.push(`ws-hardening B: trusted Tauri webview Origin was rejected — got: ${JSON.stringify(tauriOrigin)}`); wsHardeningOk = false; }
 	if (TOKEN2) {
+		// Matching attacker-controlled Origin/Host is NOT proof of same-origin trust: under DNS
+		// rebinding the TCP peer is loopback while both strings remain the attacker's hostname.
+		const rebound = await rawUpgrade("/", {
+			host: `evil.example:${PORT}`,
+			origin: `http://evil.example:${PORT}`,
+		});
+		if (!/\b403\b/.test(rebound))
+			{ fails.push(`ws-hardening B: DNS-rebound matching Origin/Host was not rejected 403 — got: ${JSON.stringify(rebound)}`); wsHardeningOk = false; }
+
+		// A terminal non-200 probe response must be DESTROYED, not drained after the verifier's
+		// deadline clears: this server deliberately never ends its body. The upgrade still rejects
+		// promptly, and close() below proves the probe did not leave the response socket hanging.
+		const endlessServer = http.createServer((_req, res) => { res.writeHead(403); res.write("never-ending"); });
+		await new Promise((resolve, reject) => {
+			endlessServer.once("error", reject);
+			endlessServer.listen(0, "127.0.0.1", resolve);
+		});
+		const endlessAddress = endlessServer.address();
+		const endlessPort = endlessAddress && typeof endlessAddress === "object" ? endlessAddress.port : 0;
+		const endlessStatus = await rawUpgrade("/", { origin: `http://127.0.0.1:${endlessPort}` });
+		if (!/\b403\b/.test(endlessStatus))
+			{ fails.push(`ws-hardening B: non-ending failed sibling probe did not reject promptly — got: ${JSON.stringify(endlessStatus)}`); wsHardeningOk = false; }
+		await new Promise((resolve) => endlessServer.close(resolve));
+
+		// Cookies cross ports. Even a local service that FORGES the public /meta JSON shape must
+		// not inherit authority without a matching live registry identity.
+		const unrelatedServer = http.createServer((_req, res) => {
+			res.writeHead(200, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ served: true, sessionId: "forged-local-service", protocolVersion: entry.protocolVersion }));
+		});
+		await new Promise((resolve, reject) => {
+			unrelatedServer.once("error", reject);
+			unrelatedServer.listen(0, "127.0.0.1", resolve);
+		});
+		const unrelatedAddress = unrelatedServer.address();
+		const unrelatedPort = unrelatedAddress && typeof unrelatedAddress === "object" ? unrelatedAddress.port : 0;
+		const crossPortCookie = await rawUpgrade("/", {
+			origin: `http://127.0.0.1:${unrelatedPort}`,
+			cookie: `accordion_token_p${PORT}=${TOKEN2}`,
+		});
+		await new Promise((resolve) => unrelatedServer.close(resolve));
+		if (!/\b403\b/.test(crossPortCookie))
+			{ fails.push(`ws-hardening B: different-port Origin with ambient cookie was not rejected 403 — got: ${JSON.stringify(crossPortCookie)}`); wsHardeningOk = false; }
+
+		// But a page CURRENTLY served by another Accordion server is the intentional loopback
+		// multi-session switch path. Prove current ownership through the sibling's live /meta
+		// response, then close it and prove the same stale Origin immediately loses authority.
+		const siblingServer = http.createServer((req, res) => {
+			if (req.url === "/__accordion/meta") {
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ served: true, sessionId: "s-origin-smoke", protocolVersion: entry.protocolVersion }));
+				return;
+			}
+			res.writeHead(404); res.end();
+		});
+		await new Promise((resolve, reject) => {
+			siblingServer.once("error", reject);
+			siblingServer.listen(0, "127.0.0.1", resolve);
+		});
+		const siblingAddress = siblingServer.address();
+		const siblingPort = siblingAddress && typeof siblingAddress === "object" ? siblingAddress.port : 0;
+		const siblingEntryPath = path.join(SESSIONS_DIR, "s-origin-smoke.json");
+		fs.writeFileSync(siblingEntryPath, JSON.stringify({
+			...entry,
+			sessionId: "s-origin-smoke",
+			port: siblingPort,
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		}));
+		const siblingOrigin = await rawUpgrade("/", { origin: `http://127.0.0.1:${siblingPort}` });
+		if (!/\b101\b/.test(siblingOrigin))
+			{ fails.push(`ws-hardening B: live sibling Accordion Origin was rejected — got: ${JSON.stringify(siblingOrigin)}`); wsHardeningOk = false; }
+		await new Promise((resolve) => siblingServer.close(resolve));
+		try { fs.unlinkSync(siblingEntryPath); } catch { /* best-effort test cleanup */ }
+		const staleSiblingOrigin = await rawUpgrade("/", { origin: `http://127.0.0.1:${siblingPort}` });
+		if (!/\b403\b/.test(staleSiblingOrigin))
+			{ fails.push(`ws-hardening B: stopped sibling Origin retained authority — got: ${JSON.stringify(staleSiblingOrigin)}`); wsHardeningOk = false; }
+
+		// The legitimate tokenless reload path remains: exact served Origin + its cookie.
+		const servedCookie = await rawUpgrade("/", {
+			origin: `http://127.0.0.1:${PORT}`,
+			cookie: `accordion_token_p${PORT}=${TOKEN2}`,
+		});
+		if (!/\b101\b/.test(servedCookie))
+			{ fails.push(`ws-hardening B: exact served Origin with cookie was rejected — got: ${JSON.stringify(servedCookie)}`); wsHardeningOk = false; }
+
 		const evilWithToken = await dialWs({ origin: "http://evil.example" }, `/?token=${TOKEN2}`);
 		if (!evilWithToken.open)
 			{ fails.push(`ws-hardening B: hostile Origin WITH a valid token was rejected (token must override) — got: ${JSON.stringify(evilWithToken)}`); wsHardeningOk = false; }
@@ -1567,11 +1655,11 @@ let wsHardeningOk = true;
 	if (oversized.code !== 1009)
 		{ fails.push(`ws-hardening C1: oversized (>8 MiB) frame not rejected with close 1009 — got: ${JSON.stringify(oversized)}`); wsHardeningOk = false; }
 
-	// ── C2. paid completions bounded: duplicate reqId + concurrency ceiling ──
+	// ── C2. paid completions bounded across reconnect; duplicates coalesce ──
 	// Drive `latestCtx` to a stub whose getApiKeyAndHeaders never resolves on its own, so each
-	// admitted completion parks in-flight holding its slot. Then a duplicate reqId and a request
-	// past the ceiling must both be refused; an admitted one reaches the auth step (proving the
-	// happy path still works). Finally release the stubs so nothing hangs the run.
+	// admitted completion parks in-flight holding its slot. A duplicate must NOT launch another
+	// provider call or reject the original promise; a reconnect must NOT clear the four global
+	// slots. Finally release the stubs and prove a real settlement opens capacity again.
 	const heldResolvers = [];
 	const holdCtx = {
 		ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
@@ -1588,24 +1676,60 @@ let wsHardeningOk = true;
 	});
 	handlers.context({ messages: [] }, holdCtx); // sets latestCtx=holdCtx synchronously (before any await)
 	await new Promise((r) => setTimeout(r, 80));
+	// First isolate duplicate semantics on one live socket: one provider call, no duplicate error,
+	// and exactly one eventual result under the original correlation id.
+	wsC.send(JSON.stringify({ type: "completeRequest", reqId: 100, prompt: "original" }));
+	await waitFor(() => heldResolvers.length === 1, 2000, "original completion admitted").catch(() => {});
+	wsC.send(JSON.stringify({ type: "completeRequest", reqId: 100, prompt: "duplicate" }));
+	await new Promise((r) => setTimeout(r, 50));
+	if (heldResolvers.length !== 1) { fails.push(`ws-hardening C2: duplicate reqId launched another provider call (auth waits=${heldResolvers.length})`); wsHardeningOk = false; }
+	if (completeResults.some((r) => r.reqId === 100)) { fails.push("ws-hardening C2: duplicate reqId emitted a result before the original settled"); wsHardeningOk = false; }
+	if (heldResolvers[0]) heldResolvers[0]({ ok: false, error: "duplicate-original-result" });
+	await waitFor(() => completeResults.filter((r) => r.reqId === 100 && /duplicate-original-result/.test(r.error || "")).length === 1, 2000, "original duplicate-correlated result").catch(() => {});
+	if (completeResults.filter((r) => r.reqId === 100).length !== 1) { fails.push(`ws-hardening C2: duplicate correlation produced ${completeResults.filter((r) => r.reqId === 100).length} results instead of one`); wsHardeningOk = false; }
+	heldResolvers.length = 0;
+
 	// Fill the concurrency ceiling (MAX_CONCURRENT_COMPLETIONS = 4): reqIds 101..104 park in flight.
 	for (const id of [101, 102, 103, 104]) wsC.send(JSON.stringify({ type: "completeRequest", reqId: id, prompt: "hold" }));
-	await new Promise((r) => setTimeout(r, 200)); // let all four register as in-flight
-	wsC.send(JSON.stringify({ type: "completeRequest", reqId: 101, prompt: "dup" })); // duplicate reqId
+	await waitFor(() => heldResolvers.length === 4, 2000, "four completions admitted").catch(() => {});
+	wsC.send(JSON.stringify({ type: "completeRequest", reqId: 101, prompt: "dup" })); // ignored/coalesced
 	wsC.send(JSON.stringify({ type: "completeRequest", reqId: 105, prompt: "over" })); // over the ceiling
-	await waitFor(() => completeResults.some((r) => r.reqId === 101 && /duplicate/i.test(r.error || "")) && completeResults.some((r) => r.reqId === 105 && /concurrent/i.test(r.error || "")), 2000, "completion caps").catch(() => {});
-	const dupRej = completeResults.find((r) => r.reqId === 101 && r.ok === false && /duplicate/i.test(r.error || ""));
+	await waitFor(() => completeResults.some((r) => r.reqId === 105 && /concurrent/i.test(r.error || "")), 2000, "completion cap").catch(() => {});
 	const capRej = completeResults.find((r) => r.reqId === 105 && r.ok === false && /concurrent/i.test(r.error || ""));
-	if (!dupRej) { fails.push(`ws-hardening C2: duplicate in-flight completion reqId was NOT rejected — got: ${JSON.stringify(completeResults)}`); wsHardeningOk = false; }
+	if (heldResolvers.length !== 4) { fails.push(`ws-hardening C2: duplicate reqId launched another provider call (auth waits=${heldResolvers.length})`); wsHardeningOk = false; }
+	if (completeResults.some((r) => r.reqId === 101 && /duplicate/i.test(r.error || ""))) { fails.push("ws-hardening C2: duplicate reqId incorrectly rejected the original correlated request"); wsHardeningOk = false; }
 	if (!capRej) { fails.push(`ws-hardening C2: over-concurrency completion was NOT rejected — got: ${JSON.stringify(completeResults)}`); wsHardeningOk = false; }
-	// Release the parked stubs (resolve the auth as a failure) so the four in-flight completions
-	// finish, free their slots, and the run can exit. Their reply proves they were ADMITTED past
-	// the caps and reached the auth step — the happy path is intact.
+
+	// Supersede the GUI while the four provider calls are still parked. Their replies will be
+	// discarded, but their GLOBAL paid-call slots must remain occupied until actual settlement.
+	const wsC2 = new WebSocket(`ws://127.0.0.1:${PORT}`);
+	await new Promise((res, rej) => { wsC2.on("open", res); wsC2.on("error", rej); });
+	const reconnectResults = [];
+	wsC2.on("message", (data) => {
+		let m = null; try { m = JSON.parse(data.toString()); } catch { return; }
+		if (m && m.type === "completeResult") reconnectResults.push(m);
+	});
+	wsC2.send(JSON.stringify({ type: "completeRequest", reqId: 201, prompt: "must-still-be-capped" }));
+	await waitFor(() => reconnectResults.some((r) => r.reqId === 201 && /concurrent/i.test(r.error || "")), 2000, "reconnect-preserved completion cap").catch(() => {});
+	if (!reconnectResults.some((r) => r.reqId === 201 && /concurrent/i.test(r.error || ""))) {
+		fails.push(`ws-hardening C2: reconnect cleared live paid-call slots — got: ${JSON.stringify(reconnectResults)}`);
+		wsHardeningOk = false;
+	}
+	if (heldResolvers.length !== 4) { fails.push(`ws-hardening C2: reconnect admitted a fifth provider call (auth waits=${heldResolvers.length})`); wsHardeningOk = false; }
+	// Release the parked stubs (resolve auth as a failure) so the four superseded completions
+	// actually settle and free their global slots. The four queued resolvers already prove those
+	// requests were admitted to the auth step; their replies are correctly suppressed after swap.
 	for (const res of heldResolvers) res({ ok: false, error: "test-teardown" });
-	await waitFor(() => completeResults.filter((r) => r.reqId >= 101 && r.reqId <= 104 && /test-teardown/.test(r.error || "")).length >= 4, 2000, "admitted completions drained").catch(() => {});
-	const admitted = completeResults.filter((r) => r.reqId >= 101 && r.reqId <= 104 && /test-teardown/.test(r.error || "")).length;
-	if (admitted < 4) { fails.push(`ws-hardening C2: expected 4 admitted completions to reach the auth step, got ${admitted}`); wsHardeningOk = false; }
+	// The old replies are intentionally suppressed after reconnect. Once their actual promises
+	// settle, one new request must reach auth, proving `finally` released the global tokens.
+	await new Promise((r) => setTimeout(r, 100));
+	wsC2.send(JSON.stringify({ type: "completeRequest", reqId: 202, prompt: "after-settlement" }));
+	await waitFor(() => heldResolvers.length === 5, 2000, "completion slot released after settlement").catch(() => {});
+	if (heldResolvers.length !== 5) { fails.push("ws-hardening C2: settled provider calls did not release global capacity"); wsHardeningOk = false; }
+	else heldResolvers[4]({ ok: false, error: "test-teardown-new-client" });
+	await waitFor(() => reconnectResults.some((r) => r.reqId === 202 && /test-teardown-new-client/.test(r.error || "")), 2000, "new completion drained").catch(() => {});
 	try { wsC.close(); } catch { /* ignore */ }
+	try { wsC2.close(); } catch { /* ignore */ }
 	await new Promise((r) => setTimeout(r, 50));
 }
 
