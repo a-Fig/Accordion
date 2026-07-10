@@ -13,6 +13,7 @@ import { createJiti } from "jiti";
 import { WebSocket } from "ws";
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1484,7 +1485,132 @@ if (!(armedSmoke.nextDisarmedMs !== null && armedSmoke.nextDisarmedMs < 900))
 	}
 }
 
+// ── WS auth hardening (private security review of the devmain promotion) ─────
+// Covers the three fixes:
+//   A. a malformed WS upgrade target is rejected 400 (not an uncaught crash)
+//   B. loopback CSWSH defense: a browser Origin with no token is rejected, while a
+//      tokenless dial with NO Origin (native/Tauri path) and a trusted Tauri Origin pass
+//   C. an oversized inbound frame is rejected (maxPayload), and paid completions are
+//      bounded (duplicate reqId + concurrency ceiling both refused)
+let wsHardeningOk = true;
+{
+	const browserLine2 = notifications.map((n) => n.message).reverse().find((m) => m.includes("Browser: http"));
+	const TOKEN2 = browserLine2 && (browserLine2.match(/token=([0-9a-f]+)/) || [])[1];
+	if (!TOKEN2) { fails.push("ws-hardening: could not recover the session token from notifications"); wsHardeningOk = false; }
+
+	// ── A. malformed upgrade target → 400, no crash ──────────────────────────
+	// A raw upgrade whose request-target is authority-form with an out-of-range port makes
+	// `new URL()` throw. `ws`'s verifyClient does NOT catch a synchronous throw, so without the
+	// fix this is an uncaught exception that kills the process (this smoke run runs the server
+	// IN-PROCESS, so a regression would crash the whole run rather than just fail an assert).
+	const rawUpgrade = (requestTarget) =>
+		new Promise((resolve) => {
+			const s = net.connect(PORT, "127.0.0.1", () => {
+				s.write(
+					`GET ${requestTarget} HTTP/1.1\r\n` +
+						`Host: 127.0.0.1:${PORT}\r\n` +
+						`Upgrade: websocket\r\nConnection: Upgrade\r\n` +
+						`Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+				);
+			});
+			let buf = "";
+			const finish = () => { try { s.destroy(); } catch { /* ignore */ } resolve(buf.split("\r\n")[0] || "(no response)"); };
+			s.on("data", (d) => { buf += d.toString(); if (buf.includes("\r\n")) finish(); });
+			s.on("error", () => resolve("(socket error)"));
+			setTimeout(finish, 1500);
+		});
+	const malformedStatus = await rawUpgrade("http://x:999999/");
+	if (!/\b400\b/.test(malformedStatus))
+		{ fails.push(`ws-hardening A: malformed upgrade target not rejected 400 — got: ${JSON.stringify(malformedStatus)}`); wsHardeningOk = false; }
+	// Prove the server survived the malformed upgrade (would be unreachable if it had crashed).
+	const aliveAfter = await new Promise((resolve) => {
+		const r = http.get({ host: "127.0.0.1", port: PORT, path: "/__accordion/meta" }, (res) => { res.resume(); resolve(res.statusCode); });
+		r.on("error", () => resolve(0));
+	});
+	if (aliveAfter !== 200)
+		{ fails.push(`ws-hardening A: server did not survive the malformed upgrade (meta returned ${aliveAfter})`); wsHardeningOk = false; }
+
+	// ── B. loopback CSWSH / Origin split ─────────────────────────────────────
+	const dialWs = (opts, suffix = "") =>
+		new Promise((resolve) => {
+			let settled = false;
+			const w = new WebSocket(`ws://127.0.0.1:${PORT}${suffix}`, opts);
+			const done = (r) => { if (settled) return; settled = true; try { w.close(); } catch { /* ignore */ } resolve(r); };
+			w.on("open", () => done({ open: true }));
+			w.on("unexpected-response", (_rq, rs) => done({ open: false, status: rs.statusCode }));
+			w.on("error", (e) => done({ open: false, error: String((e && e.message) || e) }));
+			setTimeout(() => done({ open: false, timeout: true }), 1500);
+		});
+	const evilNoToken = await dialWs({ origin: "http://evil.example" });
+	if (evilNoToken.open || evilNoToken.status !== 403)
+		{ fails.push(`ws-hardening B: loopback + hostile Origin + no token was NOT rejected 403 — got: ${JSON.stringify(evilNoToken)}`); wsHardeningOk = false; }
+	const noOrigin = await dialWs({});
+	if (!noOrigin.open)
+		{ fails.push(`ws-hardening B: tokenless loopback dial with NO Origin (Tauri/native path) was rejected — got: ${JSON.stringify(noOrigin)}`); wsHardeningOk = false; }
+	const tauriOrigin = await dialWs({ origin: "http://tauri.localhost" });
+	if (!tauriOrigin.open)
+		{ fails.push(`ws-hardening B: trusted Tauri webview Origin was rejected — got: ${JSON.stringify(tauriOrigin)}`); wsHardeningOk = false; }
+	if (TOKEN2) {
+		const evilWithToken = await dialWs({ origin: "http://evil.example" }, `/?token=${TOKEN2}`);
+		if (!evilWithToken.open)
+			{ fails.push(`ws-hardening B: hostile Origin WITH a valid token was rejected (token must override) — got: ${JSON.stringify(evilWithToken)}`); wsHardeningOk = false; }
+	}
+
+	// ── C1. oversized inbound frame → rejected (maxPayload), server survives ──
+	const oversized = await new Promise((resolve) => {
+		const w = new WebSocket(`ws://127.0.0.1:${PORT}`);
+		w.on("open", () => { try { w.send(Buffer.alloc(9 * 1024 * 1024, 0x61)); } catch { /* ignore */ } });
+		w.on("close", (code) => resolve({ code }));
+		w.on("error", () => { /* the close (1009) is what we assert */ });
+		setTimeout(() => resolve({ code: null, timeout: true }), 4000);
+	});
+	if (oversized.code !== 1009)
+		{ fails.push(`ws-hardening C1: oversized (>8 MiB) frame not rejected with close 1009 — got: ${JSON.stringify(oversized)}`); wsHardeningOk = false; }
+
+	// ── C2. paid completions bounded: duplicate reqId + concurrency ceiling ──
+	// Drive `latestCtx` to a stub whose getApiKeyAndHeaders never resolves on its own, so each
+	// admitted completion parks in-flight holding its slot. Then a duplicate reqId and a request
+	// past the ceiling must both be refused; an admitted one reaches the auth step (proving the
+	// happy path still works). Finally release the stubs so nothing hangs the run.
+	const heldResolvers = [];
+	const holdCtx = {
+		ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
+		model: { id: "test/hold-model", contextWindow: 2000 },
+		getContextUsage: () => ({ tokens: 1, contextWindow: 2000 }),
+		modelRegistry: { getApiKeyAndHeaders: () => new Promise((res) => heldResolvers.push(res)) },
+	};
+	const wsC = new WebSocket(`ws://127.0.0.1:${PORT}`);
+	await new Promise((res, rej) => { wsC.on("open", res); wsC.on("error", rej); });
+	const completeResults = [];
+	wsC.on("message", (data) => {
+		let m = null; try { m = JSON.parse(data.toString()); } catch { return; }
+		if (m && m.type === "completeResult") completeResults.push(m);
+	});
+	handlers.context({ messages: [] }, holdCtx); // sets latestCtx=holdCtx synchronously (before any await)
+	await new Promise((r) => setTimeout(r, 80));
+	// Fill the concurrency ceiling (MAX_CONCURRENT_COMPLETIONS = 4): reqIds 101..104 park in flight.
+	for (const id of [101, 102, 103, 104]) wsC.send(JSON.stringify({ type: "completeRequest", reqId: id, prompt: "hold" }));
+	await new Promise((r) => setTimeout(r, 200)); // let all four register as in-flight
+	wsC.send(JSON.stringify({ type: "completeRequest", reqId: 101, prompt: "dup" })); // duplicate reqId
+	wsC.send(JSON.stringify({ type: "completeRequest", reqId: 105, prompt: "over" })); // over the ceiling
+	await waitFor(() => completeResults.some((r) => r.reqId === 101 && /duplicate/i.test(r.error || "")) && completeResults.some((r) => r.reqId === 105 && /concurrent/i.test(r.error || "")), 2000, "completion caps").catch(() => {});
+	const dupRej = completeResults.find((r) => r.reqId === 101 && r.ok === false && /duplicate/i.test(r.error || ""));
+	const capRej = completeResults.find((r) => r.reqId === 105 && r.ok === false && /concurrent/i.test(r.error || ""));
+	if (!dupRej) { fails.push(`ws-hardening C2: duplicate in-flight completion reqId was NOT rejected — got: ${JSON.stringify(completeResults)}`); wsHardeningOk = false; }
+	if (!capRej) { fails.push(`ws-hardening C2: over-concurrency completion was NOT rejected — got: ${JSON.stringify(completeResults)}`); wsHardeningOk = false; }
+	// Release the parked stubs (resolve the auth as a failure) so the four in-flight completions
+	// finish, free their slots, and the run can exit. Their reply proves they were ADMITTED past
+	// the caps and reached the auth step — the happy path is intact.
+	for (const res of heldResolvers) res({ ok: false, error: "test-teardown" });
+	await waitFor(() => completeResults.filter((r) => r.reqId >= 101 && r.reqId <= 104 && /test-teardown/.test(r.error || "")).length >= 4, 2000, "admitted completions drained").catch(() => {});
+	const admitted = completeResults.filter((r) => r.reqId >= 101 && r.reqId <= 104 && /test-teardown/.test(r.error || "")).length;
+	if (admitted < 4) { fails.push(`ws-hardening C2: expected 4 admitted completions to reach the auth step, got ${admitted}`); wsHardeningOk = false; }
+	try { wsC.close(); } catch { /* ignore */ }
+	await new Promise((r) => setTimeout(r, 50));
+}
+
 // ── assertions ───────────────────────────────────────────────────────────────
+if (!wsHardeningOk) { /* individual failures already pushed above */ }
 if (!seen.hello) fails.push("never received hello");
 if (!seen.flushOnAttach) fails.push("GUI received no history flush on attach (would stay empty until first message — the bug)");
 if (seen.flushBlocks < 4) fails.push(`attach flush carried too few blocks: got ${seen.flushBlocks}, expected >=4`);
@@ -1538,6 +1664,7 @@ console.log(
 							`passthrough acks (applied/empty-plan/timeout-stale/timeout-raw) ✓  /__accordion/meta planOutcomes ✓  ` +
 							`port-qualified cookie (collision guard) ✓  parseBindPort/displayHostFor unit tests ✓  ` +
 							`ack counts reflect applied-not-submitted ✓  bind failure surfaced ✓  invalid --accordion-port warns ✓  ` +
-							`specific-interface bind warns ✓`,
+							`specific-interface bind warns ✓  ` +
+							`ws-hardening (malformed-target 400 / loopback CSWSH Origin split / oversized-frame 1009 / completion dup+concurrency caps) ✓`,
 );
 process.exit(0);

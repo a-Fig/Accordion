@@ -133,6 +133,39 @@ const UNFOLD_TIMEOUT_MS = 2000;
 // folded block's full content back THIS turn — so the same generous wait applies.
 const RECALL_TIMEOUT_MS = 2000;
 
+// ── WS hardening (private security review of the devmain promotion) ──────────────
+// Cap on any single inbound WS frame. `ws` defaults to 100 MiB (maxPayload), which lets an
+// unauthenticated loopback peer stream ~100 MiB per message straight into JSON.parse. Real
+// plans/backlogs are kilobytes; 8 MiB is a comfortable ceiling far below the default.
+const MAX_WS_PAYLOAD_BYTES = 8 * 1024 * 1024;
+// Cap on concurrently in-flight paid provider completions (`completeRequest`). Each accepted
+// request launches a real, billable model call; without a ceiling a client (or a hijacked
+// socket) can fan out unbounded spend. The legitimate handoff/compaction path issues one at a
+// time, so a small cap never blocks it.
+const MAX_CONCURRENT_COMPLETIONS = 4;
+// Does this browser Origin belong to the trusted Tauri DESKTOP webview? The Tauri app dials
+// `new WebSocket("ws://127.0.0.1:<port>")` from inside its own webview (see
+// app/src/lib/live/liveClient.svelte.ts) — so WebView2 (Windows) / WKWebView (macOS/Linux)
+// DO attach an Origin to the handshake. NOTE: this contradicts the "Tauri sends no Origin"
+// assumption — the dial is a browser WebSocket, so it always carries one. The webview's origin
+// is one of a small fixed family (see tauri.conf.json: devUrl http://localhost:1420;
+// frontendDist ⇒ the `tauri.localhost` custom-protocol origin in a production build). A hostile
+// web page in the user's NORMAL browser cannot forge any of these: the browser sets Origin from
+// the page's real origin, and no public site is served from the `tauri:` scheme or the
+// `tauri.localhost` host. Matched by predicate (not an exact-string set) so a scheme/port
+// variant across Tauri/OS versions still authorizes the legitimate desktop dial.
+function isTrustedNativeWebviewOrigin(origin: string): boolean {
+	let u: URL;
+	try { u = new URL(origin); } catch { return false; }
+	// macOS / Linux custom protocol: tauri://localhost
+	if (u.protocol === "tauri:") return true;
+	// Windows (WebView2) custom protocol: http(s)://tauri.localhost
+	if (u.hostname === "tauri.localhost") return true;
+	// `npm run tauri dev`: the webview loads devUrl http://localhost:1420
+	if ((u.hostname === "localhost" || u.hostname === "127.0.0.1") && u.port === "1420") return true;
+	return false;
+}
+
 // Base dir is overridable for tests (smoke.mjs) so they don't touch the real home.
 const HOME = process.env.ACCORDION_HOME || os.homedir();
 const REGISTRY_ROOT = path.join(HOME, REGISTRY_DIR);
@@ -420,6 +453,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	let reqSeq = 0;
 	let epoch = 0; // bumped on every new GUI connection; invalidates in-flight requests
 	const pending = new Map<number, (r: PlanResult) => void>();
+	// reqIds of paid completions currently in flight (admission control — see the completeRequest
+	// handler). Bounds concurrent billable model calls and rejects duplicate reqIds. Cleared on a
+	// fresh GUI connection (a superseded client's completions are discarded by the reply guard).
+	const inFlightCompletions = new Set<number>();
 	// Last plan the GUI DELIVERED (issue #58). Cached — including a genuinely empty plan
 	// (empty = "conductor wants no folds", so caching it prevents wrongly re-applying an
 	// older non-empty plan) — so a timed-out `context` can apply it instead of shipping the
@@ -1018,16 +1055,56 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			&& cookie.split(";").some((c) => c.trim() === `${accordionCookieName()}=${webToken}`);
 	}
 
+	// Same-origin upgrade: the browser-served UI steering its OWN session. Its Origin's
+	// host:port equals the Host header it was served from. A cross-site attacker's page has a
+	// different origin, so it can never match. (The served UI also carries the token/cookie, so
+	// this is belt-and-suspenders — but it keeps the served flow working even if the cookie is
+	// briefly absent.)
+	function isSameOriginUpgrade(req: http.IncomingMessage, origin: string): boolean {
+		const host = req.headers["host"];
+		if (typeof host !== "string" || host === "") return false;
+		try { return new URL(origin).host === host; } catch { return false; }
+	}
+
 	function verifyWsUpgrade(info: { req: http.IncomingMessage }, cb: (res: boolean, code?: number, message?: string) => void): void {
-		const peer = info.req.socket.remoteAddress;
-		if (isLoopbackPeer(peer)) { cb(true); return; }
-		// Off-loopback peer: require the per-session token. The browser-served page
-		// forwards it on the upgrade URL (?token=…) on first load; on a later reload
-		// without ?token=… the browser still sends the HttpOnly accordion_token cookie,
-		// which we accept here so the same source of truth authorizes both halves.
-		const u = new URL(info.req.url || "/", "http://accordion.local");
-		const token = u.searchParams.get("token");
-		if (webToken && (token === webToken || hasAccordionCookie(info.req))) { cb(true); return; }
+		const req = info.req;
+		const peer = req.socket.remoteAddress;
+
+		// Parse the upgrade target DEFENSIVELY and ONCE, up front. A malformed request target
+		// (e.g. an authority-form target with an out-of-range port like `http://x:999999/`) makes
+		// the WHATWG URL parser throw — and `ws`'s callback-style verifyClient does NOT catch a
+		// synchronous throw, so it would escape as an uncaught exception and kill the whole pi
+		// process, from an UNAUTHENTICATED peer, before any token check. Reject 400 instead.
+		let token: string | null = null;
+		try {
+			token = new URL(req.url || "/", "http://accordion.local").searchParams.get("token");
+		} catch {
+			cb(false, 400, "bad request target");
+			return;
+		}
+		const hasToken = !!webToken && (token === webToken || hasAccordionCookie(req));
+		const origin = req.headers["origin"];
+
+		if (isLoopbackPeer(peer)) {
+			// CSWSH defense. WebSockets are NOT subject to CORS, so a malicious web page in the
+			// user's browser could open ws://127.0.0.1:<port>, receive the session backlog, become
+			// the active client, submit plans, toggle armed state, and trigger paid completions.
+			// Loopback therefore stays tokenless ONLY for:
+			//   • native clients that send NO browser Origin, and
+			//   • the trusted Tauri webview / same-origin served UI (their Origin is fixed / matches
+			//     the served Host — a cross-site attacker cannot forge either).
+			// Any OTHER browser Origin must present the token (which a CSWSH attacker cannot read).
+			if (typeof origin !== "string" || origin === "") { cb(true); return; } // native, no Origin
+			if (isTrustedNativeWebviewOrigin(origin) || isSameOriginUpgrade(req, origin)) { cb(true); return; }
+			if (hasToken) { cb(true); return; }
+			cb(false, 403, "cross-origin WebSocket blocked — open Accordion via the /accordion Browser link (it carries the session token)");
+			return;
+		}
+
+		// Off-loopback peer: require the per-session token. The browser-served page forwards it on
+		// the upgrade URL (?token=…) on first load; on a later reload without ?token=… the browser
+		// still sends the HttpOnly accordion_token cookie, accepted above via hasAccordionCookie.
+		if (hasToken) { cb(true); return; }
 		cb(false, 401, "unauthorized — open Accordion via the /accordion Browser link (it carries the session token)");
 	}
 
@@ -1053,7 +1130,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			httpServer = http.createServer(handleHttp);
 			// Attach the WS server to the HTTP server (NOT { port: 0 }) so the upgrade
 			// shares the port. verifyWsUpgrade gates non-loopback peers (see above).
-			wss = new WebSocketServer({ server: httpServer, verifyClient: verifyWsUpgrade });
+			wss = new WebSocketServer({ server: httpServer, verifyClient: verifyWsUpgrade, maxPayload: MAX_WS_PAYLOAD_BYTES });
 			httpServer.on("error", (err: NodeJS.ErrnoException) => {
 				// e.g. a fixed --accordion-port already in use (EADDRINUSE): run headless
 				// (passthrough), but — unlike before — record and log WHY, so `/accordion`
@@ -1099,6 +1176,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			epoch++;
 			sentCount = 0; // re-sync the whole context to the freshly-connected GUI
 			reqSeq = 0;
+			inFlightCompletions.clear(); // a superseded client's completions are discarded (reply guard)
 			lastPlan = null; // a new view starts with no known plan; never apply the old one to it
 			armed = false; // a fresh client is DISARMED until it declares otherwise over the wire
 			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, meta });
@@ -1190,6 +1268,19 @@ export default function accordionLive(pi: ExtensionAPI): void {
 							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "missing or empty prompt" });
 							return;
 						}
+						// Admission control (unbounded paid completions). These checks run synchronously
+						// before the first `await`, so back-to-back completeRequest events cannot race past
+						// the caps. Reject a reqId already in flight (dedupe retries/replays) and any request
+						// beyond the concurrency ceiling; each accepted request is a billable model call.
+						if (inFlightCompletions.has(req.reqId)) {
+							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "duplicate completion request already in flight" });
+							return;
+						}
+						if (inFlightCompletions.size >= MAX_CONCURRENT_COMPLETIONS) {
+							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: `too many concurrent completions in flight (max ${MAX_CONCURRENT_COMPLETIONS})` });
+							return;
+						}
+						inFlightCompletions.add(req.reqId);
 						try {
 							const ctx = latestCtx;
 							const m = latestModel ?? ctx?.model;
@@ -1243,6 +1334,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 						} catch (err: unknown) {
 							const errMsg = err instanceof Error ? err.message : String(err);
 							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: errMsg });
+						} finally {
+							// Always release the concurrency slot — success, provider error, or a client that
+							// dropped mid-flight (its reply is discarded by the guard, but the slot must free).
+							inFlightCompletions.delete(req.reqId);
 						}
 					})();
 				}
