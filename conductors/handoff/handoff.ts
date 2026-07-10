@@ -513,7 +513,7 @@ export class HandoffConductor implements Conductor {
 				// with the real cause, the live client rejects, and it landed here silently — the
 				// human saw no sign the handoff broke (PR #52 review: silent failure).
 				this.inflight = null;
-				const detail = err instanceof Error ? err.message : String(err);
+				const detail = truncateForStatus(err instanceof Error ? err.message : String(err));
 				this.failureStatus = `Handoff failed — ${detail || "model completion error"}`;
 				this.host?.setStatus(this.failureStatus, { aged: count });
 			},
@@ -546,7 +546,12 @@ export class HandoffConductor implements Conductor {
 	private buildPrompt(newlyAged: ViewBlock[]): string {
 		const conversation = newlyAged
 			.map((b) => {
-				const label = blockLabel(b);
+				// Defense-in-depth (follow-up review note): `blockLabel` interpolates `b.toolName`,
+				// which is provider/tool-supplied data, not conductor-authored text. A real tool name
+				// can never contain `</conversation>` in practice (provider tool-name charsets forbid
+				// it), so this is unreachable today — but it costs nothing to run the label through
+				// the same neutralizer as every other interpolated value instead of trusting the charset.
+				const label = neutralizeSentinels(blockLabel(b));
 				const text = neutralizeSentinels((b.text ?? "").trim());
 				return text ? `[${label}]\n${text}` : `[${label}]`;
 			})
@@ -591,6 +596,22 @@ export class HandoffConductor implements Conductor {
  */
 export function neutralizeSentinels(s: string): string {
 	return s.replace(/<\s*\/\s*(conversation|previous-handoff)/gi, "&lt;/$1");
+}
+
+/**
+ * Sensible cap on a provider error message surfaced in the sticky status bar (follow-up review
+ * note). The status bar is a one-line UI affordance, not a log: an unbounded provider error — huge
+ * text, embedded markup/HTML, a stack trace — would otherwise be embedded verbatim into
+ * `failureStatus` and pushed straight to `host.setStatus`.
+ */
+const ERROR_STATUS_MAX_LEN = 200;
+
+/**
+ * Truncate `s` to at most `max` characters, appending an ellipsis when it was cut. Used to bound
+ * provider error text before it is embedded in a human-visible status string.
+ */
+export function truncateForStatus(s: string, max: number = ERROR_STATUS_MAX_LEN): string {
+	return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
 /** Sum the full token cost of a set of blocks. */
