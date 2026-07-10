@@ -79,6 +79,42 @@ real chain of handoff documents.
 - **Model-link dependent.** If `host.can("complete")` is false, the conductor waits visibly rather
   than inventing a deterministic substitute for a handoff written by the agent.
 
+## Hardening (PR #52 review)
+
+Four defects found while reviewing the shipped conductor, now fixed in `handoff.ts`:
+
+1. **Silent failure.** The `host.complete()` reject handler swallowed the provider error, and a
+   `setStatus(null)` on the next over-threshold pass wiped even the empty-output status — so a
+   broken handoff left no visible sign. The conductor now keeps a **sticky failure status** that
+   carries the real error message and survives subsequent `conduct()` passes until a genuine retry
+   launches or a handoff commits. (A human detach-abort deliberately sets no failure — the human
+   chose to stop it.)
+
+2. **No output-token reservation.** The request always asked for the full soft cap
+   (`MAX_HANDOFF_TOKENS`). The host clamp bounds only max-*output*, not `input + output`, so at the
+   0.9 trigger with `budget === contextWindow` the request overflowed any window below ~80k and the
+   provider 400'd (feeding defect 1). The conductor now estimates prompt input (chars/4) and
+   requests `min(MAX_HANDOFF_TOKENS, contextWindow − input − safetyMargin)`; if that leaves less
+   than a ~1000-token floor it **declines** with a visible status rather than sending a doomed call.
+   When the window is unknown it falls back to the soft cap.
+
+3. **Prompt injection.** Block text and the prior handoff were interpolated verbatim inside
+   `<conversation>` / `<previous-handoff>` tags. A tool result carrying a literal `</conversation>`
+   (web fetch / file read) could break out and inject instructions into the handoff writer, and
+   because the handoff becomes the successor's whole context that poisoning would persist across the
+   session boundary. Closing sentinels in interpolated content are now neutralized, and
+   `HANDOFF_SYSTEM` declares everything inside the tags to be untrusted data.
+
+4. **Tail floor stripped while idle (accepted residual).** `tailTokens = 0` removes the host's
+   protected-tail floor globally. Ideally the zero tail would apply only while a handoff fold is in
+   effect, leaving the human's default floor during the ramp to the trigger — but the host reads
+   `tailTokens`/`locks` once, at attach (`store.svelte.ts → syncLocks`), never per `conduct()` pass,
+   and a non-zero value at attach would clamp the first handoff group out of the newest blocks and
+   break fidelity (§1 above). Per-pass tail sizing therefore needs a host change (out of scope for
+   the conductor). The residual is benign for the wire: on every no-handoff path the session ships
+   raw (nothing folded, no data loss); the only consequence is that a detach taken while idle
+   inherits a zero protected-tail target.
+
 ## Scope
 
 - No file is created; the handoff text is inline because it becomes the replacement context.

@@ -40,6 +40,35 @@ It holds all three steering locks:
 Because it is exclusive, selecting it triggers the ADR 0011 consent gate. The human's escape hatch
 is **detach**, which freezes the current view and returns controls to the user.
 
+## Output-token reservation
+
+The handoff request reserves output room against the model's context window. The host clamp bounds
+only max-*output* (the model's own ceiling), not `input + output`, so at the 0.9 trigger — where
+input is already ~90% of the window — a blind full-size request would push `input + output` past
+the window and the provider would 400. The conductor estimates the prompt's input (chars/4, the
+repo convention) and requests `min(MAX_HANDOFF_TOKENS, contextWindow − input − safetyMargin)`. If
+that leaves less than a ~1000-token floor, the input alone nearly fills the window: the conductor
+**declines** the request and surfaces a "needs a bigger window" status instead of sending a doomed
+call. When the window is unknown (`contextWindow == null`), it falls back to the soft cap and
+relies on the host's max-output clamp.
+
+## Failure visibility
+
+A handoff completion runs out of band from the model call, so a failure can only reach the human as
+a status. When a completion is **rejected** (provider 400, network error, unknown model) or returns
+an **empty document**, the conductor sets a sticky status carrying the real error message. That
+status survives subsequent `conduct()` passes until a genuine retry launches (new aged content) or
+a handoff commits — it is not wiped by the next over-threshold pass.
+
+## Untrusted conversation data
+
+Block text and the prior handoff are interpolated inside `<conversation>` / `<previous-handoff>`
+tags when building the prompt. Because the handoff becomes the successor agent's whole context, a
+tool result containing a literal `</conversation>` (a web fetch or file read) could otherwise break
+out of the data section and inject instructions that persist across the session boundary. The
+conductor neutralizes any such closing sentinel in interpolated content and the system prompt
+declares everything inside those tags to be untrusted data, not instructions.
+
 ## Unavailable model link
 
 If `host.can("complete")` is false (browser dev mode, read-only Claude Code transcript, extension
@@ -60,3 +89,11 @@ currently active.
 - Each later handoff depends on the previous handoff plus new work, so omissions can compound.
 - Depends on `host.can("complete")`.
 - It does not track its own model spend.
+- **No host tail floor while idle.** The `tail-size` lock declares `tailTokens = 0`, which is
+  required for fidelity (any non-zero tail would clamp the handoff group out of the newest blocks
+  and leak raw old-session context). The host reads `tailTokens` once, at attach, so the zero tail
+  cannot be made to apply "only while a handoff is in effect" from the conductor side — that would
+  need a host change to re-read `tailTokens` per pass. The residual is benign: on every no-handoff
+  path (below trigger, in-flight, model unavailable, empty/failed completion) the session ships raw
+  (full content, nothing folded, no data loss). The only consequence is that a detach taken while
+  idle inherits a zero protected-tail target.
