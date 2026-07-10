@@ -77,7 +77,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
-import { linearize, applyPlan, type PiMessage } from "../app/src/lib/live/mapping";
+import { linearize, applyPlan, type PiMessage, type AppliedCounts } from "../app/src/lib/live/mapping";
 import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type RecallOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
 
 /** The GUI's reply to a sync: in-place fold ops + group-collapse ops (ADR 0006). */
@@ -146,7 +146,10 @@ const ACCORDION_APP_ENV = "ACCORDION_APP_PATH";
 // Defaults keep the original loopback + OS-assigned-ephemeral behavior; setting
 // the host to 0.0.0.0 (or a specific interface) lets a remote browser reach the
 // session. Flag wins over env, which wins over the default — same precedence as
-// the ACCORDION_APP path knob above.
+// the ACCORDION_APP path knob above. Binding to a SPECIFIC non-loopback, non-wildcard
+// interface (e.g. a LAN IP) excludes loopback: the desktop app's discovery always dials
+// 127.0.0.1, so it will list such a session but cannot reach it — only the browser URL
+// (dialed via that interface) works; startServer() logs a one-time console.warn for this.
 const ACCORDION_HOST_FLAG = "accordion-host";
 const ACCORDION_HOST_ENV = "ACCORDION_HOST";
 const ACCORDION_PORT_FLAG = "accordion-port";
@@ -161,18 +164,73 @@ function resolveBindHost(pi: ExtensionAPI): string {
 	return "127.0.0.1";
 }
 
-/** Resolve the bind port: flag -> env -> 0 (OS-assigned ephemeral). Invalid/empty -> 0. */
+/**
+ * Validate a PORT string the way a config value deserves: the WHOLE trimmed string must be
+ * 1-5 ASCII digits in [0, 65535], not just a numeric PREFIX. `Number.parseInt` silently accepts
+ * "8080junk" (→ 8080) and truncates "1.5" (→ 1) — both look like a validated port but aren't.
+ * Returns null for an explicitly-set-but-invalid value (the caller logs + falls back to 0).
+ */
+export function parseBindPort(raw: string): number | null {
+	const trimmed = raw.trim();
+	if (!/^\d{1,5}$/.test(trimmed)) return null;
+	const n = Number(trimmed);
+	return n <= 65535 ? n : null;
+}
+
+/**
+ * Resolve the bind port: flag -> env -> 0 (OS-assigned ephemeral). Unset (both empty) -> 0,
+ * silently (that is the documented default, not an error). An explicitly-set but INVALID value
+ * (non-numeric, fractional, out-of-range, or trailing garbage — e.g. "8080junk", "1.5", "-1",
+ * "99999") also falls back to 0, but logs a console.warn naming the flag/env var and the
+ * rejected value, so a typo'd config doesn't silently downgrade to "OS picks a port".
+ */
 function resolveBindPort(pi: ExtensionAPI): number {
 	const flagVal = pi.getFlag(ACCORDION_PORT_FLAG);
-	const raw = (typeof flagVal === "string" ? flagVal : "") || process.env[ACCORDION_PORT_ENV] || "";
-	const n = Number.parseInt(String(raw).trim(), 10);
-	return Number.isFinite(n) && n >= 0 && n <= 65535 ? n : 0;
+	const source: { raw: string; name: string } | null =
+		typeof flagVal === "string" && flagVal.trim()
+			? { raw: flagVal, name: `--${ACCORDION_PORT_FLAG}` }
+			: process.env[ACCORDION_PORT_ENV]
+				? { raw: process.env[ACCORDION_PORT_ENV]!, name: ACCORDION_PORT_ENV }
+				: null;
+	if (!source) return 0; // nothing configured — the documented default, no warning
+	const parsed = parseBindPort(source.raw);
+	if (parsed === null) {
+		console.warn(`[accordion] ${source.name} is not a valid port (rejected value: ${JSON.stringify(source.raw)}) — falling back to an OS-assigned ephemeral port`);
+		return 0;
+	}
+	return parsed;
 }
 
 /** True if a BIND HOST string names only loopback (so off-loopback peers can't reach). */
 function isLoopbackHost(host: string): boolean {
 	const h = host.toLowerCase();
 	return h === "127.0.0.1" || h === "::1" || h === "localhost";
+}
+
+/** True if a BIND HOST string is a wildcard (binds every interface, loopback included). */
+function isWildcardHost(host: string): boolean {
+	const h = host.toLowerCase();
+	return h === "0.0.0.0" || h === "::";
+}
+
+/**
+ * The host to show in the `/accordion` status line's browser URL, given the resolved BIND
+ * host. Three distinct cases the old single `isLoopbackHost(bh) ? "127.0.0.1" : bh` conflated:
+ *   • `::1` binds IPv6-ONLY — showing "127.0.0.1" (an IPv4 address) can be unreachable on a
+ *     host without dual-stack loopback. Show the bracketed IPv6 literal instead.
+ *   • a wildcard bind (0.0.0.0 / ::) is reachable via loopback regardless — keep showing
+ *     "127.0.0.1" (a local user's own browser always works that way).
+ *   • any OTHER host containing ":" is an IPv6 literal and MUST be bracketed in a URL, or the
+ *     colons are parsed as a port separator (e.g. "http://fe80::1:PORT" is not what it looks
+ *     like).
+ */
+export function displayHostFor(bindHost: string): string {
+	const h = bindHost.toLowerCase();
+	if (h === "127.0.0.1" || h === "localhost") return "127.0.0.1";
+	if (isWildcardHost(h)) return "127.0.0.1";
+	if (h === "::1") return "[::1]";
+	if (h.includes(":")) return `[${bindHost}]`;
+	return bindHost;
 }
 
 /** True if a socket peer address is loopback (127.0.0.1 / ::1, incl. IPv4-mapped IPv6). */
@@ -502,6 +560,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	let tokens: number | null = null;
 	let contextWindow: number | null = null;
 	let heartbeat: ReturnType<typeof setInterval> | null = null;
+	// Set iff the HTTP server's bind failed (e.g. EADDRINUSE on a fixed --accordion-port).
+	// Previously the "error" listener discarded the error entirely, so `port` stayed 0
+	// forever and `/accordion` printed "port starting…" — indistinguishable from a slow,
+	// still-booting server. Surfaced verbatim in the /accordion status line instead.
+	let bindError: string | null = null;
 
 	const attached = (): boolean => !!client && client.readyState === 1; /* OPEN */
 
@@ -621,8 +684,28 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			} else if (raw && typeof raw === "object" && typeof (raw as { sessionId?: unknown }).sessionId === "string") {
 				// Recognizably a registry entry, just stale or an old protocol version — reap it.
 				// A merely-paused (not dead) session self-heals: its next heartbeat rewrites the
-				// file, so reaping a transient staleness read is harmless.
-				fs.promises.unlink(filePath).catch(() => {});
+				// file, so reaping a transient staleness read is harmless — UNLESS that heartbeat
+				// lands in the gap between our read above and the unlink below, in which case we'd
+				// delete a file a concurrent writeEntry() just atomically renamed into place (a live
+				// session's live advertisement). Narrow that window: re-read + re-check staleness
+				// immediately before unlinking. This does not ELIMINATE the race (a heartbeat could
+				// still land between this re-check and the unlink itself), only narrows it from "one
+				// readdir pass" to "one extra read" — accepted, since closing it fully would need a
+				// file lock this best-effort registry deliberately doesn't have. Any read/parse
+				// failure here (file renamed/deleted mid-recheck) is swallowed: nothing to reap.
+				fs.promises
+					.readFile(filePath, "utf8")
+					.then((freshRaw) => {
+						let fresh: unknown;
+						try {
+							fresh = JSON.parse(freshRaw);
+						} catch {
+							return; // corrupt/partial re-read — leave it for the next pass
+						}
+						if (isLiveEntry(fresh, Date.now())) return; // a heartbeat healed it — don't reap
+						return fs.promises.unlink(filePath);
+					})
+					.catch(() => {});
 			}
 		}
 		out.sort((a, b) => a.startedAt - b.startedAt);
@@ -759,12 +842,22 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		return null;
 	}
 
+	// Cookie name is PORT-QUALIFIED (not just "accordion_token"): cookies are host-scoped, not
+	// port-scoped, so two sessions on the same host (e.g. two pi sessions both browser-served on
+	// 127.0.0.1, different ports) would otherwise clobber each other's cookie — opening session B
+	// overwrites A's `accordion_token` cookie, and A's next cookie-authed request 403s. Qualifying
+	// by port keeps each session's cookie distinct. `port` is closed over and only read from
+	// request handlers, which never run before `startServer`'s `listen` callback sets it.
+	function accordionCookieName(): string {
+		return `accordion_token_p${port}`;
+	}
+
 	/** Is this request authenticated for static-file serving? (token query OR cookie.) */
 	function isWebAuthed(req: http.IncomingMessage, u: URL): boolean {
 		if (!webToken) return false;
 		if (u.searchParams.get("token") === webToken) return true;
 		const cookie = req.headers["cookie"];
-		if (typeof cookie === "string" && cookie.split(";").some((c) => c.trim() === `accordion_token=${webToken}`)) return true;
+		if (typeof cookie === "string" && cookie.split(";").some((c) => c.trim() === `${accordionCookieName()}=${webToken}`)) return true;
 		return false;
 	}
 
@@ -772,18 +865,25 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 * HTTP request handler — serves the browser build of the Accordion app, gated by a
 	 * per-session token. Runs ENTIRELY off the pi `context`/model-call hook path: it does
 	 * no folding, touches no plan, and a failure to serve a file never crashes a session
-	 * (every path is wrapped). The token gates ONLY file serving; `/__accordion/meta` is
-	 * deliberately reachable WITHOUT a token (it leaks only sessionId + protocol version,
-	 * which are unreadable cross-origin since we send NO CORS headers).
+	 * (every path is wrapped). The token gates file serving AND (off-loopback) `/meta` too —
+	 * see the meta branch below for why "same-origin protects it" was never actually true.
 	 */
 	function handleHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
 		try {
 			const u = new URL(req.url || "/", "http://127.0.0.1");
 
-			// Meta endpoint — UNGATED so the browser (and the smoke test) can probe the
-			// server without the token. Harmless: same-origin policy hides the body from
-			// any other origin because we set no CORS headers.
+			// Meta endpoint. UNGATED for a LOOPBACK peer only — local tooling (the smoke test,
+			// bellows polling from the same machine) and the browser's own same-origin fetch both
+			// depend on that. The original "same-origin policy hides the body from any other
+			// origin" justification was wrong for non-browser clients: a bare `curl` from off-
+			// loopback has no origin/CORS concept to enforce, so it read this fine over the
+			// network. Off-loopback now mirrors the static-file gate: token required.
 			if (u.pathname === "/__accordion/meta") {
+				if (!isLoopbackPeer(req.socket.remoteAddress) && !isWebAuthed(req, u)) {
+					res.writeHead(403, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ error: "forbidden" }));
+					return;
+				}
 				res.writeHead(200, { "Content-Type": "application/json" });
 				// `planOutcomes` (issue #60, ADR 0020): per-cause counts of every `context` hook
 				// resolution this extension has ever resolved, plus `total` (= `contextHookCount`,
@@ -832,7 +932,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// asset fetches, which don't carry the query string) stay authenticated.
 			const headers: Record<string, string> = {};
 			if (u.searchParams.get("token") === webToken) {
-				headers["Set-Cookie"] = `accordion_token=${webToken}; HttpOnly; SameSite=Strict; Path=/`;
+				headers["Set-Cookie"] = `${accordionCookieName()}=${webToken}; HttpOnly; SameSite=Strict; Path=/`;
 			}
 
 			const root = resolveClientRoot();
@@ -907,14 +1007,15 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 * steering for them, while a port-scanner on the network is refused.
 	 */
 	// The static-file surface (isWebAuthed) accepts the token via query OR the
-	// accordion_token cookie. The WS upgrade must accept the SAME cookie too: the cookie
-	// is HttpOnly (so JS can't read it to forward it on a reconnect without ?token=…),
-	// but the browser auto-sends it on a same-origin WS upgrade, which is the only path
-	// that lets a bookmarked/reloaded browser-served session re-steer off-loopback.
+	// port-qualified accordion cookie (see accordionCookieName). The WS upgrade must accept
+	// the SAME cookie too: the cookie is HttpOnly (so JS can't read it to forward it on a
+	// reconnect without ?token=…), but the browser auto-sends it on a same-origin WS upgrade,
+	// which is the only path that lets a bookmarked/reloaded browser-served session re-steer
+	// off-loopback.
 	function hasAccordionCookie(req: http.IncomingMessage): boolean {
 		const cookie = req.headers["cookie"];
 		return typeof cookie === "string"
-			&& cookie.split(";").some((c) => c.trim() === `accordion_token=${webToken}`);
+			&& cookie.split(";").some((c) => c.trim() === `${accordionCookieName()}=${webToken}`);
 	}
 
 	function verifyWsUpgrade(info: { req: http.IncomingMessage }, cb: (res: boolean, code?: number, message?: string) => void): void {
@@ -932,6 +1033,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 
 	function startServer(): void {
 		if (wss || httpServer) return;
+		bindError = null; // fresh attempt — clear any failure a prior call recorded
 		// Per-session token for the HTTP static surface AND (when bound off-loopback) the
 		// WS upgrade for non-loopback peers — see verifyWsUpgrade for the auth split: a
 		// loopback peer (the desktop app, or a same-machine browser) dials tokenless and
@@ -952,8 +1054,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// Attach the WS server to the HTTP server (NOT { port: 0 }) so the upgrade
 			// shares the port. verifyWsUpgrade gates non-loopback peers (see above).
 			wss = new WebSocketServer({ server: httpServer, verifyClient: verifyWsUpgrade });
-			httpServer.on("error", () => {
-				// e.g. unexpected bind failure — run headless (passthrough).
+			httpServer.on("error", (err: NodeJS.ErrnoException) => {
+				// e.g. a fixed --accordion-port already in use (EADDRINUSE): run headless
+				// (passthrough), but — unlike before — record and log WHY, so `/accordion`
+				// can show a real failure instead of an eternal "port starting…". No retry:
+				// a visible failure is the fix; the user re-runs with a free port/flag.
+				const code = err?.code ?? "unknown";
+				bindError = `bind failed: ${code} ${bindHost}:${bindPort}`;
+				console.warn(`[accordion] ${bindError}`);
 				try { httpServer?.close(); } catch { /* ignore */ }
 				httpServer = null;
 				wss = null;
@@ -962,6 +1070,16 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				const addr = httpServer?.address();
 				if (addr && typeof addr === "object") {
 					port = addr.port;
+					// A specific non-loopback, non-wildcard interface bind excludes loopback:
+					// the desktop app's discovery always dials 127.0.0.1, so it will list this
+					// session but never reach it (only the browser URL, dialed via that
+					// interface, works). One-time warning, not a hard error — this bind mode
+					// is intentional (issue #42), just easy to misread as "discovered ⇒ reachable".
+					if (!isLoopbackHost(bindHost) && !isWildcardHost(bindHost)) {
+						console.warn(
+							`[accordion] bound to ${bindHost}:${port} — desktop discovery (which always dials 127.0.0.1) will list this session but cannot reach it; the browser URL (via ${bindHost}) still works.`,
+						);
+					}
 					writeEntry(); // advertise immediately, now that the port is known
 					if (!heartbeat) {
 						heartbeat = setInterval(writeEntry, HEARTBEAT_INTERVAL_MS);
@@ -1398,13 +1516,21 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// GUI so it can reconcile — see `liveClient.svelte.ts`'s passthrough handling and
 			// ADR 0020.
 			if (hasStale) {
-				recordPlanOutcome(
-					"timeout-stale",
-					reqId,
-					{ ops: lastPlan!.ops.length, groups: lastPlan!.groups.length, recalls: lastPlan!.recalls.length },
-					client,
+				// Apply FIRST, ack AFTER — with the counts applyPlan actually substituted, not the
+				// stale plan's submitted lengths. A stale plan re-applied against messages that have
+				// moved on can easily have ids that no longer match anything live; the old code acked
+				// `lastPlan!.ops.length` etc. regardless, over-reporting what really rode the wire
+				// (ADR 0020 promises counts ACTUALLY applied).
+				const appliedCounts: AppliedCounts = { ops: 0, groups: 0, recalls: 0 };
+				const newMessages = applyPlan(
+					event.messages as unknown as PiMessage[],
+					lastPlan!.ops,
+					lastPlan!.groups,
+					lastPlan!.recalls,
+					appliedCounts,
 				);
-				return { messages: applyPlan(event.messages as unknown as PiMessage[], lastPlan!.ops, lastPlan!.groups, lastPlan!.recalls) as unknown as AgentMessage[] };
+				recordPlanOutcome("timeout-stale", reqId, appliedCounts, client);
+				return { messages: newMessages as unknown as AgentMessage[] };
 			}
 			recordPlanOutcome("timeout-raw", reqId, { ops: 0, groups: 0, recalls: 0 }, client);
 			return;
@@ -1422,8 +1548,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			return; // empty plan → pass through
 		}
 
-		recordPlanOutcome("applied", reqId, { ops: plan.ops.length, groups: plan.groups.length, recalls: recallCount }, client);
-		return { messages: applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups, plan.recalls) as unknown as AgentMessage[] };
+		// Apply FIRST, ack AFTER (same reasoning as the timeout-stale branch above): a shape-valid
+		// op/group whose id matches nothing live in `messages` is silently skipped by applyPlan, so
+		// the SUBMITTED plan length (`plan.ops.length` etc.) can overstate what actually rode the
+		// wire. `appliedCounts` reflects the real substitutions.
+		const appliedCounts: AppliedCounts = { ops: 0, groups: 0, recalls: 0 };
+		const newMessages = applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups, plan.recalls, appliedCounts);
+		recordPlanOutcome("applied", reqId, appliedCounts, client);
+		return { messages: newMessages as unknown as AgentMessage[] };
 	});
 
 	// ── model swap: keep the GUI's context window (and budget) in lockstep ───────
@@ -1631,16 +1763,20 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			const wasAttached = attached();
 			const launch = wasAttached ? null : await launchAccordionApp(pi);
 			const action = launchResultLine(launch);
+			// Port status: the real port once bound, a captured bind FAILURE (no more eternal
+			// "starting…" on an EADDRINUSE-type error — see startServer's httpServer "error"
+			// handler), or "starting" while the async listen() is still pending.
+			const portStatus = port ? String(port) : bindError ? `failed (${bindError})` : "starting";
 			const lines = [
 				action.text,
-				`Live link: ${wasAttached ? "attached" : "detached"} · port ${port || "starting"} · streamed ${sentCount} blocks`,
+				`Live link: ${wasAttached ? "attached" : "detached"} · port ${portStatus} · streamed ${sentCount} blocks`,
 			];
 			// Browser entry point: the extension also serves the web build of Accordion on
 			// the same ephemeral port, gated by a per-session token. Surface the tokenized
 			// URL so the user can open the UI in a browser instead of the desktop app.
 			if (port && webToken) {
 				const bh = resolveBindHost(pi);
-				const displayHost = isLoopbackHost(bh) ? "127.0.0.1" : bh;
+				const displayHost = displayHostFor(bh);
 				// Keep the token-bearing line FIRST so the smoke regex (token=…) still matches.
 				lines.push(`Browser: http://${displayHost}:${port}/?token=${webToken}`);
 				// When bound off-loopback, surface a remote-friendly hint using the machine's LAN IP.
@@ -1648,7 +1784,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 					const lan = firstLanIp();
 					if (lan) lines.push(`Remote:  http://${lan}:${port}/?token=${webToken}`);
 				}
-			} else lines.push("Browser: starting…");
+			} else if (bindError) {
+				lines.push(`Browser: unavailable — ${bindError}`);
+			} else {
+				lines.push("Browser: starting…");
+			}
 			ctx.ui.notify(lines.join("\n"), action.type);
 		},
 	});

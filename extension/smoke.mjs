@@ -33,6 +33,48 @@ const mod = await jiti.import("./accordion.ts");
 const accordionLive = mod.default;
 if (typeof accordionLive !== "function") throw new Error("default export is not a function");
 
+// ── unit tests: pure port/host helpers (exported for exactly this purpose) ───
+// PORT VALIDATION (adversarial-review finding): `parseBindPort` must validate the WHOLE
+// trimmed string, not accept a numeric PREFIX like the old `Number.parseInt` did.
+const portCases = [
+	["8080", 8080],
+	["  8080  ", 8080], // trimmed
+	["0", 0],
+	["65535", 65535],
+	["8080junk", null], // trailing garbage — old code silently returned 8080
+	["1.5", null], // fractional — old code silently truncated to 1
+	["-1", null], // negative — regex rejects the leading "-"
+	["70000", null], // out of range
+	["", null], // empty string — caller treats as "unset", not tested here
+	["   ", null],
+	["0x10", null], // hex — Number() would accept this; regex must not
+	["1e3", null], // scientific notation — Number() would accept this; regex must not
+	["007", 7], // leading zero — decimal, not octal
+];
+const portFails = [];
+for (const [raw, expected] of portCases) {
+	const got = mod.parseBindPort(raw);
+	if (got !== expected) portFails.push(`parseBindPort(${JSON.stringify(raw)}) = ${got}, expected ${expected}`);
+}
+if (portFails.length) throw new Error("parseBindPort unit tests failed:\n" + portFails.join("\n"));
+
+// IPv6/DISPLAY URL host resolution.
+const hostCases = [
+	["127.0.0.1", "127.0.0.1"],
+	["localhost", "127.0.0.1"],
+	["0.0.0.0", "127.0.0.1"], // wildcard → still shown as loopback
+	["::", "127.0.0.1"], // IPv6 wildcard → same
+	["::1", "[::1]"], // IPv6 loopback-ONLY bind — 127.0.0.1 would be unreachable
+	["fe80::1", "[fe80::1]"], // arbitrary IPv6 literal must be bracketed
+	["192.168.1.20", "192.168.1.20"], // specific IPv4 interface — shown as-is
+];
+const hostFails = [];
+for (const [raw, expected] of hostCases) {
+	const got = mod.displayHostFor(raw);
+	if (got !== expected) hostFails.push(`displayHostFor(${JSON.stringify(raw)}) = ${JSON.stringify(got)}, expected ${JSON.stringify(expected)}`);
+}
+if (hostFails.length) throw new Error("displayHostFor unit tests failed:\n" + hostFails.join("\n"));
+
 async function waitFor(predicate, ms, label) {
 	const start = Date.now();
 	while (Date.now() - start < ms) {
@@ -151,6 +193,10 @@ if (accordionCmd) {
 	if (noToken.status !== 403) fails.push(`GET / without a token returned ${noToken.status}, expected 403`);
 
 	// GET /?token=<token> → 200 index.html (only if the build exists).
+	// The cookie name is PORT-QUALIFIED (accordion_token_p<PORT>) — cookies are host-scoped,
+	// not port-scoped, so a fixed "accordion_token" would clobber a second session on the same
+	// host (see accordionCookieName() in accordion.ts).
+	const COOKIE_NAME = `accordion_token_p${PORT}`;
 	if (TOKEN) {
 		const buildIndex = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "app", "build", "index.html");
 		const indexExists = fs.existsSync(buildIndex);
@@ -158,10 +204,17 @@ if (accordionCmd) {
 			const ok = await httpGet(`/?token=${TOKEN}`);
 			if (ok.status !== 200) fails.push(`GET /?token=<valid> returned ${ok.status}, expected 200`);
 			const setCookie = ok.headers["set-cookie"];
-			if (!setCookie || !String(setCookie).includes(`accordion_token=${TOKEN}`))
-				fails.push("GET /?token=<valid> did not mint the accordion_token cookie");
-			// Cookie-only auth (no query token) must ALSO pass the gate.
-			const viaCookie = await httpGet("/", { Cookie: `accordion_token=${TOKEN}` });
+			if (!setCookie || !String(setCookie).includes(`${COOKIE_NAME}=${TOKEN}`))
+				fails.push(`GET /?token=<valid> did not mint the ${COOKIE_NAME} cookie (got: ${setCookie})`);
+			// A cookie name carrying the WRONG (or no) port must NOT authenticate — this is the
+			// regression the port-qualified name fixes: two sessions on the same host no longer
+			// share one cookie namespace, so a stale/foreign-port cookie must be rejected.
+			const wrongPortCookie = await httpGet("/", { Cookie: `accordion_token_p${PORT + 1}=${TOKEN}` });
+			if (wrongPortCookie.status !== 403) fails.push(`GET / with a wrong-port cookie returned ${wrongPortCookie.status}, expected 403`);
+			const unqualifiedCookie = await httpGet("/", { Cookie: `accordion_token=${TOKEN}` });
+			if (unqualifiedCookie.status !== 403) fails.push(`GET / with the OLD unqualified cookie name returned ${unqualifiedCookie.status}, expected 403 (cookie collision regression)`);
+			// Cookie-only auth (no query token), with the CORRECT port-qualified name, must pass.
+			const viaCookie = await httpGet("/", { Cookie: `${COOKIE_NAME}=${TOKEN}` });
 			if (viaCookie.status !== 200) fails.push(`GET / with cookie auth returned ${viaCookie.status}, expected 200`);
 		} else {
 			console.log("NOTE: app/build/index.html absent — skipping the index 200 assertion (meta + 403 still verified). Run `npm run build` in app/ to cover it.");
@@ -1278,6 +1331,159 @@ if (armedSmoke.inflightPendingPastTimeout !== true)
 if (!(armedSmoke.nextDisarmedMs !== null && armedSmoke.nextDisarmedMs < 900))
 	fails.push(`armed: request after disarm did not use the short timeout (${armedSmoke.nextDisarmedMs}ms)`);
 
+// ── ack counts reflect APPLIED, not SUBMITTED (issue #60 follow-up / ADR 0020) ──
+// A plan carrying one op that matches a live block and one shape-valid op that matches
+// NOTHING live (a stale id) must ack ops:1, not ops:2 — the count is what actually rode
+// the wire, computed AFTER applyPlan runs (see recordPlanOutcome call sites in the
+// `context` hook).
+{
+	const gui2 = new WebSocket(`ws://127.0.0.1:${PORT}`);
+	const acks2 = [];
+	gui2.on("message", (data) => {
+		let m;
+		try { m = JSON.parse(data.toString()); } catch { return; }
+		if (m.type === "passthrough") { acks2.push(m); return; }
+		if (m.type !== "sync" || !m.planned) return;
+		gui2.send(
+			JSON.stringify({
+				type: "plan",
+				reqId: m.reqId,
+				ops: [
+					{ id: "a:resp-abc:p0", digestText: "FOLDED-AGAIN" }, // matches a live block in `sample`
+					{ id: "a:resp-stale-zzz:p0", digestText: "FOLDED" }, // durable shape, matches nothing
+				],
+				groups: [],
+			}),
+		);
+	});
+	await new Promise((res, rej) => { gui2.on("open", res); gui2.on("error", rej); });
+	await new Promise((r) => setTimeout(r, 100)); // settle the view-only attach flush
+	await Promise.resolve(handlers.context({ messages: sample }, ctx));
+	await waitFor(() => acks2.length >= 1, 1000, "ack-counts passthrough").catch(() => fails.push("ack-counts: no passthrough ack received"));
+	if (acks2.length) {
+		const ack = acks2[acks2.length - 1];
+		if (ack.cause !== "applied") fails.push(`ack-counts: expected cause 'applied', got '${ack.cause}'`);
+		else if (ack.ops !== 1)
+			fails.push(`ack-counts: expected ops=1 (1 matched + 1 stale submitted, only the matched one applied), got ${ack.ops}`);
+	}
+	gui2.close();
+	await new Promise((r) => setTimeout(r, 50));
+}
+
+// ── bind failure is surfaced, not swallowed (defect #2) ─────────────────────
+// A second extension instance forced onto the SAME port the first instance already
+// bound must fail its `listen()` — the old code discarded the error entirely, leaving
+// `/accordion` printing "port starting…" forever. It must now report a real failure.
+{
+	const handlers2 = {};
+	const flags2 = new Map();
+	let accordionCmd2 = null;
+	const pi2 = {
+		on: (name, fn) => (handlers2[name] = fn),
+		registerFlag: (name, def) => flags2.set(name, def?.default),
+		getFlag: (name) => flags2.get(name),
+		registerCommand: (name, def) => { if (name === "accordion") accordionCmd2 = def.handler; },
+		registerTool: () => {},
+	};
+	accordionLive(pi2);
+	flags2.set("accordion-port", String(PORT)); // force EADDRINUSE against the first instance
+	const notifications2 = [];
+	const ctx2 = {
+		ui: { setStatus() {}, notify(message, type) { notifications2.push({ message, type }); }, theme: { fg: (_c, s) => s } },
+		model: { id: "test/model2", contextWindow: 1000 },
+		getContextUsage: () => ({ tokens: 1, contextWindow: 1000 }),
+	};
+	handlers2.session_start({}, ctx2);
+	let statusLine = "";
+	const start = Date.now();
+	while (Date.now() - start < 3000) {
+		if (accordionCmd2) {
+			await Promise.resolve(accordionCmd2("", ctx2));
+			statusLine = notifications2.at(-1)?.message ?? "";
+			if (/bind failed/i.test(statusLine)) break;
+		}
+		await new Promise((r) => setTimeout(r, 100));
+	}
+	if (!/bind failed/i.test(statusLine) || !/EADDRINUSE/.test(statusLine))
+		fails.push(`/accordion did not surface the bind failure — got: ${JSON.stringify(statusLine)}`);
+	if (!/unavailable/i.test(statusLine)) fails.push(`/accordion did not mark the Browser line unavailable on a bind failure — got: ${JSON.stringify(statusLine)}`);
+	if (handlers2.session_shutdown) handlers2.session_shutdown({}, ctx2);
+}
+
+// ── explicit-but-invalid --accordion-port still boots + warns (defect #1, integration) ──
+// Complements the direct `parseBindPort` unit tests above by proving `resolveBindPort`
+// actually warns (naming the flag + rejected value) when driven through session_start,
+// not just in isolation.
+{
+	const handlers4 = {};
+	const flags4 = new Map();
+	const pi4 = {
+		on: (name, fn) => (handlers4[name] = fn),
+		registerFlag: (name, def) => flags4.set(name, def?.default),
+		getFlag: (name) => flags4.get(name),
+		registerCommand: () => {},
+		registerTool: () => {},
+	};
+	accordionLive(pi4);
+	flags4.set("accordion-port", "8080junk");
+	const warnings4 = [];
+	const origWarn4 = console.warn;
+	console.warn = (...args) => { warnings4.push(args.join(" ")); origWarn4.apply(console, args); };
+	const ctx4 = {
+		ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
+		model: { id: "test/model4", contextWindow: 1000 },
+		getContextUsage: () => ({ tokens: 1, contextWindow: 1000 }),
+	};
+	handlers4.session_start({}, ctx4);
+	await waitFor(() => warnings4.some((w) => w.includes("accordion-port") && w.includes("8080junk")), 2000, "invalid --accordion-port warning").catch(
+		() => fails.push("resolveBindPort did not warn for an invalid explicit --accordion-port (integration)"),
+	);
+	console.warn = origWarn4;
+	if (handlers4.session_shutdown) handlers4.session_shutdown({}, ctx4);
+}
+
+// ── specific-interface bind warns about desktop-discovery unreachability (defect #4) ──
+// Skipped gracefully if this machine has no non-loopback IPv4 interface to bind to.
+{
+	const ifaces = os.networkInterfaces();
+	let lanIp = null;
+	outer: for (const list of Object.values(ifaces)) {
+		if (!list) continue;
+		for (const i of list) {
+			if (i.family === "IPv4" && !i.internal) { lanIp = i.address; break outer; }
+		}
+	}
+	if (!lanIp) {
+		console.log("NOTE: no non-loopback IPv4 interface found on this machine — skipping the specific-interface bind warning assertion.");
+	} else {
+		const handlers3 = {};
+		const flags3 = new Map();
+		const pi3 = {
+			on: (name, fn) => (handlers3[name] = fn),
+			registerFlag: (name, def) => flags3.set(name, def?.default),
+			getFlag: (name) => flags3.get(name),
+			registerCommand: () => {},
+			registerTool: () => {},
+		};
+		accordionLive(pi3);
+		flags3.set("accordion-host", lanIp);
+		const warnings3 = [];
+		const origWarn3 = console.warn;
+		console.warn = (...args) => { warnings3.push(args.join(" ")); origWarn3.apply(console, args); };
+		const ctx3 = {
+			ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
+			model: { id: "test/model3", contextWindow: 1000 },
+			getContextUsage: () => ({ tokens: 1, contextWindow: 1000 }),
+		};
+		handlers3.session_start({}, ctx3);
+		await waitFor(() => warnings3.some((w) => w.includes(lanIp) && w.includes("desktop discovery")), 2000, "specific-interface bind warning").catch(() =>
+			fails.push(`bind to specific interface ${lanIp} did not warn about desktop-discovery unreachability`),
+		);
+		console.warn = origWarn3;
+		if (handlers3.session_shutdown) handlers3.session_shutdown({}, ctx3);
+	}
+}
+
 // ── assertions ───────────────────────────────────────────────────────────────
 if (!seen.hello) fails.push("never received hello");
 if (!seen.flushOnAttach) fails.push("GUI received no history flush on attach (would stay empty until first message — the bug)");
@@ -1329,6 +1535,9 @@ console.log(
 					`recall tool (no-ids / detached guards, content-echo round-trip) ✓  skill discovery ✓  ` +
 					`stale-plan fallback (timeout re-applies last plan, empty plan not overridden) ✓  rttMs stamp ✓  ` +
 						`armed-over-wire (ack, disarmed=short / armed=deadline, mid-toggle snapshot) ✓  ` +
-							`passthrough acks (applied/empty-plan/timeout-stale/timeout-raw) ✓  /__accordion/meta planOutcomes ✓`,
+							`passthrough acks (applied/empty-plan/timeout-stale/timeout-raw) ✓  /__accordion/meta planOutcomes ✓  ` +
+							`port-qualified cookie (collision guard) ✓  parseBindPort/displayHostFor unit tests ✓  ` +
+							`ack counts reflect applied-not-submitted ✓  bind failure surfaced ✓  invalid --accordion-port warns ✓  ` +
+							`specific-interface bind warns ✓`,
 );
 process.exit(0);
