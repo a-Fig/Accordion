@@ -124,7 +124,7 @@
 
 	// Forward the per-session token (when present in the page URL ?token=…) on the WS
 	// upgrade so an off-loopback (0.0.0.0-bound) session can be steered from a remote
-	// browser. NOTE: the accordion_token cookie is HttpOnly, so JS cannot read it here —
+	// browser. NOTE: the per-port accordion_token_p<port> cookie is HttpOnly, so JS cannot read it here —
 	// that is deliberate. On a reload without ?token=…, readServedToken() returns null and
 	// the WS URL carries no token, but the browser still sends the HttpOnly cookie on the
 	// same-origin WS upgrade and the extension's verifyWsUpgrade accepts that cookie

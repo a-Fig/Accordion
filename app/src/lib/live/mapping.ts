@@ -189,6 +189,18 @@ export function wireToBlock(w: WireBlock): Block {
 	};
 }
 
+/**
+ * Optional out-param for `applyPlan` (additive — omitting it changes nothing). Populated with
+ * the counts of ops/groups/recalls ACTUALLY applied to the returned messages, as distinct from
+ * merely SUBMITTED in the plan: a shape-valid op/group whose id(s) match nothing live in
+ * `messages` has zero wire effect and must not be counted (see `applyPlan`'s doc comment).
+ */
+export interface AppliedCounts {
+	ops: number;
+	groups: number;
+	recalls: number;
+}
+
 /** The durable block ids a single message emits + its tool-pair callIds (mirrors `linearize`). */
 interface MsgInfo {
 	ids: string[];
@@ -237,23 +249,30 @@ function messageInfo(m: PiMessage, i: number): MsgInfo {
 
 /** Apply one message's in-place FoldOps (the original substitution path). Returns the same
  *  message by reference when nothing folds; clones lazily otherwise. `mark()` flags a change.
+ *  `onApplied(id)` is called for each op ACTUALLY substituted (not merely present in `byId`) —
+ *  an op whose id matches a `tool_call` part (or any non-text/thinking kind) is deliberately
+ *  never applied, and an op whose id matches no part at all is never even looked at again after
+ *  the `.get()` miss. Both cases must NOT be counted as applied (see `applyPlan`'s `appliedOut`).
  *  The wire trusts the engine's plan: the engine is the single foldability gate and it never
  *  folds a protected block, so no separate wire-side position protection is needed here.
  *  The durable-id + structural guards (kind checks, non-empty digest) remain the safety floor. */
-function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () => void): PiMessage {
+function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () => void, onApplied: (id: string) => void): PiMessage {
 	if (m.role === "assistant" && Array.isArray(m.content)) {
 		let parts: PiPart[] | null = null; // lazily cloned only if we actually fold
 		(m.content as PiPart[]).forEach((b, j) => {
-			const op = byId.get(blockId(m, i, j));
+			const id = blockId(m, i, j);
+			const op = byId.get(id);
 			if (!op || !op.digestText) return;
 			if (b?.type === "text") {
 				parts ??= (m.content as PiPart[]).slice();
 				parts[j] = { ...(b as PiTextPart), text: op.digestText };
+				onApplied(id);
 			} else if (b?.type === "thinking") {
 				parts ??= (m.content as PiPart[]).slice();
 				parts[j] = { ...(b as PiThinkingPart), thinking: op.digestText };
+				onApplied(id);
 			}
-			// tool_call or any other kind → ignored (never fold / id mis-map)
+			// tool_call or any other kind → ignored (never fold / id mis-map) — NOT applied
 		});
 		if (parts) {
 			mark();
@@ -262,9 +281,11 @@ function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () =>
 		return m;
 	}
 	if (m.role === "toolResult") {
-		const op = byId.get(blockId(m, i));
+		const id = blockId(m, i);
+		const op = byId.get(id);
 		if (op && op.digestText) {
 			mark();
+			onApplied(id);
 			return { ...m, content: [{ type: "text", text: op.digestText }] };
 		}
 		return m;
@@ -306,8 +327,21 @@ function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () =>
  * (no orphaned tool pair, no emptied message). Safe because this output feeds the model only
  * — the GUI's block sync/cursor run off the un-collapsed `linearize`, so removals never
  * desync the view (ADR 0006 §4).
+ *
+ * `appliedOut` (optional, additive — every pre-existing caller omits it and is unaffected) is
+ * populated with the counts ACTUALLY applied, as opposed to merely SUBMITTED: a shape-valid
+ * `FoldOp`/`GroupOp` whose id(s) match nothing in `messages` (e.g. a stale plan re-applied on
+ * timeout against messages that have since moved on) has zero effect here and must not be
+ * counted as applied — callers (the extension's plan-applied ack, ADR 0020) promise counts of
+ * what actually rode the wire, not what the plan merely asked for.
  */
-export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[] = [], recalls: RecallOp[] = []): PiMessage[] {
+export function applyPlan(
+	messages: PiMessage[],
+	ops: FoldOp[],
+	groups: GroupOp[] = [],
+	recalls: RecallOp[] = [],
+	appliedOut?: AppliedCounts,
+): PiMessage[] {
 	// Defense in depth (matches the GUI's `computeFoldOps`/`computeGroupOps`): refuse any op
 	// whose id is NOT durable or whose digest is empty, and any group with no summary/members.
 	// This is the shared safety boundary on the path that feeds the real model, so it cannot
@@ -334,9 +368,16 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 	const safeRecalls = (recalls ?? []).filter(
 		(r) => r && typeof r.afterId === "string" && r.afterId && typeof r.text === "string" && r.text,
 	);
-	if (!safeOps.length && !safeGroups.length && !safeRecalls.length) return messages;
+	if (!safeOps.length && !safeGroups.length && !safeRecalls.length) {
+		if (appliedOut) { appliedOut.ops = 0; appliedOut.groups = 0; appliedOut.recalls = 0; }
+		return messages;
+	}
 
 	const byId = new Map(safeOps.map((o) => [o.id, o] as const));
+	// Ids ACTUALLY substituted by foldOne (a subset of byId's keys: an id present in the plan
+	// but matching no part in `messages`, or matching a non-foldable part kind like tool_call,
+	// is never added here). Size = the real applied-ops count for `appliedOut`.
+	const appliedOpIds = new Set<string>();
 
 	// ── Phase A: decide which whole messages each group may remove ───────────────
 	const owner: (GroupOp | null)[] = new Array(messages.length).fill(null);
@@ -382,6 +423,11 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 			}
 		}
 	}
+	// Groups ACTUALLY applied: a safe (shape-valid) group whose member ids matched no message
+	// (or lost every member to the straggler fixpoint above) never appears in `owner` and must
+	// not be counted — only groups that own at least one surviving message really changed output.
+	const appliedGroups = new Set<GroupOp>();
+	for (const g of owner) if (g) appliedGroups.add(g);
 
 	// ── Phase B: build the output — collapse runs, fold survivors in place ────────
 	let changed = false;
@@ -416,7 +462,7 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 			i = j;
 			continue;
 		}
-		out.push(foldOne(messages[i], i, byId, mark));
+		out.push(foldOne(messages[i], i, byId, mark, (id) => appliedOpIds.add(id)));
 		outPosOf[i] = out.length - 1;
 		i++;
 	}
@@ -483,6 +529,14 @@ export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[
 				out.splice(end, 0, ...appended);
 			}
 		}
+	}
+	if (appliedOut) {
+		appliedOut.ops = appliedOpIds.size;
+		appliedOut.groups = appliedGroups.size;
+		// Every safe (shape-valid) recall always resolves to an insertion above (interior or
+		// appended — there is no additional "matched nothing" drop path for recalls, unlike
+		// ops/groups), so the applied count equals the safe count.
+		appliedOut.recalls = safeRecalls.length;
 	}
 	return changed ? out : messages;
 }
