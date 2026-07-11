@@ -19,60 +19,6 @@ Guidance for AI coding sessions. [VISION.md](VISION.md) = product north star · 
 - **browser-served** — mode where the pi extension HTTP-serves the SvelteKit UI on the same ephemeral port as the WS. Multi-session-aware (the served extension lists every live session over `/__accordion/sessions`); no Tauri desktop app required.
 - **CC** — Claude Code (as in "CC transcript", "CC browsing"). Read-only mode; sessions loaded from `~/.claude/projects/`.
 
-## Pi extension hooks
-
-Pi exposes these hooks through `pi.on(name, handler)`:
-
-For lifecycle ordering, behavior, and examples, read pi's `docs/extensions.md`; for authoritative payload and return types, inspect the exported `ExtensionAPI` and `ExtensionEvent` types from `@earendil-works/pi-coding-agent`.
-
-### Startup and resources
-
-- **`project_trust`** — Fires before pi decides whether to trust a project and load its dynamic configuration, allowing user/global and CLI extensions to return and optionally persist a trust decision.
-- **`resources_discover`** — Fires after `session_start` during startup or reload, allowing extensions to contribute additional skill, prompt, and theme paths.
-
-### Sessions
-
-- **`session_start`** — Fires when a session starts, reloads, resumes, or is created by a new-session or fork operation, identifying the reason and, for replacement flows, the previous session file.
-- **`session_info_changed`** — Fires when the current session's display name is set or cleared.
-- **`session_before_switch`** — Fires before `/new` or `/resume` replaces the current session and allows a handler to cancel the switch.
-- **`session_before_fork`** — Fires before `/fork` or `/clone` creates a replacement session from an entry and allows a handler to cancel the operation.
-- **`session_before_compact`** — Fires before manual, threshold, or overflow compaction and allows a handler to cancel compaction or supply a custom compaction result.
-- **`session_compact`** — Fires after compaction is saved and reports the resulting compaction entry, trigger reason, and whether an extension supplied it.
-- **`session_shutdown`** — Fires before a started session runtime is torn down by quit, reload, new session, resume, or fork so extensions can close session-scoped resources.
-- **`session_before_tree`** — Fires before navigation to another point in the session tree and allows a handler to cancel navigation or customize the branch summary.
-- **`session_tree`** — Fires after session-tree navigation and reports the old and new leaf IDs and any generated summary entry.
-
-### Agent and provider calls
-
-- **`before_agent_start`** — Fires after expanded user input is ready but before the agent loop starts, allowing a handler to inject a persistent custom message and replace the system prompt for that turn.
-- **`agent_start`** — Fires when a low-level agent run begins.
-- **`agent_end`** — Fires when a low-level agent run ends and includes that run's messages, although automatic retries, compaction retries, or queued continuations may still follow.
-- **`agent_settled`** — Fires once pi has no automatic retry, compaction retry, or queued continuation left to process.
-- **`turn_start`** — Fires at the start of each LLM turn and reports its index and timestamp.
-- **`turn_end`** — Fires after each LLM turn and reports the finalized assistant message and tool results.
-- **`context`** — Fires immediately before every LLM call with a deep copy of the messages destined for the model, allowing a handler to return a replacement message array without changing stored session history.
-- **`before_provider_headers`** — Fires after request headers are assembled and before the provider call, allowing handlers to mutate them in place or remove a header by assigning `null`.
-- **`before_provider_request`** — Fires after pi serializes the provider-specific request payload and immediately before sending it, allowing a handler to inspect or replace the payload.
-- **`after_provider_response`** — Fires after the provider responds but before pi consumes the response stream, exposing the HTTP status and any available normalized response headers.
-
-### Messages and tools
-
-- **`message_start`** — Fires when a user, assistant, or tool-result message begins.
-- **`message_update`** — Fires for streaming assistant-message updates and includes both the current message and token-level stream event.
-- **`message_end`** — Fires when a user, assistant, or tool-result message is finalized, allowing a handler to replace it as long as its role is unchanged.
-- **`tool_execution_start`** — Fires when tool execution begins and exposes the tool-call ID, tool name, and arguments.
-- **`tool_execution_update`** — Fires when an executing tool publishes partial output and exposes the partial result alongside the original call information.
-- **`tool_execution_end`** — Fires when tool execution finishes and reports the final result and error state.
-- **`tool_call`** — Fires immediately before a tool executes, allowing a handler to mutate its input arguments in place or block execution with an optional reason.
-- **`tool_result`** — Fires after a tool executes but before its final result events and message are emitted, allowing handlers to patch the result's content, details, or error state.
-
-### User input and model settings
-
-- **`input`** — Fires for raw user input after extension commands are checked but before skill and prompt-template expansion, allowing a handler to continue, transform, or fully handle the input.
-- **`user_bash`** — Fires when the user runs a `!` or `!!` shell command, allowing a handler to provide a custom execution backend or return a complete replacement result.
-- **`model_select`** — Fires when the active model changes through selection, cycling, or session restore and reports the new model, previous model, and change source.
-- **`thinking_level_select`** — Fires as a notification-only event when the active thinking level changes, including changes caused by model capability clamping.
-
 ## Codebase map
 
 | path | what |
@@ -203,6 +149,60 @@ Colors are brand **Spectrum** identity colors — defined in [brand/accordion-br
 - Fonts: **IBM Plex Sans** (`--sans`) / **IBM Plex Mono** (`--mono`) via `@fontsource` in `routes/+layout.svelte`
 - **Map grid:** every block is the same-size square in conversation order. Token weight = dice face 1–6. Thresholds in `ContextMap.svelte → faceFor()`: ≤100→1 · ≤500→2 · ≤1.5k→3 · ≤5k→4 · ≤15k→5 · >15k→6
 - **Two-box layout:** grid splits at `store.protectedFromIndex` — foldable region above (thin border), protected tail below (thick accented border, `.box.prot`)
+
+## Pi extension hooks
+
+Pi exposes these hooks through `pi.on(name, handler)`:
+
+For lifecycle ordering, behavior, and examples, read pi's `docs/extensions.md`; for authoritative payload and return types, inspect the exported `ExtensionAPI` and `ExtensionEvent` types from `@earendil-works/pi-coding-agent`.
+
+### Startup and resources
+
+- **`project_trust`** — Fires before pi decides whether to trust a project and load its dynamic configuration, allowing user/global and CLI extensions to return and optionally persist a trust decision.
+- **`resources_discover`** — Fires after `session_start` during startup or reload, allowing extensions to contribute additional skill, prompt, and theme paths.
+
+### Sessions
+
+- **`session_start`** — Fires when a session starts, reloads, resumes, or is created by a new-session or fork operation, identifying the reason and, for replacement flows, the previous session file.
+- **`session_info_changed`** — Fires when the current session's display name is set or cleared.
+- **`session_before_switch`** — Fires before `/new` or `/resume` replaces the current session and allows a handler to cancel the switch.
+- **`session_before_fork`** — Fires before `/fork` or `/clone` creates a replacement session from an entry and allows a handler to cancel the operation.
+- **`session_before_compact`** — Fires before manual, threshold, or overflow compaction and allows a handler to cancel compaction or supply a custom compaction result.
+- **`session_compact`** — Fires after compaction is saved and reports the resulting compaction entry, trigger reason, and whether an extension supplied it.
+- **`session_shutdown`** — Fires before a started session runtime is torn down by quit, reload, new session, resume, or fork so extensions can close session-scoped resources.
+- **`session_before_tree`** — Fires before navigation to another point in the session tree and allows a handler to cancel navigation or customize the branch summary.
+- **`session_tree`** — Fires after session-tree navigation and reports the old and new leaf IDs and any generated summary entry.
+
+### Agent and provider calls
+
+- **`before_agent_start`** — Fires after expanded user input is ready but before the agent loop starts, allowing a handler to inject a persistent custom message and replace the system prompt for that turn.
+- **`agent_start`** — Fires when a low-level agent run begins.
+- **`agent_end`** — Fires when a low-level agent run ends and includes that run's messages, although automatic retries, compaction retries, or queued continuations may still follow.
+- **`agent_settled`** — Fires once pi has no automatic retry, compaction retry, or queued continuation left to process.
+- **`turn_start`** — Fires at the start of each LLM turn and reports its index and timestamp.
+- **`turn_end`** — Fires after each LLM turn and reports the finalized assistant message and tool results.
+- **`context`** — Fires immediately before every LLM call with a deep copy of the messages destined for the model, allowing a handler to return a replacement message array without changing stored session history.
+- **`before_provider_headers`** — Fires after request headers are assembled and before the provider call, allowing handlers to mutate them in place or remove a header by assigning `null`.
+- **`before_provider_request`** — Fires after pi serializes the provider-specific request payload and immediately before sending it, allowing a handler to inspect or replace the payload.
+- **`after_provider_response`** — Fires after the provider responds but before pi consumes the response stream, exposing the HTTP status and any available normalized response headers.
+
+### Messages and tools
+
+- **`message_start`** — Fires when a user, assistant, or tool-result message begins.
+- **`message_update`** — Fires for streaming assistant-message updates and includes both the current message and token-level stream event.
+- **`message_end`** — Fires when a user, assistant, or tool-result message is finalized, allowing a handler to replace it as long as its role is unchanged.
+- **`tool_execution_start`** — Fires when tool execution begins and exposes the tool-call ID, tool name, and arguments.
+- **`tool_execution_update`** — Fires when an executing tool publishes partial output and exposes the partial result alongside the original call information.
+- **`tool_execution_end`** — Fires when tool execution finishes and reports the final result and error state.
+- **`tool_call`** — Fires immediately before a tool executes, allowing a handler to mutate its input arguments in place or block execution with an optional reason.
+- **`tool_result`** — Fires after a tool executes but before its final result events and message are emitted, allowing handlers to patch the result's content, details, or error state.
+
+### User input and model settings
+
+- **`input`** — Fires for raw user input after extension commands are checked but before skill and prompt-template expansion, allowing a handler to continue, transform, or fully handle the input.
+- **`user_bash`** — Fires when the user runs a `!` or `!!` shell command, allowing a handler to provide a custom execution backend or return a complete replacement result.
+- **`model_select`** — Fires when the active model changes through selection, cycling, or session restore and reports the new model, previous model, and change source.
+- **`thinking_level_select`** — Fires as a notification-only event when the active thinking level changes, including changes caused by model capability clamping.
 
 ## Conventions
 
