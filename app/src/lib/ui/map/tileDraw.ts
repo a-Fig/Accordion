@@ -13,6 +13,7 @@
  */
 
 import type { BlockKind } from "../../engine/types";
+import { remainingBand } from "../../engine/tokens";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -39,6 +40,18 @@ export type TileSpec = {
    * Mirrors the old `.cell.ghost.k-{kind}` CSS class. Defaults to "text" if absent.
    */
   colorKind?: BlockKind;
+  /**
+   * Fold remaining: whole-percent of tokens STILL on the wire (0-100). When
+   * present and < 100, a white corner-bracket "erosion border" is blitted onto
+   * folded block tiles and collapsed-group tiles so the human can read how
+   * much of the original content is still visible, at a glance. The bracket
+   * size is bucketed into 6 bands (see remainingBand in engine/tokens) rather
+   * than scaled continuously: >=90% renders a nearly-complete border, <10%
+   * renders nothing. Absent/100 -> no border. Live tiles never carry this.
+   * Drawn via a cached offscreen sprite (one per band, 6 total), blitted like
+   * the dice/hatch sprites - no per-tile stroke() calls in the hot loop.
+   */
+  remainingPct?: number;
 };
 
 export type Palette = {
@@ -324,6 +337,76 @@ function getHatchSprite(size: number, dpr: number): HTMLCanvasElement {
 }
 
 // ---------------------------------------------------------------------------
+// Erosion-border sprite cache (PERF) - a folded tile's "how much is left" badge,
+// drawn as 4 corner brackets whose arm length steps through 6 discrete bands
+// (see remainingBand in engine/tokens). Like the hatch/dice sprites: rendered
+// ONCE per distinct band (6 entries) to an offscreen canvas, then blitted with
+// drawImage in the hot loop. NO per-tile stroke() calls, NO filter/gradient.
+// The cache is keyed by (cellSize, dpr); rebuilt wholesale when either changes
+// (mirrors the hatch sprite's single-entry rebuild on size change).
+// ---------------------------------------------------------------------------
+
+/**
+ * Bracket arm length as a fraction of tile size at full erosion (band 5).
+ * Ratio verified in the fold-badge-style mockup (13px arm on a 30px tile) —
+ * two opposing arms nearly meet along an edge but leave a small gap, so even
+ * a "full" (>=90%) border reads as a border, not a solid frame.
+ */
+export const BAND_ARM_MAX_FRACTION = 13 / 30;
+
+/** Bracket arm length (px) for a given 0-5 band at the given tile size. Pure
+ *  geometry, shared by the canvas sprite below and the DOM/sliver SVG render. */
+export function erosionArmLength(size: number, band: number): number {
+  const b = Math.max(0, Math.min(5, band));
+  return size * BAND_ARM_MAX_FRACTION * (b / 5);
+}
+
+function drawBandBracket(ctx: CanvasRenderingContext2D, size: number, band: number): void {
+  const arm = erosionArmLength(size, band);
+  if (arm <= 0) return;
+  const inset = 1;
+  // [x, y, arm-direction-x, arm-direction-y] for each of the 4 corners.
+  const corners: [number, number, number, number][] = [
+    [inset, inset, 1, 1],
+    [size - inset, inset, -1, 1],
+    [inset, size - inset, 1, -1],
+    [size - inset, size - inset, -1, -1],
+  ];
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.lineWidth = 1.5;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  for (const [cx, cy, dx, dy] of corners) {
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + dx * arm, cy);
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx, cy + dy * arm);
+  }
+  ctx.stroke();
+}
+
+let _bandSprites: Map<number, HTMLCanvasElement> | null = null;
+let _bandKey = "";
+function getBandSprite(band: number, size: number, dpr: number): HTMLCanvasElement {
+  const key = `${size}:${dpr}`;
+  if (!_bandSprites || _bandKey !== key) {
+    _bandSprites = new Map();
+    _bandKey = key;
+  }
+  const cached = _bandSprites.get(band);
+  if (cached) return cached;
+  const cv = document.createElement("canvas");
+  const px = Math.max(1, Math.round(size * dpr));
+  cv.width = px;
+  cv.height = px;
+  const cx = cv.getContext("2d")!;
+  cx.scale(dpr, dpr);
+  drawBandBracket(cx, size, band);
+  _bandSprites.set(band, cv);
+  return cv;
+}
+
+// ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
 
@@ -528,6 +611,19 @@ export function drawTile(
       ctx.restore();
     } else {
       ctx.drawImage(spriteCanvas, x, y, w, h);
+    }
+  }
+
+  // ---- erosion border: corner brackets sized to the remaining-token band (6 steps,
+  // ---- see remainingBand). Drawn BEFORE the pinned/inrange/selected/hover rings below
+  // ---- so those rarer, more important interactive states always paint cleanly on top —
+  // ---- a tile that's also pinned/selected/inrange may show the border only partially,
+  // ---- but the precise percentage remains available in the tooltip/Transcript/Inspector.
+  // ---- < 100 (not >= 0) is the gate: 100 means nothing was folded away.
+  if (spec.remainingPct != null && spec.remainingPct < 100) {
+    const band = remainingBand(spec.remainingPct);
+    if (band > 0) {
+      ctx.drawImage(getBandSprite(band, w, opts.dpr ?? 1), x, y, w, h);
     }
   }
 
