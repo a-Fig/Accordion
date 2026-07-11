@@ -16,7 +16,7 @@ import { wireToBlock } from "./mapping";
 import { computeFoldOps, computeGroupOps, computeRecallOps, resolveUnfold, resolveRecall } from "./plan";
 import { folding, setFolding } from "./folding.svelte";
 import { activeRemoteRunner } from "./conductorClient.svelte";
-import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type RecallOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage, type ArmedMessage, type PassthroughCause } from "./protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, isWireBlock, type ServerMessage, type HelloMessage, type PlanMessage, type FoldOp, type GroupOp, type RecallOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage, type ArmedMessage, type PassthroughCause } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import type { CompletionRequest, CompletionResult } from "$conductors/contract";
 
@@ -279,6 +279,11 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 		if (!isServerMessage(parsed)) return; // ignore anything off-protocol
 		const msg: ServerMessage = parsed;
 		if (msg.type === "hello") {
+			// The WS is deliberately unauthenticated (tokenless Tauri dial), so any local
+			// process can send a frame. isServerMessage only vets the `type` tag — guard the
+			// nested shape here rather than letting a malformed frame throw mid-pump and
+			// strand the client half-connected.
+			const meta: Partial<HelloMessage["meta"]> = msg.meta && typeof msg.meta === "object" ? msg.meta : {};
 			if (msg.protocolVersion !== PROTOCOL_VERSION) {
 				// Refuse a version mismatch loudly rather than driving the session with a wire
 				// shape one side does not understand (in M2 that would silently corrupt the fold
@@ -310,7 +315,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			budgetLive = false;
 			session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 			session.store = new AccordionStore({
-				meta: { format: "pi", title: msg.meta.title || "live pi session", cwd: msg.meta.cwd || "", model: msg.meta.model || "" },
+				meta: { format: "pi", title: meta.title || "live pi session", cwd: meta.cwd || "", model: meta.model || "" },
 				blocks: [],
 				lineCount: 0,
 				skipped: 0,
@@ -320,9 +325,9 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// there is no active model link.
 			session.store.completer = sendCompletion;
 			session.store.wireAttached = true; // live wire up → view mirrors the wire (issue #13)
-			if (typeof msg.meta.contextWindow === "number" && msg.meta.contextWindow > 0) {
-				session.store.setContextWindow(msg.meta.contextWindow);
-				session.store.setBudget(msg.meta.contextWindow);
+			if (typeof meta.contextWindow === "number" && meta.contextWindow > 0) {
+				session.store.setContextWindow(meta.contextWindow);
+				session.store.setBudget(meta.contextWindow);
 				budgetLive = true;
 			}
 		} else if (msg.type === "sync") {
@@ -372,7 +377,10 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// keeps a birth-folding conductor from folding already-seen protected-tail content and
 			// sticking it in the sticky `birthFolded` exemption forever. A normal incremental append
 			// (`full:false`) omits the flag, so genuinely new blocks stay birth-foldable as before.
-			session.store.appendBlocks(msg.blocks.map(wireToBlock), { sent: msg.full });
+			// Same unauthenticated-WS caution as the hello path: a sync without a real blocks
+			// array — or with malformed elements — must not throw mid-pump (the plan reply
+			// below still runs) or corrupt the store's token accounting.
+			session.store.appendBlocks((Array.isArray(msg.blocks) ? msg.blocks : []).filter(isWireBlock).map(wireToBlock), { sent: msg.full });
 			const plan = computePlan();
 			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups, recalls: plan.recalls };
 			try {

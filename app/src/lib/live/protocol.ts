@@ -472,3 +472,25 @@ export function isServerMessage(v: unknown): v is ServerMessage {
 	const t = (v as any).type;
 	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult" || t === "armedAck" || t === "passthrough";
 }
+
+const WIRE_KINDS = new Set(["user", "text", "thinking", "tool_call", "tool_result"]);
+
+/**
+ * Element-level guard for `SyncMessage.blocks`. `isServerMessage` vets only the `type`
+ * tag, and the WS is deliberately unauthenticated — a malformed element must be dropped
+ * at the pump, not thrown from `wireToBlock` (a mid-pump throw stalls the plan reply and
+ * the extension waits out its timeout) nor fed into the store as NaN token accounting.
+ */
+export function isWireBlock(v: unknown): v is WireBlock {
+	if (!v || typeof v !== "object") return false;
+	const b = v as Record<string, unknown>;
+	return (
+		typeof b.id === "string" &&
+		typeof b.kind === "string" &&
+		WIRE_KINDS.has(b.kind) &&
+		typeof b.turn === "number" &&
+		typeof b.order === "number" &&
+		typeof b.text === "string" &&
+		typeof b.tokens === "number"
+	);
+}
