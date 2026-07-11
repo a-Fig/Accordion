@@ -34,7 +34,6 @@ function vblk(
 		folded: false,
 		protected: false,
 		grouped: false,
-		fresh: false,
 		text: `block ${id}`,
 		...extra,
 	};

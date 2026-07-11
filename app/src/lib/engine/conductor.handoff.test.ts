@@ -58,7 +58,6 @@ function vb(
 		folded: false,
 		protected: opts.protected ?? false,
 		grouped: opts.grouped ?? false,
-		fresh: false, // handoff never reads it; required by ViewBlock since the birth-fold exemption (ADR 0018)
 		text: opts.text ?? `content of ${id}`,
 		toolName: opts.toolName,
 	};

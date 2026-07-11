@@ -34,8 +34,8 @@
  *     delivers resyncs both sides. Unlike before #60, this divergence is no longer
  *     invisible: every `context` hook outcome (including this one) is counted and, when
  *     a client is reachable, acked back as a `passthrough` message (issue #60, ADR 0020)
- *     — see `recordPlanOutcome` below — so the GUI's birth-fold bookkeeping and the
- *     bellows bench rig can both observe it instead of assuming the fresh plan rode.
+ *     — see `recordPlanOutcome` below — so the GUI and the bellows bench rig can observe
+ *     it instead of assuming the fresh plan rode.
  *   • pi's native /compact is suppressed ONLY while the GUI is attached.
  *   • The shared mapping (linearize/applyPlan) carries the provider-safety rules
  *     (durable-id + kind checks); the engine is the single foldability gate and
@@ -1281,11 +1281,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 * The pending resolver is also driven by flushPending() (→ "unsent") on a superseded /
 	 * dropped / shutting-down GUI, so a mid-wait disconnect never runs out the full timer.
 	 *
-	 * `planned: true` — this is the ONE sync site whose reply is actually APPLIED to a model
-	 * call (the `context` hook below). The GUI advances its birth-fold "sent" cursor only on a
-	 * `planned` sync, so a fresh block born inside the protected tail stays birth-foldable until
-	 * the model has genuinely consumed it (#43, ADR 0018). Every other sync site in this file is
-	 * VIEW-ONLY and must NOT set this flag.
+	 * This is the ONE sync site whose reply is actually APPLIED to a model call (the `context`
+	 * hook below). Every other sync site in this file is VIEW-ONLY.
 	 */
 	function requestPlan(reqId: number, full: boolean, blocks: ReturnType<typeof linearize>, armedNow: boolean): Promise<PlanResult> {
 		const waitMs = armedNow ? PLAN_DEADLINE_MS : PLAN_TIMEOUT_MS;
@@ -1302,7 +1299,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				clearTimeout(timer);
 				resolve(r);
 			});
-			send(ws, { type: "sync", reqId, full, blocks, contextWindow, planned: true });
+			send(ws, { type: "sync", reqId, full, blocks, contextWindow });
 		});
 	}
 
@@ -1510,11 +1507,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			}
 			// Recalls replay with the rest of the stale plan: a recall op is "keep this text
 			// injected for this call" desired state, exactly like a fold op, and applyPlan's
-			// anchor fallback keeps a stale anchor safe. Issue #60 (fixed): the GUI's own fresh
-			// plan for this reqId did NOT ride the wire, so its birth-fold markSent() cannot
-			// assume it did. `recordPlanOutcome` below acks `timeout-stale`/`timeout-raw` to the
-			// GUI so it can reconcile — see `liveClient.svelte.ts`'s passthrough handling and
-			// ADR 0020.
+			// anchor fallback keeps a stale anchor safe. `recordPlanOutcome` below acks
+			// `timeout-stale`/`timeout-raw` to the GUI for its wire-outcome tally (ADR 0020).
 			if (hasStale) {
 				// Apply FIRST, ack AFTER — with the counts applyPlan actually substituted, not the
 				// stale plan's submitted lengths. A stale plan re-applied against messages that have

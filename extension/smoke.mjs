@@ -1343,7 +1343,9 @@ if (!(armedSmoke.nextDisarmedMs !== null && armedSmoke.nextDisarmedMs < 900))
 		let m;
 		try { m = JSON.parse(data.toString()); } catch { return; }
 		if (m.type === "passthrough") { acks2.push(m); return; }
-		if (m.type !== "sync" || !m.planned) return;
+		// Reply to every sync; a plan for a view-only (non-awaited) sync's reqId is ignored
+		// by the extension, so only the context-hook sync's reply is actually applied.
+		if (m.type !== "sync") return;
 		gui2.send(
 			JSON.stringify({
 				type: "plan",

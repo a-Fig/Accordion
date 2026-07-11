@@ -20,7 +20,6 @@ import { Bear2HybridConductor } from "./bear2-hybrid/bear2-hybrid";
 import { CodeSkeletonConductor } from "./code-skeleton/code-skeleton";
 import { KeelConductor } from "./keel/keel";
 import { HandoffConductor } from "./handoff/handoff";
-import { BirthFoldDemoConductor } from "./birth-fold-demo/birth-fold-demo";
 import { RecallDemoConductor } from "./recall-demo/recall-demo";
 import type { Conductor, LockName } from "./contract";
 
@@ -34,7 +33,6 @@ export { Bear2HybridConductor } from "./bear2-hybrid/bear2-hybrid";
 export { CodeSkeletonConductor } from "./code-skeleton/code-skeleton";
 export { KeelConductor } from "./keel/keel";
 export { HandoffConductor } from "./handoff/handoff";
-export { BirthFoldDemoConductor } from "./birth-fold-demo/birth-fold-demo";
 export { RecallDemoConductor } from "./recall-demo/recall-demo";
 
 /**
@@ -78,7 +76,6 @@ export const IN_PROCESS_CONDUCTORS: InProcessConductor[] = [
     locks: ["human-steering", "agent-unfold", "tail-size"],
     create: () => new HandoffConductor(),
   },
-  { id: "birth-fold-demo", label: "Birth-fold demo", create: () => new BirthFoldDemoConductor() },
   { id: "recall-demo", label: "Recall demo", create: () => new RecallDemoConductor() },
 ];
 

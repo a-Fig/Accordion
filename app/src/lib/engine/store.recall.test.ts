@@ -209,31 +209,6 @@ describe("recall — detach clears recalls", () => {
 	});
 });
 
-// ── (g) #43 interaction: a birth-folded fresh tool_result can be recalled ──────
-
-describe("recall — composes with birth-fold (#43)", () => {
-	it("a fresh, protected, birth-folded tool_result can also be recalled", () => {
-		// LIVE construction so r:c1 is fresh and born inside the protected tail.
-		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks: [], lineCount: 0, skipped: 0 };
-		const s = new AccordionStore(parsed);
-		s.appendBlocks(session());
-		s.setProtect(20_000); // whole small session sits in the protected tail
-		expect(s.isProtected(s.get("r:c1")!)).toBe(true);
-
-		const c = new StubConductor();
-		// Birth-fold the fresh protected result, then recall it — both compose.
-		c.cmds = [{ kind: "fold", ids: ["r:c1"] }, { kind: "recall", ids: ["r:c1"] }];
-		s.attach(c);
-
-		expect(s.isFolded(s.get("r:c1")!)).toBe(true); // birth-folded despite protection
-		expect(s.isRecalled("r:c1")).toBe(true); // and recalled to the tail
-		expect(s.lastReports.some((r) => r.ids.includes("r:c1"))).toBe(false); // neither clamped
-		const ops = computeRecallOps(s);
-		expect(ops.length).toBe(1);
-		expect(ops[0].id).toBe("r:c1");
-	});
-});
-
 // ── computeRecallOps emits only for still-folded ids ─────────────────────────
 
 describe("recall — computeRecallOps gating", () => {

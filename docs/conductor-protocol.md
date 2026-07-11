@@ -99,7 +99,6 @@ wire:
 | `folded`       | boolean  | currently rendered folded in the view                                            |
 | `protected`    | boolean  | inside the host's protected working tail                                         |
 | `grouped`      | boolean  | member of a folded group (the host owns it)                                      |
-| `fresh`        | boolean  | never yet part of a completed model call — you may fold/replace it despite `protected`, no lock required (the "birth-fold" exemption, ADR 0018). Also true for a block YOU birth-folded on a prior pass, for as long as it remains in the tail — you needn't track this yourself. |
 | `text`         | string?  | full content (in-process always; on the wire under `wants:"full"`)               |
 | `preview`      | string?  | one-line taste (on the wire under `wants:"shape"` / `"onDemand"`)                |
 
@@ -164,7 +163,7 @@ A **`ClampReport`** is `{ command, ids, reason, detail }`. `reason` is one of:
 | `human-override` | a human pin / manual fold / manual unfold owns the block — the human wins      |
 | `grouped`        | the block is inside a folded group; the group overlay owns it                  |
 | `invalid-group`  | a `group`'s ids were not a valid contiguous, ungrouped, ≥1-member run entirely outside the protected tail |
-| `protected`      | the block is inside the active protected working tail; the host refuses to fold it. Without `tail-size` this is the human's `protectTokens` tail; with `tail-size` it is the conductor's declared `tailTokens` tail (`tailTokens = 0` ⇒ no tail, no `protected` clamps). One narrow exemption: a `fresh` block (never yet sent to the model) may still be folded despite being protected, no lock required — see `fresh` in the `ViewBlock` table and ADR 0018. See ADR 0011 |
+| `protected`      | the block is inside the active protected working tail; the host refuses to fold it. Without `tail-size` this is the human's `protectTokens` tail; with `tail-size` it is the conductor's declared `tailTokens` tail (`tailTokens = 0` ⇒ no tail, no `protected` clamps). See ADR 0011 |
 | `not-foldable`   | the command targeted a kind the engine never folds/replaces (`user` or `tool_call`) |
 | `not-recallable` | a `recall` targeted a block that exists but is not currently folded on the wire (a live block, a non-foldable kind, a non-durable id, or a grouped member) — nothing to recall. A nonexistent id clamps `unknown-id` instead. See ADR 0019 |
 | `noop`           | the command was a no-op (e.g. restoring an already-live block)                 |

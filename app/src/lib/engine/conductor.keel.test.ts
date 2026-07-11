@@ -252,7 +252,6 @@ function vblk(i: number, tokens: number, extra: Partial<ConductorView["blocks"][
 		folded: false,
 		protected: false,
 		grouped: false,
-		fresh: false,
 		text: `block ${i} content describing topic ${i} at some length`,
 		...extra,
 	};
@@ -458,7 +457,6 @@ describe("Keel — pass determinism", () => {
 			folded: false,
 			protected: false,
 			grouped: false,
-			fresh: false,
 			text: `block ${i} content with some words about topic ${i}`,
 		}));
 		const view: ConductorView = {

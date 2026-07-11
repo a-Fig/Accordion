@@ -77,15 +77,6 @@ export const live = $state<{
 });
 
 /**
- * The reqId of the last PLANNED sync this client replied to (issue #60). Gates birth-fold
- * reconciliation on a `passthrough` ack: an ack for an OLDER or unknown reqId means either a
- * reconnect happened in between (the store is already fresh — see the `hello` handler's
- * structural reset) or the ack is stray, so it must never retroactively reconcile a store
- * that has moved on. Reset alongside the other per-connection state on every new connection.
- */
-let lastPlannedReqId: number | null = null;
-
-/**
  * The fold plan the GUI returns for a sync — Milestone 2, "engine on."
  *
  * The folder is OPT-IN and OFF by default (`folding.enabled`). While off, the GUI
@@ -255,7 +246,6 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 	live.sessionId = null;
 	live.port = port;
 	live.planOutcomes = freshPlanOutcomes(); // issue #60: counters describe THIS connection only
-	lastPlannedReqId = null;
 	session.error = "";
 
 	let ws: WebSocket;
@@ -369,38 +359,16 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			}
 			// Committed blocks arrive HERE (the appendBlocks path), NEVER from ghost state.
 			// Invariant: a ghost is only removed, never converted to a block.
-			// `sent: msg.full` (#43/ADR 0018 protection-bypass fix): a `full:true` sync is a
-			// backlog/reconcile REPLAY of history the model has already genuinely seen — including
-			// the very first sync after a fresh GUI attach/reconnect, which rebuilds an EMPTY store
-			// (see the `hello`/structural-reset paths above) and replays the WHOLE prior history in
-			// one shot. Marking that replay as already-sent BEFORE the conduct pass it triggers
-			// keeps a birth-folding conductor from folding already-seen protected-tail content and
-			// sticking it in the sticky `birthFolded` exemption forever. A normal incremental append
-			// (`full:false`) omits the flag, so genuinely new blocks stay birth-foldable as before.
 			// Same unauthenticated-WS caution as the hello path: a sync without a real blocks
 			// array — or with malformed elements — must not throw mid-pump (the plan reply
 			// below still runs) or corrupt the store's token accounting.
-			session.store.appendBlocks((Array.isArray(msg.blocks) ? msg.blocks : []).filter(isWireBlock).map(wireToBlock), { sent: msg.full });
+			session.store.appendBlocks((Array.isArray(msg.blocks) ? msg.blocks : []).filter(isWireBlock).map(wireToBlock));
 			const plan = computePlan();
 			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups, recalls: plan.recalls };
 			try {
 				ws.send(JSON.stringify(reply));
 			} catch {
 				/* socket gone — extension will time out and pass through */
-			}
-			// #43/ADR 0018: only a PLANNED sync's reply is actually applied to a model call — the
-			// extension marks exactly one sync site this way (the `context` hook). Advance the
-			// birth-fold "sent" cursor only here, so a fresh block stays birth-foldable until the
-			// model has genuinely consumed it. A view-only sync (message_end/agent_end/model_select)
-			// never carries `planned: true` and must not advance the cursor. `rawWire`: disarmed
-			// folding replied with an EMPTY plan above, so this call's wire was raw — every block
-			// crossed whole, and the store must drop birth-fold exemptions accordingly (else a
-			// disarmed-era exemption leaks into a later armed run).
-			if (msg.planned) {
-				// Issue #60: remember which reqId this reply answers, so a later `passthrough` ack
-				// for it can be told apart from a stray/superseded one (see the `passthrough` handler).
-				lastPlannedReqId = msg.reqId;
-				session.store.markSent({ rawWire: !folding.enabled });
 			}
 		} else if (msg.type === "unfoldRequest") {
 			// The live agent asked (via the `unfold` tool) to restore folded blocks it saw
@@ -497,42 +465,13 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			}
 		} else if (msg.type === "passthrough") {
 			// The extension's per-outcome ack for a `context` hook resolution (issue #60, ADR
-			// 0020). Two jobs: tally the counter for the "wire N/M" readout, and — for the two
-			// causes that mean the GUI's OWN fresh plan did not ride the wire — reconcile
-			// birth-fold bookkeeping.
+			// 0020). Tally the counter for the "wire N/M" readout.
 			// `msg.cause` comes off the wire untyped — a malformed/unknown cause must not add a
 			// spurious key (e.g. NaN-poisoning via prototype/array quirks) or bump `total` for an
 			// outcome we can't attribute. Only tally a cause we actually have a bucket for.
 			if (msg.cause in live.planOutcomes) {
 				live.planOutcomes[msg.cause]++;
 				live.planOutcomes.total++;
-			}
-
-			// Birth-fold reconciliation (the correctness half, not just the counter). A
-			// `"timeout-stale"`/`"timeout-raw"` ack means the plan THIS client sent for
-			// `msg.reqId` missed the wait — the extension applied a stale cached plan (or
-			// nothing) instead, so the model may have seen ANY block from that call whole.
-			// Conservatively drop every birth-fold exemption exactly as a disarmed (`rawWire`)
-			// planned reply would; `markSent`'s cursor advance is a `Math.max`, so calling it
-			// again here is idempotent and safe even if it already ran for other reasons.
-			//
-			// Guard: only reconcile when this ack answers the reqId this client actually
-			// planned-synced LAST (`lastPlannedReqId`) — an ack for an unknown/older reqId means
-			// a reconnect happened in between (the store is already fresh) or the ack is stray.
-			// `"epoch-mismatch"` acks are for a SUPERSEDED view and are never reconciled (counted
-			// only) — matching the extension's own comment at that send site.
-			//
-			// Ordering assumption: WS delivery is FIFO and the extension sends this ack strictly
-			// AFTER the plan wait for `msg.reqId` resolves — i.e. after the sync it answers and
-			// before the NEXT planned sync — so this reconciliation always lands before this
-			// client's next `markSent()` call and can never race a later legitimate exemption.
-			if (
-				(msg.cause === "timeout-stale" || msg.cause === "timeout-raw") &&
-				session.store &&
-				lastPlannedReqId !== null &&
-				msg.reqId === lastPlannedReqId
-			) {
-				session.store.markSent({ rawWire: true });
 			}
 		}
 	};
