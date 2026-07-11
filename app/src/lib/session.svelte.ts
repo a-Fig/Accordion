@@ -44,8 +44,11 @@ export async function loadSample() {
 		if (!res.ok) throw new Error(`fetch failed (${res.status})`);
 		const text = await res.text();
 		if (token !== _loadToken) return; // a newer selection superseded this sample load — drop it
+		// Parse BEFORE disposing (same as _load): the SPA fallback can serve index.html with
+		// res.ok for a missing sample, and parse() must not leave a disposed store rendered.
+		const parsed = parse(text);
 		session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
-		session.store = new AccordionStore(parse(text));
+		session.store = new AccordionStore(parsed);
 		session.filePath = null;
 		session.readOnly = false;
 		_expose();
@@ -129,10 +132,13 @@ export async function loadFilePath(path: string): Promise<void> {
 async function _load(path: string, readFn: (p: string) => Promise<string>, token: number) {
 	const text = await readFn(path);
 	if (token !== _loadToken) return; // a newer selection superseded this load — drop it
+	// Parse BEFORE disposing: parse() throws on unrecognized/empty input (e.g. a transcript
+	// caught mid-rewrite on the tail poll), and the current store must survive a bad read.
+	const parsed = parse(text);
 	const prevBudget = session.store?.budget;
 	const prevProtect = session.store?.protectTokens;
 	session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
-	session.store = new AccordionStore(parse(text));
+	session.store = new AccordionStore(parsed);
 	if (prevBudget !== undefined) session.store.setBudget(prevBudget);
 	if (prevProtect !== undefined) session.store.setProtect(prevProtect);
 	session.filePath = path;
@@ -163,9 +169,18 @@ function _startPolling(path: string, readFn: (p: string) => Promise<string>, tok
 			const text = await readFn(path);
 			if (token !== _loadToken) return; // this poll belongs to a file/session that was superseded
 			if (text.length !== _lastLen) {
-				await _load(path, readFn, token);
+				try {
+					await _load(path, readFn, token);
+				} catch {
+					// Transient parse failure — the transcript was likely caught mid-rewrite
+					// (truncated/partial JSONL). The current store is intact (_load parses
+					// before disposing); keep tailing. _lastLen is only advanced on success,
+					// so the very next tick retries the read.
+				}
 			}
 		} catch {
+			// The READ itself failed (file gone, permission, native command error) — stop
+			// tailing; there is nothing to retry against.
 			if (token === _loadToken) _stopPolling();
 		}
 	}, 1500);
