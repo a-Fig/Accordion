@@ -26,10 +26,6 @@
 	let manualPort = $state(DEFAULT_PORT);
 	let activityOpen = $state(false);
 	let browserServed = $state(false);
-	// The sessionId that SERVED this page (from /__accordion/meta). In browser-served mode
-	// its per-session token is the one carried in our URL, so off-loopback it is the ONLY
-	// session we can actually steer — see crossSessionRemote / selectAndConnect.
-	let servedSessionId = $state<string | null>(null);
 
 	// Which session source the sidebar lists: live pi vs read-only Claude Code.
 	const SRC_KEY = "accordion.sidebar.source";
@@ -122,70 +118,22 @@
 		return p ? p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p : "";
 	}
 
-	// Forward the per-session token (when present in the page URL ?token=…) on the WS
-	// upgrade so an off-loopback (0.0.0.0-bound) session can be steered from a remote
-	// browser. NOTE: the per-port accordion_token_p<port> cookie is HttpOnly, so JS cannot read it here —
-	// that is deliberate. On a reload without ?token=…, readServedToken() returns null and
-	// the WS URL carries no token, but the browser still sends the HttpOnly cookie on the
-	// same-origin WS upgrade and the extension's verifyWsUpgrade accepts that cookie
-	// (mirroring isWebAuthed). So the cookie fallback lives on the server side of the
-	// upgrade, not in JS.
+	// The per-session token carried in the page URL (?token=…). The live link binds loopback
+	// only, so verifyWsUpgrade accepts a loopback dial tokenless and this is effectively inert;
+	// it is still forwarded on the WS upgrade for symmetry with the static-file surface.
 	function readServedToken(): string | null {
 		if (typeof window === "undefined") return null;
 		return new URLSearchParams(window.location.search).get("token");
 	}
 
-	// A page origin the extension's verifyWsUpgrade treats as loopback — dialed tokenless,
-	// so cross-session switching Just Works. Anything else (a LAN IP or a real hostname) is
-	// off-loopback: the WS upgrade then requires each session's OWN token, and we only hold
-	// the served session's. Mirrors isLoopbackPeer in extension/accordion.ts — including the
-	// IPv4-mapped prefix strip — but also unwraps the `[…]` brackets that location.hostname
-	// puts around an IPv6 literal and accepts the fully-expanded ::1 spelling, so an
-	// IPv6-loopback URL isn't mistaken for remote (which would falsely lock every sibling).
-	function isLoopbackHost(host: string): boolean {
-		let h = host.toLowerCase();
-		if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1); // [::1] → ::1
-		if (h.startsWith("::ffff:")) h = h.slice(7); // IPv4-mapped IPv6 → bare IPv4
-		return (
-			h === "localhost" ||
-			h === "127.0.0.1" ||
-			h === "::1" ||
-			h === "0:0:0:0:0:0:0:1"
-		);
-	}
-
-	// True when this browser-served page was reached over a NON-loopback origin. In that case
-	// only the served session is steerable (its token is in our URL); every OTHER discovered
-	// session carries a different token the extension would reject, so we mark those rows as
-	// loopback-only rather than let a click fail with a generic "could not reach pi" error.
-	// Gated on knowing the served id: without it we can't tell WHICH row is the steerable one,
-	// so we fail open (mark nothing) rather than risk locking the connected session too.
-	const crossSessionRemote = $derived(
-		browserServed &&
-			typeof window !== "undefined" &&
-			!isLoopbackHost(window.location.hostname) &&
-			servedSessionId !== null,
-	);
-
 	function selectAndConnect(s: SessionEntry): void {
 		if (discovery.selected === s.sessionId && live.status === "connected") return;
-		// Off-loopback, only the served session's token is valid (see crossSessionRemote). The
-		// sidebar already renders these rows as loopback-only/non-clickable, so this is
-		// defense-in-depth for the click path: refuse the dial rather than let it fail with a
-		// misleading "could not reach pi" error if a locked row is ever activated anyway.
-		if (crossSessionRemote && s.sessionId !== servedSessionId) return;
 		session.readOnly = false; // a live pi session is steerable, not read-only
 		claudeDiscovery.selected = null;
 		discovery.selected = s.sessionId;
 		// Only browser-served mode dials over host/token: desktop (Tauri) always reaches pi
-		// on plain loopback with no static-file gate to carry a token from. Reusing the page's
-		// OWN hostname/token for every discovered session (not just the one that served this
-		// page) is safe even when they differ: verifyWsUpgrade ignores the token entirely for
-		// a loopback peer (the common case), and for a genuinely remote peer dialing a DIFFERENT
-		// off-loopback session, a mismatched token is rejected exactly as if none were sent —
-		// each session mints its own independent token, so there is no shared secret to reuse
-		// across sessions to steer them from a fully remote browser (a known limitation, not a
-		// regression: browser-served mode could not switch sessions here AT ALL before this).
+		// on plain loopback. The live link binds loopback only, so verifyWsUpgrade accepts the
+		// dial tokenless; the token is forwarded when present but ignored for a loopback peer.
 		if (browserServed) {
 			connectLive(s.port, { host: window.location.hostname, token: readServedToken() ?? undefined });
 		} else {
@@ -234,7 +182,6 @@
 					const body = await res.json() as { served?: boolean; sessionId?: string; protocolVersion?: number };
 					if (body.served !== true) return;
 					browserServed = true;
-					servedSessionId = body.sessionId ?? null;
 					// This session's own port is dialed immediately so the view doesn't wait on
 					// the first discovery poll; the sidebar itself (below) is populated by
 					// startBrowserDiscovery, which lists every OTHER live session too.
@@ -301,8 +248,6 @@
 			claudeSelected={claudeDiscovery.selected}
 			onselectclaude={selectClaudeSession}
 			{browserServed}
-			{crossSessionRemote}
-			{servedSessionId}
 		/>
 	{/if}
 

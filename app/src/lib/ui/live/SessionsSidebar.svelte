@@ -22,8 +22,6 @@
 		claudeSelected = null,
 		onselectclaude = () => {},
 		browserServed = false,
-		crossSessionRemote = false,
-		servedSessionId = null,
 	}: {
 		source?: "pi" | "claude";
 		onsource?: (s: "pi" | "claude") => void;
@@ -42,13 +40,6 @@
 		// the source switcher: browsing read-only Claude Code transcripts reads ~/.claude
 		// straight off disk, which still requires the Tauri Rust layer.
 		browserServed?: boolean;
-		// Browser-served over a non-loopback origin: only `servedSessionId` carries a token the
-		// extension accepts off-loopback, so every OTHER session row is un-steerable from here.
-		// We render those rows as loopback-only (dimmed, lock badge, non-clickable) so the rail
-		// never lists a session it cannot actually open. Both false/null in the common (desktop
-		// or same-machine) case, where every session is dialable.
-		crossSessionRemote?: boolean;
-		servedSessionId?: string | null;
 	} = $props();
 
 	const STORE_KEY = "accordion.sidebar.collapsed";
@@ -99,13 +90,6 @@
 	function label(s: SessionEntry): string {
 		return baseName(s.cwd) || s.title || "session";
 	}
-	// A session this rail can actually open. Off-loopback (crossSessionRemote) only the served
-	// session's token is valid, so every other row is loopback-only. Always true otherwise.
-	function steerable(s: SessionEntry): boolean {
-		return !crossSessionRemote || s.sessionId === servedSessionId;
-	}
-	const LOCKED_TIP =
-		"Loopback-only — served by a different pi session, so it can't be steered from this remote browser. Open it from that session's own /accordion URL.";
 
 	// browserServed forces the pi source (no CC transcript browsing without Tauri fs access).
 	const effectiveSource = $derived(browserServed ? "pi" : source);
@@ -140,22 +124,14 @@
 			<div class="icon-list">
 				{#each sessions as s (s.sessionId)}
 					{@const isSel = s.sessionId === selected}
-					{@const canSteer = steerable(s)}
 					<button
 						class="rail-btn dot-btn"
 						class:sel={isSel}
-						class:locked={!canSteer}
-						title={canSteer ? label(s) : `${label(s)} — ${LOCKED_TIP}`}
-						aria-label={canSteer ? label(s) : `${label(s)} (loopback-only)`}
-						onclick={() => { if (canSteer) onselect(s); }}
-						aria-disabled={!canSteer}
-						tabindex={canSteer ? undefined : -1}
+						title={label(s)}
+						aria-label={label(s)}
+						onclick={() => onselect(s)}
 					>
-						{#if canSteer}
-							<span class="status-dot" class:on={isSel && connected} class:steering={isSel && connected && folding.enabled}></span>
-						{:else}
-							<Icon name="lock" size={12} />
-						{/if}
+						<span class="status-dot" class:on={isSel && connected} class:steering={isSel && connected && folding.enabled}></span>
 					</button>
 				{/each}
 			</div>
@@ -264,25 +240,19 @@
 						{#each sessions as s (s.sessionId)}
 							{@const p = pct(s)}
 							{@const isSel = s.sessionId === selected}
-							{@const canSteer = steerable(s)}
 							<li>
 								<button
 									class="row"
 									class:sel={isSel}
-									class:locked={!canSteer}
-									onclick={() => { if (canSteer) onselect(s); }}
-									aria-disabled={!canSteer}
-									tabindex={canSteer ? undefined : -1}
-									title={canSteer ? s.cwd : LOCKED_TIP}
+									onclick={() => onselect(s)}
+									title={s.cwd}
 								>
 									<span class="status-dot" class:on={isSel && connected} class:steering={isSel && connected && folding.enabled}></span>
 									<span class="body">
 										<span class="t1">{label(s)}</span>
 										<span class="t2 mono">{shortModel(s.model)}</span>
 									</span>
-									{#if !canSteer}
-										<span class="lock-badge mono" title={LOCKED_TIP}><Icon name="lock" size={10} />local</span>
-									{:else if p !== null}
+									{#if p !== null}
 										<span class="usage" title={`${s.tokens} / ${s.contextWindow} tokens`}>
 											<span class="bar"><span class="fill" class:hot={p >= 80} style:width={`${p}%`}></span></span>
 											<span class="pct mono"><AnimatedNumber value={s.tokens ?? 0} format={fmtTokens} /></span>
@@ -824,35 +794,6 @@
 		border: 1px solid var(--line);
 		border-radius: var(--radius-sm);
 		padding: 1px var(--sp-1);
-	}
-
-	/* ===== Loopback-only (un-steerable from a remote browser) rows ===== */
-	.row.locked {
-		cursor: default;
-		opacity: 0.5;
-	}
-	.row.locked:hover {
-		background: transparent; /* no hover affordance — it isn't clickable */
-	}
-	.dot-btn.locked {
-		cursor: default;
-		opacity: 0.5;
-		color: var(--faint);
-	}
-	.dot-btn.locked:hover {
-		background: transparent;
-		border-color: transparent;
-		color: var(--faint);
-	}
-	.lock-badge {
-		flex: 0 0 auto;
-		display: flex;
-		align-items: center;
-		gap: 3px;
-		font-size: var(--fs-2xs);
-		letter-spacing: 0.08em;
-		text-transform: uppercase;
-		color: var(--faint);
 	}
 
 	/* ===== CC footer note ===== */

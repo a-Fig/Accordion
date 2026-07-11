@@ -142,96 +142,9 @@ const FOCUS_PATH = path.join(REGISTRY_ROOT, FOCUS_FILE);
 const ACCORDION_APP_FLAG = "accordion-app";
 const ACCORDION_APP_ENV = "ACCORDION_APP_PATH";
 
-// Bind knobs (issue #42): the host/interface and port the live link listens on.
-// Defaults keep the original loopback + OS-assigned-ephemeral behavior; setting
-// the host to 0.0.0.0 (or a specific interface) lets a remote browser reach the
-// session. Flag wins over env, which wins over the default — same precedence as
-// the ACCORDION_APP path knob above. Binding to a SPECIFIC non-loopback, non-wildcard
-// interface (e.g. a LAN IP) excludes loopback: the desktop app's discovery always dials
-// 127.0.0.1, so it will list such a session but cannot reach it — only the browser URL
-// (dialed via that interface) works; startServer() logs a one-time console.warn for this.
-const ACCORDION_HOST_FLAG = "accordion-host";
-const ACCORDION_HOST_ENV = "ACCORDION_HOST";
-const ACCORDION_PORT_FLAG = "accordion-port";
-const ACCORDION_PORT_ENV = "ACCORDION_PORT";
-
-/** Resolve the bind host: flag -> env -> 127.0.0.1 (loopback, the safe default). */
-function resolveBindHost(pi: ExtensionAPI): string {
-	const flagVal = pi.getFlag(ACCORDION_HOST_FLAG);
-	if (typeof flagVal === "string" && flagVal.trim()) return flagVal.trim();
-	const envVal = process.env[ACCORDION_HOST_ENV];
-	if (typeof envVal === "string" && envVal.trim()) return envVal.trim();
-	return "127.0.0.1";
-}
-
-/**
- * Validate a PORT string the way a config value deserves: the WHOLE trimmed string must be
- * 1-5 ASCII digits in [0, 65535], not just a numeric PREFIX. `Number.parseInt` silently accepts
- * "8080junk" (→ 8080) and truncates "1.5" (→ 1) — both look like a validated port but aren't.
- * Returns null for an explicitly-set-but-invalid value (the caller logs + falls back to 0).
- */
-export function parseBindPort(raw: string): number | null {
-	const trimmed = raw.trim();
-	if (!/^\d{1,5}$/.test(trimmed)) return null;
-	const n = Number(trimmed);
-	return n <= 65535 ? n : null;
-}
-
-/**
- * Resolve the bind port: flag -> env -> 0 (OS-assigned ephemeral). Unset (both empty) -> 0,
- * silently (that is the documented default, not an error). An explicitly-set but INVALID value
- * (non-numeric, fractional, out-of-range, or trailing garbage — e.g. "8080junk", "1.5", "-1",
- * "99999") also falls back to 0, but logs a console.warn naming the flag/env var and the
- * rejected value, so a typo'd config doesn't silently downgrade to "OS picks a port".
- */
-function resolveBindPort(pi: ExtensionAPI): number {
-	const flagVal = pi.getFlag(ACCORDION_PORT_FLAG);
-	const source: { raw: string; name: string } | null =
-		typeof flagVal === "string" && flagVal.trim()
-			? { raw: flagVal, name: `--${ACCORDION_PORT_FLAG}` }
-			: process.env[ACCORDION_PORT_ENV]
-				? { raw: process.env[ACCORDION_PORT_ENV]!, name: ACCORDION_PORT_ENV }
-				: null;
-	if (!source) return 0; // nothing configured — the documented default, no warning
-	const parsed = parseBindPort(source.raw);
-	if (parsed === null) {
-		console.warn(`[accordion] ${source.name} is not a valid port (rejected value: ${JSON.stringify(source.raw)}) — falling back to an OS-assigned ephemeral port`);
-		return 0;
-	}
-	return parsed;
-}
-
-/** True if a BIND HOST string names only loopback (so off-loopback peers can't reach). */
-function isLoopbackHost(host: string): boolean {
-	const h = host.toLowerCase();
-	return h === "127.0.0.1" || h === "::1" || h === "localhost";
-}
-
-/** True if a BIND HOST string is a wildcard (binds every interface, loopback included). */
-function isWildcardHost(host: string): boolean {
-	const h = host.toLowerCase();
-	return h === "0.0.0.0" || h === "::";
-}
-
-/**
- * The host to show in the `/accordion` status line's browser URL, given the resolved BIND
- * host. Three distinct cases the old single `isLoopbackHost(bh) ? "127.0.0.1" : bh` conflated:
- *   • `::1` binds IPv6-ONLY — showing "127.0.0.1" (an IPv4 address) can be unreachable on a
- *     host without dual-stack loopback. Show the bracketed IPv6 literal instead.
- *   • a wildcard bind (0.0.0.0 / ::) is reachable via loopback regardless — keep showing
- *     "127.0.0.1" (a local user's own browser always works that way).
- *   • any OTHER host containing ":" is an IPv6 literal and MUST be bracketed in a URL, or the
- *     colons are parsed as a port separator (e.g. "http://fe80::1:PORT" is not what it looks
- *     like).
- */
-export function displayHostFor(bindHost: string): string {
-	const h = bindHost.toLowerCase();
-	if (h === "127.0.0.1" || h === "localhost") return "127.0.0.1";
-	if (isWildcardHost(h)) return "127.0.0.1";
-	if (h === "::1") return "[::1]";
-	if (h.includes(":")) return `[${bindHost}]`;
-	return bindHost;
-}
+// The live link binds an OS-assigned ephemeral port on loopback (127.0.0.1) only — a
+// same-machine surface. The desktop app's discovery dials 127.0.0.1; the browser-served
+// page auto-connects to the same origin. There is no remote/off-loopback bind mode.
 
 /** True if a socket peer address is loopback (127.0.0.1 / ::1, incl. IPv4-mapped IPv6). */
 function isLoopbackPeer(addr: string | undefined | null): boolean {
@@ -240,22 +153,6 @@ function isLoopbackPeer(addr: string | undefined | null): boolean {
 	// Strip the IPv4-mapped IPv6 prefix so 127.0.0.1 is recognized under dual-stack.
 	const v4 = a.startsWith("::ffff:") ? a.slice(7) : a;
 	return v4 === "127.0.0.1" || v4 === "::1" || v4 === "localhost";
-}
-
-/** Best-effort first non-internal IPv4 from the network interfaces, for the remote hint. */
-function firstLanIp(): string | null {
-	try {
-		const ifaces = os.networkInterfaces();
-		for (const list of Object.values(ifaces)) {
-			if (!list) continue;
-			for (const i of list) {
-				if (i.family === "IPv4" && !i.internal) return i.address;
-			}
-		}
-	} catch {
-		/* best-effort */
-	}
-	return null;
 }
 
 type LaunchSource = "cli" | "env" | "default";
@@ -390,27 +287,18 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		description: "Path to the Accordion desktop app executable for /accordion launch/focus",
 		type: "string",
 	});
-	pi.registerFlag(ACCORDION_HOST_FLAG, {
-		description: "Host/interface the Accordion live link binds (default 127.0.0.1; use 0.0.0.0 to allow remote browsers)",
-		type: "string",
-	});
-	pi.registerFlag(ACCORDION_PORT_FLAG, {
-		description: "Fixed port for the Accordion live link (default 0 = OS-assigned ephemeral)",
-		type: "string",
-	});
 
 	let wss: WebSocketServer | null = null;
 	// The HTTP server that BOTH hosts the WebSocket upgrade AND serves the browser
 	// build of the Accordion app on the same ephemeral port (feat/browser-served-extension).
 	// One server per pi session; closed alongside `wss` at shutdown.
 	let httpServer: http.Server | null = null;
-	// Per-session token gating the HTTP static-file surface AND (when bound off-loopback)
-	// the WS upgrade for non-loopback peers. Generated once when the server starts.
-	// A loopback peer (the desktop Tauri app, or a same-machine browser) dials tokenless
-	// and keeps working unchanged; a NON-loopback peer — only reachable when the bind host
-	// is 0.0.0.0 or a specific interface — must present this token on the upgrade. The
-	// browser-served page already carries it in its URL (?token=…), so the real user never
-	// types it; the gate keeps a network port-scanner from steering the agent's context.
+	// Per-session token gating the HTTP static-file surface (and the /__accordion/sessions
+	// list). Generated once when the server starts. The WS upgrade is loopback-only and
+	// tokenless (the desktop app and a same-machine browser both dial 127.0.0.1). The
+	// browser-served page carries the token in its URL (?token=…), so the real user never
+	// types it; the gate keeps another local origin from reading a served file it wasn't
+	// handed the link for.
 	let webToken = "";
 	let client: WebSocket | null = null; // the GUI (one driver at a time in M1)
 	let sessionId = "";
@@ -559,7 +447,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	let tokens: number | null = null;
 	let contextWindow: number | null = null;
 	let heartbeat: ReturnType<typeof setInterval> | null = null;
-	// Set iff the HTTP server's bind failed (e.g. EADDRINUSE on a fixed --accordion-port).
+	// Set iff the HTTP server's bind failed (e.g. an unexpected EADDRINUSE on the ephemeral port).
 	// Previously the "error" listener discarded the error entirely, so `port` stayed 0
 	// forever and `/accordion` printed "port starting…" — indistinguishable from a slow,
 	// still-booting server. Surfaced verbatim in the /accordion status line instead.
@@ -864,25 +752,16 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 * HTTP request handler — serves the browser build of the Accordion app, gated by a
 	 * per-session token. Runs ENTIRELY off the pi `context`/model-call hook path: it does
 	 * no folding, touches no plan, and a failure to serve a file never crashes a session
-	 * (every path is wrapped). The token gates file serving AND (off-loopback) `/meta` too —
-	 * see the meta branch below for why "same-origin protects it" was never actually true.
+	 * (every path is wrapped). The token gates file serving; `/meta` is ungated (loopback-only).
 	 */
 	function handleHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
 		try {
 			const u = new URL(req.url || "/", "http://127.0.0.1");
 
-			// Meta endpoint. UNGATED for a LOOPBACK peer only — local tooling (the smoke test,
-			// bellows polling from the same machine) and the browser's own same-origin fetch both
-			// depend on that. The original "same-origin policy hides the body from any other
-			// origin" justification was wrong for non-browser clients: a bare `curl` from off-
-			// loopback has no origin/CORS concept to enforce, so it read this fine over the
-			// network. Off-loopback now mirrors the static-file gate: token required.
+			// Meta endpoint. UNGATED — the whole surface is loopback-only, and local tooling (the
+			// smoke test, bellows polling from the same machine) and the browser's own same-origin
+			// fetch all depend on reading it without a token.
 			if (u.pathname === "/__accordion/meta") {
-				if (!isLoopbackPeer(req.socket.remoteAddress) && !isWebAuthed(req, u)) {
-					res.writeHead(403, { "Content-Type": "application/json" });
-					res.end(JSON.stringify({ error: "forbidden" }));
-					return;
-				}
 				res.writeHead(200, { "Content-Type": "application/json" });
 				// `planOutcomes` (issue #60, ADR 0020): per-cause counts of every `context` hook
 				// resolution this extension has ever resolved, plus `total` (= `contextHookCount`,
@@ -894,14 +773,9 @@ export default function accordionLive(pi: ExtensionAPI): void {
 
 			// Session list — powers the browser-served multi-session sidebar. TOKEN-GATED
 			// (unlike /meta): it reveals cwd/title/model across every live session on the
-			// machine, not just this one, so it must not be reachable without the token.
-			// Accepted tradeoff (deliberate, not accidental): because the WS itself is
-			// PERMANENTLY unauthenticated by design (so the desktop app can dial tokenlessly —
-			// see startServer's banner), a leaked token+URL for THIS session now also reveals
-			// the port/cwd/title/model of every OTHER live session on the machine, where before
-			// this endpoint existed it only exposed the one session whose URL leaked. That is a
-			// real increase in blast radius from a single leaked token, traded for the feature
-			// this PR adds; it is not mitigated further here (e.g. no per-session confirmation).
+			// machine, not just this one, so it must not be reachable without the token — a
+			// leaked token for THIS session otherwise exposes every other live session's
+			// port/cwd/title/model too. An accepted tradeoff for the multi-session sidebar.
 			if (u.pathname === "/__accordion/sessions") {
 				if (!isWebAuthed(req, u)) {
 					res.writeHead(403, { "Content-Type": "application/json" });
@@ -997,88 +871,46 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * Gate the WS upgrade by peer address. A loopback peer (the desktop app, or a
-	 * same-machine browser) connects tokenless — unchanged from the original design.
-	 * A NON-loopback peer — only reachable when the bind host is 0.0.0.0 or a specific
-	 * interface — must present the per-session `webToken`, which the browser-served page
-	 * already carries in its URL (?token=…) and forwards on the upgrade. This keeps
-	 * remote reachability safe by default: the token the user already has unlocks
-	 * steering for them, while a port-scanner on the network is refused.
+	 * Gate the WS upgrade by peer address. The server binds loopback only, so every peer
+	 * should already be loopback (the desktop app or a same-machine browser) and connects
+	 * tokenless. A non-loopback peer can't reach a loopback bind in practice; if one somehow
+	 * does, it is refused — defense in depth, not a reachable path.
 	 */
-	// The static-file surface (isWebAuthed) accepts the token via query OR the
-	// port-qualified accordion cookie (see accordionCookieName). The WS upgrade must accept
-	// the SAME cookie too: the cookie is HttpOnly (so JS can't read it to forward it on a
-	// reconnect without ?token=…), but the browser auto-sends it on a same-origin WS upgrade,
-	// which is the only path that lets a bookmarked/reloaded browser-served session re-steer
-	// off-loopback.
-	function hasAccordionCookie(req: http.IncomingMessage): boolean {
-		const cookie = req.headers["cookie"];
-		return typeof cookie === "string"
-			&& cookie.split(";").some((c) => c.trim() === `${accordionCookieName()}=${webToken}`);
-	}
-
 	function verifyWsUpgrade(info: { req: http.IncomingMessage }, cb: (res: boolean, code?: number, message?: string) => void): void {
-		const peer = info.req.socket.remoteAddress;
-		if (isLoopbackPeer(peer)) { cb(true); return; }
-		// Off-loopback peer: require the per-session token. The browser-served page
-		// forwards it on the upgrade URL (?token=…) on first load; on a later reload
-		// without ?token=… the browser still sends the HttpOnly accordion_token cookie,
-		// which we accept here so the same source of truth authorizes both halves.
-		const u = new URL(info.req.url || "/", "http://accordion.local");
-		const token = u.searchParams.get("token");
-		if (webToken && (token === webToken || hasAccordionCookie(info.req))) { cb(true); return; }
-		cb(false, 401, "unauthorized — open Accordion via the /accordion Browser link (it carries the session token)");
+		cb(isLoopbackPeer(info.req.socket.remoteAddress));
 	}
 
 	function startServer(): void {
 		if (wss || httpServer) return;
 		bindError = null; // fresh attempt — clear any failure a prior call recorded
-		// Per-session token for the HTTP static surface AND (when bound off-loopback) the
-		// WS upgrade for non-loopback peers — see verifyWsUpgrade for the auth split: a
-		// loopback peer (the desktop app, or a same-machine browser) dials tokenless and
-		// must keep working; a NON-loopback peer — only reachable when the bind host is
-		// 0.0.0.0 or a specific interface — must present this token, which the browser-
-		// served page already carries in its URL (?token=…). Without it anyone on the
-		// network could connect to the steering WS and fold/unfold/pin the agent's context.
+		// Per-session token for the HTTP static surface (and /__accordion/sessions). The WS
+		// upgrade is loopback-only and tokenless (see verifyWsUpgrade). The browser-served
+		// page carries this token in its URL (?token=…), so the real user never types it.
 		webToken = crypto.randomBytes(16).toString("hex");
-		const bindHost = resolveBindHost(pi);
-		const bindPort = resolveBindPort(pi);
 		try {
-			// One HTTP server hosts BOTH halves on the SAME port:
+			// One HTTP server hosts BOTH halves on the SAME ephemeral loopback port:
 			//   • HTTP GETs → handleHttp (the browser build, token-gated)
-			//   • WS upgrades → the WebSocketServer below (loopback tokenless;
-			//     off-loopback token-gated via verifyWsUpgrade)
+			//   • WS upgrades → the WebSocketServer below (loopback-only, tokenless)
 			// port 0 ⇒ OS assigns a free ephemeral port (one server per pi session).
 			httpServer = http.createServer(handleHttp);
 			// Attach the WS server to the HTTP server (NOT { port: 0 }) so the upgrade
-			// shares the port. verifyWsUpgrade gates non-loopback peers (see above).
+			// shares the port. verifyWsUpgrade refuses any non-loopback peer.
 			wss = new WebSocketServer({ server: httpServer, verifyClient: verifyWsUpgrade });
 			httpServer.on("error", (err: NodeJS.ErrnoException) => {
-				// e.g. a fixed --accordion-port already in use (EADDRINUSE): run headless
-				// (passthrough), but — unlike before — record and log WHY, so `/accordion`
-				// can show a real failure instead of an eternal "port starting…". No retry:
-				// a visible failure is the fix; the user re-runs with a free port/flag.
+				// Unexpected listen failure (e.g. EADDRINUSE): run headless (passthrough), but
+				// record and log WHY, so `/accordion` can show a real failure instead of an
+				// eternal "port starting…". No retry: a visible failure is the fix.
 				const code = err?.code ?? "unknown";
-				bindError = `bind failed: ${code} ${bindHost}:${bindPort}`;
+				bindError = `bind failed: ${code}`;
 				console.warn(`[accordion] ${bindError}`);
 				try { httpServer?.close(); } catch { /* ignore */ }
 				httpServer = null;
 				wss = null;
 			});
-			httpServer.listen(bindPort, bindHost, () => {
+			httpServer.listen(0, "127.0.0.1", () => {
 				const addr = httpServer?.address();
 				if (addr && typeof addr === "object") {
 					port = addr.port;
-					// A specific non-loopback, non-wildcard interface bind excludes loopback:
-					// the desktop app's discovery always dials 127.0.0.1, so it will list this
-					// session but never reach it (only the browser URL, dialed via that
-					// interface, works). One-time warning, not a hard error — this bind mode
-					// is intentional (issue #42), just easy to misread as "discovered ⇒ reachable".
-					if (!isLoopbackHost(bindHost) && !isWildcardHost(bindHost)) {
-						console.warn(
-							`[accordion] bound to ${bindHost}:${port} — desktop discovery (which always dials 127.0.0.1) will list this session but cannot reach it; the browser URL (via ${bindHost}) still works.`,
-						);
-					}
 					writeEntry(); // advertise immediately, now that the port is known
 					if (!heartbeat) {
 						heartbeat = setInterval(writeEntry, HEARTBEAT_INTERVAL_MS);
@@ -1761,18 +1593,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				`Live link: ${wasAttached ? "attached" : "detached"} · port ${portStatus} · streamed ${sentCount} blocks`,
 			];
 			// Browser entry point: the extension also serves the web build of Accordion on
-			// the same ephemeral port, gated by a per-session token. Surface the tokenized
-			// URL so the user can open the UI in a browser instead of the desktop app.
+			// the same ephemeral loopback port, gated by a per-session token. Surface the
+			// tokenized URL so the user can open the UI in a browser instead of the desktop app.
 			if (port && webToken) {
-				const bh = resolveBindHost(pi);
-				const displayHost = displayHostFor(bh);
-				// Keep the token-bearing line FIRST so the smoke regex (token=…) still matches.
-				lines.push(`Browser: http://${displayHost}:${port}/?token=${webToken}`);
-				// When bound off-loopback, surface a remote-friendly hint using the machine's LAN IP.
-				if (!isLoopbackHost(bh)) {
-					const lan = firstLanIp();
-					if (lan) lines.push(`Remote:  http://${lan}:${port}/?token=${webToken}`);
-				}
+				lines.push(`Browser: http://127.0.0.1:${port}/?token=${webToken}`);
 			} else if (bindError) {
 				lines.push(`Browser: unavailable — ${bindError}`);
 			} else {

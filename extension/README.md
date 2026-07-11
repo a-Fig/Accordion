@@ -48,23 +48,6 @@ sees.
 > native Rust layer. For that, conductors that need local model resources, or the native
 > window, build the [desktop app](https://github.com/a-Fig/Accordion) from source.
 
-### Remote / custom-port binding
-
-By default the live link binds `127.0.0.1` on an OS-assigned ephemeral port, so it is
-only reachable from the same machine. To steer a session running on a remote box (a
-dev server, a container, a GPU host) from your laptop browser, bind a reachable
-interface and optionally a fixed port:
-
-```bash
-ACCORDION_HOST=0.0.0.0 ACCORDION_PORT=8080 pi
-```
-
-or as flags: `--accordion-host=0.0.0.0 --accordion-port=8080`. The `/accordion` status
-line prints the tokenized browser URL (and a remote-friendly hint). Off-loopback
-connections require the per-session token that the browser URL already carries, so a
-port-scanner on the network cannot steer the agent; loopback connections stay
-tokenless, so the desktop app and a same-machine browser are unchanged.
-
 ## How it works
 
 The **context Map** is the whole window at a glance: one square per block, sized by token

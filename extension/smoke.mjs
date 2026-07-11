@@ -33,48 +33,6 @@ const mod = await jiti.import("./accordion.ts");
 const accordionLive = mod.default;
 if (typeof accordionLive !== "function") throw new Error("default export is not a function");
 
-// ── unit tests: pure port/host helpers (exported for exactly this purpose) ───
-// PORT VALIDATION (adversarial-review finding): `parseBindPort` must validate the WHOLE
-// trimmed string, not accept a numeric PREFIX like the old `Number.parseInt` did.
-const portCases = [
-	["8080", 8080],
-	["  8080  ", 8080], // trimmed
-	["0", 0],
-	["65535", 65535],
-	["8080junk", null], // trailing garbage — old code silently returned 8080
-	["1.5", null], // fractional — old code silently truncated to 1
-	["-1", null], // negative — regex rejects the leading "-"
-	["70000", null], // out of range
-	["", null], // empty string — caller treats as "unset", not tested here
-	["   ", null],
-	["0x10", null], // hex — Number() would accept this; regex must not
-	["1e3", null], // scientific notation — Number() would accept this; regex must not
-	["007", 7], // leading zero — decimal, not octal
-];
-const portFails = [];
-for (const [raw, expected] of portCases) {
-	const got = mod.parseBindPort(raw);
-	if (got !== expected) portFails.push(`parseBindPort(${JSON.stringify(raw)}) = ${got}, expected ${expected}`);
-}
-if (portFails.length) throw new Error("parseBindPort unit tests failed:\n" + portFails.join("\n"));
-
-// IPv6/DISPLAY URL host resolution.
-const hostCases = [
-	["127.0.0.1", "127.0.0.1"],
-	["localhost", "127.0.0.1"],
-	["0.0.0.0", "127.0.0.1"], // wildcard → still shown as loopback
-	["::", "127.0.0.1"], // IPv6 wildcard → same
-	["::1", "[::1]"], // IPv6 loopback-ONLY bind — 127.0.0.1 would be unreachable
-	["fe80::1", "[fe80::1]"], // arbitrary IPv6 literal must be bracketed
-	["192.168.1.20", "192.168.1.20"], // specific IPv4 interface — shown as-is
-];
-const hostFails = [];
-for (const [raw, expected] of hostCases) {
-	const got = mod.displayHostFor(raw);
-	if (got !== expected) hostFails.push(`displayHostFor(${JSON.stringify(raw)}) = ${JSON.stringify(got)}, expected ${JSON.stringify(expected)}`);
-}
-if (hostFails.length) throw new Error("displayHostFor unit tests failed:\n" + hostFails.join("\n"));
-
 async function waitFor(predicate, ms, label) {
 	const start = Date.now();
 	while (Date.now() - start < ms) {
@@ -1196,11 +1154,11 @@ if (passthroughs.length < 4) {
 	else if (!(timeoutStale.ops >= 1)) fails.push(`passthrough #2 (timeout-stale) expected ops>=1 (the re-applied stale plan), got ${timeoutStale.ops}`);
 
 	if (emptyPlan.cause !== "empty-plan") fails.push(`passthrough #3 expected cause 'empty-plan', got '${emptyPlan.cause}'`);
-	else if (emptyPlan.ops !== 0 || emptyPlan.groups !== 0 || emptyPlan.recalls !== 0)
+	else if (emptyPlan.ops !== 0 || emptyPlan.groups !== 0)
 		fails.push(`passthrough #3 (empty-plan) expected all-zero counts, got ${JSON.stringify(emptyPlan)}`);
 
 	if (timeoutRaw.cause !== "timeout-raw") fails.push(`passthrough #4 expected cause 'timeout-raw', got '${timeoutRaw.cause}'`);
-	else if (timeoutRaw.ops !== 0 || timeoutRaw.groups !== 0 || timeoutRaw.recalls !== 0)
+	else if (timeoutRaw.ops !== 0 || timeoutRaw.groups !== 0)
 		fails.push(`passthrough #4 (timeout-raw) expected all-zero counts, got ${JSON.stringify(timeoutRaw)}`);
 }
 
@@ -1372,120 +1330,6 @@ if (!(armedSmoke.nextDisarmedMs !== null && armedSmoke.nextDisarmedMs < 900))
 	await new Promise((r) => setTimeout(r, 50));
 }
 
-// ── bind failure is surfaced, not swallowed (defect #2) ─────────────────────
-// A second extension instance forced onto the SAME port the first instance already
-// bound must fail its `listen()` — the old code discarded the error entirely, leaving
-// `/accordion` printing "port starting…" forever. It must now report a real failure.
-{
-	const handlers2 = {};
-	const flags2 = new Map();
-	let accordionCmd2 = null;
-	const pi2 = {
-		on: (name, fn) => (handlers2[name] = fn),
-		registerFlag: (name, def) => flags2.set(name, def?.default),
-		getFlag: (name) => flags2.get(name),
-		registerCommand: (name, def) => { if (name === "accordion") accordionCmd2 = def.handler; },
-		registerTool: () => {},
-	};
-	accordionLive(pi2);
-	flags2.set("accordion-port", String(PORT)); // force EADDRINUSE against the first instance
-	const notifications2 = [];
-	const ctx2 = {
-		ui: { setStatus() {}, notify(message, type) { notifications2.push({ message, type }); }, theme: { fg: (_c, s) => s } },
-		model: { id: "test/model2", contextWindow: 1000 },
-		getContextUsage: () => ({ tokens: 1, contextWindow: 1000 }),
-	};
-	handlers2.session_start({}, ctx2);
-	let statusLine = "";
-	const start = Date.now();
-	while (Date.now() - start < 3000) {
-		if (accordionCmd2) {
-			await Promise.resolve(accordionCmd2("", ctx2));
-			statusLine = notifications2.at(-1)?.message ?? "";
-			if (/bind failed/i.test(statusLine)) break;
-		}
-		await new Promise((r) => setTimeout(r, 100));
-	}
-	if (!/bind failed/i.test(statusLine) || !/EADDRINUSE/.test(statusLine))
-		fails.push(`/accordion did not surface the bind failure — got: ${JSON.stringify(statusLine)}`);
-	if (!/unavailable/i.test(statusLine)) fails.push(`/accordion did not mark the Browser line unavailable on a bind failure — got: ${JSON.stringify(statusLine)}`);
-	if (handlers2.session_shutdown) handlers2.session_shutdown({}, ctx2);
-}
-
-// ── explicit-but-invalid --accordion-port still boots + warns (defect #1, integration) ──
-// Complements the direct `parseBindPort` unit tests above by proving `resolveBindPort`
-// actually warns (naming the flag + rejected value) when driven through session_start,
-// not just in isolation.
-{
-	const handlers4 = {};
-	const flags4 = new Map();
-	const pi4 = {
-		on: (name, fn) => (handlers4[name] = fn),
-		registerFlag: (name, def) => flags4.set(name, def?.default),
-		getFlag: (name) => flags4.get(name),
-		registerCommand: () => {},
-		registerTool: () => {},
-	};
-	accordionLive(pi4);
-	flags4.set("accordion-port", "8080junk");
-	const warnings4 = [];
-	const origWarn4 = console.warn;
-	console.warn = (...args) => { warnings4.push(args.join(" ")); origWarn4.apply(console, args); };
-	const ctx4 = {
-		ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
-		model: { id: "test/model4", contextWindow: 1000 },
-		getContextUsage: () => ({ tokens: 1, contextWindow: 1000 }),
-	};
-	handlers4.session_start({}, ctx4);
-	await waitFor(() => warnings4.some((w) => w.includes("accordion-port") && w.includes("8080junk")), 2000, "invalid --accordion-port warning").catch(
-		() => fails.push("resolveBindPort did not warn for an invalid explicit --accordion-port (integration)"),
-	);
-	console.warn = origWarn4;
-	if (handlers4.session_shutdown) handlers4.session_shutdown({}, ctx4);
-}
-
-// ── specific-interface bind warns about desktop-discovery unreachability (defect #4) ──
-// Skipped gracefully if this machine has no non-loopback IPv4 interface to bind to.
-{
-	const ifaces = os.networkInterfaces();
-	let lanIp = null;
-	outer: for (const list of Object.values(ifaces)) {
-		if (!list) continue;
-		for (const i of list) {
-			if (i.family === "IPv4" && !i.internal) { lanIp = i.address; break outer; }
-		}
-	}
-	if (!lanIp) {
-		console.log("NOTE: no non-loopback IPv4 interface found on this machine — skipping the specific-interface bind warning assertion.");
-	} else {
-		const handlers3 = {};
-		const flags3 = new Map();
-		const pi3 = {
-			on: (name, fn) => (handlers3[name] = fn),
-			registerFlag: (name, def) => flags3.set(name, def?.default),
-			getFlag: (name) => flags3.get(name),
-			registerCommand: () => {},
-			registerTool: () => {},
-		};
-		accordionLive(pi3);
-		flags3.set("accordion-host", lanIp);
-		const warnings3 = [];
-		const origWarn3 = console.warn;
-		console.warn = (...args) => { warnings3.push(args.join(" ")); origWarn3.apply(console, args); };
-		const ctx3 = {
-			ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
-			model: { id: "test/model3", contextWindow: 1000 },
-			getContextUsage: () => ({ tokens: 1, contextWindow: 1000 }),
-		};
-		handlers3.session_start({}, ctx3);
-		await waitFor(() => warnings3.some((w) => w.includes(lanIp) && w.includes("desktop discovery")), 2000, "specific-interface bind warning").catch(() =>
-			fails.push(`bind to specific interface ${lanIp} did not warn about desktop-discovery unreachability`),
-		);
-		console.warn = origWarn3;
-		if (handlers3.session_shutdown) handlers3.session_shutdown({}, ctx3);
-	}
-}
-
 // ── assertions ───────────────────────────────────────────────────────────────
 if (!seen.hello) fails.push("never received hello");
 if (!seen.flushOnAttach) fails.push("GUI received no history flush on attach (would stay empty until first message — the bug)");
@@ -1538,8 +1382,7 @@ console.log(
 					`stale-plan fallback (timeout re-applies last plan, empty plan not overridden) ✓  rttMs stamp ✓  ` +
 						`armed-over-wire (ack, disarmed=short / armed=deadline, mid-toggle snapshot) ✓  ` +
 							`passthrough acks (applied/empty-plan/timeout-stale/timeout-raw) ✓  /__accordion/meta planOutcomes ✓  ` +
-							`port-qualified cookie (collision guard) ✓  parseBindPort/displayHostFor unit tests ✓  ` +
-							`ack counts reflect applied-not-submitted ✓  bind failure surfaced ✓  invalid --accordion-port warns ✓  ` +
-							`specific-interface bind warns ✓`,
+							`port-qualified cookie (collision guard) ✓  ` +
+							`ack counts reflect applied-not-submitted ✓`,
 );
 process.exit(0);
