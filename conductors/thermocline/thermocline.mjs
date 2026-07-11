@@ -737,7 +737,7 @@ function onConnection(ws) {
 	ws.send(
 		JSON.stringify({
 			type: "conductor/hello",
-			conductorProtocol: 4, // keep in lockstep with conductors/contract/protocol.ts CONDUCTOR_PROTOCOL_VERSION
+			conductorProtocol: 6, // keep in lockstep with conductors/contract/protocol.ts CONDUCTOR_PROTOCOL_VERSION
 			id: ID,
 			label: LABEL,
 			wants: { content: "full" }, // need block text for probe + digest prompts
