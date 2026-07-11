@@ -1,6 +1,6 @@
 # ADR 0018 — The birth-fold exemption: letting a conductor fold a block before it is ever sent
 
-**Status:** removed from devmain 2026-07-11 — feature ripped out for simplification; see the removal PR.
+**Status:** removed from devmain 2026-07-11 — ripped out for simplification; re-filed as issue #77.
 **Date:** 2026-07-05
 **Builds on:** [ADR 0007](0007-conductor-protocol.md) (the conductor contract — `conduct →
 Command[]`, the "complete desired state" re-apply model), [ADR 0011](0011-conductor-involvement-locks.md)

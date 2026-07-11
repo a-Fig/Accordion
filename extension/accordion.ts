@@ -78,10 +78,10 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { linearize, applyPlan, type PiMessage, type AppliedCounts } from "../app/src/lib/live/mapping";
-import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type RecallOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
 
 /** The GUI's reply to a sync: in-place fold ops + group-collapse ops (ADR 0006). */
-type Plan = { ops: FoldOp[]; groups: GroupOp[]; recalls: RecallOp[] };
+type Plan = { ops: FoldOp[]; groups: GroupOp[] };
 /**
  * Outcome of awaiting a plan (issue #58). The old code collapsed all three cases into
  * a single `{ops:[],groups:[]}`/`null`, so a genuine empty plan (conductor wants no
@@ -494,7 +494,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	function recordPlanOutcome(
 		cause: PlanOutcomeCause,
 		reqId: number | null,
-		applied: { ops: number; groups: number; recalls: number },
+		applied: { ops: number; groups: number },
 		ackTarget: WebSocket | null,
 	): void {
 		planOutcomeCounts[cause]++;
@@ -515,7 +515,6 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				cause: cause as Exclude<PlanOutcomeCause, "no-gui" | "unsent">,
 				ops: applied.ops,
 				groups: applied.groups,
-				recalls: applied.recalls,
 			});
 		}
 	}
@@ -1139,7 +1138,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 						// A delivered plan — possibly genuinely empty. "plan" (not the "timeout"/"unsent"
 						// sentinels) tells the context hook the GUI actually replied, so an empty reply
 						// is honored as "no folds" and cached, not mistaken for a slow/absent GUI.
-						resolve({ kind: "plan", plan: { ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [], recalls: Array.isArray(msg.recalls) ? msg.recalls : [] } });
+						resolve({ kind: "plan", plan: { ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [] } });
 					}
 				}
 				if (msg?.type === "armed" && typeof msg.armed === "boolean") {
@@ -1455,7 +1454,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		pendingSince = [];
 		const all = linearize(lastMessages);
 		if (!attached()) {
-			recordPlanOutcome("no-gui", null, { ops: 0, groups: 0, recalls: 0 }, null);
+			recordPlanOutcome("no-gui", null, { ops: 0, groups: 0 }, null);
 			return; // no GUI → pass through untouched
 		}
 
@@ -1473,11 +1472,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// A new client attached mid-wait, superseding the view this request was sent to.
 			// Ack the CURRENT client anyway (it can still count the outcome) — its `reqId`
 			// belongs to the superseded view, not to anything the current client itself sent.
-			recordPlanOutcome("epoch-mismatch", reqId, { ops: 0, groups: 0, recalls: 0 }, client);
+			recordPlanOutcome("epoch-mismatch", reqId, { ops: 0, groups: 0 }, client);
 			return; // GUI reconnected mid-flight → don't apply/advance
 		}
 		if (result.kind === "unsent") {
-			recordPlanOutcome("unsent", reqId, { ops: 0, groups: 0, recalls: 0 }, null);
+			recordPlanOutcome("unsent", reqId, { ops: 0, groups: 0 }, null);
 			return; // couldn't deliver (no GUI / dropped) → pass through, don't advance
 		}
 
@@ -1488,13 +1487,13 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// through ops for ids no longer present). Never silent: log cause + reqId + elapsed.
 			sentCount = Math.max(sentCount, all.length);
 			const elapsed = lastPlanRttMs;
-			const hasStale = !!lastPlan && (lastPlan.ops.length > 0 || lastPlan.groups.length > 0 || lastPlan.recalls.length > 0);
-			// Three distinct outcomes, not two: a cached EMPTY plan (lastPlan set, 0 ops/groups/
-			// recalls — the conductor explicitly asked for no folds) still passes through unfolded,
+			const hasStale = !!lastPlan && (lastPlan.ops.length > 0 || lastPlan.groups.length > 0);
+			// Three distinct outcomes, not two: a cached EMPTY plan (lastPlan set, 0 ops/groups
+			// — the conductor explicitly asked for no folds) still passes through unfolded,
 			// same as genuinely having no cached plan at all — but the two causes are worth telling
 			// apart in the log rather than both reading as "no cached plan".
 			const detail = hasStale
-				? `applying last known plan (${lastPlan!.ops.length} ops, ${lastPlan!.groups.length} groups, ${lastPlan!.recalls.length} recalls)`
+				? `applying last known plan (${lastPlan!.ops.length} ops, ${lastPlan!.groups.length} groups)`
 				: lastPlan
 					? "cached plan is empty (no folds) — passing through unfolded"
 					: "no cached plan — passing through unfolded";
@@ -1505,28 +1504,25 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			} else {
 				console.warn(`[accordion] plan timeout: reqId=${reqId} after ${elapsed}ms — ${detail}`);
 			}
-			// Recalls replay with the rest of the stale plan: a recall op is "keep this text
-			// injected for this call" desired state, exactly like a fold op, and applyPlan's
-			// anchor fallback keeps a stale anchor safe. `recordPlanOutcome` below acks
-			// `timeout-stale`/`timeout-raw` to the GUI for its wire-outcome tally (ADR 0020).
+			// `recordPlanOutcome` below acks `timeout-stale`/`timeout-raw` to the GUI for its
+			// wire-outcome tally (ADR 0020).
 			if (hasStale) {
 				// Apply FIRST, ack AFTER — with the counts applyPlan actually substituted, not the
 				// stale plan's submitted lengths. A stale plan re-applied against messages that have
 				// moved on can easily have ids that no longer match anything live; the old code acked
 				// `lastPlan!.ops.length` etc. regardless, over-reporting what really rode the wire
 				// (ADR 0020 promises counts ACTUALLY applied).
-				const appliedCounts: AppliedCounts = { ops: 0, groups: 0, recalls: 0 };
+				const appliedCounts: AppliedCounts = { ops: 0, groups: 0 };
 				const newMessages = applyPlan(
 					event.messages as unknown as PiMessage[],
 					lastPlan!.ops,
 					lastPlan!.groups,
-					lastPlan!.recalls,
 					appliedCounts,
 				);
 				recordPlanOutcome("timeout-stale", reqId, appliedCounts, client);
 				return { messages: newMessages as unknown as AgentMessage[] };
 			}
-			recordPlanOutcome("timeout-raw", reqId, { ops: 0, groups: 0, recalls: 0 }, client);
+			recordPlanOutcome("timeout-raw", reqId, { ops: 0, groups: 0 }, client);
 			return;
 		}
 
@@ -1536,9 +1532,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		const plan = result.plan;
 		lastPlan = plan;
 		sentCount = Math.max(sentCount, all.length); // advance cursor; never rewind (a message_end during the await may have advanced it further)
-		const recallCount = plan.recalls?.length ?? 0;
-		if (plan.ops.length === 0 && plan.groups.length === 0 && recallCount === 0) {
-			recordPlanOutcome("empty-plan", reqId, { ops: 0, groups: 0, recalls: 0 }, client);
+		if (plan.ops.length === 0 && plan.groups.length === 0) {
+			recordPlanOutcome("empty-plan", reqId, { ops: 0, groups: 0 }, client);
 			return; // empty plan → pass through
 		}
 
@@ -1546,8 +1541,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		// op/group whose id matches nothing live in `messages` is silently skipped by applyPlan, so
 		// the SUBMITTED plan length (`plan.ops.length` etc.) can overstate what actually rode the
 		// wire. `appliedCounts` reflects the real substitutions.
-		const appliedCounts: AppliedCounts = { ops: 0, groups: 0, recalls: 0 };
-		const newMessages = applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups, plan.recalls, appliedCounts);
+		const appliedCounts: AppliedCounts = { ops: 0, groups: 0 };
+		const newMessages = applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups, appliedCounts);
 		recordPlanOutcome("applied", reqId, appliedCounts, client);
 		return { messages: newMessages as unknown as AgentMessage[] };
 	});

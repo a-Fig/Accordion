@@ -13,10 +13,10 @@
 import { session, cancelPendingLoad } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import { wireToBlock } from "./mapping";
-import { computeFoldOps, computeGroupOps, computeRecallOps, resolveUnfold, resolveRecall } from "./plan";
+import { computeFoldOps, computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
 import { folding, setFolding } from "./folding.svelte";
 import { activeRemoteRunner } from "./conductorClient.svelte";
-import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, isWireBlock, type ServerMessage, type HelloMessage, type PlanMessage, type FoldOp, type GroupOp, type RecallOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage, type ArmedMessage, type PassthroughCause } from "./protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, isWireBlock, type ServerMessage, type HelloMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage, type ArmedMessage, type PassthroughCause } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import type { CompletionRequest, CompletionResult } from "$conductors/contract";
 
@@ -89,9 +89,9 @@ export const live = $state<{
  *
  * This is the one place the GUI can alter a real model call; keep it a pure read.
  */
-function computePlan(): { ops: FoldOp[]; groups: GroupOp[]; recalls: RecallOp[] } {
-	if (!folding.enabled || !session.store) return { ops: [], groups: [], recalls: [] };
-	return { ops: computeFoldOps(session.store), groups: computeGroupOps(session.store), recalls: computeRecallOps(session.store) };
+function computePlan(): { ops: FoldOp[]; groups: GroupOp[] } {
+	if (!folding.enabled || !session.store) return { ops: [], groups: [] };
+	return { ops: computeFoldOps(session.store), groups: computeGroupOps(session.store) };
 }
 
 /**
@@ -364,7 +364,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// below still runs) or corrupt the store's token accounting.
 			session.store.appendBlocks((Array.isArray(msg.blocks) ? msg.blocks : []).filter(isWireBlock).map(wireToBlock));
 			const plan = computePlan();
-			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups, recalls: plan.recalls };
+			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups };
 			try {
 				ws.send(JSON.stringify(reply));
 			} catch {

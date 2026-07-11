@@ -1,6 +1,6 @@
 # ADR 0019 — Conductor `recall`: surfacing folded content without a prompt-cache miss
 
-**Status:** accepted
+**Status:** removed from devmain 2026-07-11 — ripped out for simplification; re-filed as issue #78.
 **Date:** 2026-07-05
 **Builds on:** [ADR 0005](0005-agent-unfold.md) (the agent's `recall` tool — the read that this is
 the conductor analog of), [ADR 0006](0006-multiblock-folds.md) (group collapse — the recall
