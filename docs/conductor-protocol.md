@@ -104,8 +104,9 @@ wire:
 
 The four booleans fold the host's policy into plain flags so you never call an engine
 helper: skip a block when `held`, `protected`, or `grouped`, and read `foldedTokens` for the
-saving a fold would buy. `fresh` is the one exception worth checking FOR, not against: a
-`protected && fresh` block is fair game even without the `tail-size` lock.
+saving a fold would buy. Protection has no per-block exemption — the only way to fold
+inside the protected tail is holding the `tail-size` involvement lock (ADR 0011). (The
+birth-fold `fresh` exemption that once relaxed this was removed in PR #81.)
 
 ## What you return — the command set
 
@@ -418,7 +419,7 @@ wants full content, and on each `context/update` folds the oldest non-`protected
 // recency-folder.js — run: node recency-folder.js   (npm i ws)
 // Advertise it for auto-discovery by writing this JSON to
 // ~/.accordion/conductors/recency-folder.json (refresh heartbeatAt every few seconds):
-//   { "registryProtocol":1, "conductorProtocol":3, "id":"recency-folder",
+//   { "registryProtocol":1, "conductorProtocol":6, "id":"recency-folder",
 //     "label":"Recency folder", "url":"ws://127.0.0.1:7700",
 //     "pid":<pid>, "startedAt":<ms>, "heartbeatAt":<ms> }
 import { WebSocketServer } from "ws";
