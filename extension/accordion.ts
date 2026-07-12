@@ -148,6 +148,9 @@ const MAX_CONCURRENT_COMPLETIONS = 4;
 // Finish before the GUI's 120 s completion backstop and pass the abort signal through to pi-ai.
 // The override keeps smoke tests fast; invalid values retain the production default.
 const COMPLETION_TIMEOUT_MS = envPositiveInt("ACCORDION_COMPLETION_TIMEOUT_MS", 110_000);
+// Vite's fixed localhost:1420 Origin is browser-obtainable, unlike Tauri's production custom
+// origins. Trust it only for an explicit local development session; shipped installs stay closed.
+const ALLOW_TAURI_DEV_ORIGIN = process.env.ACCORDION_ALLOW_TAURI_DEV_ORIGIN === "1";
 
 /** Origins used by Accordion's Tauri webview. Normal web pages cannot mint these origins. */
 function isTrustedTauriOrigin(origin: string): boolean {
@@ -158,8 +161,12 @@ function isTrustedTauriOrigin(origin: string): boolean {
 	// https://tauri.localhost on Windows (the latter may also be http in older WebView2 builds).
 	if (u.protocol === "tauri:" && u.hostname === "localhost" && !u.port) return true;
 	if ((u.protocol === "https:" || u.protocol === "http:") && u.hostname === "tauri.localhost" && !u.port) return true;
-	// tauri.conf.json's development URL.
-	return u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1") && u.port === "1420";
+	// tauri.conf.json's Vite development URL — opt-in only because port 1420 is not a
+	// cryptographically distinguished origin and may be occupied by unrelated local content.
+	return ALLOW_TAURI_DEV_ORIGIN
+		&& u.protocol === "http:"
+		&& (u.hostname === "localhost" || u.hostname === "127.0.0.1")
+		&& u.port === "1420";
 }
 
 // Base dir is overridable for tests (smoke.mjs) so they don't touch the real home.

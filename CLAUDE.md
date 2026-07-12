@@ -222,6 +222,10 @@ npm run check        # svelte-check — keep 0 errors / 0 warnings
 npm run test         # vitest
 ```
 
+For live-link testing under `tauri dev`, launch the **pi process** with
+`ACCORDION_ALLOW_TAURI_DEV_ORIGIN=1`. The Vite `http://localhost:1420` Origin is intentionally
+not trusted by default; production Tauri custom-protocol origins do not need this opt-in.
+
 ```bash
 cd extension && node smoke.mjs     # extension smoke test
 cd extension && npm pack --dry-run # package readiness: app build → client copy → bundle → smoke → tarball listing

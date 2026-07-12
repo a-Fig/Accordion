@@ -1398,10 +1398,13 @@ if (!(armedSmoke.nextDisarmedMs !== null && armedSmoke.nextDisarmedMs < 900))
 	if (opaque.open || opaque.status !== 403) fails.push(`ws-hardening: opaque browser Origin was not rejected (${JSON.stringify(opaque)})`);
 	const native = await dialWs();
 	if (!native.open) fails.push(`ws-hardening: no-Origin native client was rejected (${JSON.stringify(native)})`);
-	for (const origin of ["tauri://localhost", "https://tauri.localhost", "http://tauri.localhost", "http://localhost:1420"]) {
+	for (const origin of ["tauri://localhost", "https://tauri.localhost", "http://tauri.localhost"]) {
 		const tauri = await dialWs({ origin });
 		if (!tauri.open) fails.push(`ws-hardening: trusted Tauri Origin ${origin} was rejected (${JSON.stringify(tauri)})`);
 	}
+	const tauriDevDefault = await dialWs({ origin: "http://localhost:1420" });
+	if (tauriDevDefault.open || tauriDevDefault.status !== 403)
+		fails.push(`ws-hardening: Tauri dev Origin was trusted without explicit opt-in (${JSON.stringify(tauriDevDefault)})`);
 
 	if (TOKEN) {
 		// Matching Origin and Host are attacker-controlled under DNS rebinding; a non-literal host
