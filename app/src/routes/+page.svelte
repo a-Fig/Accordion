@@ -118,9 +118,8 @@
 		return p ? p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p : "";
 	}
 
-	// The per-session token carried in the page URL (?token=…). The live link binds loopback
-	// only, so verifyWsUpgrade accepts a loopback dial tokenless and this is effectively inert;
-	// it is still forwarded on the WS upgrade for symmetry with the static-file surface.
+	// The per-session bearer carried in the page URL (?token=…). Browser WebSocket upgrades
+	// are Origin/token-gated even on loopback; forwarding this authorizes the serving session.
 	function readServedToken(): string | null {
 		if (typeof window === "undefined") return null;
 		return new URLSearchParams(window.location.search).get("token");
@@ -131,9 +130,9 @@
 		session.readOnly = false; // a live pi session is steerable, not read-only
 		claudeDiscovery.selected = null;
 		discovery.selected = s.sessionId;
-		// Only browser-served mode dials over host/token: desktop (Tauri) always reaches pi
-		// on plain loopback. The live link binds loopback only, so verifyWsUpgrade accepts the
-		// dial tokenless; the token is forwarded when present but ignored for a loopback peer.
+		// Browser-served mode dials with the page's loopback host and bearer. On a sibling
+		// switch the bearer belongs to the serving session, so the target verifies the page's
+		// live Accordion Origin instead. Desktop Tauri origins are trusted tokenless.
 		if (browserServed) {
 			connectLive(s.port, { host: window.location.hostname, token: readServedToken() ?? undefined });
 		} else {

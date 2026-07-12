@@ -4,9 +4,9 @@ import { session } from "../session.svelte";
 import { PROTOCOL_VERSION } from "./protocol";
 
 /*
- * Malformed-frame hardening. The live WS is deliberately unauthenticated (tokenless
- * Tauri dial), so any local process can put a frame on the wire. isServerMessage only
- * vets the `type` tag — these tests pin that a hello without a real `meta` object and
+ * Malformed-frame hardening. Browser upgrades are authenticated, but native/Tauri clients
+ * remain tokenless and any authorized peer may still send malformed data. isServerMessage
+ * only vets the `type` tag — these tests pin that a hello without a real `meta` object and
  * a sync without a real `blocks` array are absorbed gracefully instead of throwing
  * mid-pump and stranding the client half-connected.
  *
