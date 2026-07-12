@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { applyPlan, type PiMessage, type AppliedCounts } from "./mapping";
-import type { FoldOp, GroupOp, RecallOp } from "./protocol";
+import type { FoldOp, GroupOp } from "./protocol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // applyPlan's optional `appliedOut` param (issue #60 follow-up, ADR 0020): the
@@ -9,7 +9,7 @@ import type { FoldOp, GroupOp, RecallOp } from "./protocol";
 // match nothing live in `messages` (e.g. a stale plan re-applied after the
 // conversation moved on) has zero wire effect and must not be counted.
 //
-// Purely additive: every pre-existing call site omits the 5th arg and is
+// Purely additive: every pre-existing call site omits the appliedOut arg and is
 // unaffected (covered by every other mapping*.test.ts file passing unchanged).
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -32,7 +32,7 @@ function msgs(): PiMessage[] {
 }
 
 function counts(): AppliedCounts {
-	return { ops: -1, groups: -1, recalls: -1 }; // sentinel so an un-set field is obvious
+	return { ops: -1, groups: -1 }; // sentinel so an un-set field is obvious
 }
 
 describe("applyPlan — appliedOut counts (actually-applied, not submitted)", () => {
@@ -44,15 +44,14 @@ describe("applyPlan — appliedOut counts (actually-applied, not submitted)", ()
 
 	it("a matched FoldOp on a text part is counted as applied", () => {
 		const out = counts();
-		applyPlan(msgs(), [{ id: "a:resp_a:p1", digestText: "FOLDED" }], [], [], out);
+		applyPlan(msgs(), [{ id: "a:resp_a:p1", digestText: "FOLDED" }], [], out);
 		expect(out.ops).toBe(1);
 		expect(out.groups).toBe(0);
-		expect(out.recalls).toBe(0);
 	});
 
 	it("a matched FoldOp on a tool_result is counted as applied", () => {
 		const out = counts();
-		applyPlan(msgs(), [{ id: "r:call_1", digestText: "folded read" }], [], [], out);
+		applyPlan(msgs(), [{ id: "r:call_1", digestText: "folded read" }], [], out);
 		expect(out.ops).toBe(1);
 	});
 
@@ -60,7 +59,7 @@ describe("applyPlan — appliedOut counts (actually-applied, not submitted)", ()
 		const out = counts();
 		const src = msgs();
 		const staleOps: FoldOp[] = [{ id: "a:resp_zzz:p0", digestText: "FOLDED" }]; // durable id, no such block
-		const result = applyPlan(src, staleOps, [], [], out);
+		const result = applyPlan(src, staleOps, [], out);
 		expect(out.ops).toBe(0);
 		expect(result).toBe(src); // identity passthrough — nothing actually changed
 	});
@@ -69,7 +68,7 @@ describe("applyPlan — appliedOut counts (actually-applied, not submitted)", ()
 		// a:resp_a:p2 is the toolCall part — foldOne deliberately never folds it (would orphan
 		// the tool_result). The id is present in `byId` but never substituted.
 		const out = counts();
-		applyPlan(msgs(), [{ id: "a:resp_a:p2", digestText: "FOLDED" }], [], [], out);
+		applyPlan(msgs(), [{ id: "a:resp_a:p2", digestText: "FOLDED" }], [], out);
 		expect(out.ops).toBe(0);
 	});
 
@@ -81,7 +80,6 @@ describe("applyPlan — appliedOut counts (actually-applied, not submitted)", ()
 				{ id: "a:resp_a:p1", digestText: "FOLDED" }, // matches → applied
 				{ id: "u:9999999", digestText: "FOLDED" }, // durable shape, no such message → not applied
 			],
-			[],
 			[],
 			out,
 		);
@@ -95,7 +93,7 @@ describe("applyPlan — appliedOut counts (actually-applied, not submitted)", ()
 			memberIds: ["a:resp_a:p0", "a:resp_a:p1", "a:resp_a:p2", "r:call_1"],
 			summaryText: "{#g FOLDED} read the file",
 		};
-		applyPlan(msgs(), [], [group], [], out);
+		applyPlan(msgs(), [], [group], out);
 		expect(out.groups).toBe(1);
 		expect(out.ops).toBe(0);
 	});
@@ -107,7 +105,7 @@ describe("applyPlan — appliedOut counts (actually-applied, not submitted)", ()
 			memberIds: ["a:resp_zzz:p0", "a:resp_zzz:p1"],
 			summaryText: "{#g FOLDED} nothing here",
 		};
-		applyPlan(msgs(), [], [staleGroup], [], out);
+		applyPlan(msgs(), [], [staleGroup], out);
 		expect(out.groups).toBe(0);
 		// Passthrough: nothing durable matched, so applyPlan returns the identity (no change).
 		const src = msgs();
@@ -119,7 +117,7 @@ describe("applyPlan — appliedOut counts (actually-applied, not submitted)", ()
 		// fixpoint demotes this to a straggler — nothing is actually removed.
 		const out = counts();
 		const straggler: GroupOp = { id: "g:2", memberIds: ["r:call_1"], summaryText: null };
-		applyPlan(msgs(), [], [straggler], [], out);
+		applyPlan(msgs(), [], [straggler], out);
 		expect(out.groups).toBe(0);
 	});
 
@@ -131,41 +129,17 @@ describe("applyPlan — appliedOut counts (actually-applied, not submitted)", ()
 			summaryText: "{#g FOLDED} done",
 		};
 		const stale: GroupOp = { id: "g:stale", memberIds: ["a:resp_zzz:p0"], summaryText: "{#g FOLDED} stale" };
-		applyPlan(msgs(), [], [real, stale], [], out);
+		applyPlan(msgs(), [], [real, stale], out);
 		expect(out.groups).toBe(1);
-	});
-
-	it("a safe RecallOp is always counted as applied (every safe recall inserts somewhere)", () => {
-		const out = counts();
-		const recalls: RecallOp[] = [{ id: "rc:1", afterId: "u:1000", text: "the original folded text" }];
-		applyPlan(msgs(), [], [], recalls, out);
-		expect(out.recalls).toBe(1);
-		expect(out.ops).toBe(0);
-		expect(out.groups).toBe(0);
-	});
-
-	it("a recall whose anchor is unknown still applies (append-at-end fallback) and is counted", () => {
-		const out = counts();
-		const recalls: RecallOp[] = [{ id: "rc:1", afterId: "u:999999999", text: "orphaned recall text" }];
-		const result = applyPlan(msgs(), [], [], recalls, out);
-		expect(out.recalls).toBe(1);
-		expect(JSON.stringify(result)).toContain("orphaned recall text");
-	});
-
-	it("a shape-INVALID recall (empty text) is filtered before counting — not counted", () => {
-		const out = counts();
-		const recalls: RecallOp[] = [{ id: "rc:1", afterId: "u:1000", text: "" }];
-		applyPlan(msgs(), [], [], recalls, out);
-		expect(out.recalls).toBe(0);
 	});
 
 	it("everything empty/omitted → all-zero counts, no crash on the early-return path", () => {
 		const out = counts();
-		applyPlan(msgs(), [], [], [], out);
-		expect(out).toEqual({ ops: 0, groups: 0, recalls: 0 });
+		applyPlan(msgs(), [], [], out);
+		expect(out).toEqual({ ops: 0, groups: 0 });
 	});
 
-	it("combined plan: matched op + matched group + matched recall — all three counted independently", () => {
+	it("combined plan: matched op + matched group — counted independently", () => {
 		const out = counts();
 		const ops: FoldOp[] = [{ id: "u:2000", digestText: "FOLDED-USER" }]; // user role never folds → not applied
 		const group: GroupOp = {
@@ -173,10 +147,8 @@ describe("applyPlan — appliedOut counts (actually-applied, not submitted)", ()
 			memberIds: ["a:resp_a:p0", "a:resp_a:p1", "a:resp_a:p2", "r:call_1"],
 			summaryText: "{#g FOLDED} read the file",
 		};
-		const recalls: RecallOp[] = [{ id: "rc:1", afterId: "u:1000", text: "recalled text" }];
-		applyPlan(msgs(), ops, [group], recalls, out);
+		applyPlan(msgs(), ops, [group], out);
 		expect(out.ops).toBe(0); // user messages are never folded by foldOne
 		expect(out.groups).toBe(1);
-		expect(out.recalls).toBe(1);
 	});
 });

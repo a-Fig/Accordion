@@ -20,6 +20,15 @@ deliberately left open.
 > still v5 when devmain (v7) was promoted, so a jump was forced regardless, and v7 never shipped
 > past devmain. Read "no bump" in sections 2 and Rejected-alternatives as superseded by this note.
 
+> **Update (2026-07-11, PR #81 — birth folding and conductor recall removed):** the birth-fold
+> exemption (ADR 0018) and the conductor `RecallCommand` (ADR 0019) were ripped out of devmain
+> for simplification. Read the affected parts of this ADR as historical: the `markSent`/
+> `birthFolded` reconciliation (section 4 and the PR #52 note above) no longer exists — there is
+> no optimistic cursor left to repair — and `PassthroughMessage` no longer carries a `recalls`
+> count (`ops`/`groups` remain). What survives, unchanged, is this ADR's core: every `context`
+> hook outcome is still classified, acked as `passthrough`, and counted in `/__accordion/meta`'s
+> `planOutcomes`, feeding the GUI's wire-health readout. `PROTOCOL_VERSION` is 9 as of PR #81.
+
 ## Context
 
 `extension/accordion.ts`'s `context` hook has always had more outcomes than "apply the GUI's

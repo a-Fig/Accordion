@@ -198,7 +198,6 @@ function makeProseView(n: number, budget: number): ConductorView {
 			folded: false,
 			protected: false,
 			grouped: false,
-			fresh: false,
 		});
 	}
 	const liveTokens = blocks.reduce((s, b) => s + b.tokens, 0);

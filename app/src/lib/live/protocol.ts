@@ -36,9 +36,9 @@
  *  - v4: group collapse ops (`GroupOp`, `PlanMessage.groups`).
  *  - v5: recall tool (`recallRequest` / `recallResult`) plus completion relay
  *        (`completeRequest` / `completeResult`) for out-of-band model completions.
- *  - v6: `SyncMessage.planned` (ADR 0018) — the birth-fold exemption. Additive.
+ *  - v6: `SyncMessage.planned` (ADR 0018) — the birth-fold exemption. Additive. (removed in v9)
  *  - v7: `PlanMessage.recalls` (`RecallOp`, ADR 0019) — conductor recall injects a folded
- *        block's full text at a stable tail anchor without unfolding it. Additive.
+ *        block's full text at a stable tail anchor without unfolding it. Additive. (removed in v9)
  *  - (no bump, additive) `armed` / `armedAck`: the attached client declares its
  *    ARMED state over the wire (client→server `armed`), and the extension replies
  *    `armedAck` whenever it processes one. PROTOCOL_VERSION is DELIBERATELY NOT
@@ -53,18 +53,16 @@
  *    (and can scream) — so the version number buys nothing a bump would cost.
  *  - v8: `passthrough`: the extension's per-outcome ack for every `context` hook resolution
  *        (issue #60, ADR 0020) — `applied` / `empty-plan` / `timeout-stale` / `timeout-raw` /
- *        `epoch-mismatch`. Unlike `armed`/`armedAck`, this is NOT purely informational: its
- *        `timeout-stale`/`timeout-raw` cause is what lets the GUI learn its optimistic birth-fold
- *        `markSent` assumed a plan that never rode the wire, and repair the exemption bookkeeping
- *        (ADR 0018/0020). A v8 peer therefore MUST emit it — a silent v7-era extension paired with
- *        a birth-folding GUI would leave a stale exemption that folds already-seen protected
- *        content. It landed on the wire without a bump (v7 was never promoted past devmain); this
- *        bump to v8 makes the correctness-critical ack part of the version contract, and `main`
- *        (still v5 at the time of the devmain→main promotion) has to jump anyway, so the bump is
- *        free. The strict `protocolVersion !== PROTOCOL_VERSION` check both peers do then refuses a
- *        pre-ack peer instead of pairing silently.
+ *        `epoch-mismatch`. The GUI tallies these into its "wire N/M" readout. The strict
+ *        `protocolVersion !== PROTOCOL_VERSION` check both peers do refuses a pre-ack peer
+ *        instead of pairing silently.
+ *  - v9: birth folding (ADR 0018) and conductor recall (ADR 0019) were ripped out for
+ *        simplification. `SyncMessage.planned`, `RecallOp`, `PlanMessage.recalls`, and
+ *        `PassthroughMessage.recalls` are gone. The plan-applied ack (`passthrough`) and its
+ *        cause taxonomy STAY — only their birth-fold/recall-specific fields and roles are
+ *        removed. Bumped (never renumbered downward) so a stale client can't pair silently.
  */
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi
@@ -143,37 +141,6 @@ export interface GroupOp {
 	summaryText: string | null;
 }
 
-/**
- * One recall instruction (ADR 0019) — the conductor analog of the agent's `recall` tool. The
- * folded block `id` STAYS folded on the wire (its `{#code FOLDED}` digest is untouched); instead
- * `applyPlan` inserts ONE synthetic user-role message `{ role:"user", content:[{type:"text",
- * text}] }` immediately AFTER the message that emits `afterId`. That anchor is FROZEN when the
- * recall is first issued, so the prefix up to it never shifts on later passes — the injection is
- * cache-SAFE (unlike an unfold, which mutates history in place and forces a cache miss).
- *
- * `text` is the block's ORIGINAL full content, already labeled by the GUI (so the extension
- * substitutes it opaquely, exactly like `FoldOp.digestText`). `id` is carried for
- * correlation/dedup only — the wire keys the insertion on `afterId`, not `id`.
- *
- * GROUP-SWALLOW FALLBACK: if a `GroupOp` in the same plan collapsed the anchor message,
- * `applyPlan` inserts after that group's summary message instead; if the run was dropped with no
- * summary, after the last surviving message before the gap; if the anchor cannot be resolved at
- * all, it appends at the very end. A malformed op is skipped. It never throws, and it keeps
- * tool_call/result pairing balanced on every path: the GUI never anchors on any block of a
- * tool-calling message; `applyPlan` slides an interior insertion forward past any tool_result
- * message(s); and the append-at-end fallback lands BEFORE a trailing unpaired tool_call if the
- * tail ever holds one. The synthetic user message can never sit between a call and its result
- * (an INSERTION between a pair breaks it without touching either message).
- */
-export interface RecallOp {
-	/** The folded block being recalled (for correlation/dedup; not the insertion key). */
-	id: string;
-	/** Durable id of the frozen anchor block; the synthetic message is inserted after its message. */
-	afterId: string;
-	/** The block's original full content, already labeled — substituted opaquely on the wire. */
-	text: string;
-}
-
 // ── Server → client (extension → GUI) ────────────────────────────────────────
 
 /** Sent once when the GUI connects. */
@@ -197,11 +164,6 @@ export interface SyncMessage {
 	full: boolean;
 	blocks: WireBlock[];
 	contextWindow?: number | null;
-	/** True only on the pre-model-call `context` sync whose plan the extension will
-	 *  APPLY. Absent/false on view-only syncs (message_end / agent_end / model_select).
-	 *  The GUI advances its "sent" cursor only on a planned sync, so a fresh block stays
-	 *  birth-foldable until the model actually consumes it (#43). */
-	planned?: boolean;
 }
 
 /**
@@ -324,20 +286,12 @@ export type PassthroughCause = "applied" | "empty-plan" | "timeout-stale" | "tim
 /**
  * Sent by the extension after EVERY `context` hook resolution (issue #60, ADR 0020) —
  * the observability fix for the silent-passthrough branches (`no-gui` excepted, which has
- * no reachable client to ack). `ops`/`groups`/`recalls` are the counts ACTUALLY applied to
- * the wire for this call (0 for every raw/empty cause); on `"applied"`/`"timeout-stale"`
- * they reflect the plan that was really used (the fresh plan, or the stale fallback,
- * respectively).
+ * no reachable client to ack). `ops`/`groups` are the counts ACTUALLY applied to the wire
+ * for this call (0 for every raw/empty cause); on `"applied"`/`"timeout-stale"` they reflect
+ * the plan that was really used (the fresh plan, or the stale fallback, respectively).
  *
- * The GUI never REPLIES to this message, but it is not merely informational: a v8 peer MUST
- * emit it, because it is correctness-critical for birth-fold. Its two jobs on the receiving end:
- * (1) tally `planOutcomes` for the UI's "wire N/M" readout, and (2) drive birth-fold
- * reconciliation — a `"timeout-stale"`/`"timeout-raw"` ack means the GUI's OWN fresh plan for
- * `reqId` did not ride the wire, so any birth-fold exemption it assumed on reply must be
- * conservatively dropped (see `liveClient.svelte.ts`'s handling). A silent extension that skipped
- * this ack would leave the GUI folding protected content the model has already seen whole — which
- * is exactly why `passthrough` is now part of the version contract (bumped to v8), rather than an
- * additive no-bump message like `armed`/`armedAck`.
+ * The GUI never REPLIES to this message; it tallies `planOutcomes` for the UI's "wire N/M"
+ * readout. Part of the version contract so a pre-ack peer can't pair silently.
  */
 export interface PassthroughMessage {
 	type: "passthrough";
@@ -345,7 +299,6 @@ export interface PassthroughMessage {
 	cause: PassthroughCause;
 	ops: number;
 	groups: number;
-	recalls: number;
 }
 
 export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage | CompleteResultMessage | ArmedAckMessage | PassthroughMessage;
@@ -359,8 +312,6 @@ export interface PlanMessage {
 	ops: FoldOp[];
 	/** Group-collapse ops (ADR 0006). Optional/additive — omitted ⇒ no group collapse. */
 	groups?: GroupOp[];
-	/** Conductor recall ops (ADR 0019). Optional/additive — omitted ⇒ no tail injections. */
-	recalls?: RecallOp[];
 }
 
 /**

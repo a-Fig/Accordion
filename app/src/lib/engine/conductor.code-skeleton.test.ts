@@ -82,7 +82,6 @@ function vb(
 		folded: false,
 		protected: opts.protected ?? false,
 		grouped: opts.grouped ?? false,
-		fresh: false,
 		callId: opts.callId,
 		text: opts.text,
 		toolName: opts.toolName,

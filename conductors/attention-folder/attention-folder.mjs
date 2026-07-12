@@ -196,7 +196,7 @@ wss.on("connection", (ws) => {
 	ws.send(
 		JSON.stringify({
 			type: "conductor/hello",
-			conductorProtocol: 4, // keep in lockstep with conductors/contract/protocol.ts CONDUCTOR_PROTOCOL_VERSION
+			conductorProtocol: 6, // keep in lockstep with conductors/contract/protocol.ts CONDUCTOR_PROTOCOL_VERSION
 			id: ID,
 			label: LABEL,
 			wants: { content: "full" }, // we need block text for the probe

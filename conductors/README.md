@@ -107,35 +107,6 @@ privileged richer input — so reading it teaches you the whole interface. The f
 (the `ConductorView` / `ViewBlock` field tables, every command, the clamp reasons) is the
 first half of [`docs/conductor-protocol.md`](../docs/conductor-protocol.md).
 
-## Folding a block before it's ever sent (`fresh`, ADR 0018)
-
-The protected tail is a token-target walk-back from the newest block, so a single huge
-`tool_result` that just streamed in is often protected the instant it arrives — before any
-non-`tail-size` conductor can touch it, the model would see it whole on its first call. Every
-`ViewBlock` carries `fresh: boolean`: true for a block that has never yet been part of a
-completed model call. You may `fold`/`replace` a `fresh` block even while `protected: true`,
-with no lock required — there is nothing to protect in a block the model hasn't seen yet. The
-exemption stays sticky across passes for a block you already folded this way (you needn't
-track a seen-set yourself); it stops applying once the block ages out of the tail, at which
-point ordinary fold rules take over. See [ADR 0018](../docs/adr/0018-conductor-birth-fold.md)
-and the worked example [`birth-fold-demo/`](birth-fold-demo/).
-
-## Recalling folded content without a cache miss (`recall`, ADR 0019)
-
-`restore` un-folds a block **in place** — the full text goes back mid-history, rewriting the
-provider's cached prefix, so the next call is a prompt-cache miss. When you only need a folded
-block's detail back in view for a stretch of work, `recall` is the cheaper move: `{ kind:"recall",
-ids }` keeps the block **folded** (its digest keeps costing only the digest) and injects its
-original full text as one synthetic user message at a **frozen anchor** near the tail — cache-safe,
-the conductor analog of the agent's own `recall` tool.
-
-Recall is **sticky**: it is the ONE command exempt from the "complete desired state" reset. Omitting
-it from a later batch does NOT drop it (dropping the tail injection would mutate the prefix and cost
-the very cache miss recall avoids). A recall persists until the block is unfolded / leaves the store,
-or you issue `restore` for that id (the explicit opt-out). A block must be folded on the wire to be
-recallable, else `not-recallable`. See [ADR 0019](../docs/adr/0019-conductor-recall.md) and the
-worked example [`recall-demo/`](recall-demo/).
-
 ## Calling a model from a conductor (host capabilities)
 
 A conductor can request an out-of-band model completion via the `ConductorHost` injected
@@ -229,8 +200,6 @@ session is currently active.
 | [`compaction-naive/`](compaction-naive/) | TypeScript | in-process | **Naive compaction baseline.** Summarizes aged context into a single prose blob via `host.complete`; lossy + recursive (each compaction only sees the prior summary — compounding amnesia). No `{#code FOLDED}` tag → the agent cannot self-unfold. The intentional foil that reversible folding is designed to beat. See [ADR 0014](../docs/adr/0014-naive-compaction-conductor.md). |
 | [`code-skeleton/`](code-skeleton/) | TypeScript | in-process | **Structural code compression.** Replaces a large code-file read (`tool_result`) with a deterministic interface SKELETON — imports/exports, types, class/function signatures, docstrings; bodies elided — at ~1/5 the tokens. Emitted via `replace` + the additive `ReplaceCommand.recoverable` flag, so the engine tags it `{#code FOLDED}` and the agent can `unfold`/`recall` the full source — the **reversible** answer to naive compaction. Precision-gated classification (`classify.ts`) rejects grep dumps / images / markdown / JSON / dir listings / streams; deterministic per-language skeletonizer (`skeletonize.ts`) keeps the prefix cache-warm. Collaborative; 3-pass budget, never worse than the built-in. See [ADR 0016](../docs/adr/0016-code-skeleton-conductor.md). |
 | [`handoff/`](handoff/) | TypeScript | in-process | **Fresh-start handoff workflow.** Automatically simulates: ask the current agent for a handoff document via `host.complete`, `/clear`, then reseed a fresh agent with that handoff and nothing else. Holds the **`tail-size`** lock with `tailTokens = 0`, so no old-session tail leaks into the successor context. The handoff group has no `{#code FOLDED}` tag, so the agent cannot self-unfold the killed transcript; the human can still detach. See [ADR 0017](../docs/adr/0017-handoff-conductor.md). |
-| [`birth-fold-demo/`](birth-fold-demo/) | TypeScript | in-process | **Worked example for `fresh`.** Folds any block where `fresh && protected && kind === "tool_result"` above a small size threshold — demonstrates the birth-fold exemption (ADR 0018) in ~15 lines. Not a serious strategy on its own. |
-| [`recall-demo/`](recall-demo/) | TypeScript | in-process | **Worked example for `recall`.** Folds large older `tool_result`s and recalls the most recent of them to the tail — demonstrates the conductor `recall` command (ADR 0019): stays folded, full text injected at a frozen anchor, cache-safe. Not a serious strategy on its own. |
 | [`tiered-relevance/`](tiered-relevance/) | Node.js | out-of-process (WS) | **Level-of-detail equilibrium** — a *simplified reinterpretation* of `the_conductor`. One unified relevance score (goal + trajectory) puts every block at the fidelity tier it earns inside a 60–90% hysteresis band; fold/unfold/anti-thrash fall out of one re-tiering. Embeddings (Ollama/transformers) + LLM digests, all degrading gracefully. |
 | [`the-conductor/`](the-conductor/) | TypeScript | out-of-process (WS) | **Faithful port of `the_conductor`'s strategy.** Vendors the original `runConductor` core (`strategy.ts`) and re-expresses only its I/O: self-calibrating fold-target band, graduated Full/Trim/Digest/Group levels, three-stage relevance (keyword → embeddings → cross-encoder rerank), risk-aware unfold floors. Collaborative. Cuts what the contract can't carry (non-contiguous grouping; agent-facing header → surfaced to the human via `conductor/status`). See its [README](the-conductor/README.md). |
 
