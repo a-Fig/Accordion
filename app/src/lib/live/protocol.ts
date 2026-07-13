@@ -175,8 +175,8 @@ export interface SyncMessage {
  * contentIndex: the assistantMessageEvent's contentIndex (0-based part index).
  * When contentIndex < 0 in an "abort" frame it means "clear ALL active ghosts."
  *
- * PROTOCOL_VERSION stays at 2 — this entire ADR 0003 ships as one unreleased
- * protocol version; do NOT bump again here.
+ * This stream-frame shape was introduced as part of protocol v2 and did not require an
+ * additional bump at that time. See the version history above for later protocol changes.
  */
 export interface StreamMessage {
 	type: "stream";
@@ -428,7 +428,7 @@ const WIRE_KINDS = new Set(["user", "text", "thinking", "tool_call", "tool_resul
 
 /**
  * Element-level guard for `SyncMessage.blocks`. `isServerMessage` vets only the `type`
- * tag, and the WS is deliberately unauthenticated — a malformed element must be dropped
+ * tag, and an authorized WS peer may still be malformed — a bad element must be dropped
  * at the pump, not thrown from `wireToBlock` (a mid-pump throw stalls the plan reply and
  * the extension waits out its timeout) nor fed into the store as NaN token accounting.
  */

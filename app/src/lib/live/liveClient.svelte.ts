@@ -234,11 +234,10 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 	cancelPendingLoad(); // invalidate any pending file/CC load that would otherwise clobber the live store
 	disconnectLive(); // drop any prior socket
 	manualClose = false;
-	// Host defaults to loopback (the desktop app is always co-located with pi). In
-	// browser-served mode the caller passes window.location.hostname so a remote
-	// browser reaches a 0.0.0.0-bound session. The token — only needed when dialing
-	// off-loopback — is forwarded on the WS URL; the browser-served page already has
-	// it in its own URL (?token=…), so the user never types it.
+	// Host defaults to loopback (the desktop app is always co-located with pi). A
+	// browser-served page uses its literal loopback hostname and forwards the bearer from
+	// its /accordion URL. The extension also recognizes exact-origin cookies and verified
+	// sibling Accordion Origins, which preserves reloads and multi-session switching.
 	const host = opts.host ?? "127.0.0.1";
 	const tokenQs = opts.token ? `/?token=${encodeURIComponent(opts.token)}` : "";
 	live.status = "connecting";
@@ -269,8 +268,9 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 		if (!isServerMessage(parsed)) return; // ignore anything off-protocol
 		const msg: ServerMessage = parsed;
 		if (msg.type === "hello") {
-			// The WS is deliberately unauthenticated (tokenless Tauri dial), so any local
-			// process can send a frame. isServerMessage only vets the `type` tag — guard the
+			// Browser upgrades are Origin/token-gated, but trusted native/Tauri clients remain
+			// tokenless and any accepted peer can still send malformed data. isServerMessage
+			// only vets the `type` tag — guard the
 			// nested shape here rather than letting a malformed frame throw mid-pump and
 			// strand the client half-connected.
 			const meta: Partial<HelloMessage["meta"]> = msg.meta && typeof msg.meta === "object" ? msg.meta : {};

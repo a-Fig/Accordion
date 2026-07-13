@@ -13,6 +13,7 @@ import { createJiti } from "jiti";
 import { WebSocket } from "ws";
 import * as fs from "node:fs";
 import * as http from "node:http";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,6 +22,8 @@ import { fileURLToPath } from "node:url";
 // ACCORDION_HOME at module load) so we never touch the real ~/.accordion.
 const HOME = path.join(os.tmpdir(), `accordion-smoke-${process.pid}`);
 process.env.ACCORDION_HOME = HOME;
+// Exercise the completion watchdog without waiting for the 110 s production deadline.
+process.env.ACCORDION_COMPLETION_TIMEOUT_MS = "500";
 // Prevent the /accordion command smoke assertion from launching a real developer
 // build via the repo-local default candidates. An explicit-but-missing path must
 // stop fallback, which is also one of the launcher contract's safety rules.
@@ -54,6 +57,7 @@ let unfoldTool = null; // captured registerTool def for the `unfold` tool (M3)
 let recallTool = null; // captured registerTool def for the `recall` tool (ADR 0011)
 const flags = new Map();
 const notifications = [];
+let completionImpl = async () => { throw new Error("unexpected injected completion call"); };
 const pi = {
 	on: (name, fn) => (handlers[name] = fn),
 	registerFlag: (name, def) => flags.set(name, def?.default),
@@ -67,7 +71,7 @@ const pi = {
 	},
 	appendEntry: () => {},
 };
-accordionLive(pi);
+accordionLive(pi, { complete: (...args) => completionImpl(...args) });
 const ctx = {
 	ui: { setStatus() {}, notify(message, type) { notifications.push({ message, type }); }, theme: { fg: (_c, s) => s } },
 	// Mirror the REAL pi ExtensionContext: `model` is a property (getter), not a
@@ -1330,6 +1334,263 @@ if (!(armedSmoke.nextDisarmedMs !== null && armedSmoke.nextDisarmedMs < 900))
 	await new Promise((r) => setTimeout(r, 50));
 }
 
+// ── WebSocket authorization, payload, and paid-completion bounds ────────────
+// These are security regressions with concrete browser/client paths, not helper-only tests:
+// real upgrade requests exercise Origin/token/cookie handling, and real WS frames exercise ws's
+// maxPayload and the extension's completion admission state across a reconnect.
+{
+	const browserLine = notifications.map((n) => n.message).reverse().find((m) => m.includes("Browser: http"));
+	const TOKEN = browserLine && (browserLine.match(/token=([0-9a-f]+)/) || [])[1];
+	if (!TOKEN) fails.push("ws-hardening: could not recover the session token");
+
+	const rawUpgrade = (requestTarget, { host = `127.0.0.1:${PORT}`, origin = null, cookie = null } = {}) =>
+		new Promise((resolve) => {
+			const socket = net.connect(PORT, "127.0.0.1");
+			let firstLine = "";
+			let settled = false;
+			const finish = (value = firstLine || "(no response)") => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				try { socket.destroy(); } catch { /* ignore */ }
+				resolve(value);
+			};
+			const timer = setTimeout(() => finish(), 1500);
+			socket.on("connect", () => socket.write(
+				`GET ${requestTarget} HTTP/1.1\r\nHost: ${host}\r\n` +
+				(origin ? `Origin: ${origin}\r\n` : "") +
+				(cookie ? `Cookie: ${cookie}\r\n` : "") +
+				"Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+				"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+			));
+			socket.on("data", (data) => {
+				firstLine = (firstLine + data.toString()).split("\r\n")[0];
+				if (firstLine) finish(firstLine);
+			});
+			socket.on("error", (error) => finish(`socket error: ${error.message}`));
+		});
+
+	const dialWs = (options = {}, suffix = "") =>
+		new Promise((resolve) => {
+			const candidate = new WebSocket(`ws://127.0.0.1:${PORT}${suffix}`, options);
+			let settled = false;
+			const finish = (result) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				try { candidate.close(); } catch { /* ignore */ }
+				resolve(result);
+			};
+			const timer = setTimeout(() => finish({ open: false, timeout: true }), 1500);
+			candidate.on("open", () => finish({ open: true }));
+			candidate.on("unexpected-response", (_request, response) => finish({ open: false, status: response.statusCode }));
+			candidate.on("error", (error) => finish({ open: false, error: error.message }));
+		});
+
+	// The verifier now parses the request target for its bearer token. A malformed target must
+	// reject rather than throw out of ws's callback-style verifyClient and kill the pi process.
+	const malformed = await rawUpgrade("http://x:999999/");
+	if (!/\b400\b/.test(malformed)) fails.push(`ws-hardening: malformed target was not rejected 400 (${malformed})`);
+
+	const hostile = await dialWs({ origin: "http://evil.example" });
+	if (hostile.open || hostile.status !== 403) fails.push(`ws-hardening: hostile browser Origin was not rejected (${JSON.stringify(hostile)})`);
+	const opaque = await dialWs({ origin: "null" });
+	if (opaque.open || opaque.status !== 403) fails.push(`ws-hardening: opaque browser Origin was not rejected (${JSON.stringify(opaque)})`);
+	const native = await dialWs();
+	if (!native.open) fails.push(`ws-hardening: no-Origin native client was rejected (${JSON.stringify(native)})`);
+	for (const origin of ["tauri://localhost", "https://tauri.localhost", "http://tauri.localhost"]) {
+		const tauri = await dialWs({ origin });
+		if (!tauri.open) fails.push(`ws-hardening: trusted Tauri Origin ${origin} was rejected (${JSON.stringify(tauri)})`);
+	}
+	const tauriDevDefault = await dialWs({ origin: "http://localhost:1420" });
+	if (tauriDevDefault.open || tauriDevDefault.status !== 403)
+		fails.push(`ws-hardening: Tauri dev Origin was trusted without explicit opt-in (${JSON.stringify(tauriDevDefault)})`);
+
+	if (TOKEN) {
+		// Matching Origin and Host are attacker-controlled under DNS rebinding; a non-literal host
+		// must not become trusted just because the TCP peer resolves to loopback.
+		const rebound = await rawUpgrade("/", { host: `evil.example:${PORT}`, origin: `http://evil.example:${PORT}` });
+		if (!/\b403\b/.test(rebound)) fails.push(`ws-hardening: DNS-rebound Origin/Host was not rejected (${rebound})`);
+
+		// Origin proof is upgrade-time network I/O. A peer that never ends a 200 response must be
+		// cut off by the verifier deadline rather than leave the handshake parked indefinitely.
+		const endless = http.createServer((_req, res) => {
+			res.writeHead(200, { "Content-Type": "application/json" });
+			res.write('{"served":true');
+		});
+		await new Promise((resolve, reject) => { endless.once("error", reject); endless.listen(0, "127.0.0.1", resolve); });
+		const endlessAddress = endless.address();
+		const endlessPort = endlessAddress && typeof endlessAddress === "object" ? endlessAddress.port : 0;
+		const endlessProbe = await rawUpgrade("/", { origin: `http://127.0.0.1:${endlessPort}` });
+		if (!/\b403\b/.test(endlessProbe)) fails.push(`ws-hardening: non-ending sibling probe was not bounded (${endlessProbe})`);
+		await new Promise((resolve) => endless.close(resolve));
+
+		// Cookies cross ports. A page on another local port receives ambient cookies for the same
+		// host, but must not use them to authorize this port's WebSocket.
+		const unrelated = http.createServer((_req, res) => {
+			res.writeHead(200, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ served: true, sessionId: "forged-local-service", protocolVersion: entry.protocolVersion }));
+		});
+		await new Promise((resolve, reject) => { unrelated.once("error", reject); unrelated.listen(0, "127.0.0.1", resolve); });
+		const unrelatedAddress = unrelated.address();
+		const unrelatedPort = unrelatedAddress && typeof unrelatedAddress === "object" ? unrelatedAddress.port : 0;
+		const crossPortCookie = await rawUpgrade("/", {
+			origin: `http://127.0.0.1:${unrelatedPort}`,
+			cookie: `accordion_token_p${PORT}=${TOKEN}`,
+		});
+		await new Promise((resolve) => unrelated.close(resolve));
+		if (!/\b403\b/.test(crossPortCookie)) fails.push(`ws-hardening: cross-port ambient cookie was accepted (${crossPortCookie})`);
+
+		// Exact served Origin + cookie is the reload/bookmark path. An explicit bearer is proof of
+		// possession and may authorize regardless of Origin.
+		const servedCookie = await rawUpgrade("/", {
+			origin: `http://127.0.0.1:${PORT}`,
+			cookie: `accordion_token_p${PORT}=${TOKEN}`,
+		});
+		if (!/\b101\b/.test(servedCookie)) fails.push(`ws-hardening: exact served Origin cookie was rejected (${servedCookie})`);
+		const explicit = await dialWs({ origin: "http://evil.example" }, `/?token=${TOKEN}`);
+		if (!explicit.open) fails.push(`ws-hardening: explicit bearer was rejected (${JSON.stringify(explicit)})`);
+
+		// Preserve browser multi-session switching: a literal loopback Origin is admitted only
+		// while its /meta identity and live registry entry agree.
+		const siblingId = "s-origin-smoke";
+		const sibling = http.createServer((req, res) => {
+			if (req.url === "/__accordion/meta") {
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ served: true, sessionId: siblingId, protocolVersion: entry.protocolVersion }));
+				return;
+			}
+			res.writeHead(404); res.end();
+		});
+		await new Promise((resolve, reject) => { sibling.once("error", reject); sibling.listen(0, "127.0.0.1", resolve); });
+		const siblingAddress = sibling.address();
+		const siblingPort = siblingAddress && typeof siblingAddress === "object" ? siblingAddress.port : 0;
+		const siblingPath = path.join(SESSIONS_DIR, `${siblingId}.json`);
+		fs.writeFileSync(siblingPath, JSON.stringify({
+			...entry, sessionId: siblingId, port: siblingPort, startedAt: Date.now(), heartbeatAt: Date.now(),
+		}));
+		const liveSibling = await rawUpgrade("/", { origin: `http://127.0.0.1:${siblingPort}` });
+		if (!/\b101\b/.test(liveSibling)) fails.push(`ws-hardening: live sibling Origin was rejected (${liveSibling})`);
+		await new Promise((resolve) => sibling.close(resolve));
+		try { fs.unlinkSync(siblingPath); } catch { /* cleanup */ }
+		const staleSibling = await rawUpgrade("/", { origin: `http://127.0.0.1:${siblingPort}` });
+		if (!/\b403\b/.test(staleSibling)) fails.push(`ws-hardening: stale sibling Origin retained authority (${staleSibling})`);
+
+		// A syntactically valid, registry-matching /meta response still loses authority when its
+		// body exceeds the verifier's cap. Without the cap this exact response would be accepted.
+		const largeSiblingId = "s-origin-large";
+		const largeSibling = http.createServer((_req, res) => {
+			res.writeHead(200, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ served: true, sessionId: largeSiblingId, protocolVersion: entry.protocolVersion, padding: "x".repeat(17 * 1024) }));
+		});
+		await new Promise((resolve, reject) => { largeSibling.once("error", reject); largeSibling.listen(0, "127.0.0.1", resolve); });
+		const largeAddress = largeSibling.address();
+		const largePort = largeAddress && typeof largeAddress === "object" ? largeAddress.port : 0;
+		const largePath = path.join(SESSIONS_DIR, `${largeSiblingId}.json`);
+		fs.writeFileSync(largePath, JSON.stringify({
+			...entry, sessionId: largeSiblingId, port: largePort, startedAt: Date.now(), heartbeatAt: Date.now(),
+		}));
+		const largeProbe = await rawUpgrade("/", { origin: `http://127.0.0.1:${largePort}` });
+		if (!/\b403\b/.test(largeProbe)) fails.push(`ws-hardening: oversized sibling metadata was accepted (${largeProbe})`);
+		await new Promise((resolve) => largeSibling.close(resolve));
+		try { fs.unlinkSync(largePath); } catch { /* cleanup */ }
+	}
+
+	// maxPayload is enforced by ws before the extension attempts JSON parsing.
+	const oversized = await new Promise((resolve) => {
+		const candidate = new WebSocket(`ws://127.0.0.1:${PORT}`);
+		const timer = setTimeout(() => resolve({ code: null, timeout: true }), 4000);
+		candidate.on("open", () => candidate.send(Buffer.alloc(9 * 1024 * 1024, 0x61)));
+		candidate.on("close", (code) => { clearTimeout(timer); resolve({ code }); });
+		candidate.on("error", () => {});
+	});
+	if (oversized.code !== 1009) fails.push(`ws-hardening: oversized frame did not close with 1009 (${JSON.stringify(oversized)})`);
+
+	// Park API-key lookups to observe admission without making provider calls.
+	const heldResolvers = [];
+	const holdCtx = {
+		ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
+		model: { id: "test/hold-model", contextWindow: 2000 },
+		getContextUsage: () => ({ tokens: 1, contextWindow: 2000 }),
+		modelRegistry: { getApiKeyAndHeaders: () => new Promise((resolve) => heldResolvers.push(resolve)) },
+	};
+	const completionWs = new WebSocket(`ws://127.0.0.1:${PORT}`);
+	await new Promise((resolve, reject) => { completionWs.on("open", resolve); completionWs.on("error", reject); });
+	const completionResults = [];
+	completionWs.on("message", (data) => {
+		try { const message = JSON.parse(data.toString()); if (message.type === "completeResult") completionResults.push(message); } catch { /* ignore */ }
+	});
+	handlers.context({ messages: [] }, holdCtx); // refresh latestCtx synchronously
+	await new Promise((resolve) => setTimeout(resolve, 50));
+
+	completionWs.send(JSON.stringify({ type: "completeRequest", reqId: 100, prompt: "original" }));
+	await waitFor(() => heldResolvers.length === 1, 1000, "original completion admission").catch(() => {});
+	completionWs.send(JSON.stringify({ type: "completeRequest", reqId: 100, prompt: "duplicate" }));
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	if (heldResolvers.length !== 1) fails.push("completion-hardening: duplicate reqId launched another call");
+	if (completionResults.some((r) => r.reqId === 100)) fails.push("completion-hardening: duplicate settled the original correlation");
+	heldResolvers[0]?.({ ok: false, error: "original-finished" });
+	await waitFor(() => completionResults.some((r) => r.reqId === 100), 1000, "original completion result").catch(() => {});
+	heldResolvers.length = 0;
+
+	for (const reqId of [101, 102, 103, 104]) completionWs.send(JSON.stringify({ type: "completeRequest", reqId, prompt: "hold" }));
+	await waitFor(() => heldResolvers.length === 4, 1000, "completion ceiling fill").catch(() => {});
+	completionWs.send(JSON.stringify({ type: "completeRequest", reqId: 105, prompt: "over cap" }));
+	await waitFor(() => completionResults.some((r) => r.reqId === 105), 1000, "completion ceiling rejection").catch(() => {});
+	if (!completionResults.some((r) => r.reqId === 105 && /concurrent/i.test(r.error || ""))) fails.push("completion-hardening: fifth call was not rejected");
+
+	// Replacing the socket must not clear the four still-running global slots.
+	const replacementWs = new WebSocket(`ws://127.0.0.1:${PORT}`);
+	await new Promise((resolve, reject) => { replacementWs.on("open", resolve); replacementWs.on("error", reject); });
+	const replacementResults = [];
+	replacementWs.on("message", (data) => {
+		try { const message = JSON.parse(data.toString()); if (message.type === "completeResult") replacementResults.push(message); } catch { /* ignore */ }
+	});
+	replacementWs.send(JSON.stringify({ type: "completeRequest", reqId: 201, prompt: "still capped" }));
+	await waitFor(() => replacementResults.some((r) => r.reqId === 201), 1000, "reconnect-preserved cap").catch(() => {});
+	if (!replacementResults.some((r) => r.reqId === 201 && /concurrent/i.test(r.error || ""))) fails.push("completion-hardening: reconnect bypassed the global cap");
+
+	// The 500 ms test watchdog releases exact slots even though these auth lookups never settle.
+	await new Promise((resolve) => setTimeout(resolve, 650));
+	replacementWs.send(JSON.stringify({ type: "completeRequest", reqId: 202, prompt: "after timeout" }));
+	await waitFor(() => heldResolvers.length === 5, 1000, "watchdog slot release").catch(() => {});
+	if (heldResolvers.length !== 5) fails.push("completion-hardening: timed-out calls did not release capacity");
+	else heldResolvers[4]({ ok: false, error: "cleanup" });
+	await waitFor(() => replacementResults.some((r) => r.reqId === 202), 1000, "post-timeout completion result").catch(() => {});
+
+	// Once provider work has actually launched, a client-facing timeout must NOT reopen its
+	// global slot until the provider promise settles. This fake deliberately ignores AbortSignal.
+	const providerCalls = [];
+	completionImpl = (_model, _context, options) => new Promise((resolve) => providerCalls.push({ resolve, signal: options.signal }));
+	const providerCtx = {
+		ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
+		model: { id: "test/provider-model", contextWindow: 2000, maxTokens: 1000 },
+		getContextUsage: () => ({ tokens: 1, contextWindow: 2000 }),
+		modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {} }) },
+	};
+	handlers.context({ messages: [] }, providerCtx);
+	for (const reqId of [301, 302, 303, 304]) replacementWs.send(JSON.stringify({ type: "completeRequest", reqId, prompt: "provider hold" }));
+	await waitFor(() => providerCalls.length === 4, 1000, "four provider calls launched").catch(() => {});
+	await new Promise((resolve) => setTimeout(resolve, 650)); // all four client deadlines fire
+	if (!providerCalls.every((call) => call.signal?.aborted)) fails.push("completion-hardening: provider timeout did not abort every signal");
+	replacementWs.send(JSON.stringify({ type: "completeRequest", reqId: 305, prompt: "must remain capped" }));
+	await waitFor(() => replacementResults.some((r) => r.reqId === 305), 1000, "abort-ignoring provider cap").catch(() => {});
+	if (!replacementResults.some((r) => r.reqId === 305 && /concurrent/i.test(r.error || "")) || providerCalls.length !== 4)
+		fails.push("completion-hardening: timed-out but unsettled provider calls released global slots");
+
+	// Settlement of exactly one upstream call reopens exactly one slot.
+	providerCalls[0]?.resolve({ content: [], model: "test/provider-model", usage: {} });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	replacementWs.send(JSON.stringify({ type: "completeRequest", reqId: 306, prompt: "after provider settlement" }));
+	await waitFor(() => providerCalls.length === 5, 1000, "provider settlement slot release").catch(() => {});
+	if (providerCalls.length !== 5) fails.push("completion-hardening: settled provider call did not release its slot");
+	for (const call of providerCalls.slice(1)) call.resolve({ content: [], model: "test/provider-model", usage: {} });
+	await waitFor(() => replacementResults.some((r) => r.reqId === 306), 1000, "post-provider-settlement result").catch(() => {});
+	try { completionWs.close(); } catch { /* ignore */ }
+	try { replacementWs.close(); } catch { /* ignore */ }
+	await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
 // ── assertions ───────────────────────────────────────────────────────────────
 if (!seen.hello) fails.push("never received hello");
 if (!seen.flushOnAttach) fails.push("GUI received no history flush on attach (would stay empty until first message — the bug)");
@@ -1383,6 +1644,7 @@ console.log(
 						`armed-over-wire (ack, disarmed=short / armed=deadline, mid-toggle snapshot) ✓  ` +
 							`passthrough acks (applied/empty-plan/timeout-stale/timeout-raw) ✓  /__accordion/meta planOutcomes ✓  ` +
 							`port-qualified cookie (collision guard) ✓  ` +
-							`ack counts reflect applied-not-submitted ✓`,
+							`ack counts reflect applied-not-submitted ✓  ` +
+							`WS auth (CSWSH/rebinding/cookie/sibling bounds) ✓  payload cap ✓  completion bounds ✓`,
 );
 process.exit(0);
