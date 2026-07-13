@@ -140,3 +140,41 @@ describe("liveClient — armed over the wire", () => {
 		expect(FakeWebSocket.last).toBeNull();
 	});
 });
+
+/*
+ * passthrough-ack handling (issue #60, ADR 0020). The extension acks every `context` hook
+ * outcome as a `passthrough` message; the live client tallies `live.planOutcomes` for the
+ * "wire N/M" readout. Driven end-to-end through the FakeWebSocket harness (this file's
+ * existing pattern).
+ */
+describe("liveClient — passthrough ack handling (issue #60)", () => {
+	it("tallies planOutcomes counters per cause and a running total", () => {
+		connectAndHello();
+		const ws = FakeWebSocket.last!;
+		expect(live.planOutcomes.total).toBe(0);
+
+		ws.emit({ type: "passthrough", reqId: 1, cause: "applied", ops: 2, groups: 0 });
+		ws.emit({ type: "passthrough", reqId: 2, cause: "empty-plan", ops: 0, groups: 0 });
+		ws.emit({ type: "passthrough", reqId: 3, cause: "timeout-stale", ops: 1, groups: 0 });
+		ws.emit({ type: "passthrough", reqId: 4, cause: "timeout-raw", ops: 0, groups: 0 });
+		ws.emit({ type: "passthrough", reqId: 5, cause: "epoch-mismatch", ops: 0, groups: 0 });
+
+		expect(live.planOutcomes).toEqual({
+			applied: 1,
+			"empty-plan": 1,
+			"timeout-stale": 1,
+			"timeout-raw": 1,
+			"epoch-mismatch": 1,
+			total: 5,
+		});
+	});
+
+	it("resets planOutcomes to zero on a fresh connection", () => {
+		connectAndHello();
+		FakeWebSocket.last!.emit({ type: "passthrough", reqId: 1, cause: "applied", ops: 0, groups: 0 });
+		expect(live.planOutcomes.total).toBe(1);
+
+		connectAndHello(); // fresh connect — connectLive() drops the prior socket first
+		expect(live.planOutcomes.total).toBe(0);
+	});
+});

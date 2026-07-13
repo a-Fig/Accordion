@@ -18,8 +18,14 @@
  *   2. Extension sends `sync` with the blocks added since the last sync.
  *   3. GUI updates its live store, runs the engine, replies `plan { ops }`.
  *   4. Extension applies the ops to the real messages and returns them to pi.
- *      If no GUI is connected, or the reply times out, the extension passes the
- *      messages through UNMODIFIED (never corrupts context).
+ *      If no GUI is connected, the reply times out with no cached plan, or the
+ *      GUI's view was superseded mid-wait, the extension passes the messages
+ *      through UNMODIFIED (never corrupts context). A timeout WITH a cached plan
+ *      re-applies that last-known plan instead of shipping raw (issue #58). Every
+ *      one of these outcomes — including success — is counted and, where a client
+ *      is reachable, acked back as a `passthrough` message (issue #60, ADR 0020) so
+ *      the GUI (and the bellows bench rig polling `/__accordion/meta`) can see what
+ *      actually rode the wire instead of inferring it from silence.
  *
  * Milestone 1 deliberately ships an EMPTY plan (`ops: []`) from the GUI: the loop
  * is proven end-to-end while never altering a single model call.
@@ -30,7 +36,10 @@
  *  - v4: group collapse ops (`GroupOp`, `PlanMessage.groups`).
  *  - v5: recall tool (`recallRequest` / `recallResult`) plus completion relay
  *        (`completeRequest` / `completeResult`) for out-of-band model completions.
- *  - (still v5, additive) `armed` / `armedAck`: the attached client declares its
+ *  - v6: `SyncMessage.planned` (ADR 0018) — the birth-fold exemption. Additive. (removed in v9)
+ *  - v7: `PlanMessage.recalls` (`RecallOp`, ADR 0019) — conductor recall injects a folded
+ *        block's full text at a stable tail anchor without unfolding it. Additive. (removed in v9)
+ *  - (no bump, additive) `armed` / `armedAck`: the attached client declares its
  *    ARMED state over the wire (client→server `armed`), and the extension replies
  *    `armedAck` whenever it processes one. PROTOCOL_VERSION is DELIBERATELY NOT
  *    bumped here. Both live peers that carry the pi wire — the GUI (liveClient's
@@ -42,8 +51,18 @@
  *    fast path. Capability is detected out-of-band via `armedAck` — a new client
  *    that sends `armed` and gets no ack back knows it is talking to an old extension
  *    (and can scream) — so the version number buys nothing a bump would cost.
+ *  - v8: `passthrough`: the extension's per-outcome ack for every `context` hook resolution
+ *        (issue #60, ADR 0020) — `applied` / `empty-plan` / `timeout-stale` / `timeout-raw` /
+ *        `epoch-mismatch`. The GUI tallies these into its "wire N/M" readout. The strict
+ *        `protocolVersion !== PROTOCOL_VERSION` check both peers do refuses a pre-ack peer
+ *        instead of pairing silently.
+ *  - v9: birth folding (ADR 0018) and conductor recall (ADR 0019) were ripped out for
+ *        simplification. `SyncMessage.planned`, `RecallOp`, `PlanMessage.recalls`, and
+ *        `PassthroughMessage.recalls` are gone. The plan-applied ack (`passthrough`) and its
+ *        cause taxonomy STAY — only their birth-fold/recall-specific fields and roles are
+ *        removed. Bumped (never renumbered downward) so a stale client can't pair silently.
  */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 9;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi
@@ -156,8 +175,8 @@ export interface SyncMessage {
  * contentIndex: the assistantMessageEvent's contentIndex (0-based part index).
  * When contentIndex < 0 in an "abort" frame it means "clear ALL active ghosts."
  *
- * PROTOCOL_VERSION stays at 2 — this entire ADR 0003 ships as one unreleased
- * protocol version; do NOT bump again here.
+ * This stream-frame shape was introduced as part of protocol v2 and did not require an
+ * additional bump at that time. See the version history above for later protocol changes.
  */
 export interface StreamMessage {
 	type: "stream";
@@ -245,7 +264,44 @@ export interface ArmedAckMessage {
 	armed: boolean;
 }
 
-export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage | CompleteResultMessage | ArmedAckMessage;
+/**
+ * The cause of one `context` hook resolution the extension is willing to ack over the
+ * wire (issue #60). The full server-side taxonomy also has `"no-gui"` and `"unsent"` —
+ * those two mean there is no reachable client to ack, so they never appear here; they
+ * are counter-only on the extension side (see `/__accordion/meta`'s `planOutcomes`).
+ *   • "applied"       — the GUI's plan (non-empty) was applied to the model call.
+ *   • "empty-plan"    — the GUI intentionally replied with no folds; the call rode raw.
+ *   • "timeout-stale" — the plan reply missed the wait; the LAST KNOWN plan was
+ *     re-applied instead (issue #58). The GUI's fresh plan for this `reqId` did NOT
+ *     ride the wire.
+ *   • "timeout-raw"   — the plan reply missed the wait and there was no usable cached
+ *     plan; the call rode raw, same as "empty-plan" but caused by a miss, not intent.
+ *   • "epoch-mismatch" — a new client attached mid-wait, superseding the view that sent
+ *     this request; acked to the CURRENT client (whoever that now is) purely so it can
+ *     count the outcome — `reqId` belongs to the superseded view, not to anything the
+ *     current client itself sent.
+ */
+export type PassthroughCause = "applied" | "empty-plan" | "timeout-stale" | "timeout-raw" | "epoch-mismatch";
+
+/**
+ * Sent by the extension after EVERY `context` hook resolution (issue #60, ADR 0020) —
+ * the observability fix for the silent-passthrough branches (`no-gui` excepted, which has
+ * no reachable client to ack). `ops`/`groups` are the counts ACTUALLY applied to the wire
+ * for this call (0 for every raw/empty cause); on `"applied"`/`"timeout-stale"` they reflect
+ * the plan that was really used (the fresh plan, or the stale fallback, respectively).
+ *
+ * The GUI never REPLIES to this message; it tallies `planOutcomes` for the UI's "wire N/M"
+ * readout. Part of the version contract so a pre-ack peer can't pair silently.
+ */
+export interface PassthroughMessage {
+	type: "passthrough";
+	reqId: number;
+	cause: PassthroughCause;
+	ops: number;
+	groups: number;
+}
+
+export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage | CompleteResultMessage | ArmedAckMessage | PassthroughMessage;
 
 // ── Client → server (GUI → extension) ────────────────────────────────────────
 
@@ -365,5 +421,27 @@ export type ClientMessage = PlanMessage | UnfoldResultMessage | RecallResultMess
 export function isServerMessage(v: unknown): v is ServerMessage {
 	if (!v || typeof v !== "object" || !("type" in v)) return false;
 	const t = (v as any).type;
-	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult" || t === "armedAck";
+	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult" || t === "armedAck" || t === "passthrough";
+}
+
+const WIRE_KINDS = new Set(["user", "text", "thinking", "tool_call", "tool_result"]);
+
+/**
+ * Element-level guard for `SyncMessage.blocks`. `isServerMessage` vets only the `type`
+ * tag, and an authorized WS peer may still be malformed — a bad element must be dropped
+ * at the pump, not thrown from `wireToBlock` (a mid-pump throw stalls the plan reply and
+ * the extension waits out its timeout) nor fed into the store as NaN token accounting.
+ */
+export function isWireBlock(v: unknown): v is WireBlock {
+	if (!v || typeof v !== "object") return false;
+	const b = v as Record<string, unknown>;
+	return (
+		typeof b.id === "string" &&
+		typeof b.kind === "string" &&
+		WIRE_KINDS.has(b.kind) &&
+		typeof b.turn === "number" &&
+		typeof b.order === "number" &&
+		typeof b.text === "string" &&
+		typeof b.tokens === "number"
+	);
 }

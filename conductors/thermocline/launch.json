@@ -2,5 +2,6 @@
   "id": "thermocline",
   "label": "Thermocline",
   "command": "node",
-  "args": ["thermocline.mjs"]
+  "args": ["thermocline.mjs"],
+  "portEnv": "THERMO_PORT"
 }

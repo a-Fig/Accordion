@@ -16,7 +16,7 @@ Guidance for AI coding sessions. [VISION.md](VISION.md) = product north star · 
 - **held** — a block carrying a human override (manual pin, fold, or unfold). `ViewBlock.held = true`; the host refuses conductor commands on held blocks unless the conductor holds a `human-steering` involvement lock.
 - **conductor** — a pluggable context-management strategy (`conduct(view) → Command[]`). Decides which blocks to fold, group, replace, pin, etc. between turns.
 - **the wire** — the messages array sent to the LLM provider. "Wire-valid" = the outgoing array is well-formed. Distinct from the WebSocket between the app and the pi extension (that's the live link / accordion protocol).
-- **browser-served** — mode where the pi extension HTTP-serves the SvelteKit UI on the same ephemeral port as the WS. Single-session; no Tauri desktop app required.
+- **browser-served** — mode where the pi extension HTTP-serves the SvelteKit UI on the same ephemeral port as the WS. Multi-session-aware (the served extension lists every live session over `/__accordion/sessions`); no Tauri desktop app required.
 - **CC** — Claude Code (as in "CC transcript", "CC browsing"). Read-only mode; sessions loaded from `~/.claude/projects/`.
 
 ## Codebase map
@@ -50,9 +50,9 @@ Guidance for AI coding sessions. [VISION.md](VISION.md) = product north star · 
 
 ## Live link
 
-`app/src/lib/live/` + `extension/accordion.ts`. **GUI drives, extension is thin** — the extension streams pi's messages and applies whatever plan the app sends; it makes no folding decisions. Multi-session discovery (the Sessions list / switcher) is **desktop-only** — a plain browser can't read `~/.accordion/`.
+`app/src/lib/live/` + `extension/accordion.ts`. **GUI drives, extension is thin** — the extension streams pi's messages and applies whatever plan the app sends; it makes no folding decisions. Multi-session discovery (the Sessions list / switcher) works in both desktop and browser-served mode; only Claude Code transcript browsing (reading `~/.claude` off disk) is **desktop-only**, since that still needs the Tauri Rust layer.
 
-**Browser-served mode.** The extension also HTTP-serves the SvelteKit build on the same ephemeral WS port. `/accordion` prints the browser URL; the page auto-connects to that one session — single-session, no desktop app needed. Static serving is token-gated; the WS stays unauthenticated so the Tauri app's tokenless dial is unaffected. Left rail is trimmed in browser mode (`browserServed` prop on `SessionsSidebar`). Resolve order is `extension/dist/client` first, then `../app/build`. In npm package installs `../app/build` does not exist, so `dist/client` is required. **Dev footgun:** a stale `extension/dist/client` shadows `../app/build` — delete `extension/dist` after any local `build:client` experiment when you want repo-dev fallback behavior.
+**Browser-served mode.** The extension also HTTP-serves the SvelteKit build on the same ephemeral WS port. `/accordion` prints the browser URL; the page auto-connects to that session. A browser tab can't read `~/.accordion/` itself, but the extension process CAN (it's Node, not sandboxed) — so it exposes every live session's registry entry over `GET /__accordion/sessions` (token-gated, unlike the ungated `/__accordion/meta`), and the browser polls that endpoint the same way the desktop app polls `list_sessions` (`app/src/lib/live/browserDiscovery.svelte.ts`, feeding the same `discovery.sessions` state as `discovery.svelte.ts`). The result: one browser tab shows every pi session on the machine in the left rail and can switch between them (`connectLive` just dials a different session's port) — no desktop app required. `SessionsSidebar`'s `browserServed` prop now only hides the pi/Claude-Code source switcher, not the session list. The live link binds loopback (`127.0.0.1`) only, on an ephemeral port — a same-machine surface, no remote/off-loopback bind mode. Static serving is token-gated. WebSocket upgrades additionally enforce Origin/token authorization to prevent a hostile web page from hijacking loopback: native no-Origin clients and fixed Tauri origins are trusted; the served browser uses its explicit bearer or exact-origin cookie; and a cross-session dial is accepted only after the source Origin proves it is a live, registry-matching Accordion loopback server. `/__accordion/sessions` is token-gated (unlike the ungated `/meta`) since it reveals every session's cwd/title/model, not just this one — a deliberate, accepted tradeoff: a leaked token exposes every live session's port, not just the one it was minted for. The endpoint also opportunistically reaps stale registry files it encounters (a browser-only user has no desktop app ever running to do that cleanup). Known limitation: `browserDiscovery.svelte.ts`'s poll is pinned to whichever session's origin served the page — see that file's banner comment for the full rationale and the `connectedFallback()` mitigation. Resolve order is `extension/dist/client` first, then `../app/build`. In npm package installs `../app/build` does not exist, so `dist/client` is required. **Dev footgun:** a stale `extension/dist/client` shadows `../app/build` — delete `extension/dist` after any local `build:client` experiment when you want repo-dev fallback behavior.
 
 ## npm / pi package
 
@@ -100,7 +100,7 @@ README surfaces:
 
 **Invariants (don't break):**
 - Discovery I/O is best-effort; **never blocks or alters a model call**
-- No GUI / reply timeout / empty plan → messages pass through untouched
+- No GUI / empty plan → messages pass through untouched; a reply timeout falls back to the last known plan when one is cached, else passes through raw (issue #58). Every `context` hook outcome is counted and acked to the GUI as a `passthrough` message (issue #60, ADR 0020) — see `/__accordion/meta`'s `planOutcomes`
 - No disk I/O on the `context` (pre-model-call) hook
 - The completion relay (`completeRequest / completeResult`) runs out-of-band — **never on the `context` hook path** and never blocks the agent's own model call
 - Folding the live agent is OPT-IN and OFF by default (`folding.enabled`, a header toggle)
@@ -150,6 +150,60 @@ Colors are brand **Spectrum** identity colors — defined in [brand/accordion-br
 - **Map grid:** every block is the same-size square in conversation order. Token weight = dice face 1–6. Thresholds in `ContextMap.svelte → faceFor()`: ≤100→1 · ≤500→2 · ≤1.5k→3 · ≤5k→4 · ≤15k→5 · >15k→6
 - **Two-box layout:** grid splits at `store.protectedFromIndex` — foldable region above (thin border), protected tail below (thick accented border, `.box.prot`)
 
+## Pi extension hooks
+
+Pi exposes these hooks through `pi.on(name, handler)`:
+
+For lifecycle ordering, behavior, and examples, read pi's `docs/extensions.md`; for authoritative payload and return types, inspect the exported `ExtensionAPI` and `ExtensionEvent` types from `@earendil-works/pi-coding-agent`.
+
+### Startup and resources
+
+- **`project_trust`** — Fires before pi decides whether to trust a project and load its dynamic configuration, allowing user/global and CLI extensions to return and optionally persist a trust decision.
+- **`resources_discover`** — Fires after `session_start` during startup or reload, allowing extensions to contribute additional skill, prompt, and theme paths.
+
+### Sessions
+
+- **`session_start`** — Fires when a session starts, reloads, resumes, or is created by a new-session or fork operation, identifying the reason and, for replacement flows, the previous session file.
+- **`session_info_changed`** — Fires when the current session's display name is set or cleared.
+- **`session_before_switch`** — Fires before `/new` or `/resume` replaces the current session and allows a handler to cancel the switch.
+- **`session_before_fork`** — Fires before `/fork` or `/clone` creates a replacement session from an entry and allows a handler to cancel the operation.
+- **`session_before_compact`** — Fires before manual, threshold, or overflow compaction and allows a handler to cancel compaction or supply a custom compaction result.
+- **`session_compact`** — Fires after compaction is saved and reports the resulting compaction entry, trigger reason, and whether an extension supplied it.
+- **`session_shutdown`** — Fires before a started session runtime is torn down by quit, reload, new session, resume, or fork so extensions can close session-scoped resources.
+- **`session_before_tree`** — Fires before navigation to another point in the session tree and allows a handler to cancel navigation or customize the branch summary.
+- **`session_tree`** — Fires after session-tree navigation and reports the old and new leaf IDs and any generated summary entry.
+
+### Agent and provider calls
+
+- **`before_agent_start`** — Fires after expanded user input is ready but before the agent loop starts, allowing a handler to inject a persistent custom message and replace the system prompt for that turn.
+- **`agent_start`** — Fires when a low-level agent run begins.
+- **`agent_end`** — Fires when a low-level agent run ends and includes that run's messages, although automatic retries, compaction retries, or queued continuations may still follow.
+- **`agent_settled`** — Fires once pi has no automatic retry, compaction retry, or queued continuation left to process.
+- **`turn_start`** — Fires at the start of each LLM turn and reports its index and timestamp.
+- **`turn_end`** — Fires after each LLM turn and reports the finalized assistant message and tool results.
+- **`context`** — Fires immediately before every LLM call with a deep copy of the messages destined for the model, allowing a handler to return a replacement message array without changing stored session history.
+- **`before_provider_headers`** — Fires after request headers are assembled and before the provider call, allowing handlers to mutate them in place or remove a header by assigning `null`.
+- **`before_provider_request`** — Fires after pi serializes the provider-specific request payload and immediately before sending it, allowing a handler to inspect or replace the payload.
+- **`after_provider_response`** — Fires after the provider responds but before pi consumes the response stream, exposing the HTTP status and any available normalized response headers.
+
+### Messages and tools
+
+- **`message_start`** — Fires when a user, assistant, or tool-result message begins.
+- **`message_update`** — Fires for streaming assistant-message updates and includes both the current message and token-level stream event.
+- **`message_end`** — Fires when a user, assistant, or tool-result message is finalized, allowing a handler to replace it as long as its role is unchanged.
+- **`tool_execution_start`** — Fires when tool execution begins and exposes the tool-call ID, tool name, and arguments.
+- **`tool_execution_update`** — Fires when an executing tool publishes partial output and exposes the partial result alongside the original call information.
+- **`tool_execution_end`** — Fires when tool execution finishes and reports the final result and error state.
+- **`tool_call`** — Fires immediately before a tool executes, allowing a handler to mutate its input arguments in place or block execution with an optional reason.
+- **`tool_result`** — Fires after a tool executes but before its final result events and message are emitted, allowing handlers to patch the result's content, details, or error state.
+
+### User input and model settings
+
+- **`input`** — Fires for raw user input after extension commands are checked but before skill and prompt-template expansion, allowing a handler to continue, transform, or fully handle the input.
+- **`user_bash`** — Fires when the user runs a `!` or `!!` shell command, allowing a handler to provide a custom execution backend or return a complete replacement result.
+- **`model_select`** — Fires when the active model changes through selection, cycling, or session restore and reports the new model, previous model, and change source.
+- **`thinking_level_select`** — Fires as a notification-only event when the active thinking level changes, including changes caused by model capability clamping.
+
 ## Conventions
 
 - **Svelte 5 runes:** `$state`, `$derived`, `$derived.by`, `$effect`, `$props`. `ssr = false`, adapter-static SPA. Vite port 1420
@@ -167,6 +221,10 @@ npm run tauri dev    # native desktop — REQUIRED for live session discovery
 npm run check        # svelte-check — keep 0 errors / 0 warnings
 npm run test         # vitest
 ```
+
+For live-link testing under `tauri dev`, launch the **pi process** with
+`ACCORDION_ALLOW_TAURI_DEV_ORIGIN=1`. The Vite `http://localhost:1420` Origin is intentionally
+not trusted by default; production Tauri custom-protocol origins do not need this opt-in.
 
 ```bash
 cd extension && node smoke.mjs     # extension smoke test

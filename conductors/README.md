@@ -145,6 +145,18 @@ endpoint that Accordion dials as a client; the `context/update` frame carries th
 heartbeat file at `~/.accordion/conductors/<id>.json` so the desktop app auto-discovers them;
 off-box ones are added by `ws://` URL in the header dropdown.
 
+Each out-of-process conductor also ships a `launch.json` manifest — `{ id, label, command,
+args, portEnv? }` — that lets a host spawn it directly (the desktop app's "launch" button reads
+`command`/`args` from it; external spawning hosts, like the bellows bench harness, can too). The
+optional `portEnv` names the environment variable the conductor reads its listen port from (e.g.
+`"THERMO_PORT"`); an external harness that sets it can assign a free port per run so several
+instances coexist. The desktop launch button (`app/src-tauri/src/lib.rs → launch_conductor`)
+currently does **not** set `portEnv` — it spawns with only `command`/`args`, so desktop-launched
+instances fall back to whatever port the conductor's own code defaults to, and multiple
+desktop-launched instances of the same conductor cannot coexist via `portEnv`. Conductors should
+also honor `ACCORDION_HOME` for the heartbeat directory — every conductor in this repo already
+does.
+
 The runnable wire example is [`recency-folder/`](recency-folder/) (Node.js). The full
 lifecycle and message reference is the second half of
 [`docs/conductor-protocol.md`](../docs/conductor-protocol.md).
@@ -171,6 +183,7 @@ session is currently active.
 | [`recency-folder/`](recency-folder/) | The runnable out-of-process (WebSocket) example. |
 | [`compaction-naive/`](compaction-naive/) | The naive compaction baseline — lossy LLM summary via `host.complete`. The foil to reversible folding. |
 | [`code-skeleton/`](code-skeleton/) | Structural code compression — replaces a large code-file read with a reversible skeleton (signatures kept, bodies elided). The reversible counterpart to naive compaction. |
+| [`handoff/`](handoff/) | Simulates the manual handoff workflow — write a handoff doc, `/clear`, reseed a fresh agent. Owns a zero inherited tail (`tail-size` lock) and folds the whole current session into one handoff. |
 
 ## Conductors here
 
@@ -186,6 +199,7 @@ session is currently active.
 | [`recency-folder/`](recency-folder/) | Node.js | out-of-process (WS) | **Wire example.** Folds the oldest non-protected `tool_result` blocks until under budget, and auto-advertises for discovery. Intentionally crude — copy it and grow your own. |
 | [`compaction-naive/`](compaction-naive/) | TypeScript | in-process | **Naive compaction baseline.** Summarizes aged context into a single prose blob via `host.complete`; lossy + recursive (each compaction only sees the prior summary — compounding amnesia). No `{#code FOLDED}` tag → the agent cannot self-unfold. The intentional foil that reversible folding is designed to beat. See [ADR 0014](../docs/adr/0014-naive-compaction-conductor.md). |
 | [`code-skeleton/`](code-skeleton/) | TypeScript | in-process | **Structural code compression.** Replaces a large code-file read (`tool_result`) with a deterministic interface SKELETON — imports/exports, types, class/function signatures, docstrings; bodies elided — at ~1/5 the tokens. Emitted via `replace` + the additive `ReplaceCommand.recoverable` flag, so the engine tags it `{#code FOLDED}` and the agent can `unfold`/`recall` the full source — the **reversible** answer to naive compaction. Precision-gated classification (`classify.ts`) rejects grep dumps / images / markdown / JSON / dir listings / streams; deterministic per-language skeletonizer (`skeletonize.ts`) keeps the prefix cache-warm. Collaborative; 3-pass budget, never worse than the built-in. See [ADR 0016](../docs/adr/0016-code-skeleton-conductor.md). |
+| [`handoff/`](handoff/) | TypeScript | in-process | **Fresh-start handoff workflow.** Automatically simulates: ask the current agent for a handoff document via `host.complete`, `/clear`, then reseed a fresh agent with that handoff and nothing else. Holds the **`tail-size`** lock with `tailTokens = 0`, so no old-session tail leaks into the successor context. The handoff group has no `{#code FOLDED}` tag, so the agent cannot self-unfold the killed transcript; the human can still detach. See [ADR 0017](../docs/adr/0017-handoff-conductor.md). |
 | [`tiered-relevance/`](tiered-relevance/) | Node.js | out-of-process (WS) | **Level-of-detail equilibrium** — a *simplified reinterpretation* of `the_conductor`. One unified relevance score (goal + trajectory) puts every block at the fidelity tier it earns inside a 60–90% hysteresis band; fold/unfold/anti-thrash fall out of one re-tiering. Embeddings (Ollama/transformers) + LLM digests, all degrading gracefully. |
 | [`the-conductor/`](the-conductor/) | TypeScript | out-of-process (WS) | **Faithful port of `the_conductor`'s strategy.** Vendors the original `runConductor` core (`strategy.ts`) and re-expresses only its I/O: self-calibrating fold-target band, graduated Full/Trim/Digest/Group levels, three-stage relevance (keyword → embeddings → cross-encoder rerank), risk-aware unfold floors. Collaborative. Cuts what the contract can't carry (non-contiguous grouping; agent-facing header → surfaced to the human via `conductor/status`). See its [README](the-conductor/README.md). |
 

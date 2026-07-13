@@ -40,10 +40,13 @@ The extension HTTP-serves the Accordion UI on a local ephemeral port and prints 
 default** — flip the **Folding** toggle in the header to start steering what the agent
 sees.
 
-> **Single session, browser only.** This package serves the UI in your browser for the
-> current pi session. For multi-session discovery, conductors that need local model
-> resources, and the native window, build the
-> [desktop app](https://github.com/a-Fig/Accordion) from source.
+> **Multi-session, browser-served — no desktop app required.** The extension serves the UI
+> in your browser and exposes every live pi session on the machine over a token-gated
+> endpoint; the browser polls it and lists them all in the sidebar, so you can switch
+> between sessions the same way the desktop app does. The one thing that's still
+> desktop-only is browsing **Claude Code** transcripts (`~/.claude`), since that needs the
+> native Rust layer. For that, conductors that need local model resources, or the native
+> window, build the [desktop app](https://github.com/a-Fig/Accordion) from source.
 
 ## How it works
 

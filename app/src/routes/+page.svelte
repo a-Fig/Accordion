@@ -4,6 +4,7 @@
 	import { settings } from "$lib/settings.svelte.ts";
 	import { connectLive, disconnectLive, live } from "$lib/live/liveClient.svelte";
 	import { discovery, startDiscovery, stopDiscovery, DEMO_ID } from "$lib/live/discovery.svelte";
+	import { startBrowserDiscovery, stopBrowserDiscovery } from "$lib/live/browserDiscovery.svelte";
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery } from "$lib/live/claudeDiscovery.svelte";
 	import { conductorState } from "$lib/live/conductor.svelte";
 	import { startConductorDiscovery, stopConductorDiscovery, allConductors, isLaunching } from "$lib/live/conductorDiscovery.svelte";
@@ -25,7 +26,6 @@
 	let manualPort = $state(DEFAULT_PORT);
 	let activityOpen = $state(false);
 	let browserServed = $state(false);
-	let servedSessionId = $state<string | null>(null);
 
 	// Which session source the sidebar lists: live pi vs read-only Claude Code.
 	const SRC_KEY = "accordion.sidebar.source";
@@ -118,12 +118,26 @@
 		return p ? p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || p : "";
 	}
 
+	// The per-session bearer carried in the page URL (?token=…). Browser WebSocket upgrades
+	// are Origin/token-gated even on loopback; forwarding this authorizes the serving session.
+	function readServedToken(): string | null {
+		if (typeof window === "undefined") return null;
+		return new URLSearchParams(window.location.search).get("token");
+	}
+
 	function selectAndConnect(s: SessionEntry): void {
 		if (discovery.selected === s.sessionId && live.status === "connected") return;
 		session.readOnly = false; // a live pi session is steerable, not read-only
 		claudeDiscovery.selected = null;
 		discovery.selected = s.sessionId;
-		connectLive(s.port);
+		// Browser-served mode dials with the page's loopback host and bearer. On a sibling
+		// switch the bearer belongs to the serving session, so the target verifies the page's
+		// live Accordion Origin instead. Desktop Tauri origins are trusted tokenless.
+		if (browserServed) {
+			connectLive(s.port, { host: window.location.hostname, token: readServedToken() ?? undefined });
+		} else {
+			connectLive(s.port);
+		}
 	}
 
 	// The bundled demo behaves like a session you can pick — it just loads the
@@ -133,15 +147,6 @@
 		claudeDiscovery.selected = null;
 		discovery.selected = DEMO_ID;
 		loadSample();
-	}
-
-	// Browser-served mode is single-session: the extension that served this page hosts the
-	// live WS on the SAME origin port. This is the "way back" to the live session — e.g.
-	// after viewing the Demo — since the browser has no multi-session discovery to pick from.
-	function reconnectServed(): void {
-		discovery.selected = null;
-		claudeDiscovery.selected = null;
-		connectLive(Number(window.location.port) || DEFAULT_PORT);
 	}
 
 	// A Claude Code transcript: load it read-only and tail it for appends. There is
@@ -176,9 +181,12 @@
 					const body = await res.json() as { served?: boolean; sessionId?: string; protocolVersion?: number };
 					if (body.served !== true) return;
 					browserServed = true;
-					servedSessionId = body.sessionId ?? null;
+					// This session's own port is dialed immediately so the view doesn't wait on
+					// the first discovery poll; the sidebar itself (below) is populated by
+					// startBrowserDiscovery, which lists every OTHER live session too.
 					const port = Number(window.location.port) || DEFAULT_PORT;
-					connectLive(port);
+					connectLive(port, { host: window.location.hostname, token: readServedToken() ?? undefined });
+					startBrowserDiscovery();
 				} catch {
 					// 404, network error, non-JSON — leave browserServed false; manual UI stays.
 				}
@@ -187,6 +195,7 @@
 
 		return () => {
 			stopDiscovery();
+			stopBrowserDiscovery();
 			stopClaudeDiscovery();
 			stopConductorDiscovery();
 			disconnectLive();
@@ -195,6 +204,16 @@
 
 	const isLive = $derived(live.status === "connected");
 	const isWatching = $derived(session.readOnly && !isLive);
+
+	// Browser-served mode has no explicit "select" step for the session this page auto-
+	// connected to on mount (selectAndConnect is only invoked by a sidebar click) — sync
+	// `discovery.selected` from the live socket's own sessionId so that session's row shows
+	// as selected/live in the sidebar once startBrowserDiscovery's poll lists it.
+	$effect(() => {
+		if (browserServed && live.status === "connected" && live.sessionId) {
+			discovery.selected = live.sessionId;
+		}
+	});
 
 	// View↔wire fold alarm (indicator-only): re-run the divergence check on every settled
 	// store change. `st.version` is the settled-change signal (manual fold, conductor pass,
@@ -228,9 +247,6 @@
 			claudeSelected={claudeDiscovery.selected}
 			onselectclaude={selectClaudeSession}
 			{browserServed}
-			servedTitle={session.store?.meta.title ?? "pi session"}
-			servedModel={session.store?.meta.model ?? ""}
-			onreconnect={reconnectServed}
 		/>
 	{/if}
 
@@ -376,7 +392,7 @@
 								<input class="port" type="number" min="1" max="65535" bind:value={manualPort} aria-label="pi port" />
 								<button
 									class="btn-primary"
-									onclick={() => connectLive(manualPort)}
+									onclick={() => connectLive(manualPort, !isTauriEnv ? { host: window.location.hostname, token: readServedToken() ?? undefined } : {})}
 									disabled={live.status === "connecting"}
 								>
 									<Icon name="activity" size={14} />

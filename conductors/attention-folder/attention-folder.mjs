@@ -51,7 +51,7 @@ function advertise() {
 	mkdirSync(REG_DIR, { recursive: true });
 	const entry = {
 		registryProtocol: 1,
-		conductorProtocol: 3,
+		conductorProtocol: 4, // keep in lockstep with conductors/contract/protocol.ts CONDUCTOR_PROTOCOL_VERSION
 		id: ID,
 		label: LABEL,
 		url: URL,
@@ -196,7 +196,7 @@ wss.on("connection", (ws) => {
 	ws.send(
 		JSON.stringify({
 			type: "conductor/hello",
-			conductorProtocol: 3,
+			conductorProtocol: 6, // keep in lockstep with conductors/contract/protocol.ts CONDUCTOR_PROTOCOL_VERSION
 			id: ID,
 			label: LABEL,
 			wants: { content: "full" }, // we need block text for the probe

@@ -2,5 +2,6 @@
   "id": "tiered-relevance",
   "label": "Tiered relevance",
   "command": "node",
-  "args": ["tiered-relevance.mjs"]
+  "args": ["tiered-relevance.mjs"],
+  "portEnv": "TIERS_PORT"
 }

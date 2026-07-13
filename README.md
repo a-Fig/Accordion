@@ -12,7 +12,7 @@
 
 <img src="docs/assets/accordion-hero.gif" alt="Accordion — the context map demo: blocks folding and unfolding while the protected tail stays intact" width="820">
 
-<sub>Your whole context window split in 2 sections. The lower section represents your agents most recent context and is protected against any interference</sub>
+<sub>Your whole context window split in 2 sections. The lower section represents your agent's most recent context and is protected against any interference</sub>
 </div>
 
 ---
@@ -32,7 +32,7 @@ your agent's entire context window at a glance and lets you manage it manually o
 > your context window is automatically managed for you in the background, keeping you below your limit
 
 #### 2. longer more useful sessions
-> The relevance of each block is ranked so we only fold bloat, and keep whats important. 
+> The relevance of each block is ranked so we only fold bloat, and keep what's important. 
 
 #### 3. Cheaper inference costs
 > Accordion keeps your context window lean, with cache optimizations in mind.

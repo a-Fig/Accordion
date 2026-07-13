@@ -66,6 +66,9 @@ npm run tauri dev   # the native desktop window — REQUIRED for live session di
 ```
 
 `tauri dev` starts the Vite dev server and the native shell together (hot-reload on save).
+Its browser-obtainable `http://localhost:1420` Origin is not trusted by the pi extension in
+shipped/default mode. For live-link testing only, start the **pi process** with
+`ACCORDION_ALLOW_TAURI_DEV_ORIGIN=1`; production Tauri custom-protocol origins need no flag.
 
 For pure UI iteration you can skip the native shell:
 

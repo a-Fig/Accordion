@@ -26,7 +26,9 @@ function parseLines(raw: string): any[] {
 function detectFormat(entries: any[]): SessionMeta["format"] {
 	if (!entries.length) return "unknown";
 	if (entries[0]?.type === "session") return "pi";
-	for (const e of entries.slice(0, 12)) {
+	// Scan ALL entries: Claude Code transcripts can open with an arbitrarily long run of
+	// non-message lines (summary/meta rows without a uuid) before the first real message.
+	for (const e of entries) {
 		if (e?.uuid && (e.type === "user" || e.type === "assistant")) return "claude";
 	}
 	return "unknown";

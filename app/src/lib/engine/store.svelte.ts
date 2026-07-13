@@ -459,7 +459,7 @@ export class AccordionStore {
 	 * new `protectTokens`. Because `protectedFromIndex` uses the same walk-back algorithm for
 	 * both the locked and unlocked path, the boundary is IDENTICAL before and after detach —
 	 * no block newly enters the protected tail, so `healProtected` never fires on the detach
-	 * refold, and the budget is not re-blown. The human's prior `protectTokens` is overwritten;
+	 * refold. The human's prior `protectTokens` is overwritten;
 	 * a subsequently attached collaborative conductor runs with the inherited value until the
 	 * human re-drags the slider. If the conductor did not hold `tail-size`, `protectTokens` is
 	 * left untouched.
@@ -1099,6 +1099,8 @@ export class AccordionStore {
 					this.substOne(c.id, c.content, by, "replace", reports, c.recoverable ?? false);
 					break;
 				case "restore":
+					for (const id of c.ids) this.liveOne(id, by, c.kind, reports);
+					break;
 				case "pin":
 					for (const id of c.ids) this.liveOne(id, by, c.kind, reports);
 					break;
@@ -1121,8 +1123,8 @@ export class AccordionStore {
 		if (!b) return void reports.push(clamp(kind, [id], "unknown-id", `no block ${id}`));
 		if (b.override !== null) return void reports.push(clamp(kind, [id], "human-override", `${label(b)} is held by the human`));
 		if (this.groupWire.has(id)) return void reports.push(clamp(kind, [id], "grouped", `${label(b)} is inside a folded group`));
-		// Protection is ABSOLUTE: a block in the working tail is never folded, by a conductor
-		// OR the user. Refuse and report rather than violate the safety pillar.
+		// Protection is ABSOLUTE: a block inside the protected working tail is never folded, by a
+		// conductor or the human. Refuse and report, never silently apply.
 		if (this.isProtected(b)) return void reports.push(clamp(kind, [id], "protected", `${label(b)} is in the protected working tail`));
 		// One foldability gate, shared with the wire (`wireFoldable`). A kind the wire would
 		// never fold — `user` (intent) or `tool_call` (folding it orphans its result) — is

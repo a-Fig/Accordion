@@ -56,6 +56,16 @@ const SCENARIOS = {
 		wantWarn: true,
 		wantStaleFold: true,
 	},
+	// The browser-obtainable Vite origin is NOT trusted in shipped/default mode. Developers
+	// running the Tauri shell against Vite must opt in explicitly in the pi process.
+	"tauri-dev-origin": {
+		env: { ACCORDION_ALLOW_TAURI_DEV_ORIGIN: "1" },
+		origin: "http://localhost:1420",
+		band: [150, 400],
+		wantError: false,
+		wantWarn: true,
+		wantStaleFold: true,
+	},
 };
 
 // ── orchestrator ─────────────────────────────────────────────────────────────
@@ -98,7 +108,7 @@ if (!SCENARIO) {
 		console.error("SMOKE-CONFIG FAIL");
 		process.exit(1);
 	}
-	console.log("SMOKE-CONFIG PASS — armed deadline (armed over the wire) ✓  env defaults (invalid → 250) ✓  custom timeout honored ✓");
+	console.log("SMOKE-CONFIG PASS — armed deadline (armed over the wire) ✓  env defaults (invalid → 250) ✓  custom timeout honored ✓  Tauri dev Origin explicit opt-in ✓");
 	process.exit(0);
 }
 
@@ -158,7 +168,7 @@ const sample = [
 	{ role: "assistant", content: [{ type: "text", text: "ORIGINAL" }], responseId: "resp-abc", timestamp: T0 + 1 },
 ];
 
-const gui = new WebSocket(`ws://127.0.0.1:${PORT}`);
+const gui = new WebSocket(`ws://127.0.0.1:${PORT}`, spec.origin ? { origin: spec.origin } : {});
 let mode = "ignore"; // "fold" → reply once to prime the cache; "drop" → withhold (force fallback)
 let armedAcked = false;
 gui.on("message", (data) => {

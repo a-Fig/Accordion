@@ -20,7 +20,7 @@ import { join } from "node:path";
 
 const ID = "recency-folder";
 const LABEL = "Recency folder";
-const PORT = 7700;
+const PORT = Number(process.env.RECENCY_PORT) || 7700;
 const URL = `ws://127.0.0.1:${PORT}`;
 
 // ── Auto-discovery: advertise a heartbeat file under ~/.accordion/conductors/ ──
@@ -35,7 +35,7 @@ function advertise() {
 	mkdirSync(REG_DIR, { recursive: true });
 	const entry = {
 		registryProtocol: 1,
-		conductorProtocol: 3,
+		conductorProtocol: 4, // keep in lockstep with conductors/contract/protocol.ts CONDUCTOR_PROTOCOL_VERSION
 		id: ID,
 		label: LABEL,
 		url: URL,
@@ -71,7 +71,7 @@ wss.on("connection", (ws) => {
 	ws.send(
 		JSON.stringify({
 			type: "conductor/hello",
-			conductorProtocol: 3,
+			conductorProtocol: 6, // keep in lockstep with conductors/contract/protocol.ts CONDUCTOR_PROTOCOL_VERSION
 			id: ID,
 			label: LABEL,
 			wants: { content: "full" },

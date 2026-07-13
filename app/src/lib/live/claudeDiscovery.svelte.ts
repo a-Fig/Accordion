@@ -9,6 +9,7 @@
  * stays a silent no-op and the sidebar section is simply empty.
  */
 import { isClaudeSession, type ClaudeCodeSession } from "./claude";
+import { isTauriEnv } from "../session.svelte";
 
 export const claudeDiscovery = $state<{
 	sessions: ClaudeCodeSession[];
@@ -38,7 +39,9 @@ async function refreshClaude(): Promise<void> {
 }
 
 export function startClaudeDiscovery(): void {
-	if (_timer !== null) return; // idempotent — already running
+	// Same internal guard as startDiscovery/startConductorDiscovery: outside Tauri the
+	// native command doesn't exist — don't spin an interval of failing dynamic imports.
+	if (!isTauriEnv || _timer !== null) return; // idempotent — already running
 	void refreshClaude();
 	_timer = setInterval(() => void refreshClaude(), 3000);
 }

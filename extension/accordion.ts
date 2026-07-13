@@ -15,6 +15,13 @@
  * best-effort launch/reinvoke the desktop app (single-instance keeps that from
  * becoming duplicate windows).
  *
+ * Browser-served multi-session discovery: a browser tab has no filesystem access, but
+ * THIS process does (it's Node, not sandboxed) — so any one session's HTTP server can
+ * read every OTHER session's registry file and serve the list over `/__accordion/sessions`
+ * (token-gated). The browser UI polls that endpoint and dials whichever session's port the
+ * user picks, giving a single browser tab the same multi-session sidebar the desktop app
+ * gets from its Tauri `list_sessions` command — no desktop app required.
+ *
  * Safety:
  *   • No GUI connected → pass messages through UNMODIFIED. We never corrupt context.
  *   • The plan reply times out → apply the LAST KNOWN plan instead of silently
@@ -23,9 +30,12 @@
  *     yet, pass through as before — but always log the timeout (never silent). Note:
  *     on a timeout-with-stale-fallback turn, what the GUI is showing can diverge for
  *     that one turn from what the extension actually sent the model (the stale plan
- *     may be missing folds/unfolds the GUI has since queued) — the fold alarm has no
- *     visibility into this, since it never receives the applied plan back. The next
- *     plan the GUI delivers resyncs both sides.
+ *     may be missing folds/unfolds the GUI has since queued) — the next plan the GUI
+ *     delivers resyncs both sides. Unlike before #60, this divergence is no longer
+ *     invisible: every `context` hook outcome (including this one) is counted and, when
+ *     a client is reachable, acked back as a `passthrough` message (issue #60, ADR 0020)
+ *     — see `recordPlanOutcome` below — so the GUI and the bellows bench rig can observe
+ *     it instead of assuming the fresh plan rode.
  *   • pi's native /compact is suppressed ONLY while the GUI is attached.
  *   • The shared mapping (linearize/applyPlan) carries the provider-safety rules
  *     (durable-id + kind checks); the engine is the single foldability gate and
@@ -67,7 +77,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
-import { linearize, applyPlan, type PiMessage } from "../app/src/lib/live/mapping";
+import { linearize, applyPlan, type PiMessage, type AppliedCounts } from "../app/src/lib/live/mapping";
 import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
 
 /** The GUI's reply to a sync: in-place fold ops + group-collapse ops (ADR 0006). */
@@ -92,6 +102,7 @@ import {
 	SESSIONS_SUBDIR,
 	FOCUS_FILE,
 	HEARTBEAT_INTERVAL_MS,
+	isLiveEntry,
 	type SessionEntry,
 	type FocusRequest,
 } from "../app/src/lib/live/registry";
@@ -122,6 +133,42 @@ const UNFOLD_TIMEOUT_MS = 2000;
 // folded block's full content back THIS turn — so the same generous wait applies.
 const RECALL_TIMEOUT_MS = 2000;
 
+// WebSocket frames otherwise inherit ws's 100 MiB default. Plans and control messages are
+// normally kilobytes; 8 MiB leaves ample headroom while bounding allocation + JSON.parse work.
+const MAX_WS_PAYLOAD_BYTES = 8 * 1024 * 1024;
+// Browser-served session A may switch to session B without possessing B's token. B verifies A
+// through A's loopback-only /__accordion/meta endpoint plus the live registry. Bound that
+// upgrade-time probe so an unrelated local port cannot tie up verifier work indefinitely.
+const SIBLING_ORIGIN_PROBE_MS = 750;
+const SIBLING_ORIGIN_META_MAX_BYTES = 16 * 1024;
+const MAX_PENDING_SIBLING_ORIGIN_PROBES = 8;
+// completeRequest launches real provider work. Keep the spend bound process-wide across socket
+// replacement: superseding a GUI suppresses its reply, but does not itself stop the provider.
+const MAX_CONCURRENT_COMPLETIONS = 4;
+// Finish before the GUI's 120 s completion backstop and pass the abort signal through to pi-ai.
+// The override keeps smoke tests fast; invalid values retain the production default.
+const COMPLETION_TIMEOUT_MS = envPositiveInt("ACCORDION_COMPLETION_TIMEOUT_MS", 110_000);
+// Vite's fixed localhost:1420 Origin is browser-obtainable, unlike Tauri's production custom
+// origins. Trust it only for an explicit local development session; shipped installs stay closed.
+const ALLOW_TAURI_DEV_ORIGIN = process.env.ACCORDION_ALLOW_TAURI_DEV_ORIGIN === "1";
+
+/** Origins used by Accordion's Tauri webview. Normal web pages cannot mint these origins. */
+function isTrustedTauriOrigin(origin: string): boolean {
+	let u: URL;
+	try { u = new URL(origin); } catch { return false; }
+	if (u.username || u.password) return false;
+	// Tauri v2 production origins: tauri://localhost on macOS/Linux and
+	// https://tauri.localhost on Windows (the latter may also be http in older WebView2 builds).
+	if (u.protocol === "tauri:" && u.hostname === "localhost" && !u.port) return true;
+	if ((u.protocol === "https:" || u.protocol === "http:") && u.hostname === "tauri.localhost" && !u.port) return true;
+	// tauri.conf.json's Vite development URL — opt-in only because port 1420 is not a
+	// cryptographically distinguished origin and may be occupied by unrelated local content.
+	return ALLOW_TAURI_DEV_ORIGIN
+		&& u.protocol === "http:"
+		&& (u.hostname === "localhost" || u.hostname === "127.0.0.1")
+		&& u.port === "1420";
+}
+
 // Base dir is overridable for tests (smoke.mjs) so they don't touch the real home.
 const HOME = process.env.ACCORDION_HOME || os.homedir();
 const REGISTRY_ROOT = path.join(HOME, REGISTRY_DIR);
@@ -131,12 +178,36 @@ const FOCUS_PATH = path.join(REGISTRY_ROOT, FOCUS_FILE);
 const ACCORDION_APP_FLAG = "accordion-app";
 const ACCORDION_APP_ENV = "ACCORDION_APP_PATH";
 
+// The live link binds an OS-assigned ephemeral port on loopback (127.0.0.1) only — a
+// same-machine surface. The desktop app's discovery dials 127.0.0.1; the browser-served
+// page auto-connects to the same origin. There is no remote/off-loopback bind mode.
+
+/** True if a socket peer address is loopback (127.0.0.1 / ::1, incl. IPv4-mapped IPv6). */
+function isLoopbackPeer(addr: string | undefined | null): boolean {
+	if (!addr) return false;
+	const a = addr.toLowerCase();
+	// Strip the IPv4-mapped IPv6 prefix so 127.0.0.1 is recognized under dual-stack.
+	const v4 = a.startsWith("::ffff:") ? a.slice(7) : a;
+	return v4 === "127.0.0.1" || v4 === "::1" || v4 === "localhost";
+}
+
 type LaunchSource = "cli" | "env" | "default";
 type LaunchResult =
 	| { ok: true; path: string; source: LaunchSource }
 	| { ok: false; reason: "explicit-invalid"; path: string; source: Extract<LaunchSource, "cli" | "env"> }
 	| { ok: false; reason: "not-found" }
 	| { ok: false; reason: "spawn-failed"; path: string; source: LaunchSource; error: unknown };
+
+type CompletionFunction = (
+	model: any,
+	context: { systemPrompt?: string; messages: Array<{ role: "user"; content: string; timestamp: number }> },
+	options: { apiKey: string; headers?: Record<string, string>; signal?: AbortSignal; maxTokens?: number },
+) => Promise<any>;
+
+interface RuntimeDependencies {
+	/** Test seam; production resolves pi-ai lazily through pi's package alias. */
+	complete?: CompletionFunction;
+}
 
 function cleanExplicitPath(value: unknown): string | null {
 	if (typeof value !== "string") return null;
@@ -258,7 +329,7 @@ function launchResultLine(result: LaunchResult | null): { text: string; type: "i
 	};
 }
 
-export default function accordionLive(pi: ExtensionAPI): void {
+export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDependencies = {}): void {
 	pi.registerFlag(ACCORDION_APP_FLAG, {
 		description: "Path to the Accordion desktop app executable for /accordion launch/focus",
 		type: "string",
@@ -269,10 +340,9 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// build of the Accordion app on the same ephemeral port (feat/browser-served-extension).
 	// One server per pi session; closed alongside `wss` at shutdown.
 	let httpServer: http.Server | null = null;
-	// Per-session token gating the HTTP static-file serving ONLY. Generated once when
-	// the server starts. The WS upgrade path stays UNAUTHENTICATED (see startServer's
-	// banner): the desktop Tauri app dials ws://127.0.0.1:<port> with no token and must
-	// keep working unchanged, so the token never guards the WebSocket — only file serving.
+	// Per-session token gating the HTTP surface and browser WebSocket upgrades. Native clients
+	// without an Origin and the Tauri webview remain tokenless. Browser clients authenticate
+	// explicitly, by an exact-origin cookie, or as a verified live sibling Accordion origin.
 	let webToken = "";
 	let client: WebSocket | null = null; // the GUI (one driver at a time in M1)
 	let sessionId = "";
@@ -282,6 +352,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	let reqSeq = 0;
 	let epoch = 0; // bumped on every new GUI connection; invalidates in-flight requests
 	const pending = new Map<number, (r: PlanResult) => void>();
+	// Unique tokens, rather than request ids, make cleanup exact when a later connection reuses
+	// an id. This set is deliberately not reset on reconnect while old provider work is running.
+	const activeCompletionCalls = new Set<symbol>();
+	let pendingSiblingOriginProbes = 0;
 	// Last plan the GUI DELIVERED (issue #58). Cached — including a genuinely empty plan
 	// (empty = "conductor wants no folds", so caching it prevents wrongly re-applying an
 	// older non-empty plan) — so a timed-out `context` can apply it instead of shipping the
@@ -300,6 +374,87 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// `message_end` to stamp `usage.rttMs` on the assistant message this request produced.
 	// null = no context RTT to attribute (e.g. no GUI attached this turn) → no field stamped.
 	let lastPlanRttMs: number | null = null;
+
+	// ── plan-outcome observability (issue #60, ADR 0020) ────────────────────────────
+	// Every `context` hook resolves to EXACTLY one of these causes — the full taxonomy of
+	// what happened to a model call's context, including the two that used to be totally
+	// silent (`no-gui`, `epoch-mismatch`) and the pre-existing-but-unobservable timeout
+	// fallbacks. `no-gui`/`unsent` have no reachable client to ack (see `recordPlanOutcome`),
+	// so they are counter-only; the other five are also acked to the GUI as a `passthrough`
+	// message (`PassthroughCause` in protocol.ts is this type minus those two).
+	type PlanOutcomeCause = "applied" | "empty-plan" | "timeout-stale" | "timeout-raw" | "no-gui" | "epoch-mismatch" | "unsent";
+	// Per-extension-lifetime counters (plain in-memory state, mirrors `sentCount`'s pattern).
+	// Deliberately NOT reset on `session_start` — a session swap doesn't invalidate the
+	// observability value of a running total, unlike `sentCount`/`epoch`/`lastPlan`, which
+	// genuinely describe THIS session's cursor and must not leak across a swap. Never
+	// persisted (the context hook must stay disk-I/O-free — see the header Safety note).
+	const planOutcomeCounts: Record<PlanOutcomeCause, number> = {
+		applied: 0,
+		"empty-plan": 0,
+		"timeout-stale": 0,
+		"timeout-raw": 0,
+		"no-gui": 0,
+		"epoch-mismatch": 0,
+		unsent: 0,
+	};
+	let contextHookCount = 0; // total `context` hook invocations this extension lifetime
+	// Previous outcome cause — used ONLY to log a TRANSITION into a silent-passthrough state
+	// (not every call: every session legitimately starts unattached, so per-turn no-gui
+	// logging would be pure noise). null until the first `context` hook ever resolves.
+	let lastOutcomeCause: PlanOutcomeCause | null = null;
+	const SILENT_CAUSES: ReadonlySet<PlanOutcomeCause> = new Set(["no-gui", "unsent", "epoch-mismatch"]);
+
+	/**
+	 * Record the outcome of ONE `context` hook resolution (issue #60). Called exactly once
+	 * per hook invocation, on every exit path — including the success path — so every
+	 * `context` call increments exactly one counter.
+	 *
+	 * Side effects, in order:
+	 *   1. Bump `planOutcomeCounts[cause]` and `contextHookCount`.
+	 *   2. `console.warn` iff this call is entering a SILENT state (no-gui/unsent/
+	 *      epoch-mismatch) from a non-silent ("healthy") one — e.g. the first no-gui call
+	 *      after having been attached, or the first unsent/epoch-mismatch after a healthy
+	 *      run. Never warns on the very first call ever (nothing to transition FROM), and
+	 *      never warns silent→silent (already noisy enough at the transition). The
+	 *      already-logged timeout branches (`timeout-stale`/`timeout-raw`) are untouched —
+	 *      they log every call via `console.warn`/`console.error` at their call sites.
+	 *   3. Fire-and-forget a `passthrough` ack to `ackTarget` iff it is non-null and OPEN.
+	 *      `ackTarget` is null for `no-gui`/`unsent` (no reachable client — counter-only per
+	 *      spec) and the CURRENT client for every other cause, including `epoch-mismatch`
+	 *      (whose `reqId` belongs to the superseded view — the current client can still
+	 *      count it, it just can't correlate the id to anything it itself sent).
+	 *
+	 * NEVER awaited by the caller — `send()` is itself fire-and-forget (try/catch, no
+	 * return value), so this can never delay or block the `context` hook's own return.
+	 */
+	function recordPlanOutcome(
+		cause: PlanOutcomeCause,
+		reqId: number | null,
+		applied: { ops: number; groups: number },
+		ackTarget: WebSocket | null,
+	): void {
+		planOutcomeCounts[cause]++;
+		contextHookCount++;
+		if (SILENT_CAUSES.has(cause) && lastOutcomeCause !== null && !SILENT_CAUSES.has(lastOutcomeCause)) {
+			console.warn(
+				`[accordion] context hook: silent passthrough (${cause})${reqId != null ? ` reqId=${reqId}` : ""} — previous outcome was '${lastOutcomeCause}'`,
+			);
+		}
+		lastOutcomeCause = cause;
+		if (ackTarget && ackTarget.readyState === 1 /* OPEN */) {
+			// Cast: `no-gui`/`unsent` never reach here with a non-null ackTarget (every call
+			// site below passes `null` for those two causes), so `cause` is always one of
+			// protocol.ts's narrower `PassthroughCause` at runtime despite the wider static type.
+			send(ackTarget, {
+				type: "passthrough",
+				reqId: reqId ?? -1,
+				cause: cause as Exclude<PlanOutcomeCause, "no-gui" | "unsent">,
+				ops: applied.ops,
+				groups: applied.groups,
+			});
+		}
+	}
+
 	// Unfold requests: keyed by reqId, resolved when the GUI replies (or null on flush).
 	// Deliberately NOT reset on reconnect (unlike reqSeq): a late reply from a superseded
 	// GUI can never alias a fresh request's reqId, and flushPending() drains the map anyway.
@@ -340,6 +495,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	let tokens: number | null = null;
 	let contextWindow: number | null = null;
 	let heartbeat: ReturnType<typeof setInterval> | null = null;
+	// Set iff the HTTP server's bind failed (e.g. an unexpected EADDRINUSE on the ephemeral port).
+	// Previously the "error" listener discarded the error entirely, so `port` stayed 0
+	// forever and `/accordion` printed "port starting…" — indistinguishable from a slow,
+	// still-booting server. Surfaced verbatim in the /accordion status line instead.
+	let bindError: string | null = null;
 
 	const attached = (): boolean => !!client && client.readyState === 1; /* OPEN */
 
@@ -414,6 +574,77 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		} catch {
 			/* already gone */
 		}
+	}
+
+	/**
+	 * Read every OTHER live session's advertised entry alongside our own. This is plain
+	 * Node `fs` access (unlike a browser tab, this extension process is never filesystem-
+	 * sandboxed) — the same directory the desktop app's Tauri layer reads, just read from
+	 * the other side. Powers the browser-served multi-session sidebar (no Tauri required):
+	 * any one session's HTTP server can list every session on the machine. Best-effort:
+	 * an unreadable directory or a partially-written/corrupt file is skipped, never thrown.
+	 *
+	 * ASYNC (fs.promises), not fs.*Sync: this runs on the same event loop as the `context`
+	 * hook's `requestPlan`, which only allows REQUEST_TIMEOUT_MS (250ms) before falling back
+	 * to passthrough. A browser tab polls this every second — synchronous directory/file I/O
+	 * here would add avoidable jitter to that budget; the async form yields between files.
+	 *
+	 * Opportunistically REAPS dead entries it encounters (unlike a bare read): a browser-only
+	 * user has no desktop app ever running to clean up `~/.accordion/sessions/` after a
+	 * SIGKILLed pi (skips session_shutdown's own deleteEntry), so if nothing reaps here, stale
+	 * files accumulate forever for exactly this feature's target user. Mirrors the desktop
+	 * app's own reap-on-poll behavior (discovery.svelte.ts). Deleting a stale file is itself
+	 * best-effort and never blocks the response.
+	 */
+	async function listLiveSessions(): Promise<SessionEntry[]> {
+		const now = Date.now();
+		const out: SessionEntry[] = [];
+		let names: string[] = [];
+		try {
+			names = await fs.promises.readdir(SESSIONS_DIR);
+		} catch {
+			return out;
+		}
+		for (const name of names) {
+			if (!name.endsWith(".json")) continue;
+			const filePath = path.join(SESSIONS_DIR, name);
+			let raw: unknown;
+			try {
+				raw = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
+			} catch {
+				continue; // partial write / corrupt file / deleted mid-scan — skip, never crash
+			}
+			if (isLiveEntry(raw, now)) {
+				out.push(raw);
+			} else if (raw && typeof raw === "object" && typeof (raw as { sessionId?: unknown }).sessionId === "string") {
+				// Recognizably a registry entry, just stale or an old protocol version — reap it.
+				// A merely-paused (not dead) session self-heals: its next heartbeat rewrites the
+				// file, so reaping a transient staleness read is harmless — UNLESS that heartbeat
+				// lands in the gap between our read above and the unlink below, in which case we'd
+				// delete a file a concurrent writeEntry() just atomically renamed into place (a live
+				// session's live advertisement). Narrow that window: re-read + re-check staleness
+				// immediately before unlinking. This does not ELIMINATE the race (a heartbeat could
+				// still land between this re-check and the unlink itself), only narrows it from "one
+				// readdir pass" to "one extra read" — accepted, since closing it fully would need a
+				// file lock this best-effort registry deliberately doesn't have. Any read/parse
+				// failure here (file renamed/deleted mid-recheck) is swallowed: nothing to reap.
+				fs.promises
+					.readFile(filePath, "utf8")
+					.then((freshRaw) => {
+						let fresh: unknown;
+						try {
+							fresh = JSON.parse(freshRaw);
+						} catch {
+							return; // corrupt/partial re-read — leave it for the next pass
+						}
+						if (isLiveEntry(fresh, Date.now())) return; // a heartbeat healed it — don't reap
+						return fs.promises.unlink(filePath);
+					})
+					.catch(() => {});
+			}
+		}
+		out.sort((a, b) => a.startedAt - b.startedAt);
+		return out;
 	}
 
 	/** /accordion writes a one-shot request for the app to focus us once it is open. */
@@ -546,12 +777,22 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		return null;
 	}
 
+	// Cookie name is PORT-QUALIFIED (not just "accordion_token"): cookies are host-scoped, not
+	// port-scoped, so two sessions on the same host (e.g. two pi sessions both browser-served on
+	// 127.0.0.1, different ports) would otherwise clobber each other's cookie — opening session B
+	// overwrites A's `accordion_token` cookie, and A's next cookie-authed request 403s. Qualifying
+	// by port keeps each session's cookie distinct. `port` is closed over and only read from
+	// request handlers, which never run before `startServer`'s `listen` callback sets it.
+	function accordionCookieName(): string {
+		return `accordion_token_p${port}`;
+	}
+
 	/** Is this request authenticated for static-file serving? (token query OR cookie.) */
 	function isWebAuthed(req: http.IncomingMessage, u: URL): boolean {
 		if (!webToken) return false;
 		if (u.searchParams.get("token") === webToken) return true;
 		const cookie = req.headers["cookie"];
-		if (typeof cookie === "string" && cookie.split(";").some((c) => c.trim() === `accordion_token=${webToken}`)) return true;
+		if (typeof cookie === "string" && cookie.split(";").some((c) => c.trim() === `${accordionCookieName()}=${webToken}`)) return true;
 		return false;
 	}
 
@@ -559,20 +800,46 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 * HTTP request handler — serves the browser build of the Accordion app, gated by a
 	 * per-session token. Runs ENTIRELY off the pi `context`/model-call hook path: it does
 	 * no folding, touches no plan, and a failure to serve a file never crashes a session
-	 * (every path is wrapped). The token gates ONLY file serving; `/__accordion/meta` is
-	 * deliberately reachable WITHOUT a token (it leaks only sessionId + protocol version,
-	 * which are unreadable cross-origin since we send NO CORS headers).
+	 * (every path is wrapped). The token gates file serving; `/meta` is ungated (loopback-only).
 	 */
 	function handleHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
 		try {
 			const u = new URL(req.url || "/", "http://127.0.0.1");
 
-			// Meta endpoint — UNGATED so the browser (and the smoke test) can probe the
-			// server without the token. Harmless: same-origin policy hides the body from
-			// any other origin because we set no CORS headers.
+			// Meta endpoint. UNGATED — the whole surface is loopback-only, and local tooling (the
+			// smoke test, bellows polling from the same machine) and the browser's own same-origin
+			// fetch all depend on reading it without a token.
 			if (u.pathname === "/__accordion/meta") {
 				res.writeHead(200, { "Content-Type": "application/json" });
-				res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION }));
+				// `planOutcomes` (issue #60, ADR 0020): per-cause counts of every `context` hook
+				// resolution this extension has ever resolved, plus `total` (= `contextHookCount`,
+				// the total invocation count) — what the bellows bench rig polls to see how much
+				// of a session actually rode the GUI's plan vs. a silent/fallback passthrough.
+				res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION, planOutcomes: { ...planOutcomeCounts, total: contextHookCount } }));
+				return;
+			}
+
+			// Session list — powers the browser-served multi-session sidebar. TOKEN-GATED
+			// (unlike /meta): it reveals cwd/title/model across every live session on the
+			// machine, not just this one, so it must not be reachable without the token — a
+			// leaked token for THIS session otherwise exposes every other live session's
+			// port/cwd/title/model too. An accepted tradeoff for the multi-session sidebar.
+			if (u.pathname === "/__accordion/sessions") {
+				if (!isWebAuthed(req, u)) {
+					res.writeHead(403, { "Content-Type": "application/json" });
+					res.end(JSON.stringify({ error: "forbidden" }));
+					return;
+				}
+				void listLiveSessions().then(
+					(sessions) => {
+						res.writeHead(200, { "Content-Type": "application/json" });
+						res.end(JSON.stringify({ sessions }));
+					},
+					() => {
+						res.writeHead(500, { "Content-Type": "application/json" });
+						res.end(JSON.stringify({ error: "internal error" }));
+					},
+				);
 				return;
 			}
 
@@ -586,7 +853,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// asset fetches, which don't carry the query string) stay authenticated.
 			const headers: Record<string, string> = {};
 			if (u.searchParams.get("token") === webToken) {
-				headers["Set-Cookie"] = `accordion_token=${webToken}; HttpOnly; SameSite=Strict; Path=/`;
+				headers["Set-Cookie"] = `${accordionCookieName()}=${webToken}; HttpOnly; SameSite=Strict; Path=/`;
 			}
 
 			const root = resolveClientRoot();
@@ -651,23 +918,170 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 	}
 
+	function hasAccordionCookie(req: http.IncomingMessage): boolean {
+		const cookie = req.headers.cookie;
+		return !!webToken && typeof cookie === "string"
+			&& cookie.split(";").some((part) => part.trim() === `${accordionCookieName()}=${webToken}`);
+	}
+
+	/**
+	 * Cookies are ambient and host-scoped, not port-scoped. Only accept Accordion's cookie when
+	 * the browser Origin exactly names this upgrade Host on a literal loopback hostname. The
+	 * literal-host requirement prevents DNS rebinding from turning matching attacker-controlled
+	 * Origin/Host strings into authority over a loopback connection.
+	 */
+	function isExactServedOrigin(req: http.IncomingMessage, origin: string): boolean {
+		const host = req.headers.host;
+		if (typeof host !== "string" || !host) return false;
+		try {
+			const u = new URL(origin);
+			if (u.protocol !== "http:" || u.username || u.password) return false;
+			if (u.host.toLowerCase() !== host.trim().toLowerCase()) return false;
+			const hostname = u.hostname.toLowerCase();
+			return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Browser-served mode intentionally supports switching from session A's page to sibling B.
+	 * A does not know B's token, so B verifies that A is a currently live Accordion loopback
+	 * origin. A literal host check defeats DNS rebinding; a bounded live /meta probe proves
+	 * current port ownership; the matching registry identity prevents an unrelated local HTTP
+	 * service from authorizing itself by copying the public JSON shape.
+	 */
+	function isKnownAccordionLoopbackOrigin(origin: string): Promise<boolean> {
+		let u: URL;
+		try { u = new URL(origin); } catch { return Promise.resolve(false); }
+		if (u.protocol !== "http:" || u.username || u.password) return Promise.resolve(false);
+		const hostname = u.hostname.toLowerCase();
+		if (hostname !== "localhost" && hostname !== "127.0.0.1" && hostname !== "[::1]") return Promise.resolve(false);
+		const originPort = Number(u.port || 80);
+		if (!Number.isSafeInteger(originPort) || originPort <= 0 || originPort > 65535) return Promise.resolve(false);
+		if (pendingSiblingOriginProbes >= MAX_PENDING_SIBLING_ORIGIN_PROBES) return Promise.resolve(false);
+		const requestHost = hostname === "[::1]" ? "::1" : hostname;
+		pendingSiblingOriginProbes++;
+
+		return new Promise((resolve) => {
+			let settled = false;
+			let request: http.ClientRequest | null = null;
+			const finish = (ok: boolean): void => {
+				if (settled) return;
+				settled = true;
+				pendingSiblingOriginProbes--;
+				clearTimeout(deadline);
+				resolve(ok);
+			};
+			const deadline = setTimeout(() => {
+				request?.destroy();
+				finish(false);
+			}, SIBLING_ORIGIN_PROBE_MS);
+			request = http.get({ hostname: requestHost, port: originPort, path: "/__accordion/meta" }, (response) => {
+				if (response.statusCode !== 200 || !isLoopbackPeer(response.socket.remoteAddress)) {
+					response.destroy();
+					finish(false);
+					return;
+				}
+				const contentType = response.headers["content-type"];
+				if (typeof contentType !== "string" || !contentType.toLowerCase().includes("application/json")) {
+					response.destroy();
+					finish(false);
+					return;
+				}
+				const chunks: Buffer[] = [];
+				let bodyBytes = 0;
+				response.on("data", (chunk: Buffer) => {
+					bodyBytes += chunk.length;
+					if (bodyBytes > SIBLING_ORIGIN_META_MAX_BYTES) {
+						response.destroy();
+						finish(false);
+						return;
+					}
+					chunks.push(chunk);
+				});
+				response.on("end", () => {
+					if (settled) return;
+					try {
+						const sibling = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+							served?: unknown; sessionId?: unknown; protocolVersion?: unknown;
+						};
+						if (sibling.served !== true || typeof sibling.sessionId !== "string" || sibling.protocolVersion !== PROTOCOL_VERSION) {
+							finish(false);
+							return;
+						}
+						void listLiveSessions().then(
+							(sessions) => finish(sessions.some((s) => s.sessionId === sibling.sessionId && s.port === originPort)),
+							() => finish(false),
+						);
+					} catch {
+						finish(false);
+					}
+				});
+				response.on("aborted", () => finish(false));
+				response.on("error", () => finish(false));
+			});
+			request.on("error", () => finish(false));
+		});
+	}
+
+	/**
+	 * Loopback binding blocks network peers, but not cross-site WebSocket hijacking: browsers do
+	 * not apply CORS to WebSocket handshakes. A hostile page that finds the ephemeral port could
+	 * otherwise replace the GUI, read the backlog, steer plans, and launch paid completions.
+	 */
+	function verifyWsUpgrade(info: { req: http.IncomingMessage }, cb: (res: boolean, code?: number, message?: string) => void): void {
+		const req = info.req;
+		if (!isLoopbackPeer(req.socket.remoteAddress)) {
+			cb(false, 403, "loopback connection required");
+			return;
+		}
+
+		let token: string | null;
+		try {
+			token = new URL(req.url || "/", "http://accordion.local").searchParams.get("token");
+		} catch {
+			// ws does not protect callback-style verifyClient from a synchronous throw.
+			cb(false, 400, "bad request target");
+			return;
+		}
+
+		const origin = req.headers.origin;
+		if (typeof origin !== "string" || origin === "") { cb(true); return; } // native client
+		if (isTrustedTauriOrigin(origin)) { cb(true); return; }
+		if (!!webToken && token === webToken) { cb(true); return; } // explicit bearer
+		if (hasAccordionCookie(req) && isExactServedOrigin(req, origin)) { cb(true); return; }
+
+		// A browser page served by another live Accordion session is the one intentional
+		// cross-origin path. verifyClient supports an asynchronous callback.
+		void isKnownAccordionLoopbackOrigin(origin).then(
+			(ok) => cb(ok, ok ? undefined : 403, ok ? undefined : "cross-origin WebSocket blocked"),
+			() => cb(false, 403, "cross-origin WebSocket blocked"),
+		);
+	}
+
 	function startServer(): void {
 		if (wss || httpServer) return;
-		// Per-session token for the HTTP static surface. The WS upgrade is NEVER gated by
-		// it (see the file banner + handleHttp): the desktop app dials the WS tokenless and
-		// must keep working, so authentication lives only on file serving, not the socket.
+		bindError = null; // fresh attempt — clear any failure a prior call recorded
+		// Per-session token for the HTTP surface and browser WebSocket upgrades. Native/Tauri
+		// clients and verified sibling Accordion origins are the only tokenless paths.
 		webToken = crypto.randomBytes(16).toString("hex");
 		try {
-			// One HTTP server hosts BOTH halves on the SAME ephemeral port:
+			// One HTTP server hosts BOTH halves on the SAME ephemeral loopback port:
 			//   • HTTP GETs → handleHttp (the browser build, token-gated)
-			//   • WS upgrades → the WebSocketServer below (UNAUTHENTICATED, unchanged)
+			//   • WS upgrades → the WebSocketServer below (loopback-only, Origin/token-gated)
 			// port 0 ⇒ OS assigns a free ephemeral port (one server per pi session).
 			httpServer = http.createServer(handleHttp);
 			// Attach the WS server to the HTTP server (NOT { port: 0 }) so the upgrade
-			// shares the port. `wss.on("connection")` below is byte-for-byte unchanged.
-			wss = new WebSocketServer({ server: httpServer });
-			httpServer.on("error", () => {
-				// e.g. unexpected bind failure — run headless (passthrough).
+			// shares the port. maxPayload bounds memory/parse work before protocol validation.
+			wss = new WebSocketServer({ server: httpServer, verifyClient: verifyWsUpgrade, maxPayload: MAX_WS_PAYLOAD_BYTES });
+			httpServer.on("error", (err: NodeJS.ErrnoException) => {
+				// Unexpected listen failure (e.g. EADDRINUSE): run headless (passthrough), but
+				// record and log WHY, so `/accordion` can show a real failure instead of an
+				// eternal "port starting…". No retry: a visible failure is the fix.
+				const code = err?.code ?? "unknown";
+				bindError = `bind failed: ${code}`;
+				console.warn(`[accordion] ${bindError}`);
 				try { httpServer?.close(); } catch { /* ignore */ }
 				httpServer = null;
 				wss = null;
@@ -690,6 +1104,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			return;
 		}
 		wss.on("connection", (ws: WebSocket) => {
+			// Request-id deduplication is per connection; paid-call accounting above is global.
+			const connectionCompletionIds = new Set<number>();
 			flushPending(); // supersede any prior GUI: its in-flight requests pass through
 			client = ws;
 			epoch++;
@@ -769,7 +1185,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 						});
 					}
 				}
-				if (msg?.type === "completeRequest" && typeof msg.reqId === "number") {
+				if (msg?.type === "completeRequest" && Number.isSafeInteger(msg.reqId) && msg.reqId >= 0) {
 					// Out-of-band: fire async and NEVER block the message handler or any hook.
 					// Dynamic import so the module is resolved lazily — at pi load time pi's jiti
 					// alias table maps "@earendil-works/pi-ai" to its bundled copy; the smoke test
@@ -781,11 +1197,42 @@ export default function accordionLive(pi: ExtensionAPI): void {
 							// Only send if this GUI is still the active client (reconnect guard).
 							if (capturedWs === client && capturedWs.readyState === 1) send(capturedWs, r);
 						};
+						// A duplicate is a replay of the one GUI promise keyed by reqId. Coalesce it onto
+						// the original; replying with an error under the same id would reject that promise
+						// while its already-paid provider call continued unseen.
+						if (connectionCompletionIds.has(req.reqId)) return;
 						// Validate prompt before doing any async work.
 						if (typeof req.prompt !== "string" || req.prompt.length === 0) {
 							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "missing or empty prompt" });
 							return;
 						}
+						if (req.maxOutputTokens !== undefined && (!Number.isSafeInteger(req.maxOutputTokens) || req.maxOutputTokens <= 0)) {
+							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "maxOutputTokens must be a positive safe integer" });
+							return;
+						}
+						// Admission is synchronous before the first await, so back-to-back frames cannot
+						// race past the cap. A unique token makes cleanup safe across reconnect/id reuse.
+						if (activeCompletionCalls.size >= MAX_CONCURRENT_COMPLETIONS) {
+							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: `too many concurrent completions in flight (max ${MAX_CONCURRENT_COMPLETIONS})` });
+							return;
+						}
+						const callToken = Symbol(`completion:${req.reqId}`);
+						activeCompletionCalls.add(callToken);
+						connectionCompletionIds.add(req.reqId);
+						const completionAbort = new AbortController();
+						const timeoutError = new Error(`completion timed out after ${COMPLETION_TIMEOUT_MS}ms`);
+						let completionTimer: ReturnType<typeof setTimeout> | null = null;
+						// Non-null only after complete() has actually launched provider work. A client-facing
+						// timeout aborts that work, but the global slot remains occupied until the underlying
+						// promise confirms settlement; an adapter that ignores AbortSignal must not let spend
+						// accounting reopen early.
+						let providerSettlement: Promise<void> | null = null;
+						const deadline = new Promise<never>((_resolve, reject) => {
+							completionTimer = setTimeout(() => {
+								completionAbort.abort(timeoutError);
+								reject(timeoutError);
+							}, COMPLETION_TIMEOUT_MS);
+						});
 						try {
 							const ctx = latestCtx;
 							const m = latestModel ?? ctx?.model;
@@ -793,12 +1240,13 @@ export default function accordionLive(pi: ExtensionAPI): void {
 								reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "no model available" });
 								return;
 							}
-							const auth = await ctx.modelRegistry.getApiKeyAndHeaders(m);
+							const auth = await Promise.race([ctx.modelRegistry.getApiKeyAndHeaders(m), deadline]);
 							if (!auth.ok) {
 								reply({ type: "completeResult", reqId: req.reqId, ok: false, error: `could not resolve API key: ${(auth as any).error ?? "unknown"}` });
 								return;
 							}
-							const { complete } = await import("@earendil-works/pi-ai");
+							const complete: CompletionFunction = dependencies.complete
+								?? (await Promise.race([import("@earendil-works/pi-ai"), deadline])).complete;
 							// Pass system only if it's a string; treat as optional.
 							const context = {
 								...(typeof req.system === "string" ? { systemPrompt: req.system } : {}),
@@ -808,15 +1256,19 @@ export default function accordionLive(pi: ExtensionAPI): void {
 							// so a conductor requesting more than the model allows can't trigger a provider
 							// rejection; the model still hard-caps generation (truncates at the limit).
 							let maxTokens: number | undefined;
-							if (typeof req.maxOutputTokens === "number" && req.maxOutputTokens > 0) {
-								const modelCeiling = typeof m.maxTokens === "number" && m.maxTokens > 0 ? m.maxTokens : undefined;
+							if (typeof req.maxOutputTokens === "number") {
+								const modelCeiling = Number.isSafeInteger(m.maxTokens) && m.maxTokens > 0 ? m.maxTokens : undefined;
 								maxTokens = modelCeiling !== undefined ? Math.min(req.maxOutputTokens, modelCeiling) : req.maxOutputTokens;
 							}
-							const result = await complete(m, context, {
+							const providerCall = complete(m, context, {
 								apiKey: auth.apiKey,
 								headers: auth.headers,
+								signal: completionAbort.signal,
 								...(maxTokens !== undefined ? { maxTokens } : {}),
 							});
+							// Consume either outcome for cleanup without changing providerCall's result used below.
+							providerSettlement = providerCall.then(() => {}, () => {});
+							const result = await Promise.race([providerCall, deadline]);
 							// Concatenate ALL text parts in order (a multi-part response must not be
 							// truncated to the first part only). Defensively guard non-array content
 							// and missing/non-string part text.
@@ -839,6 +1291,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 						} catch (err: unknown) {
 							const errMsg = err instanceof Error ? err.message : String(err);
 							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: errMsg });
+						} finally {
+							if (completionTimer) clearTimeout(completionTimer);
+							const release = (): void => {
+								activeCompletionCalls.delete(callToken);
+								connectionCompletionIds.delete(req.reqId);
+							};
+							if (providerSettlement) void providerSettlement.then(release);
+							else release(); // timed out/failed before provider work launched
 						}
 					})();
 				}
@@ -876,6 +1336,9 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 *   • "plan"    — the GUI replied (delivered via the pending resolver / flushPending).
 	 * The pending resolver is also driven by flushPending() (→ "unsent") on a superseded /
 	 * dropped / shutting-down GUI, so a mid-wait disconnect never runs out the full timer.
+	 *
+	 * This is the ONE sync site whose reply is actually APPLIED to a model call (the `context`
+	 * hook below). Every other sync site in this file is VIEW-ONLY.
 	 */
 	function requestPlan(reqId: number, full: boolean, blocks: ReturnType<typeof linearize>, armedNow: boolean): Promise<PlanResult> {
 		const waitMs = armedNow ? PLAN_DEADLINE_MS : PLAN_TIMEOUT_MS;
@@ -1047,7 +1510,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		lastMessages = event.messages as unknown as PiMessage[];
 		pendingSince = [];
 		const all = linearize(lastMessages);
-		if (!attached()) return; // no GUI → pass through untouched
+		if (!attached()) {
+			recordPlanOutcome("no-gui", null, { ops: 0, groups: 0 }, null);
+			return; // no GUI → pass through untouched
+		}
 
 		const fresh = all.slice(sentCount);
 		const reqId = ++reqSeq;
@@ -1059,8 +1525,17 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		const result = await requestPlan(reqId, full, fresh, myArmed);
 		lastPlanRttMs = Date.now() - t0;
 
-		if (epoch !== myEpoch) return; // GUI reconnected mid-flight → don't apply/advance
-		if (result.kind === "unsent") return; // couldn't deliver (no GUI / dropped) → pass through, don't advance
+		if (epoch !== myEpoch) {
+			// A new client attached mid-wait, superseding the view this request was sent to.
+			// Ack the CURRENT client anyway (it can still count the outcome) — its `reqId`
+			// belongs to the superseded view, not to anything the current client itself sent.
+			recordPlanOutcome("epoch-mismatch", reqId, { ops: 0, groups: 0 }, client);
+			return; // GUI reconnected mid-flight → don't apply/advance
+		}
+		if (result.kind === "unsent") {
+			recordPlanOutcome("unsent", reqId, { ops: 0, groups: 0 }, null);
+			return; // couldn't deliver (no GUI / dropped) → pass through, don't advance
+		}
 
 		if (result.kind === "timeout") {
 			// Issue #58: the plan missed the wait. Blocks WERE delivered, so advance the cursor
@@ -1070,10 +1545,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			sentCount = Math.max(sentCount, all.length);
 			const elapsed = lastPlanRttMs;
 			const hasStale = !!lastPlan && (lastPlan.ops.length > 0 || lastPlan.groups.length > 0);
-			// Three distinct outcomes, not two: a cached EMPTY plan (lastPlan set, 0 ops/groups —
-			// the conductor explicitly asked for no folds) still passes through unfolded, same as
-			// genuinely having no cached plan at all — but the two causes are worth telling apart
-			// in the log rather than both reading as "no cached plan".
+			// Three distinct outcomes, not two: a cached EMPTY plan (lastPlan set, 0 ops/groups
+			// — the conductor explicitly asked for no folds) still passes through unfolded,
+			// same as genuinely having no cached plan at all — but the two causes are worth telling
+			// apart in the log rather than both reading as "no cached plan".
 			const detail = hasStale
 				? `applying last known plan (${lastPlan!.ops.length} ops, ${lastPlan!.groups.length} groups)`
 				: lastPlan
@@ -1086,7 +1561,25 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			} else {
 				console.warn(`[accordion] plan timeout: reqId=${reqId} after ${elapsed}ms — ${detail}`);
 			}
-			if (hasStale) return { messages: applyPlan(event.messages as unknown as PiMessage[], lastPlan!.ops, lastPlan!.groups) as unknown as AgentMessage[] };
+			// `recordPlanOutcome` below acks `timeout-stale`/`timeout-raw` to the GUI for its
+			// wire-outcome tally (ADR 0020).
+			if (hasStale) {
+				// Apply FIRST, ack AFTER — with the counts applyPlan actually substituted, not the
+				// stale plan's submitted lengths. A stale plan re-applied against messages that have
+				// moved on can easily have ids that no longer match anything live; the old code acked
+				// `lastPlan!.ops.length` etc. regardless, over-reporting what really rode the wire
+				// (ADR 0020 promises counts ACTUALLY applied).
+				const appliedCounts: AppliedCounts = { ops: 0, groups: 0 };
+				const newMessages = applyPlan(
+					event.messages as unknown as PiMessage[],
+					lastPlan!.ops,
+					lastPlan!.groups,
+					appliedCounts,
+				);
+				recordPlanOutcome("timeout-stale", reqId, appliedCounts, client);
+				return { messages: newMessages as unknown as AgentMessage[] };
+			}
+			recordPlanOutcome("timeout-raw", reqId, { ops: 0, groups: 0 }, client);
 			return;
 		}
 
@@ -1096,9 +1589,19 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		const plan = result.plan;
 		lastPlan = plan;
 		sentCount = Math.max(sentCount, all.length); // advance cursor; never rewind (a message_end during the await may have advanced it further)
-		if (plan.ops.length === 0 && plan.groups.length === 0) return; // empty plan → pass through
+		if (plan.ops.length === 0 && plan.groups.length === 0) {
+			recordPlanOutcome("empty-plan", reqId, { ops: 0, groups: 0 }, client);
+			return; // empty plan → pass through
+		}
 
-		return { messages: applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups) as unknown as AgentMessage[] };
+		// Apply FIRST, ack AFTER (same reasoning as the timeout-stale branch above): a shape-valid
+		// op/group whose id matches nothing live in `messages` is silently skipped by applyPlan, so
+		// the SUBMITTED plan length (`plan.ops.length` etc.) can overstate what actually rode the
+		// wire. `appliedCounts` reflects the real substitutions.
+		const appliedCounts: AppliedCounts = { ops: 0, groups: 0 };
+		const newMessages = applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups, appliedCounts);
+		recordPlanOutcome("applied", reqId, appliedCounts, client);
+		return { messages: newMessages as unknown as AgentMessage[] };
 	});
 
 	// ── model swap: keep the GUI's context window (and budget) in lockstep ───────
@@ -1306,15 +1809,24 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			const wasAttached = attached();
 			const launch = wasAttached ? null : await launchAccordionApp(pi);
 			const action = launchResultLine(launch);
+			// Port status: the real port once bound, a captured bind FAILURE (no more eternal
+			// "starting…" on an EADDRINUSE-type error — see startServer's httpServer "error"
+			// handler), or "starting" while the async listen() is still pending.
+			const portStatus = port ? String(port) : bindError ? `failed (${bindError})` : "starting";
 			const lines = [
 				action.text,
-				`Live link: ${wasAttached ? "attached" : "detached"} · port ${port || "starting"} · streamed ${sentCount} blocks`,
+				`Live link: ${wasAttached ? "attached" : "detached"} · port ${portStatus} · streamed ${sentCount} blocks`,
 			];
 			// Browser entry point: the extension also serves the web build of Accordion on
-			// the same ephemeral port, gated by a per-session token. Surface the tokenized
-			// URL so the user can open the UI in a browser instead of the desktop app.
-			if (port && webToken) lines.push(`Browser: http://127.0.0.1:${port}/?token=${webToken}`);
-			else lines.push("Browser: starting…");
+			// the same ephemeral loopback port, gated by a per-session token. Surface the
+			// tokenized URL so the user can open the UI in a browser instead of the desktop app.
+			if (port && webToken) {
+				lines.push(`Browser: http://127.0.0.1:${port}/?token=${webToken}`);
+			} else if (bindError) {
+				lines.push(`Browser: unavailable — ${bindError}`);
+			} else {
+				lines.push("Browser: starting…");
+			}
 			ctx.ui.notify(lines.join("\n"), action.type);
 		},
 	});

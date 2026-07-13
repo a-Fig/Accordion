@@ -16,7 +16,7 @@ import { wireToBlock } from "./mapping";
 import { computeFoldOps, computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
 import { folding, setFolding } from "./folding.svelte";
 import { activeRemoteRunner } from "./conductorClient.svelte";
-import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, type ServerMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage, type ArmedMessage } from "./protocol";
+import { DEFAULT_PORT, PROTOCOL_VERSION, isServerMessage, isWireBlock, type ServerMessage, type HelloMessage, type PlanMessage, type FoldOp, type GroupOp, type UnfoldResultMessage, type RecallResultMessage, type CompleteRequestMessage, type ArmedMessage, type PassthroughCause } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import type { CompletionRequest, CompletionResult } from "$conductors/contract";
 
@@ -49,11 +49,31 @@ const pendingCompletions = new Map<number, { resolve: (r: CompletionResult) => v
 /** Monotonic counter for `completeRequest` reqIds. Starts at 1 to distinguish from unset/zero. */
 let completionReqId = 0;
 
-/** Live connection status, for the UI. */
-export const live = $state<{ status: "idle" | "connecting" | "connected" | "error"; detail: string; sessionId: string | null }>({
+/** A fresh, all-zero `planOutcomes` counter map (issue #60) — one connection's worth. */
+function freshPlanOutcomes(): Record<PassthroughCause, number> & { total: number } {
+	return { applied: 0, "empty-plan": 0, "timeout-stale": 0, "timeout-raw": 0, "epoch-mismatch": 0, total: 0 };
+}
+
+/**
+ * Live connection status, for the UI. `planOutcomes` (issue #60, ADR 0020) tallies every
+ * `passthrough` ack this connection has received — one bucket per `PassthroughCause`, plus
+ * `total` (acked model calls seen this connection). Reset to zero on every new connection
+ * (see `connectLive`) alongside `sessionId`/`port` — it describes THIS connection's wire
+ * history, not a running lifetime total (contrast the extension's own `/__accordion/meta`
+ * counters, which ARE lifetime totals).
+ */
+export const live = $state<{
+	status: "idle" | "connecting" | "connected" | "error";
+	detail: string;
+	sessionId: string | null;
+	port: number | null;
+	planOutcomes: Record<PassthroughCause, number> & { total: number };
+}>({
 	status: "idle",
 	detail: "",
 	sessionId: null,
+	port: null,
+	planOutcomes: freshPlanOutcomes(),
 });
 
 /**
@@ -209,22 +229,31 @@ export function setArmed(on: boolean): void {
 	sendArmed(on);
 }
 
-export function connectLive(port: number = DEFAULT_PORT): void {
+export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; token?: string } = {}): void {
 	if (typeof window === "undefined" || typeof WebSocket === "undefined") return;
 	cancelPendingLoad(); // invalidate any pending file/CC load that would otherwise clobber the live store
 	disconnectLive(); // drop any prior socket
 	manualClose = false;
+	// Host defaults to loopback (the desktop app is always co-located with pi). A
+	// browser-served page uses its literal loopback hostname and forwards the bearer from
+	// its /accordion URL. The extension also recognizes exact-origin cookies and verified
+	// sibling Accordion Origins, which preserves reloads and multi-session switching.
+	const host = opts.host ?? "127.0.0.1";
+	const tokenQs = opts.token ? `/?token=${encodeURIComponent(opts.token)}` : "";
 	live.status = "connecting";
-	live.detail = `ws://127.0.0.1:${port}`;
+	live.detail = `ws://${host}:${port}`;
 	live.sessionId = null;
+	live.port = port;
+	live.planOutcomes = freshPlanOutcomes(); // issue #60: counters describe THIS connection only
 	session.error = "";
 
 	let ws: WebSocket;
 	try {
-		ws = new WebSocket(`ws://127.0.0.1:${port}`);
+		ws = new WebSocket(`ws://${host}:${port}${tokenQs}`);
 	} catch (e) {
 		live.status = "error";
 		live.detail = e instanceof Error ? e.message : String(e);
+		live.port = null;
 		return;
 	}
 	socket = ws;
@@ -239,6 +268,12 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 		if (!isServerMessage(parsed)) return; // ignore anything off-protocol
 		const msg: ServerMessage = parsed;
 		if (msg.type === "hello") {
+			// Browser upgrades are Origin/token-gated, but trusted native/Tauri clients remain
+			// tokenless and any accepted peer can still send malformed data. isServerMessage
+			// only vets the `type` tag — guard the
+			// nested shape here rather than letting a malformed frame throw mid-pump and
+			// strand the client half-connected.
+			const meta: Partial<HelloMessage["meta"]> = msg.meta && typeof msg.meta === "object" ? msg.meta : {};
 			if (msg.protocolVersion !== PROTOCOL_VERSION) {
 				// Refuse a version mismatch loudly rather than driving the session with a wire
 				// shape one side does not understand (in M2 that would silently corrupt the fold
@@ -270,7 +305,7 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			budgetLive = false;
 			session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 			session.store = new AccordionStore({
-				meta: { format: "pi", title: msg.meta.title || "live pi session", cwd: msg.meta.cwd || "", model: msg.meta.model || "" },
+				meta: { format: "pi", title: meta.title || "live pi session", cwd: meta.cwd || "", model: meta.model || "" },
 				blocks: [],
 				lineCount: 0,
 				skipped: 0,
@@ -280,9 +315,9 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			// there is no active model link.
 			session.store.completer = sendCompletion;
 			session.store.wireAttached = true; // live wire up → view mirrors the wire (issue #13)
-			if (typeof msg.meta.contextWindow === "number" && msg.meta.contextWindow > 0) {
-				session.store.setContextWindow(msg.meta.contextWindow);
-				session.store.setBudget(msg.meta.contextWindow);
+			if (typeof meta.contextWindow === "number" && meta.contextWindow > 0) {
+				session.store.setContextWindow(meta.contextWindow);
+				session.store.setBudget(meta.contextWindow);
 				budgetLive = true;
 			}
 		} else if (msg.type === "sync") {
@@ -324,7 +359,10 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 			}
 			// Committed blocks arrive HERE (the appendBlocks path), NEVER from ghost state.
 			// Invariant: a ghost is only removed, never converted to a block.
-			session.store.appendBlocks(msg.blocks.map(wireToBlock));
+			// Same unauthenticated-WS caution as the hello path: a sync without a real blocks
+			// array — or with malformed elements — must not throw mid-pump (the plan reply
+			// below still runs) or corrupt the store's token accounting.
+			session.store.appendBlocks((Array.isArray(msg.blocks) ? msg.blocks : []).filter(isWireBlock).map(wireToBlock));
 			const plan = computePlan();
 			const reply: PlanMessage = { type: "plan", reqId: msg.reqId, ops: plan.ops, groups: plan.groups };
 			try {
@@ -425,6 +463,16 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 				// `pending.resolve/reject` already delete the entry via the `settle` wrapper
 				// in `sendCompletion`, so no explicit `pendingCompletions.delete` here.
 			}
+		} else if (msg.type === "passthrough") {
+			// The extension's per-outcome ack for a `context` hook resolution (issue #60, ADR
+			// 0020). Tally the counter for the "wire N/M" readout.
+			// `msg.cause` comes off the wire untyped — a malformed/unknown cause must not add a
+			// spurious key (e.g. NaN-poisoning via prototype/array quirks) or bump `total` for an
+			// outcome we can't attribute. Only tally a cause we actually have a bucket for.
+			if (msg.cause in live.planOutcomes) {
+				live.planOutcomes[msg.cause]++;
+				live.planOutcomes.total++;
+			}
 		}
 	};
 
@@ -432,6 +480,7 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 		live.status = "error";
 		live.detail = `could not reach pi on :${port} — is a pi session running with the accordion extension?`;
 		live.sessionId = null;
+		live.port = null;
 	};
 
 	ws.onclose = () => {
@@ -445,6 +494,7 @@ export function connectLive(port: number = DEFAULT_PORT): void {
 		if (socket === ws) {
 			socket = null;
 			live.sessionId = null;
+			live.port = null;
 			// Clear the completion backend so `host.can("complete")` returns false while
 			// disconnected. Drain any pending completion promises with a disconnection error
 			// so they do not hang indefinitely.
@@ -483,4 +533,5 @@ export function disconnectLive(): void {
 	}
 	if (live.status !== "error") live.status = "idle";
 	live.sessionId = null;
+	live.port = null;
 }

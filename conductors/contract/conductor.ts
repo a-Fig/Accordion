@@ -178,7 +178,9 @@ export interface GroupCommand {
 	digest?: string | null;
 }
 
-/** Return blocks to full, live content (undo a fold/replace). No-op on human-held blocks. */
+/**
+ * Return blocks to full, live content (undo a fold/replace). No-op on human-held blocks.
+ */
 export interface RestoreCommand {
 	kind: "restore";
 	ids: string[];
