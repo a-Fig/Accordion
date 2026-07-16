@@ -4,11 +4,8 @@
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 	import EditableNumber from "$lib/ui/EditableNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
-	import ConductorMenu from "./ConductorMenu.svelte";
 	import { folding } from "$lib/live/folding.svelte";
 	import { live, setArmed } from "$lib/live/liveClient.svelte";
-	import { conductorStatus } from "$lib/live/conductorClient.svelte";
-	import type { JSONValue } from "$conductors/contract";
 
 	let { store, readOnly = false }: { store: AccordionStore; readOnly?: boolean } = $props();
 
@@ -28,8 +25,6 @@
 	});
 
 	const denom = $derived(Math.max(store.fullTokens, store.budget, 1));
-	const conductorStatusText = $derived(store.conductorStatus.text || conductorStatus.text);
-	const conductorStatusDetails = $derived(store.conductorStatus.text ? store.conductorStatus.details : conductorStatus.details);
 	// fmt/k formatters must round their input because AnimatedNumber passes a float mid-tween
 	const fmt = (n: number) => Math.round(n).toLocaleString();
 	const k = (n: number) => {
@@ -41,36 +36,6 @@
 		return r >= 1000 ? `${(r / 1000).toFixed(r >= 10000 ? 0 : 1)}k` : `${r}`;
 	};
 	const fmtOverBy = (n: number) => k(Math.round(n));
-	function formatStatusDetails(value: JSONValue | undefined): string {
-		if (value == null) return "";
-		const lines: string[] = [];
-		const pushList = (title: string, items: JSONValue | undefined) => {
-			if (!Array.isArray(items) || items.length === 0) return;
-			lines.push(title);
-			for (const item of items.slice(0, 8)) {
-				if (item && typeof item === "object" && !Array.isArray(item)) {
-					const obj = item as Record<string, JSONValue>;
-					const turn = typeof obj.turn === "number" ? `t${obj.turn}: ` : "";
-					const cat = typeof obj.cat === "string" ? `[${obj.cat}] ` : "";
-					const label = typeof obj.label === "string" ? obj.label : typeof obj.value === "string" ? obj.value : JSON.stringify(item);
-					lines.push(`  ${turn}${cat}${label}`);
-				} else {
-					lines.push(`  ${String(item)}`);
-				}
-			}
-		};
-		if (typeof value === "object" && !Array.isArray(value)) {
-			const obj = value as Record<string, JSONValue>;
-			pushList("facts", obj.factLedger);
-			pushList("folded TOC", obj.relevanceTOC);
-			const summary = obj.summary;
-			if (summary && typeof summary === "object" && !Array.isArray(summary)) {
-				lines.push(`summaries ${JSON.stringify(summary)}`);
-			}
-			if (lines.length) return lines.join("\n");
-		}
-		return JSON.stringify(value, null, 2);
-	}
 
 	// ── Protected tail: an on-bar handle (left = 0, drag right to protect more) ──
 	const PROT_MAX = 60_000;
@@ -117,15 +82,6 @@
 			`epoch-mismatch (view superseded mid-wait): ${live.planOutcomes["epoch-mismatch"]}`,
 	);
 
-	// ── Involvement locks (ADR 0011) — the honest mirror of the engine's gating. A locked
-	// control LOOKS locked in every mode (preview/demo/read-only included), driven purely off
-	// `store.isLocked(...)`. The engine already no-ops the underlying action; this is the UI
-	// reflecting that, not the enforcement. The budget dial is NEVER gated (sacred tier).
-	const tailLocked = $derived(store.isLocked("tail-size"));
-	const steerLocked = $derived(store.isLocked("human-steering"));
-	const lockedBy = $derived(store.lockingConductorLabel);
-	const lockTip = $derived(`Locked by ${lockedBy ?? "the active conductor"} — detach to take back control`);
-
 	function protectFromClientX(clientX: number): number {
 		if (!barEl) return store.protectTokens;
 		const r = barEl.getBoundingClientRect();
@@ -140,7 +96,6 @@
 		if (snapped !== store.protectTokens) store.setProtect(snapped);
 	}
 	function onProtPointerDown(e: PointerEvent) {
-		if (tailLocked) return; // tail-size locked by the conductor — the handle is inert
 		e.preventDefault();
 		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 		dragTokens = protectFromClientX(e.clientX); // visual only — no refold yet
@@ -155,7 +110,6 @@
 		dragTokens = null;
 	}
 	function onProtKeydown(e: KeyboardEvent) {
-		if (tailLocked) return; // tail-size locked — keyboard nudges are inert too
 		let v = store.protectTokens;
 		if (e.key === "ArrowLeft" || e.key === "ArrowDown") v -= PROT_STEP;
 		else if (e.key === "ArrowRight" || e.key === "ArrowUp") v += PROT_STEP;
@@ -187,10 +141,6 @@
 
 		<!-- ── Right: controls cluster ── -->
 		<div class="ctl">
-			<!-- Active conductor (ADR 0007): which strategy is managing this context. The store
-			     drives the lock-aware affordances (ADR 0011: consent gate + kill switch). -->
-			<ConductorMenu {store} />
-
 			{#if readOnly}
 				<span
 					class="ro-badge mono"
@@ -239,28 +189,19 @@
 			<!-- Protect readout: eyebrow + editable mono value (the dial lives on the bar). -->
 			<div
 				class="ctl-field protect-read"
-				class:ctl-locked={tailLocked}
-				aria-disabled={tailLocked}
-				title={tailLocked
-					? lockTip + " (the conductor now owns the tail)"
-					: `Actual protected tail: ${fmt(store.protectedTokens)} tokens; target: ${fmt(store.protectTokens)} tokens — click the value or drag the handle to change it`}
+				title={`Actual protected tail: ${fmt(store.protectedTokens)} tokens; target: ${fmt(store.protectTokens)} tokens — click the value or drag the handle to change it`}
 			>
 				<span class="ctl-eyebrow mono">
 					<Icon name="lock" size={10} />
 					PROTECT
 				</span>
 				<span class="ctl-value mono tnum">
-					{#if tailLocked}
-						<!-- tail-size locked: a static readout, not an editable dial. -->
-						<span class="kl-val">{k(store.protectTokens)}</span>
-					{:else}
-						<EditableNumber
-							value={store.protectTokens}
-							format={k}
-							label="Protected tail target in thousands of tokens"
-							oncommit={(n) => store.setProtect(Math.max(0, Math.min(PROT_MAX, n)))}
-						/>
-					{/if}
+					<EditableNumber
+						value={store.protectTokens}
+						format={k}
+						label="Protected tail target in thousands of tokens"
+						oncommit={(n) => store.setProtect(Math.max(0, Math.min(PROT_MAX, n)))}
+					/>
 					{#if Math.abs(store.protectedTokens - store.protectTokens) > 500}
 						<span class="kl-target tnum">({k(store.protectedTokens)})</span>
 					{/if}
@@ -296,13 +237,10 @@
 			<button
 				class="btn-secondary reset-btn"
 				onclick={() => store.resetAll()}
-				disabled={editCount === 0 || steerLocked}
-				aria-disabled={steerLocked}
-				title={steerLocked
-					? lockTip
-					: editCount === 0
-						? "No manual edits — the view is already automatic"
-						: `Clear ${editCount} manual edit${editCount === 1 ? "" : "s"} and return to the automatic fold view`}
+				disabled={editCount === 0}
+				title={editCount === 0
+					? "No manual edits — the view is already automatic"
+					: `Clear ${editCount} manual edit${editCount === 1 ? "" : "s"} and return to the automatic fold view`}
 			>
 				<Icon name="rotate-ccw" size={13} />
 				Revert to auto
@@ -310,22 +248,6 @@
 			</button>
 		</div>
 	</div>
-
-	<!-- ── Conductor telemetry (display-only): one-line status from the active conductor. -->
-	{#if conductorStatusText}
-		<div class="cond-telemetry-wrap">
-			<div class="cond-telemetry" role="status" title={conductorStatusText}>
-				<Icon name="activity" size={11} />
-				<span class="cond-telemetry-text mono">{conductorStatusText}</span>
-			</div>
-			{#if conductorStatusDetails}
-				<details class="cond-detail">
-					<summary class="cond-detail-trigger mono">details</summary>
-					<pre class="cond-detail-body mono">{formatStatusDetails(conductorStatusDetails)}</pre>
-				</details>
-			{/if}
-		</div>
-	{/if}
 
 	<!-- ── Composition bar + on-bar protected control ── -->
 	<div class="bar-area">
@@ -351,22 +273,18 @@
 			<span class="bar-marker-cap" aria-hidden="true"></span>
 		</span>
 
-		<!-- draggable protected handle (floats above the clipped bar). Inert under the
-		     tail-size lock — the conductor owns the tail (ADR 0011 §7). -->
+		<!-- draggable protected handle (floats above the clipped bar). -->
 		<div
 			class="prot-grip"
 			class:dragging={dragTokens != null}
-			class:locked={tailLocked}
 			style:left="{handlePct}%"
 			role="slider"
-			tabindex={tailLocked ? -1 : 0}
+			tabindex={0}
 			aria-label="Protected tail in tokens"
-			aria-disabled={tailLocked}
 			aria-valuemin="0"
 			aria-valuemax={PROT_MAX}
 			aria-valuenow={store.protectTokens}
 			aria-valuetext="{fmt(store.protectTokens)} tokens protected"
-			title={tailLocked ? lockTip : undefined}
 			onpointerdown={onProtPointerDown}
 			onpointermove={onProtPointerMove}
 			onpointerup={onProtPointerUp}
@@ -669,65 +587,6 @@
 		color: var(--muted);
 	}
 
-	/* A control gated by an involvement lock (ADR 0011): greyed, reduced affordance. The
-	   honest mirror of the engine's server-side gating — looks locked in every mode. */
-	.ctl-locked {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	/* ── Conductor telemetry line: one muted, mono status from the active conductor ──
-	   Right-aligned so it sits under the conductor switcher in the controls cluster. */
-	.cond-telemetry-wrap {
-		display: flex;
-		flex-direction: column;
-		align-items: flex-end;
-		gap: 3px;
-		min-width: 0;
-	}
-	.cond-telemetry {
-		display: flex;
-		align-items: center;
-		justify-content: flex-end;
-		gap: 5px;
-		margin-top: -2px;
-		min-width: 0;
-		color: var(--faint);
-	}
-	.cond-telemetry-text {
-		font-size: var(--fs-2xs);
-		letter-spacing: 0.01em;
-		color: var(--muted);
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		min-width: 0;
-	}
-	.cond-detail {
-		max-width: min(760px, 100%);
-		color: var(--muted);
-		font-size: var(--fs-2xs);
-	}
-	.cond-detail-trigger {
-		cursor: pointer;
-		color: var(--faint);
-		list-style: none;
-		text-align: right;
-	}
-	.cond-detail-trigger::-webkit-details-marker {
-		display: none;
-	}
-	.cond-detail-body {
-		margin: 2px 0 0;
-		padding: var(--sp-2);
-		max-height: 180px;
-		overflow: auto;
-		white-space: pre-wrap;
-		border: 1px solid var(--line-soft);
-		background: var(--panel-2);
-		color: var(--muted);
-	}
-
 	/* ── Composition bar area: bar + on-bar protected control + underline ── */
 	.bar-area {
 		position: relative;
@@ -798,19 +657,6 @@
 	}
 	.prot-grip:focus-visible {
 		outline: none;
-	}
-
-	/* tail-size locked: the handle is inert and dimmed (the conductor owns the tail). */
-	.prot-grip.locked {
-		cursor: not-allowed;
-		opacity: 0.4;
-	}
-	.prot-grip.locked::before {
-		background: var(--faint);
-		box-shadow: none;
-	}
-	.prot-grip.locked:hover::before {
-		box-shadow: none;
 	}
 
 	/* The slight underline echoing the protected extent */
