@@ -15,6 +15,8 @@
  * for the reintroduced auto-folder.
  */
 import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
+import type { LockName } from "./locks";
+import { hasLock } from "./locks";
 import { digest, digestTokens, groupDigest, groupDigestTokens, wireFoldable } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { isDurableId } from "../live/mapping";
@@ -112,6 +114,115 @@ export class AccordionStore {
 	 * issue explicitly permits whenever "no wire is involved").
 	 */
 	wireAttached = false;
+
+	// ---- involvement locks (ADR 0011) -------------------------------------
+	/**
+	 * Reactive snapshot of the currently-held lock-set (ADR 0011). Empty ⇒ collaborative —
+	 * every gate below is byte-for-byte the human-operated engine's behavior. A non-empty set
+	 * ⇒ exclusive: the named human/agent controls are refused and (under `tail-size`) the
+	 * protected tail is driven by `activeTailTokens` instead of `protectTokens`.
+	 *
+	 * NOTHING holds a lock today except the programmatic API (`setLocks`/`clearLocks`) driven
+	 * by tests and the future conductor host — there is no conductor object. The engine's
+	 * per-action gates read this snapshot; because `setLocks` writes it synchronously before
+	 * the `refold()` it triggers, enforcement is exact.
+	 */
+	private activeLocks = $state<readonly LockName[]>([]);
+	/**
+	 * The tail target the holder wants while holding `tail-size` (ADR 0011 §7). Semantics
+	 * parallel the human's `protectTokens`: 0 ⇒ own the whole context (no protected tail);
+	 * `N > 0` ⇒ protect the newest ~N tokens. Always 0 when `tail-size` is not held. Clamped
+	 * to a finite, non-negative integer in `setLocks` so a buggy caller can never poison the
+	 * boundary or leak a non-finite value.
+	 */
+	private activeTailTokens = $state(0);
+	/** Label of whoever set the current lock-set (for UI tooltips); null while collaborative. */
+	private holder = $state<string | null>(null);
+
+	/** Does the current lock-set hold `name`? PUBLIC — the UI gates affordances/tooltips on it. */
+	isLocked(name: LockName): boolean {
+		return hasLock(this.activeLocks, name);
+	}
+	/** The effective lock-set, as a reactive read for the UI. Empty ⇒ collaborative. */
+	get locks(): readonly LockName[] {
+		return this.activeLocks;
+	}
+	/** Label of whoever holds the current locks (for UI tooltips), or null if collaborative. */
+	get lockHolder(): string | null {
+		return this.activeLocks.length ? this.holder : null;
+	}
+	/** A HUMAN action is locked out iff it is the human's AND `human-steering` is held. */
+	private humanLocked(by: Actor): boolean {
+		return by === "you" && this.isLocked("human-steering");
+	}
+
+	/**
+	 * Set the active lock-set (ADR 0011). PUBLIC — the programmatic seam for the future
+	 * conductor host (and tests); no conductor object is involved.
+	 *
+	 * Consent-time semantics (ADR 0011 §6): acquiring a lock releases existing overrides in the
+	 * now-locked domain so the holder authors from a clean baseline — `human-steering` releases
+	 * every human override AND dissolves human-owned groups; `agent-unfold` releases the agent's
+	 * sticky unfolds. `holder` labels who took the keys (surfaced in UI tooltips). `tailTokens`
+	 * is honored only under the `tail-size` lock and is clamped to a finite non-negative integer.
+	 */
+	setLocks(locks: readonly LockName[], holder: string, tailTokens: number = 0): void {
+		this.activeLocks = locks.slice();
+		this.holder = holder;
+		// Clamp defensively: a non-finite / negative tailTokens must collapse to 0
+		// (own-the-whole-context), never poison `protectedFromIndex` or the boundary math.
+		this.activeTailTokens = Number.isFinite(tailTokens) ? Math.max(0, Math.round(tailTokens)) : 0;
+		// Release standing holds in the newly-locked domains BEFORE the refold reads them.
+		this.releaseLockedDomains(this.activeLocks);
+		this.refold();
+	}
+	/**
+	 * Release every lock and restore human seniority (ADR 0011). PUBLIC — the programmatic seam
+	 * for the future host's kill switch (and tests). Human/agent overrides that survived the
+	 * lock stay as they are; the protect target simply falls back to `protectTokens` (the
+	 * `tail-size` walk-back input reverts), and any fold the restored protected tail now covers
+	 * heals back to live on the refold. This is NOT the freeze-on-detach flow — that view-
+	 * preserving behavior returns with the conductor redesign's host.
+	 */
+	clearLocks(): void {
+		this.activeLocks = [];
+		this.holder = null;
+		this.activeTailTokens = 0;
+		this.refold();
+	}
+
+	/**
+	 * ADR 0011 consent → baseline. Clear standing overrides in the domains the incoming lock-set
+	 * claims: under `human-steering` every HUMAN override (pin / manual fold / manual unfold) AND
+	 * every human-owned group is released; under `agent-unfold` every AGENT sticky unfold is
+	 * released. No-op when the lock-set claims neither — so a collaborative set changes nothing.
+	 *
+	 * Human groups are part of the `human-steering` domain (a multiblock fold is human steering),
+	 * so they are dissolved too — otherwise a stale human group would sit in the holder's field
+	 * and `createGroup` (which refuses overlap with ANY existing group) would block the holder
+	 * from authoring the very view the lock handed it. Legacy absent-`by` groups are treated as
+	 * human here, the same as everywhere else; only explicit `by:"auto"` (dormant auto-grouping
+	 * plumbing) is preserved.
+	 */
+	private releaseLockedDomains(locks: readonly LockName[]): void {
+		const lockHuman = hasLock(locks, "human-steering");
+		const lockAgent = hasLock(locks, "agent-unfold");
+		if (!lockHuman && !lockAgent) return;
+		for (const b of this.blocks) {
+			const human = b.by === "you" && (b.override === "pinned" || b.override === "folded" || b.override === "unfolded");
+			const agentUnfold = b.by === "agent" && b.override === "unfolded";
+			if ((lockHuman && human) || (lockAgent && agentUnfold)) {
+				b.override = null;
+				b.by = null;
+			}
+		}
+		// Release human-owned (and legacy absent-`by`) groups so the holder authors from a clean
+		// field. `by:"auto"` groups are dormant auto-grouping plumbing, not the human's to release.
+		if (lockHuman && this.groups.length) {
+			const kept = this.groups.filter((g) => g.by === "auto");
+			if (kept.length !== this.groups.length) this.groups = kept;
+		}
+	}
 
 	constructor(parsed: ParsedSession) {
 		this.meta = parsed.meta;
@@ -343,7 +454,10 @@ export class AccordionStore {
 	 */
 	protectedFromIndex = $derived.by(() => {
 		if (!this.blocks.length) return 0;
-		const target = this.protectTokens;
+		// ADR 0011 `tail-size` lock: the holder's `activeTailTokens` (0 if omitted) drives the
+		// walk-back; without the lock the human's `protectTokens` drives it. Both follow exactly
+		// the same algorithm, so the boundary is stable across acquiring/releasing the lock.
+		const target = this.isLocked("tail-size") ? this.activeTailTokens : this.protectTokens;
 		// target === 0: protection disabled — every block is foldable.
 		// blocks.length ⇒ isProtected is false everywhere.
 		if (target === 0) return this.blocks.length;
@@ -468,6 +582,9 @@ export class AccordionStore {
 
 	/** Resize the protected working tail, then re-fold so the change takes effect. */
 	setProtect(n: number): void {
+		// ADR 0011 `tail-size` lock: the human can no longer resize the tail — the holder owns
+		// it. A locked resize is a silent no-op (the UI shows the dial disabled to match).
+		if (this.isLocked("tail-size")) return;
 		this.protectTokens = Math.max(0, Math.round(n));
 		this.refold();
 	}
@@ -501,6 +618,9 @@ export class AccordionStore {
 	}
 
 	fold(id: string, by: Actor = "you"): void {
+		// ADR 0011 `human-steering` lock: a human hand-fold is refused outright — no override
+		// written, no log. There is no human override to "win" under the lock.
+		if (this.humanLocked(by)) return;
 		const b = this.get(id);
 		if (!b || b.override === "pinned" || this.inFoldedGroup(id)) return;
 		// Protected working tail is never folded — not even by an explicit user action.
@@ -516,6 +636,14 @@ export class AccordionStore {
 		this.refold();
 	}
 	unfold(id: string, by: Actor = "you"): void {
+		// ADR 0011: two separate lock axes flow through this one method.
+		//  • human-steering gates the human's hand-unfold (`by === "you"`).
+		//  • agent-unfold gates the agent's `unfold` tool (`by === "agent"`, via resolveUnfold).
+		// A refused agent unfold is a silent no-op here; `resolveUnfold` VERIFIES the block is
+		// still folded after calling and reports the refusal as "missing" — this method does not
+		// signal it.
+		if (this.humanLocked(by)) return;
+		if (by === "agent" && this.isLocked("agent-unfold")) return;
 		const b = this.get(id);
 		if (!b || this.inFoldedGroup(id)) return;
 		b.override = "unfolded";
@@ -524,11 +652,15 @@ export class AccordionStore {
 		this.refold();
 	}
 	toggle(id: string, by: Actor = "you"): void {
+		// ADR 0011 `human-steering`: gate early so a locked human toggle is a true no-op.
+		if (this.humanLocked(by)) return;
 		const b = this.get(id);
 		if (!b) return;
 		this.isFolded(b) ? this.unfold(id, by) : this.fold(id, by);
 	}
 	pin(id: string): void {
+		// ADR 0011 `human-steering`: pin is human-only steering — refused under the lock.
+		if (this.humanLocked("you")) return;
 		const b = this.get(id);
 		if (!b || this.inFoldedGroup(id)) return;
 		b.override = "pinned";
@@ -537,6 +669,8 @@ export class AccordionStore {
 		this.refold();
 	}
 	unpin(id: string): void {
+		// ADR 0011 `human-steering`: unpin is human-only steering — refused under the lock.
+		if (this.humanLocked("you")) return;
 		const b = this.get(id);
 		if (!b || b.override !== "pinned") return;
 		b.override = null;
@@ -546,6 +680,8 @@ export class AccordionStore {
 	}
 	/** Hand a block back to auto (no override). */
 	auto(id: string): void {
+		// ADR 0011 `human-steering`: clearing an override by hand is human steering — refused.
+		if (this.humanLocked("you")) return;
 		const b = this.get(id);
 		if (!b || this.inFoldedGroup(id)) return; // group controls collapsed members (like fold/pin)
 		b.override = null;
@@ -554,6 +690,9 @@ export class AccordionStore {
 	}
 	/** Clear every manual override AND dissolve every group — pure budget view (back to auto). */
 	resetAll(): void {
+		// ADR 0011 `human-steering`: reset is a sweeping human steering action — refused
+		// wholesale under the lock (no overrides cleared, no groups dropped, no log).
+		if (this.isLocked("human-steering")) return;
 		for (const b of this.blocks) {
 			b.override = null;
 			b.by = null;
@@ -652,6 +791,8 @@ export class AccordionStore {
 	 * recap; `null`/`""` → drop (no wire message); non-empty string → verbatim.
 	 */
 	createGroup(startId: string, endId: string, by: Actor = "you", digest?: string | null): Group | null {
+		// ADR 0011 `human-steering`: grouping is a human steering action — refused under the lock.
+		if (this.humanLocked(by)) return null;
 		const memberIds = this.snappedRange(startId, endId);
 		if (!memberIds) return null;
 		// Never reach into the protected tail (ADR 0006 §1).
@@ -673,6 +814,7 @@ export class AccordionStore {
 	}
 	/** Delete a group (members return to normal). The UI's "edit membership" is delete + recreate. */
 	deleteGroup(id: string, by: Actor = "you"): void {
+		if (this.humanLocked(by)) return; // ADR 0011 `human-steering`
 		const g = this.groupById(id);
 		if (!g) return;
 		this.groups = this.groups.filter((x) => x.id !== id);
@@ -680,6 +822,7 @@ export class AccordionStore {
 		this.refold();
 	}
 	foldGroup(id: string, by: Actor = "you"): void {
+		if (this.humanLocked(by)) return; // ADR 0011 `human-steering`
 		const g = this.groupById(id);
 		if (!g || g.folded) return;
 		g.folded = true;
@@ -688,6 +831,11 @@ export class AccordionStore {
 		this.refold();
 	}
 	unfoldGroup(id: string, by: Actor = "you"): void {
+		if (this.humanLocked(by)) return; // ADR 0011 `human-steering`
+		// ADR 0011 `agent-unfold`: the agent forcing a folded GROUP open is gated on the same
+		// axis as its per-block `unfold` — so `resolveUnfold`'s group path is refused under the
+		// lock (and reports the code as missing).
+		if (by === "agent" && this.isLocked("agent-unfold")) return;
 		const g = this.groupById(id);
 		if (!g || !g.folded) return;
 		g.folded = false;
@@ -696,6 +844,7 @@ export class AccordionStore {
 		this.refold();
 	}
 	toggleGroup(id: string, by: Actor = "you"): void {
+		if (this.humanLocked(by)) return; // ADR 0011 `human-steering`
 		const g = this.groupById(id);
 		if (!g) return;
 		g.folded ? this.unfoldGroup(id, by) : this.foldGroup(id, by);
