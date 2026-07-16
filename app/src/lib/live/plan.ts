@@ -113,9 +113,10 @@ export function resolveUnfold(store: AccordionStore, codes: string[]): { restore
 		for (const g of store.groups) {
 			if (g.folded && foldCode(g.id) === code) {
 				store.unfoldGroup(g.id, "agent");
-				// VERIFY it took (FIX 3): under the `agent-unfold` lock `unfoldGroup(…, "agent")`
-				// is a no-op, so the group stays folded. Only count a restore that actually
-				// happened — a refused one falls through to `missing`, never a false "restored".
+				// VERIFY it took (FIX 3): the engine can refuse an unfold for reasons of its own
+				// (e.g. the group is no longer folded), leaving the group untouched. Only count a
+				// restore that actually happened — a refused one falls through to `missing`, never
+				// a false "restored".
 				if (!store.groupById(g.id)?.folded) {
 					restored.push({ code, kind: "text", label: `group · ${g.memberIds.length} blocks`, ids: g.memberIds });
 					hit = true;
@@ -137,10 +138,11 @@ export function resolveUnfold(store: AccordionStore, codes: string[]): { restore
 			const grpFolded = grp?.folded ?? false;
 			if (grpFolded) store.unfoldGroup(grp!.id, "agent");
 			else store.unfold(b.id, "agent");
-			// VERIFY the unfold actually took effect (FIX 3): under the `agent-unfold` lock both
-			// `store.unfold` and `store.unfoldGroup` are no-ops, so the block stays folded. Only
-			// report a restore that really happened; a refused one is dropped here and, if every
-			// match for this code is refused, the code falls through to `missing`.
+			// VERIFY the unfold actually took effect (FIX 3): the engine can refuse `store.unfold`
+			// / `store.unfoldGroup` for reasons of its own (e.g. the block wasn't actually folded,
+			// or it's a member of a group that changed underneath us), leaving the block folded.
+			// Only report a restore that really happened; a refused one is dropped here and, if
+			// every match for this code is refused, the code falls through to `missing`.
 			const stillFolded = grpFolded ? (grp!.folded ?? false) : store.isFolded(b);
 			if (stillFolded) continue;
 			// ids reflects the ACTUAL restore set: if routed through unfoldGroup the whole group
