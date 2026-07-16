@@ -34,10 +34,12 @@ function makeStore(nOrTokens: number | number[], tokens = 1000): AccordionStore 
 }
 
 describe("protected working tail is never folded", () => {
-	it("auto-folder folds old blocks but never a protected one", () => {
+	it("folded old blocks are all older than the protected boundary", () => {
 		const s = makeStore(5); // 5×1000 tok
 		s.setProtect(2000); // protects the newest two (indices 3,4)
-		s.setBudget(2500); // 5000 live > budget → must auto-fold
+		// The auto-folder was removed on this branch; drive the same guarantee with manual
+		// folds. fold() folds the old blocks and refuses the protected ones.
+		for (const b of s.blocks) s.fold(b.id);
 
 		expect(s.protectedFromIndex).toBe(3);
 		expect(s.foldedCount).toBeGreaterThan(0); // it actually folded something (regression guard)

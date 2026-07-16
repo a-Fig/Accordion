@@ -38,8 +38,9 @@ function storeFrom(messages: PiMessage[]): AccordionStore {
 	const blocks = linearize(messages).map(wireToBlock);
 	const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks, lineCount: 0, skipped: 0 };
 	const s = new AccordionStore(parsed);
-	s.detach(); // no conductor — isolate pure group behavior (no auto-folds to confound the delta)
-	s.setBudget(1_000_000); // never auto-fold under budget pressure
+	// No conductor / auto-folder exists on this branch, so nothing folds under budget pressure —
+	// isolate pure group behavior with no auto-folds to confound the delta.
+	s.setBudget(1_000_000);
 	s.setProtect(0); // disable the protected tail — every block is groupable
 	return s;
 }

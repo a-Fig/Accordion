@@ -1,9 +1,9 @@
 /*
- * mock-server.mjs — a fake pi session for testing CONDUCTORS, driven from a browser.
+ * mock-server.mjs — a fake pi session for testing the live link + folding, driven from a browser.
  *
  * Tricks the Accordion DESKTOP app into thinking it's attached to a live pi session,
  * and gives you a browser control panel to play/pause/restart it and change its speed.
- * The only fake thing is the agent on the far end — the app's conductor runs for real
+ * The only fake thing is the agent on the far end — the app's folding runs for real
  * against the evolving store.
  *
  * Three faces on one process:
@@ -15,9 +15,8 @@
  *      browser tab can play/pause/restart and slide TPS live.
  *
  * One shared generation clock drives every connected app. Folding lives in the app's
- * store (substitution, not removal), so a conductor's decisions are visible in the app
- * regardless — this fake never applies the returned plan (it just logs it). A conductor's
- * out-of-band completeRequest gets junk; connect real pi and it becomes a real response.
+ * store (substitution, not removal), so the app's fold/group decisions are visible
+ * regardless — this fake never applies the returned plan (it just logs it).
  *
  * Usage:
  *   cd extension && node mock-server.mjs        # starts paused; open the control URL
@@ -61,9 +60,7 @@ const CONTROL_PORT = Number(process.env.CONTROL_PORT || PORT + 1);
 const CW = Number(process.env.CW || 60_000);
 const GROW = process.env.GROW !== "0";
 const SAMPLE = process.env.SAMPLE || path.join(__dirname, "../app/static/sample-session.jsonl");
-const JUNK = "[stub completion] fake pi — connect a real pi session for a real model response.";
 
-const est = (s) => Math.ceil((s || "").length / 4) + 4;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const GENERATED = new Set(["thinking", "text", "tool_call"]); // typed by the model; the rest commit instantly
 
@@ -333,18 +330,7 @@ piWss.on("connection", (ws) => {
 		} catch {
 			return;
 		}
-		if (m.type === "completeRequest") {
-			send(ws, {
-				type: "completeResult",
-				reqId: m.reqId,
-				ok: true,
-				text: JUNK,
-				model: "fake-model",
-				inputTokens: est(m.system) + est(m.prompt),
-				outputTokens: est(JUNK),
-			});
-			console.log(`completeRequest #${m.reqId} → junk`);
-		} else if (m.type === "plan") {
+		if (m.type === "plan") {
 			const n = (m.ops?.length || 0) + (m.groups?.length || 0);
 			if (n) console.log(`plan #${m.reqId}: ${m.ops?.length || 0} folds, ${m.groups?.length || 0} groups (logged, not applied)`);
 		}
