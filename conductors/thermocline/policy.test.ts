@@ -403,6 +403,51 @@ describe("deterministic + empty-scores invariants", () => {
 	});
 });
 
+// ── IRREDUCIBLE OVERFLOW (P1-4) — the ladder gives up with projected still > cap ────────────────
+//
+// Every mover on the Rung-5 hard-cap floor excludes `held`/`protected`/`grouped` units BY DESIGN
+// (biggestForceFoldable, ageBasedRuns) — Truth itself refuses to fold inside the protected tail. So
+// when the protected tail alone (nothing else can ever move) already exceeds the cap, the ladder
+// cannot terminate at "≤ cap" no matter how many rungs it tries. `planEpoch` must say so explicitly
+// via `Plan.irreducible` rather than just returning a `projected` that silently exceeds `cap`.
+describe("IRREDUCIBLE OVERFLOW (P1-4)", () => {
+	test("planEpoch marks irreducible when the protected tail ALONE exceeds the cap — nothing moved", () => {
+		_order = 0;
+		const N = 10;
+		// Every block is protected (both the per-block flag AND protectedFromIndex:0 agree) — the
+		// ladder has NOTHING eligible to fold/group/drop at any rung.
+		const blocks = Array.from({ length: N }, (_, i) => blk({ id: `p${i}`, tokens: 3_000, foldedTokens: 50, order: i, protected: true }));
+		const v = view(blocks, { budget: 12_000, contextWindow: 12_000, protectedFromIndex: 0 });
+		const plan = planEpoch(v, new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(plan.irreducible).toBe(true);
+		expect(plan.projected).toBeGreaterThan(plan.cap);
+		expect(plan.projected).toBe(30_000); // fully protected — the ladder touched nothing
+		expect(plan.folds.length).toBe(0);
+		expect(plan.strata.length).toBe(0);
+	});
+
+	test("planEpoch does NOT mark irreducible when the ladder CAN reach cap (nothing protected)", () => {
+		_order = 0;
+		const N = 10;
+		const blocks = Array.from({ length: N }, (_, i) => blk({ id: `q${i}`, tokens: 3_000, foldedTokens: 50, order: i }));
+		const v = view(blocks, { budget: 12_000, contextWindow: 12_000, protectedFromIndex: N }); // nothing protected
+		const plan = planEpoch(v, new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(plan.irreducible).toBe(false);
+		expect(plan.projected).toBeLessThanOrEqual(plan.cap);
+	});
+
+	test("raising the budget for the SAME protected-everything config clears irreducible", () => {
+		_order = 0;
+		const N = 10;
+		const blocks = Array.from({ length: N }, (_, i) => blk({ id: `p${i}`, tokens: 3_000, foldedTokens: 50, order: i, protected: true }));
+		const v = view(blocks, { budget: 40_000, contextWindow: 40_000, protectedFromIndex: 0 }); // 30k tail now fits
+		const plan = planEpoch(v, new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(plan.irreducible).toBe(false);
+		expect(plan.projected).toBe(30_000);
+		expect(plan.projected).toBeLessThanOrEqual(plan.cap);
+	});
+});
+
 // ── emitOps — engine op shapes + recoverability ──────────────────────────────────────────────
 describe("emitOps", () => {
 	test("a fold emits a recoverable `replace` op with the BARE body (engine adds the tag)", () => {

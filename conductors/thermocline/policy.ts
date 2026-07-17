@@ -143,6 +143,21 @@ export interface Plan {
 	targetTokens: number;
 	cap: number;
 	projected: number;
+	/**
+	 * IRREDUCIBLE OVERFLOW (P1-4). True iff, after the ladder has run every rung including the
+	 * Rung-5 hard-cap floor, `projected` STILL exceeds `cap`. The hard-budget invariant is a
+	 * CONFIGURATION guarantee, not an unconditional one: every mover on the floor excludes
+	 * `held`/`protected`/`grouped` units (biggestForceFoldable, ageBasedRuns) BY DESIGN — Truth
+	 * refuses to fold inside the protected tail and a conductor may never override a human pin.
+	 * So when the protected tail (± held buoys) alone already exceeds `cap`, NO combination of
+	 * folds/groups/drops the ladder can construct will ever bring `projected` under it — the loop
+	 * bottoms out (either the `before >= prev` no-progress guard, or the `!droppedAny` floor) with
+	 * `projected` still over `cap`. Optional (defaults falsy) so pure hand-built `Plan` literals in
+	 * tests that don't route through `planEpoch` need no change. See thermocline.ts's
+	 * `irreducibleOverflow` surfacing — never silent, and re-derived fresh every epoch so it clears
+	 * the instant the configuration (budget raised, tail shrunk, content aged out) becomes winnable.
+	 */
+	irreducible?: boolean;
 }
 
 /** The dwell/graduation/touch state the caller threads through updateGraduation / planEpoch. */
@@ -671,12 +686,17 @@ export function planEpoch(
 		}
 	}
 
+	const projected = project(view, applied());
 	return {
 		folds,
 		strata,
 		targetTokens,
 		cap,
-		projected: project(view, applied()),
+		projected,
+		// The Rung-5 loop above is gated on `project(...) > cap`; if it still is here (either break —
+		// the no-progress guard at its top, or the `!droppedAny` exhaustion floor inside branch (c) —
+		// left it unsatisfied), the floor genuinely cannot reach cap. See the Plan.irreducible doc.
+		irreducible: projected > cap,
 	};
 }
 
