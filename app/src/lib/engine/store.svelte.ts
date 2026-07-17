@@ -112,6 +112,7 @@ export class AccordionStore {
 					this.blocks.push(cloneBlock(b));
 				}
 				this.syncOverlay(); // healing may have touched older blocks
+				this.syncGroups(); // append housekeeping (pruneProtectedGroups) can touch groups too
 				break;
 			case "ops-applied":
 				this.syncOverlay();

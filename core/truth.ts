@@ -80,11 +80,22 @@ export class Truth {
 	private activeTailTok = 0;
 	private holderLabel: string | null = null;
 
+	private wireAttachedFlag = false;
 	/**
 	 * True iff a live pi WIRE is attached. Only in a live session does `classifyGroup` enforce
-	 * durability-aware accounting (issue #13). Demo / loaded sessions leave this false.
+	 * durability-aware accounting (issue #13). Demo / loaded sessions leave this false. The setter
+	 * bumps `rev` on an ACTUAL change (no-op on a same-value set) so the rev-keyed group-accounting
+	 * cache (`groupWireCache`) recomputes on a connect/disconnect transition — same "bump rev, no
+	 * event" shape as `setGroups` (the caller already knows the value it just set).
 	 */
-	wireAttached = false;
+	get wireAttached(): boolean {
+		return this.wireAttachedFlag;
+	}
+	set wireAttached(v: boolean) {
+		if (this.wireAttachedFlag === v) return;
+		this.wireAttachedFlag = v;
+		this.revCounter++;
+	}
 
 	/** The highest block `order` that has actually reached the model in an applied plan. */
 	private sentThroughOrder = -1;
@@ -609,8 +620,15 @@ export class Truth {
 		this.housekeep(touched);
 		const rev = ++this.revCounter;
 		for (const id of touched) this.lastChangedRev.set(id, rev);
-		if (didReset) this.emit({ type: "reset", rev });
-		else this.emit({ type: "ops-applied", by, results, rev });
+		if (didReset) {
+			// A resetAll batched alongside other ops must not swallow their results: emit an
+			// ops-applied event for whatever else applied, THEN the reset — both carry this rev.
+			const otherResults = results.filter((r) => r.applied && r.op.kind !== "resetAll");
+			if (otherResults.length) this.emit({ type: "ops-applied", by, results: otherResults, rev });
+			this.emit({ type: "reset", rev });
+		} else {
+			this.emit({ type: "ops-applied", by, results, rev });
+		}
 		return { rev, results };
 	}
 
@@ -786,6 +804,8 @@ export class Truth {
 			if (!b) return "unknown-id";
 			if (this.stale(id, baseRev)) return "stale";
 			if (b.override !== "pinned") return "noop";
+			// A strategy/agent can never destroy a HUMAN pin — same rule every other op enforces.
+			if (by !== "you" && b.by === "you") return "human-override";
 			b.override = null;
 			b.by = by === "you" ? "you" : null;
 			return null;
