@@ -63,7 +63,7 @@
 
 	// The sacred tier — never lockable, always the human's (or the agent's, for recall).
 	const SACRED: { label: string; note: string }[] = [
-		{ label: "Watch", note: "peek, the live map, the activity log" },
+		{ label: "Watch", note: "the live map, peek, the inspector, the STATUS readout" },
 		{ label: "Recall", note: "the agent can always read folded content" },
 		{ label: "Budget", note: "the context budget stays yours" },
 		{ label: "Detach", note: "pick None anytime — take back control" },

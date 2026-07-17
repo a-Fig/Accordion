@@ -38,6 +38,25 @@
 	};
 	const fmtOverBy = (n: number) => k(Math.round(n));
 
+	// ── Involvement locks (ADR 0011) — the honest mirror of the engine's gating. A locked
+	// control LOOKS locked in every mode (preview/demo/read-only included), driven purely off
+	// `store.isLocked(...)`. The engine already no-ops the underlying action; this is the UI
+	// reflecting that, not the enforcement. The budget dial is NEVER gated (sacred tier).
+	//
+	// Declared ABOVE the protected-tail bar math below because protPct/handlePct/targetTokens
+	// all need to key off the same enforced value the PROTECT readout uses (`protectTarget`) —
+	// under a tail-size lock the active strategy owns the tail, so every chrome element (bar
+	// tint, grip position, underline, ARIA) must agree with the text, not just the text (S11).
+	const tailLocked = $derived(store.isLocked("tail-size"));
+	const steerLocked = $derived(store.isLocked("human-steering"));
+	// Under the tail-size lock the active strategy OWNS the tail — the enforced target is its
+	// declared `activeTailTokens`, not the human's now-stale `protectTokens` (ADR 0011 §7). Every
+	// PROTECT-related readout/visual must show what is actually enforced.
+	const protectTarget = $derived(tailLocked ? store.activeTailTokens : store.protectTokens);
+	const lockTip = $derived(
+		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
+	);
+
 	// ── Protected tail: an on-bar handle (left = 0, drag right to protect more) ──
 	const PROT_MAX = 60_000;
 	const PROT_STEP = 2_000;
@@ -49,11 +68,15 @@
 	let barEl = $state<HTMLDivElement>();
 	// Everything on the bar is scaled to `denom` so the protected handle/tint share
 	// the composition bar's token axis. Clamp the readout to the bar so a tiny session
-	// (protect target > whole context) never paints past the right edge.
-	const protPct = $derived(Math.min(100, (store.protectTokens / denom) * 100));
+	// (protect target > whole context) never paints past the right edge. Keyed off
+	// `protectTarget` (not the raw `store.protectTokens`) so the bar tint agrees with the
+	// numeric readout under a tail-size lock (S11) — unlocked, protectTarget === protectTokens.
+	const protPct = $derived(Math.min(100, (protectTarget / denom) * 100));
 	// While dragging, the handle follows the cursor continuously (smooth) and the
 	// expensive fold commit is throttled to one per frame. `dragTokens` is non-null
-	// only mid-drag; otherwise the handle tracks the committed target.
+	// only mid-drag; otherwise the handle tracks the committed target. Dragging is already
+	// impossible while tail-locked (onProtPointerDown bails out), so `dragTokens` stays null
+	// and this always falls through to `protPct` in that state.
 	let dragTokens = $state<number | null>(null);
 	const handlePct = $derived(
 		dragTokens != null ? Math.min(100, (dragTokens / denom) * 100) : protPct,
@@ -61,7 +84,9 @@
 	// The TARGET protected size the user is dialing in. The underline + its label echo
 	// this (smooth, matches the grip), NOT the actual protected tail — `protectedTokens`
 	// snaps to whole-block boundaries, so it differs slightly and jitters as you drag.
-	const targetTokens = $derived(dragTokens ?? store.protectTokens);
+	// Falls back to `protectTarget` (not `store.protectTokens`) so the underline label
+	// agrees with the readout under a tail-size lock (S11).
+	const targetTokens = $derived(dragTokens ?? protectTarget);
 	// Headroom: the slack between what's used and the budget ceiling. Only present when
 	// the budget exceeds the full (unfolded) size — i.e. denom === budget.
 	const headroomPct = $derived(Math.max(0, ((denom - store.fullTokens) / denom) * 100));
@@ -109,20 +134,6 @@
 	// line (`conductorStatus.text`), shown only while a conductor is actually attached and has
 	// published non-empty text — mirrors the PROTECT/BUDGET ctl-field visual pattern.
 	const showCondStatus = $derived(live.status === "connected" && !!conductorState.active && !!conductorStatus.text);
-
-	// ── Involvement locks (ADR 0011) — the honest mirror of the engine's gating. A locked
-	// control LOOKS locked in every mode (preview/demo/read-only included), driven purely off
-	// `store.isLocked(...)`. The engine already no-ops the underlying action; this is the UI
-	// reflecting that, not the enforcement. The budget dial is NEVER gated (sacred tier).
-	const tailLocked = $derived(store.isLocked("tail-size"));
-	const steerLocked = $derived(store.isLocked("human-steering"));
-	// Under the tail-size lock the active strategy OWNS the tail — the enforced target is its
-	// declared `activeTailTokens`, not the human's now-stale `protectTokens` (ADR 0011 §7). The
-	// readout must show what is actually enforced.
-	const protectTarget = $derived(tailLocked ? store.activeTailTokens : store.protectTokens);
-	const lockTip = $derived(
-		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
-	);
 
 	function protectFromClientX(clientX: number): number {
 		if (!barEl) return store.protectTokens;
@@ -378,8 +389,8 @@
 			aria-disabled={tailLocked}
 			aria-valuemin="0"
 			aria-valuemax={PROT_MAX}
-			aria-valuenow={store.protectTokens}
-			aria-valuetext="{fmt(store.protectTokens)} tokens protected"
+			aria-valuenow={protectTarget}
+			aria-valuetext="{fmt(protectTarget)} tokens protected"
 			title={tailLocked ? lockTip : undefined}
 			onpointerdown={onProtPointerDown}
 			onpointermove={onProtPointerMove}

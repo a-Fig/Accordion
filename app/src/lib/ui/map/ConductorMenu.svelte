@@ -146,7 +146,11 @@
 
 				<div class="cond-sep" role="separator"></div>
 
-				{#each conductors as c (c.id)}
+				<!-- The host's catalog carries its own "none" sentinel (load-bearing core-side —
+				     see core/conductor/registry.ts), but the hardcoded row above is already the
+				     single "detach" affordance — filter the sentinel out here so it never renders
+				     twice. -->
+				{#each conductors.filter((c) => c.id !== "none") as c (c.id)}
 					<button
 						type="button"
 						class="cond-item"
