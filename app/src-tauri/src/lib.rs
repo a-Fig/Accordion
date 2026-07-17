@@ -125,6 +125,12 @@ fn list_sessions() -> Vec<Value> {
 /// can open it. Idempotent: if a child is already alive, returns the port without
 /// re-spawning. A short post-spawn check surfaces an immediate crash (e.g. missing deps)
 /// as an actionable error instead of a phantom "running" state.
+///
+/// STALE: `mock-server.mjs` still speaks the pre-v13 wire protocol (sends `sync`/`status`,
+/// listens for `plan`), while the app's live client now speaks v13 (`snapshot`/`event`/
+/// `command`). Launching it from Settings currently opens a session that never
+/// populates. See the banner comment at the top of `mock-server.mjs` for what porting
+/// it would take; this command is left as-is (UI behavior is the owner's call).
 #[tauri::command]
 fn launch_mock_session(procs: tauri::State<'_, MockProc>) -> Result<u16, String> {
     // Already running?
@@ -514,73 +520,6 @@ fn list_claude_sessions() -> Vec<Value> {
     out
 }
 
-/// Extractive prose compression via The Token Company's Bear-2 model. This backs the
-/// in-process conductor host's optional `compress` capability (see the `ConductorHost`
-/// contract): a conductor calls `host.compress(text)`, the app `invoke`s this command,
-/// and we make the HTTPS call here so the API key never leaves native code in a form a
-/// webview can leak (and so the engine stays network-free / pure).
-///
-/// Wire shape verified against the `thetokencompany` SDK source (`_client.py` / `_types.py`):
-///   request  → POST /v1/compress  `{ "model": "bear-2", "input": <text>,
-///              "compression_settings": { "aggressiveness": <f64> } }`
-///   response → `{ "output": <str>, "output_tokens": <int>, "original_input_tokens": <int> }`
-/// We extract the top-level string `output`. Anything else is reported as an unexpected
-/// shape, with a short body snippet for debugging.
-///
-/// SECURITY: `api_key` is NEVER logged or echoed into any error message — only the request
-/// body's `input`/`output` and HTTP status/snippet ever appear in returns.
-#[tauri::command]
-async fn compress_text(text: String, api_key: String, aggressiveness: f64) -> Result<String, String> {
-    // A bounded request timeout: without it a hung call permanently consumes one of the
-    // conductor's concurrency slots and its retry/freeze machine never fires.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("client build failed: {e}"))?;
-    let resp = client
-        .post("https://api.thetokencompany.com/v1/compress")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "bear-2",
-            "input": text,
-            "compression_settings": { "aggressiveness": aggressiveness },
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("compress request failed: {e}"))?;
-
-    let status = resp.status();
-    // Read the body once; we need it for both the success path and error snippets.
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("compress response read failed (status {status}): {e}"))?;
-
-    if !status.is_success() {
-        // Cap the snippet so a huge error page doesn't flood the log. Body never contains the key.
-        let snippet: String = body.chars().take(300).collect();
-        return Err(format!("compress failed (status {status}): {snippet}"));
-    }
-
-    let parsed: Value = serde_json::from_str(&body)
-        .map_err(|e| {
-            let snippet: String = body.chars().take(300).collect();
-            format!("compress response was not JSON: {e}: {snippet}")
-        })?;
-
-    // The REST response is a JSON object with a string `output` field. Any other shape is
-    // unexpected and reported as an error (no real Bear-2 response is a bare JSON string).
-    if let Some(out) = parsed.get("output").and_then(|v| v.as_str()) {
-        return Ok(out.to_string());
-    }
-
-    let snippet: String = body.chars().take(300).collect();
-    Err(format!(
-        "compress response missing string `output` field: {snippet}"
-    ))
-}
-
 /// Read a Claude Code transcript's full text. Rust owns `~/.claude` access (the JS fs
 /// plugin's scope does not cover programmatic reads of `~/.claude/projects/**`, only
 /// dialog-picked files), so the file load + tail goes through here. The path is
@@ -633,7 +572,6 @@ pub fn run() {
             focus_window,
             list_claude_sessions,
             read_claude_session,
-            compress_text,
             launch_mock_session,
             stop_mock_session,
             mock_session_running

@@ -1,4 +1,28 @@
 /*
+ * ============================================================================
+ * KNOWN BROKEN — predates the v13 wire protocol. DO NOT rely on this file.
+ * ============================================================================
+ * This mock still speaks the OLD pi-wire shape below: it sends `{ type: "sync" }` /
+ * `{ type: "status" }` frames and listens for a `{ type: "plan" }` reply. The live
+ * protocol (core/protocol.ts, PROTOCOL_VERSION = 13) replaced that with
+ * `snapshot` / `event` (server→client) built by `serializeSnapshot()` over a
+ * `core/truth.ts` `Truth` instance, and `command` (client→server). The desktop app's
+ * real client (`app/src/lib/live/`) only understands the new shape, so it can never
+ * parse anything this mock sends.
+ *
+ * Net effect: the Tauri Settings panel's "Fake pi session" button (launches this file
+ * via the `launch_mock_session` command in `app/src-tauri/src/lib.rs`) currently opens
+ * a session that never populates — a permanently empty view. The button itself is left
+ * alone here (UI behavior is the owner's call), but treat this whole flow as
+ * non-functional until the mock is ported.
+ *
+ * To fix: rebuild this file's session/broadcast layer on top of `core/truth.ts`
+ * (`Truth`) + `core/replica.ts` (`serializeSnapshot` / `wireEventFromTruthEvent`) the
+ * same way `extension/accordion.ts` does, and switch the outgoing/incoming message
+ * types to `snapshot` / `event` / `command`. That's a non-trivial port (Truth carries
+ * fold/group/lock state this file has no equivalent for) — not attempted here.
+ * ============================================================================
+ *
  * mock-server.mjs — a fake pi session for testing the live link + folding, driven from a browser.
  *
  * Tricks the Accordion DESKTOP app into thinking it's attached to a live pi session,
