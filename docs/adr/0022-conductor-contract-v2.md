@@ -50,10 +50,15 @@ interface Conductor {
 A conductor is handed a `ConductorHost` once, at `attach`, and holds it until `detach`. It does not
 return a value from a per-turn call; instead it *subscribes* (`host.on(fn)`) to `HostEvent`s —
 `blocks-appended`, `turn-committed`, `state-changed`, `wire-departing`, `resync` — and reacts
-asynchronously by calling `host.propose({ baseRev, ops })` whenever it has something to say. This
+asynchronously by `await`ing `host.propose({ baseRev, ops })` whenever it has something to say. This
 inverts the old model: the host no longer polls a conductor every pass and clears its prior work
 first; the conductor pushes transactional diffs whenever its own reasoning (sync or eventually
-resolved) produces one.
+resolved) produces one. `propose` returns `Promise<TxnResult>` — **async by default**, the
+contract's philosophy: an in-process host applies the ops synchronously the instant `propose` is
+invoked and resolves the result on a microtask, while an out-of-process host (a spawned conductor
+over the wire, §6) resolves it after the `propose`→`proposeResult` round trip. A conductor cannot
+tell the two hosts apart, which is the portability property that lets the same `ThermoclineConductor`
+run in-process under `TestHost` and out-of-process under the remote SDK.
 
 ### 2. Every mutation is a `propose`d, `baseRev`-anchored transaction of ops
 
@@ -68,8 +73,8 @@ conductor never gets a privileged write path.
 
 Strategy ops run under actor `"auto"`: they set `autoFolded`/`subst` and leave `override` null, so
 **a human override always wins** — the same rule ADR 0007 established, now enforced by `Truth`
-itself rather than by a host-side check the conductor could bypass. `TxnResult` returns one
-`OpResult` per op (`applied` + an optional `ClampReason`), so a conductor always learns exactly
+itself rather than by a host-side check the conductor could bypass. The awaited `TxnResult` returns
+one `OpResult` per op (`applied` + an optional `ClampReason`), so a conductor always learns exactly
 what happened to its proposal — a batch is never partially silent.
 
 ### 3. `ViewConductor` — the old authoring ergonomics, ported onto the new engine
@@ -127,10 +132,14 @@ purely against `TestHost`.
 ### 7. Bounded wire-hold for last-moment shrinkage
 
 A conductor may declare `holdWireUpToMs` (default 0) to ask the host to pause the departing wire
-briefly and give it one more synchronous chance to propose before the model call actually leaves —
-`wire-departing` carries `freshIds` (blocks never yet sent whole) for exactly this purpose. Doorman
-(see [ADR 0023](0023-birth-fold-restored.md)) is the shipped example: `holdWireUpToMs: 150`, used to
-skeletonize or fold a giant fresh `tool_result` before it ever reaches the model.
+briefly and give it one more chance to propose before the model call actually leaves — `wire-departing`
+carries `freshIds` (blocks never yet sent whole) for exactly this purpose. The `propose` it fires is
+async, but its ops are *invoked* synchronously inside the host's event dispatch, so the fold lands
+in Truth before the sent cursor advances; the host awaits the handler settling (an in-process fold
+settles on a microtask — measured sub-2ms — far under the window, while a remote conductor releases
+the hold with its `propose` message). Doorman (see [ADR 0023](0023-birth-fold-restored.md)) is the
+shipped example: `holdWireUpToMs: 150`, used to skeletonize or fold a giant fresh `tool_result`
+before it ever reaches the model.
 
 ### 8. The sacred set stays sacred
 

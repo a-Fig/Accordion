@@ -568,8 +568,9 @@ export class HandoffConductor extends ViewConductor {
 					this.failureStatus = null;
 					this.handoff = `[Handoff from a previous session — ${count} earlier message${count === 1 ? "" : "s"} captured in this briefing]\n\n${text}`;
 					this.handedOffIds = launchedAgedIds;
-					// Re-run conduct() now so the handoff group takes effect immediately.
-					this.rerun();
+					// Re-run conduct() now so the handoff group takes effect immediately. Async (v2
+					// propose): ops apply on invocation, per-op results reconcile on a microtask.
+					void this.rerun();
 				},
 				(err) => {
 					// Stale-completion guard (see the resolve handler): a reject from a controller

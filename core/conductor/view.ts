@@ -116,24 +116,26 @@ export abstract class ViewConductor implements Conductor {
 		this.appliedGroups.clear();
 	}
 
-	private onHostEvent(e: HostEvent): void {
+	private onHostEvent(e: HostEvent): void | Promise<void> {
 		if (!this.attached) return;
-		if (e.type === "turn-committed") this.rerun();
-		else if (e.type === "wire-departing" && (this.holdWireUpToMs ?? 0) > 0) this.rerun();
+		if (e.type === "turn-committed") return this.rerun();
+		else if (e.type === "wire-departing" && (this.holdWireUpToMs ?? 0) > 0) return this.rerun();
 		else if (e.type === "resync") this.rebuildFromTruth();
 	}
 
 	/**
-	 * Synchronously re-materialize the view, call `conduct()`, diff, and propose. The local
-	 * successor to the old `host.requestRerun()` — an in-process conductor that finishes async work
-	 * (e.g. an LLM summary) calls this to emit its derived ops immediately. No-op while detached.
+	 * Re-materialize the view, call `conduct()`, diff, and propose. The local successor to the old
+	 * `host.requestRerun()` — an in-process conductor that finishes async work (e.g. an LLM summary)
+	 * calls this to emit its derived ops. `propose` is async (contract v2), so this is async too;
+	 * the returned promise settles once the transaction's per-op results are reconciled. No-op while
+	 * detached.
 	 */
-	protected rerun(): void {
+	protected async rerun(): Promise<void> {
 		if (!this.attached || !this.host) return;
 		const view = this.materialize();
 		const cmds = this.conduct(view);
 		if (cmds === null) return; // hold
-		this.applyDesired(cmds);
+		await this.applyDesired(cmds);
 	}
 
 	private materialize(): ConductorView {
@@ -165,7 +167,7 @@ export abstract class ViewConductor implements Conductor {
 		}
 	}
 
-	private applyDesired(cmds: Command[]): void {
+	private async applyDesired(cmds: Command[]): Promise<void> {
 		const baseRev = this.host.stats().rev;
 		const desiredFolds = new Map<string, { op: Op; sig: string }>();
 		const desiredGroups = new Map<string, { ids: string[]; digest?: string | null }>();
@@ -210,7 +212,7 @@ export abstract class ViewConductor implements Conductor {
 		}
 		if (!ops.length) return;
 
-		const res = this.host.propose({ baseRev, ops });
+		const res = await this.host.propose({ baseRev, ops });
 		// Reconcile tracked desired-state with what ACTUALLY applied. A clamped op must NOT enter
 		// the tracked state (or it would never be retried / would be wrongly diffed next pass).
 		for (const r of res.results) {

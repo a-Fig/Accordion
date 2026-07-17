@@ -14,11 +14,12 @@
  * be made at *wire-departing* time, not at the next `turn-committed` replan — by the time a
  * turn settles, the block has already gone out once. `holdWireUpToMs: 150` tells the host it
  * may hold the departing wire briefly for a last-moment proposal; every decision here is
- * synchronous CPU (string classification + string skeletonization, no `host.complete`), so
- * the hold is comfortably sub-frame in practice, and — just as important — the on(`wire-
- * departing`) handler below runs its work SYNCHRONOUSLY (no `async`/`await`) so it completes
- * inside the host's synchronous event dispatch, before the host advances its "sent" cursor
- * for this call (see `TestHost.departWire`).
+ * synchronous CPU (string classification + string skeletonization, no `host.complete`). The
+ * on(`wire-departing`) handler is `async` only because `host.propose` is async by contract
+ * (v2) — but the propose is INVOKED synchronously, so the fold lands in Truth inside the host's
+ * synchronous event dispatch, before the "sent" cursor advances (see `TestHost.departWire`); the
+ * one `await` merely defers reading the per-op results for the `handled` bookkeeping + status.
+ * The hold is comfortably sub-frame in practice (it settles on a microtask, far under 150 ms).
  *
  * Collaborative: `locks` is omitted. Doorman never claims authority over a block — a human
  * pin or fold keeps it as-is (the `held` gate below), and the moment the agent (or the
@@ -96,19 +97,22 @@ export class DoormanConductor implements Conductor {
 		this.handled.clear();
 	}
 
-	private onEvent(e: HostEvent): void {
+	private onEvent(e: HostEvent): void | Promise<void> {
 		// Only wire-departing matters to doorman — it is a wire-departing-time decision, not a
 		// turn-based replan. (No `state-changed`/`resync` handling: `handled` only ever grows, and
-		// a fresh attach starts it empty, exactly the state a resync would want anyway.)
-		if (e.type === "wire-departing") this.onWireDeparting(e);
+		// a fresh attach starts it empty, exactly the state a resync would want anyway.) Returning
+		// the promise lets the host await the handler settling for its bounded wire-departing hold.
+		if (e.type === "wire-departing") return this.onWireDeparting(e);
 	}
 
 	/**
-	 * Synchronous by construction (no `await` anywhere in this call graph): classification and
-	 * skeletonization are pure string operations, so the whole candidate scan + propose happens
-	 * inside the host's synchronous event dispatch, comfortably inside `holdWireUpToMs`.
+	 * Classification and skeletonization are pure synchronous string operations; the whole
+	 * candidate scan + the `host.propose` INVOCATION happen synchronously inside the host's event
+	 * dispatch, so the fold lands before the sent cursor advances. The handler is `async` only to
+	 * `await` the async-by-contract (v2) `propose` result for `handled`/status bookkeeping — that
+	 * awaited tail settles on a microtask, comfortably inside `holdWireUpToMs`.
 	 */
-	private onWireDeparting(e: Extract<HostEvent, { type: "wire-departing" }>): void {
+	private async onWireDeparting(e: Extract<HostEvent, { type: "wire-departing" }>): Promise<void> {
 		const host = this.host;
 		if (!host || !e.freshIds.length) return;
 
@@ -158,7 +162,7 @@ export class DoormanConductor implements Conductor {
 		if (!ops.length) return;
 
 		const baseRev = host.stats().rev;
-		const res = host.propose({ baseRev, ops });
+		const res = await host.propose({ baseRev, ops });
 		res.results.forEach((r, i) => {
 			if (r.applied) this.handled.add(opIds[i]);
 		});

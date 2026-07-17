@@ -158,9 +158,9 @@ test("belt-and-braces: a mismatched applied group id is discarded + repaired, no
 	class DetailLyingHost extends TestHost {
 		proposed: Op[][] = [];
 		lie = true;
-		propose(txn: { baseRev: number; ops: Op[] }): TxnResult {
+		async propose(txn: { baseRev: number; ops: Op[] }): Promise<TxnResult> {
 			this.proposed.push(txn.ops);
-			const res = super.propose(txn);
+			const res = await super.propose(txn);
 			if (!this.lie) return res;
 			return {
 				...res,

@@ -489,7 +489,7 @@ export class NaiveCompactionConductor extends ViewConductor {
 					this.inflight = null;
 					this.summary = `[Compacted summary of ${count} earlier message${count === 1 ? "" : "s"}]\n\n${text}`;
 					this.compactedIds = launchedAgedIds;
-					this.rerun();
+					void this.rerun(); // async (v2 propose); its ops apply on invocation, results reconcile on a microtask
 				},
 				(_err) => {
 					// Stale-completion guard (see above): a reject from a controller that is no
