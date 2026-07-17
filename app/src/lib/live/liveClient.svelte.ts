@@ -106,6 +106,7 @@ function adoptSnapshot(state: SnapshotState): void {
 		overlay: Array.isArray(state.overlay) ? state.overlay : [],
 		groups: Array.isArray(state.groups) ? state.groups : [],
 		locks: Array.isArray(state.locks) ? state.locks : [],
+		birthFolded: Array.isArray(state.birthFolded) ? state.birthFolded : [],
 	};
 	const truth = hydrateSnapshot(pendingMeta, clean);
 	const store = new AccordionStore({ meta: pendingMeta, blocks: [], lineCount: 0, skipped: 0 }, truth);

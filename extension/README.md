@@ -19,8 +19,8 @@ Accordion is a [pi](https://github.com/earendil-works/pi) extension that shows y
 agent's entire context window at a glance and lets you manage it — manually or with
 intelligence through a **conductor**.
 
-This package ships the **pi extension** (the live link that streams context and applies
-your fold plan) plus a **browser-served UI**, so you can run Accordion with `pi install`
+This package ships the **pi extension** (it holds your session's context state and is the
+live link to it) plus a **browser-served UI**, so you can run Accordion with `pi install`
 alone — no Rust, no desktop app required.
 
 ## Install
@@ -75,43 +75,22 @@ reasons over at full fidelity.
 <img src="https://raw.githubusercontent.com/a-Fig/Accordion/main/docs/assets/attention-conductor.png" alt="Attention conductor view — each block tinted by how much the working tail still attends back to it" width="600">
 </div>
 
-## Configuration
+## How the live link works
 
-Advanced knobs, read from the environment once when the extension loads. Defaults are
-tuned for interactive use. Whether the extension **blocks** on the plan is no longer an env
-flag — it follows the attached client's **armed** state, learned over the wire (see
-[Armed state](#armed-state-over-the-wire) below); the deadline knob matters mainly for a
-blocking session (interactive steering, or a benchmark harness that must enforce a hard
-context budget).
+The extension holds the **authoritative** context state for your session — every fold,
+pin, and group lives there, not in the browser tab. The GUI connects as a **replica**: it
+hydrates from a full snapshot on connect, then stays in sync over a stream of small,
+replayable events — no polling, and no round trip on the model-call path. Steering actions
+(fold, pin, group, the budget/tail dials) are sent to the extension as commands; the
+extension applies them to its own state and echoes the result back to every connected
+client, so there's never more than one copy of the truth to disagree with.
 
-| Env var | Default | Effect |
-|---|---|---|
-| `ACCORDION_PLAN_TIMEOUT_MS` | `250` | How long a model request waits for the GUI's fold plan before falling back **while the attached client is disarmed** (the fast path). On a miss the extension re-applies the **last known plan** rather than shipping the conversation unfolded (a one-turn-stale plan is strictly better than none), and logs the fallback — it is never silent. |
-| `ACCORDION_PLAN_DEADLINE_MS` | `10000` | The plan wait used **while the attached client is armed**: a hard **deadline** instead of the short timeout, so a run whose cap must hold actually holds it. A missed deadline is logged loudly (`console.error`) and still falls back to the last known plan. It never blocks when no client is attached, and a mid-wait disconnect resolves immediately. **Caution:** a hung-but-connected client (socket open, not replying) stalls *every* model request by the full deadline (10s by default) **while armed** — there is deliberately no circuit breaker yet; a consecutive-miss breaker is tracked as follow-up work. |
-
-Invalid values (non-numeric, `NaN`, `≤0`, or non-integer such as `"250.5"`) fall back to
-the default. Values are parsed with `Number()`, so scientific notation (`"1e3"`) and hex
-(`"0x10"`) are also accepted as long as they resolve to a positive integer.
-
-### Armed state over the wire
-
-Blocking is driven by the attached client, not the environment. The client sends
-`{ "type": "armed", "armed": <boolean> }` on the live WebSocket to declare whether it is
-steering; the extension adopts that state for subsequent model requests (armed → wait the
-deadline; disarmed → the short timeout) and replies `{ "type": "armedAck", "armed": <boolean> }`
-to confirm it understood. Every fresh attach starts **disarmed**, and the GUI re-declares its
-state on connect, so a stale arming can never carry across sessions.
-
-For the interactive GUI this is simply the wire form of the **arm toggle** (the FOLDING
-`preview` / `steering` button) — one steering concept for both the UI and headless hosts,
-replacing the former benchmark-only `ACCORDION_STEERING` env flag. A headless benchmark host
-declares `armed:true` the same way; the `armedAck` lets it detect an old extension (which
-would silently drop the unknown message and run non-blocking) and fail loudly instead. These
-messages are **additive** — an old peer ignores an unknown type — so the wire
-`PROTOCOL_VERSION` is intentionally not bumped.
-
-Each request also records the plan round-trip time it waited, stamped onto the assistant
-message it produced as `usage.rttMs` (integer milliseconds) in the session file.
+Folding is **opt-in and off by default** — flip the **Folding** toggle in the header to
+start steering what the agent sees. When it's off, pi's `context` hook is a no-op and your
+messages reach the model untouched. When it's on, the hook applies your **current** fold
+state locally, in-process, immediately before the model call: there's no GUI round trip and
+no timeout to tune, because the state the extension already holds *is* the state applied,
+synchronously, every time.
 
 ## Skills included
 

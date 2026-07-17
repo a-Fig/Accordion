@@ -3,7 +3,7 @@
  *
  * The extension is now the AUTHORITY: it hosts an in-process Truth per session and pi's `context`
  * hook is a LOCAL operation against it. This drives the extension with a mock `pi`, discovers the
- * session's ephemeral port from the registry file, connects a real WS client, and checks the v11
+ * session's ephemeral port from the registry file, connects a real WS client, and checks the v12
  * protocol end to end:
  *   • hello → snapshot → the replica-building handshake (empty + with-history snapshots)
  *   • the LOCAL context hook: passthrough (folding off) + folding-enabled wire serialization
@@ -90,7 +90,7 @@ const entry = readOnlyEntry();
 if (!(entry.port > 0)) fails.push(`registry port not assigned (got ${entry.port})`);
 if (entry.registryProtocol !== 1) fails.push(`registry protocol mismatch (${entry.registryProtocol})`);
 if (entry.model !== "test/model") fails.push(`model not captured (${entry.model})`);
-if (entry.protocolVersion !== 11) fails.push(`protocol version expected 11, got ${entry.protocolVersion}`);
+if (entry.protocolVersion !== 12) fails.push(`protocol version expected 12, got ${entry.protocolVersion}`);
 const PORT = entry.port;
 
 // Durable-id messages (a:/u: prefixes) the whole protocol flow builds on.
@@ -244,7 +244,7 @@ await waitFor(() => a.inbox.hello.length > 0, 2000, "client A hello").catch(() =
 await waitFor(() => a.inbox.snapshot.length > 0, 2000, "client A snapshot").catch(() => fails.push("client A never received a snapshot"));
 {
 	const hello = a.inbox.hello[0];
-	if (hello && hello.protocolVersion !== 11) fails.push(`hello.protocolVersion expected 11, got ${hello?.protocolVersion}`);
+	if (hello && hello.protocolVersion !== 12) fails.push(`hello.protocolVersion expected 12, got ${hello?.protocolVersion}`);
 	if (hello && hello.role !== "gui") fails.push(`hello.role expected "gui", got ${hello?.role}`);
 	const snap = a.inbox.snapshot[0];
 	const ids = snap ? snap.state.blocks.map((x) => x.id) : [];

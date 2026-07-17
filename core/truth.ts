@@ -140,8 +140,10 @@ export class Truth {
 	 * The GUI builds a replica Truth this way so replayed events stay rev-aligned with the
 	 * authoritative extension-side Truth: after adopting, `rev === snapshot.rev`, and each
 	 * subsequent replayed input bumps rev in lockstep — a mismatch after replay ⇒ resnapshot.
-	 * `blocks` arrive with overlay already applied; groups/locks/config/sent are set verbatim.
-	 * `birthFolded` is reset empty (no strategy folds in Phase B; a Phase-C snapshot must carry it).
+	 * `blocks` arrive with overlay already applied; groups/locks/config/sent/`birthFolded` are set
+	 * verbatim — `birthFolded` MUST round-trip (v12) or `healProtected` diverges from the host: a
+	 * replica that lost the set heals a block on its next housekeep that the host still keeps
+	 * folded, and both sides bump `rev` by exactly one, so the mismatch is otherwise invisible.
 	 */
 	adoptSnapshot(s: {
 		blocks: Block[];
@@ -154,6 +156,7 @@ export class Truth {
 		tailTokens: number;
 		sentThroughOrder: number;
 		wireAttached: boolean;
+		birthFolded: readonly string[];
 		rev: number;
 	}): void {
 		this.blockLog = s.blocks.slice();
@@ -167,12 +170,55 @@ export class Truth {
 		this.activeTailTok = s.tailTokens;
 		this.wireAttachedFlag = s.wireAttached;
 		this.sentThroughOrderValue = s.sentThroughOrder;
-		this.birthFolded.clear();
+		this.birthFolded = new Set(s.birthFolded);
 		this.lastChangedRev.clear();
 		this.revCounter = s.rev;
 		// Rev-keyed read caches are stamped stale so they recompute against the adopted rev.
 		this.pfiCache = { rev: -1, value: 0 };
 		this.groupWireCache = { rev: -1, map: new Map<string, { tokens: number; collapsed: boolean }>() };
+	}
+
+	/**
+	 * Structural-DIVERGENCE rebuild (tree-nav / compaction / another extension rewriting
+	 * `event.messages`): build a fresh Truth from `parsed`'s blocks, then carry over `prev`'s
+	 * per-block overlay, `birthFolded` membership, scalar dials, and any group whose members ALL
+	 * survive. An id absent from the fresh block log has nothing to carry — it no longer exists.
+	 * `prev === null` (the very first build of a session) skips carryover entirely: there is
+	 * nothing yet to preserve, and a brand-new session must never inherit a PRIOR session's state.
+	 *
+	 * This is the fix for the review finding that a divergence rebuild used to construct a bare
+	 * `new Truth(...)` and silently drop every human/host fold, pin, group, and dial — including
+	 * for block ids that survived the rebuild untouched. `contextWindow` is deliberately NOT
+	 * carried: it is a live fact re-derived from the current model, not a preserved dial (the
+	 * extension re-applies it right after calling this, same as any other build).
+	 *
+	 * Housekeeping runs once at the end so the freshly-carried overlay/groups can't leave the
+	 * result in a state that violates the protected-tail invariant (the new block log's tail
+	 * boundary may differ from `prev`'s).
+	 */
+	static rebuildFrom(prev: Truth | null, parsed: ParsedSession): Truth {
+		const next = new Truth(parsed);
+		if (!prev) return next;
+		next.budgetTok = prev.budgetTok;
+		next.protectTokensTarget = prev.protectTokensTarget;
+		next.activeLocks = prev.activeLocks.slice();
+		next.holderLabel = prev.holderLabel;
+		next.activeTailTok = prev.activeTailTok;
+		for (const b of next.blockLog) {
+			const old = prev.get(b.id);
+			if (!old) continue;
+			b.override = old.override;
+			b.autoFolded = old.autoFolded;
+			b.by = old.by;
+			b.subst = old.subst;
+			if (prev.birthFolded.has(b.id)) next.birthFolded.add(b.id);
+		}
+		const survivors = next.index;
+		next.groupList = prev.groupList
+			.filter((g) => g.memberIds.every((id) => survivors.has(id)))
+			.map((g) => ({ ...g, memberIds: g.memberIds.slice() }));
+		next.housekeep(new Set<string>());
+		return next;
 	}
 
 	// ── events ────────────────────────────────────────────────────────────────
@@ -212,6 +258,10 @@ export class Truth {
 	}
 	get lockHolder(): string | null {
 		return this.activeLocks.length ? this.holderLabel : null;
+	}
+	/** Ids currently birth-folded (see `birthFolded` above). A snapshot must carry this verbatim. */
+	get birthFoldedIds(): readonly string[] {
+		return [...this.birthFolded];
 	}
 	/** The tail target the holder enforces while holding `tail-size` (0 when not held). */
 	get activeTailTokens(): number {

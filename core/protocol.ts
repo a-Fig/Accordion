@@ -32,13 +32,18 @@
  *    `commandResult`/`folding`/`recall`/`stream` (server→client) and `command`
  *    (client→server). PROTOCOL_VERSION bumped so a pre-B client cannot pair silently — both
  *    peers reject on a strict `protocolVersion !== PROTOCOL_VERSION`.
+ *  - v12: `SnapshotState` gained `birthFolded`. Without it, a replica hydrated after a
+ *    birth-fold started with an empty birth-fold set, so its very next housekeep healed the
+ *    block locally while the host kept it folded — a silent divergence `rev` bookkeeping alone
+ *    couldn't catch (both sides still bump by exactly one). Bumped so a pre-v12 peer (which
+ *    would silently drop the field) cannot pair with a v12 host/client that assumes it's there.
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import type { Op, OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 12;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi session binds an
@@ -73,7 +78,7 @@ export interface WireBlock {
 /**
  * One in-place fold instruction: replace block `id`'s content with `digestText` (carrying a
  * leading `{#<code> FOLDED}` recovery tag). Consumed by `applyPlan` when the host serializes the
- * wire under `foldingEnabled`. Not a wire MESSAGE type in v11 — folding is computed host-side —
+ * wire under `foldingEnabled`. Not a wire MESSAGE type in v12 — folding is computed host-side —
  * but kept here as the shared shape `Truth.serializeWire` / `applyPlan` exchange.
  */
 export interface FoldOp {
@@ -84,7 +89,7 @@ export interface FoldOp {
 /**
  * One group-collapse instruction (ADR 0006) — the only op that changes the message count.
  * `summaryText === null` means DROP (remove the run, insert nothing). Like `FoldOp`, an internal
- * shape of the host's `serializeWire`, not a v11 wire message.
+ * shape of the host's `serializeWire`, not a v12 wire message.
  */
 export interface GroupOp {
 	id: string;
@@ -131,6 +136,13 @@ export interface SnapshotState {
 	sentThroughOrder: number;
 	wireAttached: boolean;
 	foldingEnabled: boolean;
+	/**
+	 * Ids a strategy birth-folded (folded while protected AND not-yet-sent) — see `Truth`'s
+	 * `birthFolded` field. Must round-trip through a snapshot: `healProtected` skips exactly
+	 * these ids when the protected tail grows over them, and a replica that lost this set would
+	 * heal a block the host still keeps folded (v12; see the History note above).
+	 */
+	birthFolded: string[];
 	rev: number;
 }
 
@@ -276,7 +288,9 @@ export function isServerMessage(v: unknown): v is ServerMessage {
 }
 
 export function isClientMessage(v: unknown): v is ClientMessage {
-	return !!v && typeof v === "object" && (v as { type?: unknown }).type === "command";
+	if (!v || typeof v !== "object") return false;
+	const t = (v as { type?: unknown }).type;
+	return t === "command" || t === "resnapshot";
 }
 
 const WIRE_KINDS = new Set(["user", "text", "thinking", "tool_call", "tool_result"]);

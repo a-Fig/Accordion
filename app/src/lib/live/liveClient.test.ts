@@ -81,6 +81,7 @@ function snapshotState(over: Partial<SnapshotState> = {}): SnapshotState {
 		sentThroughOrder: 1,
 		wireAttached: true,
 		foldingEnabled: false,
+		birthFolded: [],
 		rev: BASE_REV,
 		...over,
 	};
