@@ -3,10 +3,14 @@
  *
  * PORTED from the deleted `conductors/handoff/handoff.ts` (ADR 0017, git rev dc037bc) onto the NEW
  * conductor-v2 contract, via the `ViewConductor` adapter (`core/conductor/view.ts`) that bridges
- * the OLD `conduct(view) → Command[] | null` vocabulary. The algorithm — trigger math, output-
- * token reservation, prompt construction (including the injection-defense neutralizer), and the
- * sticky-failure / stale-completion bookkeeping — is unchanged. Only the host seam differs; see
- * the PORT FIDELITY notes below for every place that forced a REAL (not cosmetic) adaptation.
+ * the OLD `conduct(view) → Command[] | null` vocabulary. The algorithm — trigger math shape,
+ * output-token reservation, prompt construction (including the injection-defense neutralizer), and
+ * the sticky-failure / stale-completion bookkeeping — is unchanged. Only the host seam differs;
+ * see the PORT FIDELITY notes below for every place that forced a REAL (not cosmetic) adaptation.
+ * These notes mirror the sibling `core/conductors/compaction-naive/compaction-naive.ts` port,
+ * which hit the identical persistent-group issue first and established the fix pattern followed
+ * here (`foreignGroupedIds()` + a locally-reconstructed raw baseline) — kept consistent on purpose
+ * so every ported conductor in this tree solves the same host-seam gap the same way.
  *
  * PURPOSE (unchanged): automatically simulate the user's manual handoff workflow:
  *   1. Ask the current agent to write a handoff document.
@@ -45,70 +49,47 @@
  *      `conduct()` on request; the new `ViewConductor` adapter is exactly that local successor —
  *      `rerun()` is a protected method a subclass calls directly once its async work resolves.
  *
- *   3. GROUP PERSISTENCE (the load-bearing fix). The old host, per its own `ConductorView`
- *      contract, reset THIS conductor's own prior folds/groups back to raw before recomputing the
- *      view on every `conduct()` pass — so a block this conductor had folded on the PREVIOUS pass
- *      always came back as `grouped: false` at the start of the next one. `emitHandoffGroup`'s
- *      survivor test therefore safely included `!b.grouped` (it was really testing "grouped by
- *      someone ELSE", since the conductor's own group had just been invisibly cleared).
+ *   3. `ViewBlock.grouped` no longer means "skip this block" in `agedRegion` / `emitHandoffGroup`.
+ *      The OLD contract's per-pass view was pre-cleared of THIS conductor's own prior fold/group
+ *      before every `conduct()` call (its `ConductorView.liveTokens` doc said as much: "the host
+ *      has already cleared the previous conductor pass"), so a `grouped` block there could only
+ *      mean "some OTHER (human) group already owns this" — worth skipping. The new adapter does
+ *      NOT clear a conductor's own standing group before materializing the view — a `group` op is
+ *      a PERSISTENT `Truth` overlay the adapter reconciles by diffing (`ViewConductor.applyDesired`)
+ *      — so by the SECOND pass `grouped` is ALSO true for every block THIS conductor grouped on the
+ *      first pass. Naively keeping the old `!b.grouped` check made `agedRegion` (and
+ *      `emitHandoffGroup`'s survivor walk) silently drop the handoff's own already-covered blocks on
+ *      every pass after the first, so the adapter diffed the standing group away (`ungroup`) —
+ *      destroying the fresh-start on the very next settled turn, then recreating it the pass after
+ *      (once the un-grouping made those blocks look "aged" again), forever alternating — confirmed
+ *      by hand-tracing `ViewConductor.applyDesired` / `Truth.opGroup`/`opUngroup` while porting, and
+ *      exactly the failure mode the sibling `compaction-naive` port's own PORT FIDELITY §5 describes
+ *      hitting first ("observed directly as a spurious extra `complete()` launch per pass ... before
+ *      the fix"). Both helpers here now check `foreignGroupedIds()` — the set of ids in a folded
+ *      group with `by !== "auto"` (every conductor-proposed op runs under actor `"auto"`, so
+ *      `by !== "auto"` reliably means "a human made this group", the only kind of group this
+ *      exclusive conductor could ever encounter that ISN'T its own) — instead of the blanket
+ *      `ViewBlock.grouped`.
  *
- *      The new `Truth`/`ViewConductor` engine does NOT reset between passes: a `group` op this
- *      conductor proposes is a PERSISTENT Truth-level overlay that stays `folded: true` (hence
- *      every member reports `grouped: true`) until something explicitly ungroups it. Porting
- *      `emitHandoffGroup`'s survivor test verbatim (`handedOffIds.has(id) && !held && !grouped`)
- *      would therefore see ZERO survivors on the very next steady-state pass after the handoff
- *      commits (its own members are now `grouped: true`), return `[]`, and the adapter's
- *      Command-diff would read that as "the conductor no longer wants a group here" and issue an
- *      `ungroup` — destroying the fresh-start on the next settled turn, then recreating it, then
- *      destroying it again, forever (traced by hand against `ViewConductor.applyDesired` /
- *      `Truth.opGroup`/`opUngroup` while writing this port).
+ *   4. TRIGGER MATH's raw baseline can no longer come from `view.liveTokens`, for the same
+ *      underlying reason as §3. `view.liveTokens` (`Truth.stats().liveTokens`) already reflects
+ *      THIS conductor's own persisted group's real (small) collapsed cost once one exists — but
+ *      `agedRegion` (§3) now correctly keeps that group's members IN `aged`, so `survivors` would
+ *      include them and `savedTokens` would subtract their saving a SECOND time, starving the
+ *      trigger. The fix, identical in shape to the sibling `compaction-naive` port: `ViewBlock.tokens`
+ *      is documented (`contract.ts`) as the block's FULL cost, unaffected by current fold/group
+ *      state — summing it over EVERY block (`sumTokens(view.blocks)`) reconstructs the
+ *      always-growing raw baseline the original algorithm assumed, without relying on a stats field
+ *      whose meaning changed underneath the port. Everything downstream — `savedTokens = Σ survivor
+ *      tokens − handoff cost`, `visible = rawTotal − savedTokens`, `visible >= 0.9 * budget` — is
+ *      the untouched original formula, just fed a locally-reconstructed `rawTotal`.
  *
- *      The fix: `emitHandoffGroup`'s survivor test drops the `!b.grouped` term, keeping only
- *      `!b.held`. This is SOUND, not just convenient: a block only ever enters `handedOffIds` at
- *      the moment `agedRegion` (unchanged, see §5) judged it neither held NOR grouped, and while
- *      this conductor holds all three locks nothing else can fold, pin, or group a block for the
- *      rest of its attached lifetime — so any `handedOffIds` member that is later `grouped` can
- *      only be a member of THIS conductor's own handoff group. Recognizing it as a survivor
- *      regardless of `grouped` lets `emitHandoffGroup` keep re-declaring the SAME `[first, last]`
- *      range + digest every idle pass, which `applyDesired` diffs to a true no-op (matching key,
- *      matching digest ⇒ no ops at all) — the group persists, exactly as intended.
- *
- *   4. `handedOffIds` ACCUMULATES (union), never REPLACES. Under the old reset-per-pass model,
- *      `aged` re-surfaced the conductor's ENTIRE prior history every pass (nothing was ever
- *      actually grouped when `conduct()` ran), so `handedOffIds = launchedAgedIds` (a wholesale
- *      replace) was harmless — `launchedAgedIds` already WAS the cumulative set. Under the new
- *      persistent model, `agedRegion` (§5, unchanged) EXCLUDES already-grouped blocks, so once a
- *      handoff group exists, a later round's `aged`/`launchedAgedIds` contains ONLY the genuinely
- *      new content — a wholesale replace would silently drop the earlier rounds' ids out of
- *      `handedOffIds`, and `emitHandoffGroup` would then treat the OLD group's members as
- *      non-survivors (their ids no longer in the set) and split them out of the run on the very
- *      next pass — reintroducing raw, full-content old blocks alongside the new (recursive)
- *      handoff, exactly the leak ADR 0017 §1 exists to prevent. The resolve handler now UNIONS
- *      `launchedAgedIds` into the existing `handedOffIds` instead of replacing it, so the tracked
- *      set is monotonically growing across every round, as the field's own doc comment always
- *      said it should be ("Grows only within a session").
- *
- *      A side benefit: the "[Handoff from a previous session — N earlier messages captured]"
- *      preamble now uses `this.handedOffIds.size` (read AFTER the union) for `N`, restoring the
- *      true cumulative-total meaning the old reset model gave that number for free — under a
- *      naive per-round `agedBlocks.length`, `N` would instead mean "how many blocks this round's
- *      completion read," a materially different (smaller) number on any second-or-later round.
- *
- *   5. TRIGGER MATH IS PORTED UNCHANGED, INCLUDING `agedRegion`'s `!b.grouped` TERM, AND THAT IS
- *      DELIBERATE. `view.liveTokens` under the new engine is `Truth.stats().liveTokens`, which
- *      ALREADY reflects the real, current token cost — including this conductor's own group's
- *      real (small) collapsed cost once it exists. `agedRegion` staying unchanged means
- *      `survivors` (used only for `savedTokens`/`visible`, never for `handedOffIds`) is EMPTY in
- *      steady state — so `savedTokens = 0` and `visible = view.liveTokens` directly, which is
- *      already correct (no double-counting the group's saving). This is why — UNLIKE the sibling
- *      `compaction-naive` conductor, which reconstructs a `sumTokens(view.blocks)` raw baseline
- *      because it does NOT hold `tail-size` and needs to include its protected-tail blocks in the
- *      trigger — this conductor keeps `view.liveTokens` verbatim: with `tailTokens = 0` every
- *      block is immediately fold-eligible with no protected-tail throttle, so a raw ever-growing
- *      total here would push `overThreshold` permanently true the instant ANY new block appends
- *      after the first handoff, defeating the 90%-high-water-mark hysteresis entirely. Relying on
- *      Truth's real-time `liveTokens` (which shrinks back down once the group applies) is what
- *      makes the "wait for genuine refill" behavior correct for a zero-tail conductor specifically.
+ *      Because `agedRegion` (with the §3 fix) now re-surfaces the conductor's ENTIRE prior history
+ *      every pass — not just the newly-arrived work, since its own group's members are no longer
+ *      excluded — `aged`/`launchedAgedIds` at launch time is already the correct CUMULATIVE set on
+ *      every round, exactly like the pre-excision conductor's `aged` was under the old host's
+ *      per-pass reset. `handedOffIds = launchedAgedIds` (a wholesale replace, unchanged from the
+ *      original) is therefore still correct — no separate accumulation bookkeeping is needed.
  *
  * Everything else — `HANDOFF_SYSTEM`, both `buildPrompt` branches, `neutralizeSentinels` (the
  * prompt-injection defense across the session boundary), the output-token reservation against
@@ -138,16 +119,19 @@ const TRIGGER = 0.9;
  * `Truth.setLocks` directly to simulate what that host will eventually do (see `handoff.test.ts`).
  *
  * WHY IT STAYS ZERO EVEN WHILE IDLE (accepted residual, ADR 0017 §"Hardening", item 4 — ported,
- * still applies under the new contract). Ideally the zero tail would apply only while a handoff
- * fold is actually in effect, and the human's default tail floor would stand during the long ramp
- * to the 0.9 trigger. That is not expressible from the conductor side: `tailTokens` is a static
- * declaration read once by whatever attaches this conductor (the future Phase C host), not a
- * per-`conduct()`-pass input — a getter that varied per pass would never take effect, and a
- * non-zero value would clamp the first handoff group `invalid-group` out of the newest blocks and
- * leak raw old-session context (breaking ADR 0017 §1 fidelity). Per-pass tail sizing needs a host
- * change, out of scope here. The residual is BENIGN for the wire: on every no-handoff path (below
- * trigger, in-flight, decline, empty/failed completion) the conductor emits `[]` or the prior
- * handoff group, so the session ships RAW — full content, nothing folded, zero data loss.
+ * still applies under the new contract, UNCHANGED by the port). Ideally the zero tail would apply
+ * only while a handoff fold is actually in effect, and the human's default tail floor would stand
+ * during the long ramp to the 0.9 trigger. That is not expressible from the conductor side:
+ * `tailTokens` is a static declaration read once by whatever attaches this conductor (the future
+ * Phase C host — same as the OLD host's `store.svelte.ts → syncLocks`, called only from
+ * `attach()`/`reconcileLocks()`, never per `conduct()` pass), not a per-`conduct()`-pass input — a
+ * getter that varied per pass would never take effect, and a non-zero value would clamp the first
+ * handoff group `invalid-group` out of the newest blocks and leak raw old-session context (breaking
+ * ADR 0017 §1 fidelity). Per-pass tail sizing needs a host change, out of scope for this port (the
+ * new contract does not change this — `Conductor.tailTokens` is still a static field, not a
+ * per-pass callback). The residual is BENIGN for the wire: on every no-handoff path (below trigger,
+ * in-flight, decline, empty/failed completion) the conductor emits `[]` or the prior handoff group,
+ * so the session ships RAW — full content, nothing folded, zero data loss.
  */
 export const HANDOFF_TAIL_TOKENS = 0;
 
@@ -234,9 +218,9 @@ export class HandoffConductor extends ViewConductor {
 
 	/**
 	 * The block ids currently represented by the handoff — the monotonic "already handed off" set.
-	 * Grows only within a session (via UNION on each successful completion — see PORT FIDELITY §4
-	 * above); cleared on attach. The handoff group covers `handedOffIds ∩ aged region`. Empty until
-	 * the first handoff completes.
+	 * Grows only within a session (replaced wholesale by each successful completion's aged set,
+	 * which is itself cumulative — see PORT FIDELITY §4); cleared on attach. The handoff group
+	 * covers `handedOffIds ∩ aged region`. Empty until the first handoff completes.
 	 */
 	private handedOffIds: Set<string> = new Set();
 
@@ -299,12 +283,10 @@ export class HandoffConductor extends ViewConductor {
 
 	conduct(view: ConductorView): Command[] | null {
 		// AGED REGION: every block older than the conductor-owned protected boundary that is not
-		// human-held and not already inside a group. With `tailTokens = 0`, that boundary is the
-		// end of the session, so the first handoff can swallow the whole current conversation.
-		// ALL kinds are included — the single handoff group and the host's whole-message snap +
-		// pair-balance keeps the result wire-valid (a tool_call is never orphaned from its result).
-		// Unchanged from the pre-excision conductor — see PORT FIDELITY §5 for why this must NOT
-		// be adapted despite the group now persisting across passes.
+		// human-held and not already inside a FOREIGN (non-this-conductor) group. With
+		// `tailTokens = 0`, that boundary is the end of the session, so the first handoff can
+		// swallow the whole current conversation, and this conductor's OWN standing group never
+		// excludes its own members from later passes — see PORT FIDELITY §3.
 		const aged = this.agedRegion(view);
 
 		// Degenerate config / empty session: nothing to manage. Hold any existing handoff.
@@ -315,18 +297,16 @@ export class HandoffConductor extends ViewConductor {
 		// If a completion is in-flight, hold the current state — never launch a second.
 		if (this.inflight !== null) return this.emitHandoffGroup(view);
 
-		// The blocks already in the handoff that are still in the (unchanged) aged region. In
-		// steady state (nothing new since the last commit) this is EMPTY — the handoff's own
-		// members are `grouped` and therefore excluded from `aged` — which is exactly what makes
-		// `savedTokens` correctly collapse to 0 below (see PORT FIDELITY §5).
+		// The blocks already in the handoff that are still in the aged region. These are what the
+		// handoff group covers, and their tokens are the saving that shrinks the VISIBLE window
+		// below the raw baseline.
 		const survivors = aged.filter((b) => this.handedOffIds.has(b.id));
 
-		// VISIBLE window = current liveTokens minus any UNCREDITED saving `aged` still reveals
-		// (only non-zero when a prior handoff's blocks are stuck ungrouped, e.g. a clamped commit).
-		// `view.liveTokens` already reflects the handoff group's real cost once it exists (Truth
-		// does not reset a conductor's own folds between passes) — see PORT FIDELITY §5.
+		// RAW baseline: Σ full token cost over EVERY block. See PORT FIDELITY §4 for why this is
+		// reconstructed locally from `ViewBlock.tokens` rather than read off `view.liveTokens`.
+		const rawTotal = sumTokens(view.blocks);
 		const savedTokens = this.handoff !== null ? Math.max(0, sumTokens(survivors) - this.handoffTokenCost()) : 0;
-		const visible = view.liveTokens - savedTokens;
+		const visible = rawTotal - savedTokens;
 		const overThreshold = visible >= view.budget * TRIGGER;
 
 		// What is genuinely new since the last successful handoff.
@@ -375,17 +355,34 @@ export class HandoffConductor extends ViewConductor {
 	// ── helpers ───────────────────────────────────────────────────────────────
 
 	/**
+	 * Ids currently inside a FOLDED group this conductor did NOT create. Every conductor-proposed
+	 * op runs under actor `"auto"` (`ConductorHost.propose` → `Truth.apply(ops, "auto", …)`, see
+	 * `ViewConductor.applyDesired`), so `g.by !== "auto"` reliably means "a human made this group"
+	 * — the only kind of FOREIGN group this exclusive conductor can encounter. See PORT FIDELITY §3
+	 * for why this replaces the blanket `ViewBlock.grouped`.
+	 */
+	private foreignGroupedIds(): Set<string> {
+		const ids = new Set<string>();
+		for (const g of this.host.groups()) {
+			if (g.by === "auto") continue; // this conductor's own standing group — never foreign
+			for (const id of g.memberIds) ids.add(id);
+		}
+		return ids;
+	}
+
+	/**
 	 * The aged region: every block older than the conductor-owned protected boundary that is not
-	 * human-held and not already inside a group. For this conductor's zero tail that is the whole
-	 * current session; later, after a handoff exists, it is only the newly-arrived work (the
-	 * handoff's own members are `grouped` and excluded — see PORT FIDELITY §5). All kinds included
-	 * (the single handoff group swallows the region; the host pair-balances tool calls/results).
+	 * human-held and not already inside a FOREIGN group. For this conductor's zero tail that is the
+	 * whole current session, INCLUDING blocks already folded into this conductor's own handoff
+	 * group (only a FOREIGN group excludes — PORT FIDELITY §3). All kinds included (the single
+	 * handoff group swallows the region; the host pair-balances tool calls/results).
 	 */
 	private agedRegion(view: ConductorView): ViewBlock[] {
+		const foreign = this.foreignGroupedIds();
 		const aged: ViewBlock[] = [];
 		for (let i = 0; i < view.protectedFromIndex && i < view.blocks.length; i++) {
 			const b = view.blocks[i];
-			if (!b.held && !b.grouped) aged.push(b);
+			if (!b.held && !foreign.has(b.id)) aged.push(b);
 		}
 		return aged;
 	}
@@ -393,25 +390,18 @@ export class HandoffConductor extends ViewConductor {
 	/**
 	 * Emit the handoff as `group` command(s) (digest = handoff) covering the handed-off survivors
 	 * in the aged PREFIX. Re-derived from the LIVE view every call:
-	 *   - A survivor is a block in `handedOffIds` that is not held. UNLIKE the pre-excision
-	 *     conductor, this deliberately does NOT also require `!b.grouped` — see PORT FIDELITY §3.
-	 *     Once the handoff group exists, its own members report `grouped: true` forever (the new
-	 *     engine does not reset a conductor's own folds between passes); excluding them here would
-	 *     make this method see zero survivors on the very next pass and return `[]`, which the
-	 *     adapter reads as "ungroup" — destroying the fresh-start immediately after creating it.
-	 *     Treating `handedOffIds` membership (plus `!held`) as sufficient is sound: nothing else can
-	 *     fold/pin/group a block while this conductor holds all three locks, so a `handedOffIds`
-	 *     member that is `grouped` can only be grouped BY THIS CONDUCTOR's own handoff.
+	 *   - A survivor is a block in `handedOffIds` that is not held and not inside a FOREIGN group.
+	 *     This conductor's OWN standing group from a prior pass does NOT disqualify a block — see
+	 *     PORT FIDELITY §3 for why the pre-excision conductor's `!b.grouped` had to become
+	 *     `!foreign.has(id)`.
 	 *   - No survivors → `[]` (clear to raw; lossless — the host resets all blocks to full content
 	 *     this pass).
 	 *   - Otherwise one `group(first, last, digest)` per MAXIMAL CONTIGUOUS run of survivors,
-	 *     walking the FULL aged prefix (including held blocks, and any FOREIGN group's blocks —
-	 *     which can never be in `handedOffIds`, see PORT FIDELITY §3 — so they still correctly
-	 *     split a run) so a human-held or foreign-grouped block SPLITS the run rather than being
-	 *     spanned. Under `human-steering` the aged region is contiguous, so there is exactly ONE
-	 *     run in the common case; a pre-existing held/grouped block splitting the region yields one
-	 *     group per side, each carrying the handoff digest — every survivor stays covered, none
-	 *     dropped.
+	 *     walking the FULL aged prefix (including held/foreign-grouped blocks) so a human-held or
+	 *     foreign-grouped block SPLITS the run rather than being spanned. Under `human-steering` the
+	 *     aged region is contiguous, so there is exactly ONE run in the common case; a pre-existing
+	 *     held/foreign-grouped block splitting the region yields one group per side, each carrying
+	 *     the handoff digest — every survivor stays covered, none dropped.
 	 *
 	 * The host snaps each run outward to whole messages and refuses one whose snapped range reaches
 	 * into the protected tail (`invalid-group` clamp) — refused runs' blocks simply stay live that
@@ -425,6 +415,7 @@ export class HandoffConductor extends ViewConductor {
 	private emitHandoffGroup(view: ConductorView): Command[] | null {
 		if (this.handoff === null) return null;
 
+		const foreign = this.foreignGroupedIds();
 		const cmds: Command[] = [];
 		let runStart = -1;
 		let runEnd = -1;
@@ -442,7 +433,7 @@ export class HandoffConductor extends ViewConductor {
 		const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
 		for (let i = 0; i < pfi; i++) {
 			const b = view.blocks[i];
-			if (this.handedOffIds.has(b.id) && !b.held) {
+			if (this.handedOffIds.has(b.id) && !b.held && !foreign.has(b.id)) {
 				survivorCount++;
 				if (runStart === -1) runStart = i;
 				runEnd = i;
@@ -493,6 +484,9 @@ export class HandoffConductor extends ViewConductor {
 	 * FIDELITY §2) to schedule a fresh `conduct()` pass.
 	 *
 	 * @param agedBlocks    - all aged blocks at launch time (SNAPSHOT — don't use the view later).
+	 *                        With PORT FIDELITY §3/§4's fix this is already the CUMULATIVE set
+	 *                        (old handed-off blocks + newly aged ones), matching what the
+	 *                        pre-excision conductor's `aged` was under the old host's per-pass reset.
 	 * @param newlyAged     - subset not already in handedOffIds (used to build the recursive prompt).
 	 * @param attemptKey    - the sorted-join key of the NEWLY AGED set; stored to prevent
 	 *                        re-launching the same set after a rejection.
@@ -503,11 +497,10 @@ export class HandoffConductor extends ViewConductor {
 		// Safety: should never reach here while inflight, but guard defensively.
 		if (this.inflight !== null) return;
 
-		// Snapshot the ids at LAUNCH TIME. The resolve handler UNIONS these into `handedOffIds`
-		// (PORT FIDELITY §4) so it commits the handoff against exactly the blocks it wrote from,
-		// while never forgetting an earlier round's blocks.
+		// Snapshot the ids and count at LAUNCH TIME. The resolve handler closes over these so it
+		// commits the handoff against exactly the blocks it wrote from.
 		const launchedAgedIds = new Set(agedBlocks.map((b) => b.id));
-		const roundCount = agedBlocks.length;
+		const count = agedBlocks.length;
 
 		const prompt = this.buildPrompt(newlyAged);
 
@@ -565,17 +558,16 @@ export class HandoffConductor extends ViewConductor {
 						// genuinely new aged content before retrying this same key.
 						this.inflight = null;
 						this.failureStatus = "Handoff failed — model returned an empty document";
-						this.host.setStatus(this.failureStatus, { aged: roundCount });
+						this.host.setStatus(this.failureStatus, { aged: count });
 						return;
 					}
-					// Success: UNION the launched ids into the monotonic handed-off set (PORT
-					// FIDELITY §4 — never replace, or an earlier round's blocks silently fall out of
-					// `handedOffIds` and leak back onto the wire as raw content on the next pass).
+					// Success: commit the new handoff. The group covers `handedOffIds ∩ aged` and is
+					// re-derived from the live view every pass by emitHandoffGroup, so it stays valid
+					// even if blocks shift, vanish, or re-home across the protected boundary.
 					this.inflight = null;
 					this.failureStatus = null;
-					for (const id of launchedAgedIds) this.handedOffIds.add(id);
-					const total = this.handedOffIds.size;
-					this.handoff = `[Handoff from a previous session — ${total} earlier message${total === 1 ? "" : "s"} captured in this briefing]\n\n${text}`;
+					this.handoff = `[Handoff from a previous session — ${count} earlier message${count === 1 ? "" : "s"} captured in this briefing]\n\n${text}`;
+					this.handedOffIds = launchedAgedIds;
 					// Re-run conduct() now so the handoff group takes effect immediately.
 					this.rerun();
 				},
@@ -595,7 +587,7 @@ export class HandoffConductor extends ViewConductor {
 					this.inflight = null;
 					const detail = truncateForStatus(err instanceof Error ? err.message : String(err));
 					this.failureStatus = `Handoff failed — ${detail || "model completion error"}`;
-					this.host.setStatus(this.failureStatus, { aged: roundCount });
+					this.host.setStatus(this.failureStatus, { aged: count });
 				},
 			);
 	}
@@ -683,7 +675,7 @@ export function truncateForStatus(s: string, max: number = ERROR_STATUS_MAX_LEN)
 	return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
-/** Sum the full token cost of a set of blocks. Ported verbatim. */
+/** Sum the full token cost of a set of blocks. `ViewBlock.tokens` is always the FULL cost. Ported verbatim. */
 export function sumTokens(blocks: readonly ViewBlock[]): number {
 	let n = 0;
 	for (const b of blocks) n += b.tokens;

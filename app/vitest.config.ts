@@ -30,6 +30,6 @@ export default defineConfig({
 	},
 	test: {
 		environment: "node",
-		include: ["src/lib/**/*.test.ts", "../core/**/*.test.ts"],
+		include: ["src/lib/**/*.test.ts", "../core/**/*.test.ts", "../conductors/**/*.test.ts"],
 	},
 });
