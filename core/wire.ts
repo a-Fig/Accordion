@@ -22,7 +22,7 @@
  * compile time and `core/` carries no runtime dependency on the app. Relocating these wire
  * types into `core/` is a scoped Phase-B follow-up.
  */
-import type { WireBlock, FoldOp, GroupOp } from "../app/src/lib/live/protocol";
+import type { WireBlock, FoldOp, GroupOp } from "./protocol";
 import type { Block } from "./types";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 
@@ -119,11 +119,17 @@ const tokensFor = (text: string): number => estTokens(text) + BLOCK_OVERHEAD;
  * Linearize pi's in-memory message array into wire blocks, mirroring the on-disk
  * parser (engine/parse.ts → parsePi) but operating on live messages. Deterministic:
  * same messages → same blocks/ids.
+ *
+ * `orderStart` / `turnStart` let a caller linearize a SUFFIX with globally-correct numbering
+ * (Phase B incremental append): pass the count of blocks already appended as `orderStart` and the
+ * current turn number as `turnStart`, so the suffix's `order` continues contiguously and its `turn`
+ * continues from the last block's turn (a leading user message advances to `turnStart + 1`). Both
+ * default to 0 — a full linearize is unchanged.
  */
-export function linearize(messages: PiMessage[]): WireBlock[] {
+export function linearize(messages: PiMessage[], orderStart = 0, turnStart = 0): WireBlock[] {
 	const out: WireBlock[] = [];
-	let order = 0;
-	let turn = 0;
+	let order = orderStart;
+	let turn = turnStart;
 
 	const push = (
 		id: string,
