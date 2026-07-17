@@ -214,6 +214,40 @@ test("buoy split: a hot unit between cold units splits the run into two strata",
 	for (const r of runs) expect(r.memberIds).not.toContain("HOT");
 });
 
+// ── MESSAGE-ATOM SNAP — a run may not start/end mid assistant-message ──────────────────────────
+// Sibling parts of ONE assistant message share a messageKey (`a:m1:p0/p1/p2` → `a:m1`) but graduate
+// independently. If a run starts or ends on a mid-message part whose siblings are hot buoys, Truth's
+// group snap (core/truth.ts → snappedRange) would walk the boundary out to the whole message and pull
+// the excluded siblings into the group. sedimentRuns must snap the run INWARD to message atoms so its
+// member set is a FIXED POINT of that snap — the partial-message parts stay at their current fidelity.
+test("message-atom snap: a run excludes partial-message clusters at BOTH edges (fixed point)", () => {
+	_order = 0;
+	// mA is split at the FRONT (mA:p0 hot, mA:p1 graduated); mE is split at the BACK (mE:p0 graduated,
+	// mE:p1 hot). Only whole messages mB/mC/mD may survive into the stratum.
+	const blocks = [
+		blk({ id: "a:mA:p0", kind: "thinking", order: 0, tokens: 3_000 }), // HOT buoy
+		blk({ id: "a:mA:p1", kind: "text", order: 1, tokens: 3_000, folded: true }), // front partial
+		blk({ id: "a:mB:p0", kind: "text", order: 2, tokens: 3_000, folded: true }),
+		blk({ id: "a:mC:p0", kind: "text", order: 3, tokens: 3_000, folded: true }),
+		blk({ id: "a:mD:p0", kind: "text", order: 4, tokens: 3_000, folded: true }),
+		blk({ id: "a:mE:p0", kind: "text", order: 5, tokens: 3_000, folded: true }), // back partial
+		blk({ id: "a:mE:p1", kind: "thinking", order: 6, tokens: 3_000 }), // HOT buoy
+	];
+	const v = view(blocks, { protectedFromIndex: blocks.length });
+	const scores = new Map(blocks.map((b) => [b.id, /p1$/.test(b.id) && b.kind === "thinking" ? 0.95 : b.id === "a:mA:p0" ? 0.95 : 0.02]));
+	// Everything cold graduates; the two hot buoys (mA:p0, mE:p1) do not.
+	const graduated = new Set(["a:mA:p1", "a:mB:p0", "a:mC:p0", "a:mD:p0", "a:mE:p0"]);
+	const runs = sedimentRuns(v, scores, graduated, DEFAULT_CFG);
+
+	expect(runs.length).toBe(1);
+	const r = runs[0];
+	// Only the three WHOLE middle messages survive — the mid-message parts are excluded, not absorbed.
+	expect(r.unitIds).toEqual(["a:mB:p0", "a:mC:p0", "a:mD:p0"]);
+	expect(r.firstId).toBe("a:mB:p0");
+	expect(r.lastId).toBe("a:mD:p0");
+	for (const excluded of ["a:mA:p0", "a:mA:p1", "a:mE:p0", "a:mE:p1"]) expect(r.memberIds).not.toContain(excluded);
+});
+
 // ── DOUBLE GATE ───────────────────────────────────────────────────────────────────────────────
 describe("double-gate graduation", () => {
 	test("a cold + not-recalled folded unit graduates only after K epochs", () => {

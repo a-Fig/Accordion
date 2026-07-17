@@ -15,7 +15,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TestHost } from "../../core/conductor/testhost";
 import type { Block } from "../../core/types";
+import type { Op, TxnResult } from "../../core/ops";
+import { foldTag } from "../../core/digest";
 import { ThermoclineConductor, reconcilePlan, planWithRealStratumTokens, dropOwnStrataOldestFirst } from "./thermocline";
+import { planEpoch, emitOps, DEFAULT_CFG } from "./policy";
 import type { Plan, ConductorView, ViewBlock } from "./policy";
 
 // ── helpers ───────────────────────────────────────────────────────────────────────────────────
@@ -51,6 +54,144 @@ function pairs(n: number): Block[] {
 	}
 	return out;
 }
+
+/** A ConductorView materialized from a live host — the RAW `fullTokens` baseline the policy folds
+ *  down from (matches ThermoclineConductor.materialize). */
+function viewOf(host: TestHost): ConductorView {
+	const s = host.truth.stats();
+	return {
+		blocks: host.blocks().slice() as ViewBlock[],
+		budget: s.budget,
+		contextWindow: s.contextWindow,
+		liveTokens: s.fullTokens,
+		protectedFromIndex: s.protectedFromIndex,
+		protectTokens: s.protectTokens,
+	};
+}
+
+// ── APPLIED GROUPS MATCH THE PLAN — message-atom fixed point through the REAL Truth ────────────
+//
+// Sibling parts of one assistant message (`a:m1:p0/p1/p2` → messageKey `a:m1`) graduate independently.
+// A run that starts mid-message must NOT let Truth's group snap (core/truth.ts → snappedRange) pull the
+// excluded siblings in. These tests run the policy's ops through a REAL Truth and assert the applied
+// group's id + member set equal the plan's, and the baked recall tag equals foldTag of the id Truth
+// actually assigned. (Fixed-point ids self-map, so the bug only appears with these `:p` sibling ids.)
+describe("applied group == plan (real Truth, message-atom fixed point)", () => {
+	/** mA is split: mA:p0 is a HOT buoy, mA:p1 is cold+graduated. mB/mC/mD are whole cold messages. The
+	 *  naive run would start at mA:p1 (mid-message mA) and snap out to swallow mA:p0. */
+	function graduatedScenario(budget: number) {
+		const host = new TestHost();
+		host.setBudget(budget);
+		host.setProtect(0); // nothing protected — every block is groupable
+		host.appendBlocks([
+			block({ id: "a:mA:p0", kind: "thinking", order: 0, tokens: 3_000, text: "hot reasoning" }),
+			block({ id: "a:mA:p1", kind: "text", order: 1, tokens: 3_000, text: "assistant reply part" }),
+			block({ id: "a:mB:p0", kind: "text", order: 2, tokens: 3_000, text: "second message" }),
+			block({ id: "a:mC:p0", kind: "text", order: 3, tokens: 3_000, text: "third message" }),
+			block({ id: "a:mD:p0", kind: "text", order: 4, tokens: 3_000, text: "fourth message" }),
+		]);
+		const view = viewOf(host);
+		// Everything except the hot mA:p0 graduated.
+		const scores = new Map<string, number>([
+			["a:mA:p0", 0.95],
+			["a:mA:p1", 0.02],
+			["a:mB:p0", 0.02],
+			["a:mC:p0", 0.02],
+			["a:mD:p0", 0.02],
+		]);
+		const graduated = new Set(["a:mA:p1", "a:mB:p0", "a:mC:p0", "a:mD:p0"]);
+		const plan = planEpoch(view, scores, { dwell: new Map() }, DEFAULT_CFG, { graduated });
+		return { host, view, plan };
+	}
+
+	test("a graduated SUMMARY run whose naive boundary starts mid-message: applied group == plan; baked tag == foldTag(real id)", () => {
+		const { host, view, plan } = graduatedScenario(100_000); // roomy → the stratum stays a summary
+		const stratum = plan.strata.find((s) => s.digestKind === "summary")!;
+		expect(stratum).toBeTruthy();
+		// The plan already EXCLUDES the mid-message front part mA:p1 (and mA:p0).
+		expect(stratum.ids[0]).toBe("a:mB:p0");
+		expect(stratum.memberIds).not.toContain("a:mA:p0");
+		expect(stratum.memberIds).not.toContain("a:mA:p1");
+
+		const digests = new Map<string, string>([[`stratum:${stratum.ids[0]}`, "HOLISTIC RUN SUMMARY"]]);
+		host.truth.apply(emitOps(plan, digests, view), "auto");
+
+		const groups = host.truth.groups;
+		expect(groups.length).toBe(1);
+		const g = groups[0];
+		// INVARIANT 1: the set Truth grouped is EXACTLY the plan's — no absorbed sibling.
+		expect(new Set(g.memberIds)).toEqual(new Set(stratum.memberIds));
+		expect(g.memberIds).not.toContain("a:mA:p0");
+		expect(g.memberIds).not.toContain("a:mA:p1");
+		expect(g.id).toBe(`g:${stratum.ids[0]}`);
+		// INVARIANT 2: the baked recall tag equals foldTag of the group id Truth actually assigned.
+		expect(typeof g.digest).toBe("string");
+		expect((g.digest as string).startsWith(foldTag(g.id))).toBe(true);
+		expect(g.digest).toBe(`${foldTag(`g:${stratum.ids[0]}`)} HOLISTIC RUN SUMMARY`);
+	});
+
+	test("a DROP run of the same shape never absorbs an out-of-plan sibling", () => {
+		const { host, view, plan } = graduatedScenario(100_000);
+		const stratum = plan.strata.find((s) => s.digestKind === "summary")!;
+		// Render the same message-atom-snapped run as a DROP (summary:null). The boundary under test is
+		// still the planner's; only the drop rendering is forced.
+		const dropPlan: Plan = { ...plan, strata: plan.strata.map((s) => ({ ...s, digestKind: "drop", summaryTokens: 0 })) };
+		host.truth.apply(emitOps(dropPlan, null, view), "auto");
+
+		const groups = host.truth.groups;
+		expect(groups.length).toBe(1);
+		const g = groups[0];
+		expect(host.truth.isDropGroup(g)).toBe(true);
+		// INVARIANT 3: a drop must not silently swallow the excluded mid-message parts (no tag, no recall).
+		expect(new Set(g.memberIds)).toEqual(new Set(stratum.memberIds));
+		expect(g.memberIds).not.toContain("a:mA:p0");
+		expect(g.memberIds).not.toContain("a:mA:p1");
+	});
+});
+
+// ── belt-and-braces: a reported applied-id mismatch is repaired, never baked ──────────────────
+// If the engine ever grouped to a DIFFERENT id than `g:<firstId>` (a boundary regression), the baked
+// foldTag would be unresolvable and content may have been absorbed. The conductor detects this from
+// propose()'s real `detail`, undoes the group, discards the bookkeeping, and logs — never keeping a
+// stratum whose recall tag can't resolve. We force the mismatch by lying in the host's `detail`.
+test("belt-and-braces: a mismatched applied group id is discarded + repaired, no bad tag kept", async () => {
+	class DetailLyingHost extends TestHost {
+		proposed: Op[][] = [];
+		lie = true;
+		propose(txn: { baseRev: number; ops: Op[] }): TxnResult {
+			this.proposed.push(txn.ops);
+			const res = super.propose(txn);
+			if (!this.lie) return res;
+			return {
+				...res,
+				results: res.results.map((r) => (r.applied && r.op.kind === "group" ? { ...r, detail: "g:__BOGUS__" } : r)),
+			};
+		}
+	}
+	const host = new DetailLyingHost();
+	const cond = new ThermoclineConductor({ scorer: emptyScorer, sessionKey: null });
+	const warnings: string[] = [];
+	const origWarn = console.warn;
+	console.warn = (...a: unknown[]) => warnings.push(a.join(" "));
+	try {
+		cond.attach(host);
+		host.setBudget(30_000);
+		host.setProtect(300);
+		host.appendBlocks(pairs(8)); // over budget → emergency creates ≥1 age-stratum → group ops proposed
+		await flush();
+	} finally {
+		console.warn = origWarn;
+	}
+
+	// The engine really applied the group(s) (with the CORRECT id) — but the host LIED about the detail,
+	// so the belt-and-braces must have (a) warned, (b) proposed a repair ungroup for the bogus id, and
+	// (c) discarded the stratum from its own bookkeeping (the last status metric reports 0 strata).
+	expect(warnings.some((w) => w.includes("discarded") && w.includes("g:__BOGUS__"))).toBe(true);
+	const repairedBogus = host.proposed.some((ops) => ops.some((o) => o.kind === "ungroup" && o.groupId === "g:__BOGUS__"));
+	expect(repairedBogus).toBe(true);
+	const lastStrata = [...host.statusLog].reverse().find((s) => s.metrics && "strata" in s.metrics)?.metrics?.strata;
+	expect(lastStrata).toBe(0); // no mismatched stratum was ever recorded (no bad tag baked into applied state)
+});
 
 // ── EMERGENCY: over cap → deterministic, no LLM ──────────────────────────────────────────────
 test("EMERGENCY: over the hard cap → deterministic compression, NO host.complete", async () => {

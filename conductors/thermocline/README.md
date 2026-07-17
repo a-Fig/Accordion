@@ -35,7 +35,12 @@ Every block sits at the highest fidelity budget pressure and attention allow:
 - **L2 Digest** — a faithful 1–3 line LLM summary, content-cached. Emitted as a `replace` op with
   `recoverable:true`; the **engine** prepends the canonical `{#code FOLDED}` tag.
 - **L3 Stratum** — a contiguous cold *run* summarized holistically into one `group`. User messages
-  reproduced verbatim. Recall-able by construction.
+  reproduced verbatim. **Recall-able because every run is snapped inward to message atoms** before it
+  is emitted (`policy.ts → safeRunFromUnits`): the run's member set is a fixed point of the engine's
+  group snap (`core/truth.ts → snappedRange`), so the group id Truth assigns — and thus the baked
+  `foldTag("g:"+firstId)` recall handle — is exactly what the plan intended, and no sibling block is
+  absorbed. A belt-and-braces check in the conductor repairs any residual mismatch rather than ship
+  an unresolvable tag.
 - **L4 Merged / drop** — graded forgetting of the deep zone; `group(summary:null)` is the floor.
 
 ## How the probe works
