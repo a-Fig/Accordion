@@ -17,7 +17,9 @@
 //     signal,                                      // optional AbortSignal for teardown
 //   }): Promise<void>
 //
-//   • It dials ws://127.0.0.1:${ACCORDION_PORT} with Authorization: Bearer ${ACCORDION_TOKEN}.
+//   • It dials ws://127.0.0.1:${ACCORDION_PORT}/?role=conductor&token=${ACCORDION_TOKEN} — the
+//     token rides the QUERY STRING (never an Authorization header), exactly matching the GUI
+//     client's own dial convention (app/src/lib/live/liveClient.svelte.ts's `tokenQs`).
 //   • It builds a local `ConductorHost` that mirrors the remote Truth (streaming TruthEvents into
 //     HostEvents) and proxies `propose` / `complete` / `stats` / `setStatus` over the wire.
 //   • It calls `conductor.attach(host)` after the first sync, pumps events, and calls
@@ -51,15 +53,40 @@ async function main() {
 		process.exit(0);
 	}
 
-	// TODO(Phase C): the remote SDK does not exist yet. When it lands, this import resolves and the
-	// runner wires env → host → conductor. Until then, importing it throws and we exit gracefully.
+	// STATUS: `core/conductor/remote.ts` now EXISTS (`runRemoteConductor`, tested in
+	// `core/conductor/remote.test.ts`) — but this plain `.mjs` entry point still cannot import it,
+	// for a more specific reason than "the SDK isn't built yet":
+	//
+	//   1. Node CAN strip `.ts` type syntax from a SINGLE file with zero flags/deps on the Node
+	//      version this extension targets (verified: Node 22.22.2 imports a lone `.ts` file with no
+	//      `--experimental-strip-types` flag needed). So `import("../../core/conductor/remote.ts")`
+	//      alone would not be the blocker.
+	//   2. But `remote.ts` — like every file in `core/` (`./replica`, `./truth`, `./protocol`, …) —
+	//      uses EXTENSIONLESS relative imports, the TypeScript `moduleResolution: "bundler"`
+	//      convention `app/tsconfig.json` / Vite already rely on. Node's own ESM resolver never
+	//      infers a missing extension, `.ts` or otherwise, so the import fails several frames deep
+	//      in `core/`'s own dependency graph (e.g. "Cannot find module '.../core/replica'"), not at
+	//      this top-level specifier — confirmed by hand against the real file while investigating
+	//      this comment. Simply correcting the extension here to `remote.ts` would NOT fix that.
+	//
+	// Fixing it needs one of: (a) a build step that bundles `remote.ts` + its `core/` dependency
+	// graph into one flat, extension-resolved `.js` — mirroring how `build-extension.mjs` already
+	// bundles `accordion.ts` with esbuild (already a devDependency); (b) launching this runner
+	// through a loader that resolves bare/extensionless specifiers (e.g. `tsx`, or a custom
+	// `module.register()` resolve hook); or (c) mechanically adding explicit extensions across every
+	// `core/` import (touches `core/protocol.ts`, which is frozen, and files outside this runner's
+	// remit). All three are spawn/build-pipeline decisions the extension side owns (how and with
+	// what working directory this runner gets launched), not something this file can settle alone —
+	// flagging for the coordinator to wire in integration. Until then this stays a graceful stub:
+	// the defensive import below still throws (module-resolution failure, same as before, just
+	// deeper in the graph) and we exit 0 rather than crash a premature Phase-C spawn.
 	let runRemoteConductor;
 	try {
 		// The path is relative to the built runner location; Phase C decides whether the conductor is
 		// run from source via a TS loader or from a compiled bundle. Both resolve `core/conductor/remote`.
 		({ runRemoteConductor } = await import("../../core/conductor/remote.js"));
 	} catch {
-		log("remote conductor SDK (core/conductor/remote) not present yet — Phase C has not landed. Exiting 0.");
+		log("remote conductor SDK (core/conductor/remote) not resolvable from this plain .mjs entry point yet — see the STATUS comment above. Exiting 0.");
 		process.exit(0);
 	}
 
