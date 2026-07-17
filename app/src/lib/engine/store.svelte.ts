@@ -15,18 +15,11 @@ import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
 import type { LockName } from "./locks";
 import { hasLock } from "./locks";
 import { Truth } from "$core/truth";
-import type { Op, OpResult } from "$core/ops";
+import type { Op } from "$core/ops";
 import type { TruthEvent } from "$core/events";
 import { applyWireEvent } from "$core/replica";
 import { resolveUnfold as coreResolveUnfold, resolveRecall as coreResolveRecall } from "$core/agentView";
 import type { WireEvent, WireCommand, FoldOp, GroupOp } from "$core/protocol";
-
-interface LogEntry {
-	by: Actor;
-	action: string;
-	detail: string;
-	n: number;
-}
 
 function cloneBlock(b: Block): Block {
 	return {
@@ -72,7 +65,6 @@ export class AccordionStore {
 	budget = $state(70_000);
 	contextWindow = $state<number | null>(null);
 	protectTokens = $state(20_000);
-	log = $state<LogEntry[]>([]);
 	/** Bumped on every truth event — the reactive redraw signal the forwarded reads depend on. */
 	version = $state(0);
 
@@ -80,7 +72,6 @@ export class AccordionStore {
 	private _holder = $state<string | null>(null);
 	private _activeTail = $state(0);
 
-	private logN = 0;
 	private mirrorIndex = new Map<string, number>();
 
 	/**
@@ -135,7 +126,6 @@ export class AccordionStore {
 			case "ops-applied":
 				this.syncOverlay();
 				this.syncGroups();
-				this.logFromResults(e.by, e.results);
 				break;
 			case "config":
 				this.syncOverlay();
@@ -154,7 +144,6 @@ export class AccordionStore {
 			case "reset":
 				this.syncOverlay();
 				this.syncGroups();
-				this.emit("you", "reset", "all blocks to auto");
 				break;
 			case "sent":
 				break; // no overlay change; just a redraw
@@ -237,22 +226,6 @@ export class AccordionStore {
 	}
 	resolveRecall(codes: string[]) {
 		return coreResolveRecall(this.truth, codes);
-	}
-
-	// ── activity log (built from truth events) ──────────────────────────────
-	private emit(by: Actor, action: string, detail: string): void {
-		this.log.unshift({ by, action, detail, n: this.logN++ });
-		if (this.log.length > 80) this.log.pop();
-	}
-	private logFromResults(by: Actor, results: OpResult[]): void {
-		for (const r of results) {
-			if (!r.applied) continue;
-			const a = actionFor(r.op);
-			if (!a) continue;
-			const id = opTargetId(r.op);
-			const b = id ? this.get(id) : undefined;
-			this.emit(by, a, b ? label(b) : (opTargetId(r.op) ?? ""));
-		}
 	}
 
 	// ── reads (forward to truth; reactive via `version`) ────────────────────
@@ -454,45 +427,4 @@ export class AccordionStore {
 		if (!g) return;
 		g.folded ? this.unfoldGroup(id, by) : this.foldGroup(id, by);
 	}
-}
-
-function label(b: Block): string {
-	const where = b.turn > 0 ? `turn ${b.turn}` : "preamble";
-	return b.toolName ? `${b.kind} ${b.toolName} · ${where}` : `${b.kind} · ${where}`;
-}
-
-function actionFor(op: Op): string | null {
-	switch (op.kind) {
-		case "fold":
-			return "folded";
-		case "unfold":
-			return "unfolded";
-		case "pin":
-			return "pinned";
-		case "unpin":
-			return "unpinned";
-		case "auto":
-			return "reverted";
-		case "replace":
-			return "replaced";
-		case "group":
-			return "grouped";
-		case "ungroup":
-			return "ungrouped";
-		case "foldGroup":
-			return "group folded";
-		case "unfoldGroup":
-			return "group unfolded";
-		case "resetAll":
-			return null; // reset is logged from the "reset" event
-		case "freeze":
-			return null; // host-only conductor-detach bookkeeping (Phase C) — never a human action to log
-	}
-}
-function opTargetId(op: Op): string | undefined {
-	if (op.kind === "replace") return op.id;
-	if (op.kind === "ungroup" || op.kind === "foldGroup" || op.kind === "unfoldGroup") return op.groupId;
-	if (op.kind === "resetAll" || op.kind === "freeze") return undefined;
-	if (op.kind === "group") return op.ids[0];
-	return op.ids[0];
 }
