@@ -25,6 +25,7 @@ import {
 	type HelloMessage,
 	type SnapshotState,
 	type WireCommand,
+	type ActiveConductorMeta,
 } from "./protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 
@@ -39,20 +40,32 @@ let pendingMeta: SessionMeta = { format: "pi", title: "live pi session", cwd: ""
 
 /** Fresh, all-zero hook telemetry — one connection's worth. */
 function freshTelemetry() {
-	return { lastHookMs: 0, maxHookMs: 0, p95HookMs: 0, rebuilds: 0, hookCount: 0 };
+	return { lastHookMs: 0, maxHookMs: 0, p95HookMs: 0, rebuilds: 0, hookCount: 0, lastHoldMs: 0, holdTimeouts: 0 };
 }
 
 /**
  * Live connection status, for the UI. `telemetry` is the extension's `context`-hook duration
  * stream (Phase B replaced the plan-outcome tally): the latency badge reads `lastHookMs`, with
- * `maxHookMs` / `p95HookMs` / `rebuilds` in its tooltip. Reset on every new connection.
+ * `maxHookMs` / `p95HookMs` / `rebuilds` in its tooltip. `lastHoldMs`/`holdTimeouts` (v13) are the
+ * NEW wire-departing hold the host grants an attached conductor's last-moment proposal — the
+ * latency badge re-keys its amber/red thresholds off `lastHookMs - lastHoldMs` so a conductor
+ * legitimately spending its declared hold budget never paints the badge as if the hook itself were
+ * slow (see MapHeader.svelte). Reset on every new connection.
  */
 export const live = $state<{
 	status: "idle" | "connecting" | "connected" | "error";
 	detail: string;
 	sessionId: string | null;
 	port: number | null;
-	telemetry: { lastHookMs: number; maxHookMs: number; p95HookMs: number; rebuilds: number; hookCount: number };
+	telemetry: {
+		lastHookMs: number;
+		maxHookMs: number;
+		p95HookMs: number;
+		rebuilds: number;
+		hookCount: number;
+		lastHoldMs: number;
+		holdTimeouts: number;
+	};
 }>({
 	status: "idle",
 	detail: "",
@@ -60,6 +73,54 @@ export const live = $state<{
 	port: null,
 	telemetry: freshTelemetry(),
 });
+
+/**
+ * The host's advertised conductor catalog (Phase C, `hello.conductors`) — the SINGLE source of
+ * truth the GUI's conductor picker (`ConductorMenu.svelte`) renders from. Empty until a `hello`
+ * carrying a non-empty catalog arrives; cleared on disconnect (see `resetConductorState`).
+ */
+export const conductors = $state<ActiveConductorMeta[]>([]);
+
+/**
+ * The host's currently-attached conductor (Phase C, broadcast `conductorState`), or `null` when
+ * context is raw/human-only. Every client — GUI or conductor-role — agrees on this, never a
+ * locally tracked guess (see `ConductorStateMessage`'s doc comment in core/protocol.ts).
+ */
+export const conductorState = $state<{ active: ActiveConductorMeta | null }>({ active: null });
+
+/**
+ * The attached conductor's display-only status line/metrics (Phase C, broadcast `conductorStatus`).
+ * `text: null` is the "no status" / cleared state — there is no separate null-vs-object case to
+ * track, matching the wire message's own `text: string | null` semantics.
+ */
+export const conductorStatus = $state<{ text: string | null; metrics?: Record<string, number | string | boolean> }>({
+	text: null,
+});
+
+/** Defensive element guard for a hello's `conductors` catalog — same "authorized but maybe
+ *  malformed" caution as `isWireBlock`: a bad entry must be dropped, not thrown or fed into the
+ *  picker as an unusable id/label. */
+function isConductorMeta(v: unknown): v is ActiveConductorMeta {
+	if (!v || typeof v !== "object") return false;
+	const c = v as Record<string, unknown>;
+	return (
+		typeof c.id === "string" &&
+		typeof c.label === "string" &&
+		Array.isArray(c.locks) &&
+		typeof c.tailTokens === "number" &&
+		typeof c.holdWireUpToMs === "number" &&
+		typeof c.remote === "boolean"
+	);
+}
+
+/** Clear the conductor catalog/active/status state — a fresh connection or a dropped one both
+ *  start from "no conductors known" rather than leaking a prior session's picks. */
+function resetConductorState(): void {
+	conductors.length = 0;
+	conductorState.active = null;
+	conductorStatus.text = null;
+	conductorStatus.metrics = undefined;
+}
 
 /** Send a remote-control command to the host (guarded on socket state). */
 function sendCommand(cmd: WireCommand): void {
@@ -92,6 +153,16 @@ function requestResnapshot(): void {
  */
 export function setArmed(on: boolean): void {
 	sendCommand({ kind: "setFolding", value: on });
+}
+
+/**
+ * Attach/detach a conductor (Phase C picker). `id: null` detaches whatever is currently attached;
+ * `id: "<conductorId>"` attaches it (swapping out any prior attach). Same remote-control shape as
+ * every other steering action: NO optimistic apply — `conductorState` updates only when the host
+ * echoes it back, so a rejected/failed attach never shows a false picked state.
+ */
+export function selectConductor(id: string | null): void {
+	sendCommand({ kind: "selectConductor", id });
 }
 
 /** Build the replica store from a snapshot and install the command sink. */
@@ -132,6 +203,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 	live.sessionId = null;
 	live.port = port;
 	live.telemetry = freshTelemetry();
+	resetConductorState();
 	session.error = "";
 
 	let ws: WebSocket;
@@ -174,6 +246,10 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// READ-ONLY badge can never stick when attaching after viewing a Claude Code transcript.
 			session.readOnly = false;
 			pendingMeta = { format: "pi", title: meta.title || "live pi session", cwd: meta.cwd || "", model: meta.model || "" };
+			// The available-conductor catalog (Phase C) — the picker's SINGLE source of truth. Absent
+			// or malformed on a host with none attached/advertising ⇒ empty catalog, never a throw.
+			conductors.length = 0;
+			if (Array.isArray(msg.conductors)) conductors.push(...msg.conductors.filter(isConductorMeta));
 			// The store is built when the snapshot arrives (it carries the blocks + rev).
 			awaitingSnapshot = false;
 		} else if (msg.type === "snapshot") {
@@ -200,7 +276,19 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 				p95HookMs: msg.p95HookMs,
 				rebuilds: msg.rebuilds,
 				hookCount: msg.hookCount,
+				// v13: a pre-v13 host would omit these — default to 0 rather than NaN-poisoning the
+				// latency badge's re-keyed (lastHookMs - lastHoldMs) threshold math.
+				lastHoldMs: typeof msg.lastHoldMs === "number" ? msg.lastHoldMs : 0,
+				holdTimeouts: typeof msg.holdTimeouts === "number" ? msg.holdTimeouts : 0,
 			};
+		} else if (msg.type === "conductorState") {
+			// Broadcast to EVERY client — the honest, shared "who (if anyone) is driving" state.
+			// Guard the nested shape (isServerMessage only vets the `type` tag).
+			conductorState.active = msg.active && isConductorMeta(msg.active) ? msg.active : null;
+		} else if (msg.type === "conductorStatus") {
+			conductorStatus.text = typeof msg.text === "string" ? msg.text : null;
+			conductorStatus.metrics =
+				msg.metrics && typeof msg.metrics === "object" ? msg.metrics : undefined;
 		} else if (msg.type === "recall") {
 			// The live agent read folded content (a pure host-side read, no state change). Surfaced
 			// for conductors (Phase C); the GUI has nothing to mutate, so this is observational only.
@@ -236,6 +324,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			awaitingSnapshot = false;
 			live.sessionId = null;
 			live.port = null;
+			resetConductorState(); // wire down → no host to advertise/attach a conductor
 			if (session.store) session.store.setCommandSink(null); // wire down → no remote control
 			if (!manualClose && live.status !== "error") {
 				live.status = "idle";
@@ -249,6 +338,7 @@ export function disconnectLive(): void {
 	manualClose = true;
 	awaitingSnapshot = false;
 	ghostClearAll();
+	resetConductorState();
 	if (session.store) session.store.setCommandSink(null);
 	if (socket) {
 		try {

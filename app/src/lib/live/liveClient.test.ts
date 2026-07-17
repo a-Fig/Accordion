@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { connectLive, disconnectLive, setArmed, live } from "./liveClient.svelte";
+import { connectLive, disconnectLive, setArmed, live, conductors, conductorState, conductorStatus, selectConductor } from "./liveClient.svelte";
 import { folding } from "./folding.svelte";
 import { session } from "../session.svelte";
-import { PROTOCOL_VERSION, type SnapshotState, type WireEvent } from "./protocol";
+import { PROTOCOL_VERSION, type SnapshotState, type WireEvent, type ActiveConductorMeta } from "./protocol";
 
 /*
  * liveClient Phase B coverage. The live client is a WebSocket CLIENT, so we drive it against a fake
@@ -53,13 +53,26 @@ class FakeWebSocket {
 	}
 }
 
-function helloFrame() {
+function helloFrame(over: { conductors?: ActiveConductorMeta[] } = {}) {
 	return {
 		type: "hello",
 		protocolVersion: PROTOCOL_VERSION,
 		sessionId: "s-test",
 		role: "gui",
 		meta: { title: "t", cwd: "/tmp", model: "m", contextWindow: 1000, format: "pi" },
+		...over,
+	};
+}
+
+function conductorMeta(over: Partial<ActiveConductorMeta> = {}): ActiveConductorMeta {
+	return {
+		id: "cond-a",
+		label: "Conductor A",
+		locks: [],
+		tailTokens: 4000,
+		holdWireUpToMs: 50,
+		remote: false,
+		...over,
 	};
 }
 
@@ -204,8 +217,32 @@ describe("liveClient — remote control (commands, no optimistic apply)", () => 
 describe("liveClient — telemetry + protocol guard", () => {
 	it("updates the latency telemetry from a telemetry frame", () => {
 		const ws = connectHelloSnapshot();
+		ws.emit({
+			type: "telemetry",
+			lastHookMs: 3,
+			maxHookMs: 12,
+			p95HookMs: 7,
+			rebuilds: 1,
+			hookCount: 42,
+			lastHoldMs: 2,
+			holdTimeouts: 0,
+		});
+		expect(live.telemetry).toEqual({
+			lastHookMs: 3,
+			maxHookMs: 12,
+			p95HookMs: 7,
+			rebuilds: 1,
+			hookCount: 42,
+			lastHoldMs: 2,
+			holdTimeouts: 0,
+		});
+	});
+
+	it("defaults lastHoldMs/holdTimeouts to 0 when a pre-v13 host omits them", () => {
+		const ws = connectHelloSnapshot();
 		ws.emit({ type: "telemetry", lastHookMs: 3, maxHookMs: 12, p95HookMs: 7, rebuilds: 1, hookCount: 42 });
-		expect(live.telemetry).toEqual({ lastHookMs: 3, maxHookMs: 12, p95HookMs: 7, rebuilds: 1, hookCount: 42 });
+		expect(live.telemetry.lastHoldMs).toBe(0);
+		expect(live.telemetry.holdTimeouts).toBe(0);
 	});
 
 	it("refuses a protocol-version mismatch loudly", () => {
@@ -215,5 +252,82 @@ describe("liveClient — telemetry + protocol guard", () => {
 		ws.emit({ ...helloFrame(), protocolVersion: PROTOCOL_VERSION + 1 });
 		expect(live.status).toBe("error");
 		expect(live.detail).toContain("protocol mismatch");
+	});
+});
+
+describe("liveClient — conductor catalog + state (Phase C, v13)", () => {
+	it("captures the conductor catalog from hello", () => {
+		connectLive(1234);
+		const ws = FakeWebSocket.last!;
+		ws.open();
+		const meta = conductorMeta({ id: "cond-a", label: "Conductor A" });
+		ws.emit(helloFrame({ conductors: [meta] }));
+		expect(conductors).toEqual([meta]);
+	});
+
+	it("defaults to an empty catalog when hello omits conductors", () => {
+		connectHelloSnapshot();
+		expect(conductors).toEqual([]);
+	});
+
+	it("drops malformed catalog entries instead of throwing", () => {
+		connectLive(1234);
+		const ws = FakeWebSocket.last!;
+		ws.open();
+		const good = conductorMeta({ id: "cond-good" });
+		expect(() =>
+			ws.emit(helloFrame({ conductors: [good, { id: "cond-bad" } as unknown as ActiveConductorMeta, null as unknown as ActiveConductorMeta] })),
+		).not.toThrow();
+		expect(conductors).toEqual([good]);
+	});
+
+	it("applies a conductorState broadcast", () => {
+		const ws = connectHelloSnapshot();
+		const meta = conductorMeta({ id: "cond-a" });
+		ws.emit({ type: "conductorState", active: meta });
+		expect(conductorState.active).toEqual(meta);
+		ws.emit({ type: "conductorState", active: null });
+		expect(conductorState.active).toBeNull();
+	});
+
+	it("applies a conductorStatus broadcast, including a clearing null text", () => {
+		const ws = connectHelloSnapshot();
+		ws.emit({ type: "conductorStatus", text: "scoring turn 12", metrics: { score: 0.5 } });
+		expect(conductorStatus.text).toBe("scoring turn 12");
+		expect(conductorStatus.metrics).toEqual({ score: 0.5 });
+		ws.emit({ type: "conductorStatus", text: null });
+		expect(conductorStatus.text).toBeNull();
+	});
+
+	it("selectConductor sends a selectConductor command with a fresh seq", () => {
+		const ws = connectHelloSnapshot();
+		ws.sent.length = 0;
+		selectConductor("cond-a");
+		selectConductor(null);
+		const cmds = ws.framesOfType("command");
+		expect(cmds).toHaveLength(2);
+		expect(cmds[0].cmd).toEqual({ kind: "selectConductor", id: "cond-a" });
+		expect(cmds[1].cmd).toEqual({ kind: "selectConductor", id: null });
+		expect(cmds[1].seq).toBeGreaterThan(cmds[0].seq);
+	});
+
+	it("resets the catalog/active/status state on disconnect", () => {
+		connectLive(1234);
+		const ws = FakeWebSocket.last!;
+		ws.open();
+		ws.emit(helloFrame({ conductors: [conductorMeta()] }));
+		ws.emit({ type: "snapshot", state: snapshotState() });
+		ws.emit({ type: "conductorState", active: conductorMeta() });
+		ws.emit({ type: "conductorStatus", text: "working" });
+		expect(conductors.length).toBe(1);
+		expect(conductorState.active).not.toBeNull();
+		expect(conductorStatus.text).toBe("working");
+
+		disconnectLive();
+
+		expect(conductors).toEqual([]);
+		expect(conductorState.active).toBeNull();
+		expect(conductorStatus.text).toBeNull();
+		expect(conductorStatus.metrics).toBeUndefined();
 	});
 });
