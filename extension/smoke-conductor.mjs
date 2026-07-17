@@ -169,6 +169,30 @@ let landedGroups = 0;
 	else if (!groups.every((g) => g.by === "auto")) fails.push(`a landed stratum was not authored by the conductor (by!=="auto"): ${JSON.stringify(groups.map((g) => g.by))}`);
 }
 
+// (5b) SECURITY (finding 1): a GUI `ops` command carrying a host-only `freeze` must NOT seize the
+// conductor's strata while it holds human-steering. `freeze` is the detach-only kill switch —
+// intentionally ungated in opFreeze — so it is stripped at the wire entry and reported as a `locked`
+// clamp; the strata stay conductor-owned (by:"auto") until the REAL detach freeze runs in step (7).
+if (landedGroups >= 1) {
+	inbox.commandResult = [];
+	sendCmd({ kind: "ops", ops: [{ kind: "freeze" }] });
+	const freezeSeq = seq;
+	await waitFor(() => (inbox.commandResult || []).some((m) => m.seq === freezeSeq), 3000, "freeze commandResult").catch(
+		() => fails.push("GUI freeze command received no commandResult"),
+	);
+	const cr = (inbox.commandResult || []).find((m) => m.seq === freezeSeq);
+	const frozenOp = cr?.results?.find((r) => r.op?.kind === "freeze");
+	if (!frozenOp) fails.push("GUI freeze: no per-op result for the freeze op in the commandResult");
+	else if (frozenOp.applied !== false || frozenOp.clamped !== "locked")
+		fails.push(`GUI freeze was not clamped locked at the wire entry (got ${JSON.stringify(frozenOp)})`);
+	// The strata must still be conductor-owned — the freeze did not transfer ownership to the human.
+	inbox.snapshot.length = 0;
+	resnapshot();
+	await waitFor(() => inbox.snapshot.length > 0, 3000, "post-freeze resnapshot").catch(() => fails.push("no resnapshot after GUI freeze"));
+	const afterFreeze = inbox.snapshot.at(-1)?.state?.groups || [];
+	if (afterFreeze.some((g) => g.by !== "auto")) fails.push(`a GUI freeze seized a conductor stratum (by !== "auto"): ${JSON.stringify(afterFreeze.map((g) => g.by))}`);
+}
+
 // (6) hold telemetry sane: the child releases each wire-departing hold promptly (a real emergency
 //     propose or the sanctioned empty-ops release over the socket), so timeouts stay at/near zero and
 //     the last hold is well under the 200ms window. The hold counters ride the streamed `telemetry`

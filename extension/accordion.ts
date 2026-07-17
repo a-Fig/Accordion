@@ -59,7 +59,7 @@ import { linearize, messageInfo, wireToBlock, type PiMessage } from "../core/wir
 import { serializeSnapshot, wireEventFromTruthEvent } from "../core/replica";
 import { resolveUnfold, resolveRecall } from "../core/agentView";
 import type { SessionMeta } from "../core/types";
-import type { OpResult } from "../core/ops";
+import { applyGuardingHostOnly, type OpResult } from "../core/ops";
 import type { TruthEvent } from "../core/events";
 import {
 	DEFAULT_PORT,
@@ -397,6 +397,10 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		sendToConductor: (m) => {
 			if (conductorWs && conductorWs.readyState === 1) send(conductorWs, m);
 		},
+		sendToSocket: (socket, m) => {
+			const ws = socket as WebSocket | null;
+			if (ws && ws.readyState === 1) send(ws, m);
+		},
 		mintToken: () => crypto.randomBytes(16).toString("hex"),
 		spawnRunner: (entryFile, env) => spawnRunner(entryFile, env),
 		runCompletion: (req, signal) => runCompletion(req, signal),
@@ -478,6 +482,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			}, COMPLETION_TIMEOUT_MS);
 			(timer as { unref?: () => void }).unref?.();
 		});
+		// Non-null only AFTER complete() has actually launched provider work. A client-facing timeout
+		// aborts that work and settles this call, but the concurrency slot stays occupied until the
+		// underlying provider promise confirms settlement — an adapter that ignores AbortSignal must
+		// not let spend accounting reopen a slot while its call is still burning tokens (issue: the
+		// `finally` fires when Promise.race settles, i.e. on timeout BEFORE providerCall settles).
+		let providerSettlement: Promise<void> | null = null;
 		try {
 			const ctx = latestCtx;
 			const m = latestModelObj ?? (ctx?.model as any);
@@ -495,6 +505,8 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				maxTokens = ceiling !== undefined ? Math.min(req.maxOutputTokens, ceiling) : req.maxOutputTokens;
 			}
 			const providerCall = complete(m, context, { apiKey: auth.apiKey, headers: auth.headers, signal: abort.signal, ...(maxTokens !== undefined ? { maxTokens } : {}) });
+			// Consume either outcome for cleanup without changing the result used below.
+			providerSettlement = providerCall.then(() => {}, () => {});
 			const result = await Promise.race([providerCall, deadline]);
 			let text = "";
 			if (Array.isArray(result.content))
@@ -508,7 +520,14 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		} finally {
 			if (timer) clearTimeout(timer);
 			signal.removeEventListener("abort", onAbort);
-			activeCompletions--;
+			// Release the concurrency slot only when the provider call itself settles; if we timed out
+			// or failed before provider work ever launched, release immediately (there is nothing in
+			// flight to keep the slot for).
+			const release = (): void => {
+				activeCompletions--;
+			};
+			if (providerSettlement) void providerSettlement.then(release);
+			else release();
 		}
 	}
 
@@ -1374,7 +1393,11 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (!truth) return { results: [], rev: 0 };
 		switch (cmd.kind) {
 			case "ops": {
-				const r = truth.apply(Array.isArray(cmd.ops) ? cmd.ops : [], "you");
+				// Guard host-only ops (`freeze`) at the GUI wire entry: an authenticated client must not
+				// be able to seize a conductor's strategy folds through the ungated kill switch. A smuggled
+				// freeze is stripped and reported back as a `locked` clamp in the commandResult.
+				const t = truth;
+				const r = applyGuardingHostOnly(Array.isArray(cmd.ops) ? cmd.ops : [], (allowed) => t.apply(allowed, "you"));
 				return { results: r.results, rev: r.rev };
 			}
 			case "setBudget":

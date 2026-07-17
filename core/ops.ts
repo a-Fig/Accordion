@@ -98,4 +98,44 @@ export function anyApplied(r: TxnResult): boolean {
 	return r.results.some((x) => x.applied);
 }
 
+/**
+ * Op kinds that are HOST-ONLY — issued solely by the host's own conductor-detach kill switch,
+ * NEVER accepted from a wire client (a GUI `ops` command or a conductor `propose`). Today only
+ * `freeze`: it transfers every strategy-owned fold to the human WITHOUT the `human-steering` gate
+ * (deliberately ungated — see the `freeze` Op doc above + `Truth.opFreeze`), so a wire client that
+ * smuggled it in would seize a conductor's folds while the conductor still holds the lock — a
+ * reachable bypass of a host-only privilege. Stripped at every wire entry point via
+ * `applyGuardingHostOnly`. The host's own detach path calls `Truth.apply([{freeze}], …)` directly
+ * and never routes through a wire entry point, so the kill switch itself is unaffected.
+ */
+export const HOST_ONLY_OP_KINDS: ReadonlySet<Op["kind"]> = new Set<Op["kind"]>(["freeze"]);
+
+/** True iff `op` is host-only and must be refused when it arrives from a wire client. */
+export function isHostOnlyOp(op: Op): boolean {
+	return HOST_ONLY_OP_KINDS.has(op.kind);
+}
+
+/**
+ * Apply a batch of ops that arrived from a WIRE CLIENT (a GUI `ops` command or a conductor
+ * `propose`), refusing any host-only op (`freeze`) at the entry point instead of handing it to
+ * `Truth.apply`. A refused op is reported honestly as a `locked` clamp in the returned
+ * `TxnResult.results`, in its ORIGINAL op position — the client sees exactly which op was refused
+ * and why, never a silent drop. The surviving (allowed) ops are applied through `apply` (the
+ * caller's closure over `Truth.apply(allowed, by, baseRev)`) and their per-op results are threaded
+ * back into place; the returned `rev` is the real post-apply rev. When no op is host-only this is a
+ * straight pass-through (no array churn).
+ */
+export function applyGuardingHostOnly(ops: Op[], apply: (allowed: Op[]) => TxnResult): TxnResult {
+	if (!ops.some(isHostOnlyOp)) return apply(ops);
+	const allowed = ops.filter((op) => !isHostOnlyOp(op));
+	const inner = apply(allowed);
+	const results: OpResult[] = [];
+	let ai = 0;
+	for (const op of ops) {
+		if (isHostOnlyOp(op)) results.push({ op, applied: false, clamped: "locked", detail: "host-only op refused at wire entry" });
+		else results.push(inner.results[ai++]);
+	}
+	return { rev: inner.rev, results };
+}
+
 export type { Actor };

@@ -66,12 +66,14 @@ interface Harness {
 	deps: LiveHostDeps;
 	broadcastLog: ServerMessage[];
 	conductorLog: ServerMessage[];
+	socketLog: Array<{ socket: unknown; msg: ServerMessage }>;
 	spawned: MockChild[];
 	runCompletion: ReturnType<typeof vi.fn>;
 }
 function makeDeps(truth: Truth | null, overrides: Partial<LiveHostDeps> = {}): Harness {
 	const broadcastLog: ServerMessage[] = [];
 	const conductorLog: ServerMessage[] = [];
+	const socketLog: Array<{ socket: unknown; msg: ServerMessage }> = [];
 	const spawned: MockChild[] = [];
 	let n = 0;
 	const runCompletion = vi.fn(async (_req: unknown, _signal: AbortSignal) => ({ text: "SUMMARY", model: "m" }));
@@ -79,6 +81,7 @@ function makeDeps(truth: Truth | null, overrides: Partial<LiveHostDeps> = {}): H
 		truth: () => truth,
 		broadcast: (m) => broadcastLog.push(m),
 		sendToConductor: (m) => conductorLog.push(m),
+		sendToSocket: (socket, m) => socketLog.push({ socket, msg: m }),
 		mintToken: () => `tok-${++n}`,
 		spawnRunner: () => {
 			const c = mockChild();
@@ -90,7 +93,7 @@ function makeDeps(truth: Truth | null, overrides: Partial<LiveHostDeps> = {}): H
 		now: () => Date.now(),
 		...overrides,
 	};
-	return { deps, broadcastLog, conductorLog, spawned, runCompletion };
+	return { deps, broadcastLog, conductorLog, socketLog, spawned, runCompletion };
 }
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
@@ -338,8 +341,9 @@ describe("completion — aborted on detach", () => {
 		host.select("none"); // detach → abort in-flight completions
 		await flush();
 		expect(captured!.aborted).toBe(true);
-		const done = h.conductorLog.filter((m) => m.type === "completeResult").pop();
-		expect(done && done.type === "completeResult" && done.ok).toBe(false);
+		// The completeResult routes to the ORIGINATING socket (sendToSocket), bound to `sock`.
+		const done = h.socketLog.filter((e) => e.socket === sock && e.msg.type === "completeResult").pop();
+		expect(done && done.msg.type === "completeResult" && done.msg.ok).toBe(false);
 	});
 });
 
@@ -353,5 +357,107 @@ describe("propose — human override clamps a conductor op (pin mid-completion)"
 		expect(r.results[0].applied).toBe(false);
 		expect(r.results[0].clamped).toBe("human-override");
 		expect(t.get("a:b0:p0")!.override).toBe("pinned");
+	});
+});
+
+// ── finding 1: host-only freeze op refused at the conductor wire entry ─────────────
+describe("propose — a host-only freeze op is refused at the wire entry", () => {
+	it("strips freeze (locked clamp), applies the rest, and does NOT seize a strategy fold", async () => {
+		const t = bulk(textSeq(3));
+		t.setProtect(0); // no protected tail — a fold could otherwise heal on its own
+		const host = new LiveConductorHost(makeDeps(t).deps);
+		// A strategy-owned fold, exactly what an attached conductor holds.
+		t.apply([{ kind: "replace", id: "a:b0:p0", content: "XSUB", recoverable: false }], "auto");
+		expect(t.get("a:b0:p0")!.autoFolded).toBe(true);
+		expect(t.get("a:b0:p0")!.override).toBeNull();
+
+		// A conductor propose smuggling a freeze alongside a real fold.
+		const r = await host.propose({ baseRev: t.rev, ops: [{ kind: "freeze" }, { kind: "fold", ids: ["a:b1:p0"] }] });
+
+		// The freeze was refused in-position with a `locked` clamp; the real fold applied.
+		expect(r.results[0].op.kind).toBe("freeze");
+		expect(r.results[0].applied).toBe(false);
+		expect(r.results[0].clamped).toBe("locked");
+		expect(r.results[1].applied).toBe(true);
+
+		// The strategy fold is UNTOUCHED — the freeze did not transfer ownership to the human.
+		expect(t.get("a:b0:p0")!.autoFolded).toBe(true);
+		expect(t.get("a:b0:p0")!.override).toBeNull();
+		expect(t.get("a:b0:p0")!.by).toBe("auto");
+	});
+
+	it("the host's own detach freeze still transfers strategy ownership to the human", () => {
+		// The detach kill switch calls Truth.apply([{freeze}], "you") DIRECTLY — it never routes
+		// through applyPropose/applyCommand — so the guard must not touch it. (Covered end-to-end by
+		// "detach — freeze BEFORE clearLocks"; asserted here at the seam for finding 1 too.)
+		const t = bulk(textSeq(2));
+		t.setProtect(0);
+		const host = new LiveConductorHost(makeDeps(t).deps);
+		host.select("compaction-naive");
+		t.apply([{ kind: "replace", id: "a:b0:p0", content: "Z", recoverable: false }], "auto");
+		host.select("none"); // detach → internal freeze
+		expect(t.get("a:b0:p0")!.override).toBe("folded");
+		expect(t.get("a:b0:p0")!.by).toBe("you");
+	});
+});
+
+// ── finding 4: a late completeResult routes to the ORIGINATING socket, not the swapped-in one ──
+describe("completeRequest — reply binds to the socket that asked", () => {
+	it("a completion resolving after an A→B swap is NOT sent to B (and does not crash on closed A)", async () => {
+		const t = bulk(textSeq(2));
+		let resolveCompletion: ((r: { text: string; model: string }) => void) | null = null;
+		const h = makeDeps(t, {
+			runCompletion: () => new Promise((res) => { resolveCompletion = res as typeof resolveCompletion; }),
+		});
+		const host = new LiveConductorHost(h.deps);
+
+		// Conductor A attaches and issues a completion request that stays in flight.
+		host.select("thermocline");
+		const sockA = { id: "A" };
+		host.acceptConductorSocket(sockA, host.pendingAttachToken);
+		host.handleConductorMessage(sockA, { type: "completeRequest", reqId: 5, prompt: "summarize" });
+		expect(resolveCompletion).not.toBeNull();
+
+		// A detaches (aborting its completions) and B attaches in its place.
+		host.select("none");
+		host.select("thermocline");
+		const sockB = { id: "B" };
+		host.acceptConductorSocket(sockB, host.pendingAttachToken);
+
+		// The stale completion resolves now — it must go to A (a no-op sink), never to B.
+		resolveCompletion!({ text: "LATE", model: "m" });
+		await flush();
+
+		const toB = h.socketLog.filter((e) => e.socket === sockB && e.msg.type === "completeResult");
+		expect(toB.length).toBe(0);
+		const toA = h.socketLog.filter((e) => e.socket === sockA && e.msg.type === "completeResult");
+		expect(toA.length).toBe(1); // the reply was addressed to A's socket (the extension's sender no-ops if A is closed)
+	});
+});
+
+// ── finding 5: lastHoldMs telemetry resets on detach (cumulative holdTimeouts stays) ──
+describe("telemetry — lastHoldMs resets on detach", () => {
+	it("a hold-having conductor's lastHoldMs is cleared on detach, holdTimeouts kept cumulative", async () => {
+		vi.useFakeTimers();
+		try {
+			const t = liveTruth();
+			t.append(textSeq(2));
+			const host = new LiveConductorHost(makeDeps(t).deps);
+			host.select("thermocline"); // holdWireUpToMs = 200
+			const sock = {};
+			host.acceptConductorSocket(sock, host.pendingAttachToken);
+			// A hold that times out — records a non-zero lastHoldMs and bumps holdTimeouts.
+			const p = host.fireWireDepartingAndAwaitHold();
+			await vi.advanceTimersByTimeAsync(200);
+			await p;
+			expect(host.lastHoldMs).toBeGreaterThan(0);
+			expect(host.holdTimeouts).toBe(1);
+
+			host.select("none"); // detach
+			expect(host.lastHoldMs).toBe(0); // phantom hold no longer subtracted from netHookMs
+			expect(host.holdTimeouts).toBe(1); // cumulative counter preserved
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

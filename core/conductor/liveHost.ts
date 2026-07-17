@@ -22,6 +22,7 @@ import type { Truth, TruthStats } from "../truth";
 import type { TruthEvent } from "../events";
 import type { Actor } from "../types";
 import type { Op, TxnResult } from "../ops";
+import { applyGuardingHostOnly } from "../ops";
 import type {
 	ServerMessage,
 	ActiveConductorMeta,
@@ -50,6 +51,10 @@ export interface LiveHostDeps {
 	broadcast(msg: ServerMessage): void;
 	/** Send to the active conductor socket; a no-op if none is attached. */
 	sendToConductor(msg: ServerMessage): void;
+	/** Send to a SPECIFIC socket (the one that issued a request), regardless of which socket is
+	 *  active now; a no-op if that socket is gone/closed. Used to route a late `completeResult` back
+	 *  to its originating conductor, never to whoever attached after an A→B swap. */
+	sendToSocket(socket: unknown, msg: ServerMessage): void;
 	/** Mint a single-use bearer for a spawn conductor's WS attach. */
 	mintToken(): string;
 	/** Launch a spawn conductor's runner. Returns null if the runner is unavailable on this install. */
@@ -305,7 +310,7 @@ export class LiveConductorHost implements ConductorHost {
 			// A propose (even an EMPTY-ops "nothing to fold" ack) releases the wire-departing hold.
 			this.releaseHold();
 		} else if (m.type === "completeRequest" && Number.isSafeInteger((msg as CompleteRequestMessage).reqId)) {
-			this.handleCompleteRequest(msg as CompleteRequestMessage);
+			this.handleCompleteRequest(from, msg as CompleteRequestMessage);
 		} else if (m.type === "setConductorStatus") {
 			const sm = msg as SetConductorStatusMessage;
 			this.setAndBroadcastStatus(typeof sm.text === "string" ? sm.text : null, sm.metrics);
@@ -352,6 +357,10 @@ export class LiveConductorHost implements ConductorHost {
 		}
 		this.completions.clear();
 		this.releaseHold(); // unblock any pending wire-departing hold so a stalled hook proceeds
+		// Reset the last-hold gauge (keep the cumulative `holdTimeouts` counter): with no conductor
+		// attached no hold ever fires, so a stale `lastHoldMs` would keep MapHeader subtracting a
+		// phantom hold from the hook time (netHookMs = hookMs - holdMs) and mask a genuinely slow hook.
+		this.lastHoldMsValue = 0;
 		this.cachedStatusMsg = null;
 		this.active = null;
 		this.mode = null;
@@ -493,20 +502,29 @@ export class LiveConductorHost implements ConductorHost {
 
 	// ── internals ─────────────────────────────────────────────────────────────────
 	private applyPropose(baseRev: number | undefined, ops: Op[]): TxnResult {
-		const t = this.deps.truth();
-		if (!t) return { rev: 0, results: ops.map((op) => ({ op, applied: false, clamped: "unknown-id" as const })) };
-		return t.apply(ops, "auto", baseRev);
+		// Guard host-only ops (`freeze`) at the conductor wire entry, same as the GUI `ops` command:
+		// a conductor propose must not be able to reach the ungated detach kill switch (it would seize
+		// its OWN strategy folds as human folds). A smuggled freeze is stripped and reported back as a
+		// `locked` clamp in the proposeResult's per-op results.
+		return applyGuardingHostOnly(ops, (allowed) => {
+			const t = this.deps.truth();
+			if (!t) return { rev: 0, results: allowed.map((op) => ({ op, applied: false, clamped: "unknown-id" as const })) };
+			return t.apply(allowed, "auto", baseRev);
+		});
 	}
 
-	private handleCompleteRequest(req: CompleteRequestMessage): void {
+	private handleCompleteRequest(from: unknown, req: CompleteRequestMessage): void {
 		const controller = new AbortController();
 		this.completions.add(controller);
 		const cr: CompletionRequest = { prompt: req.prompt, system: req.system, maxOutputTokens: req.maxOutputTokens, model: req.model, signal: controller.signal };
+		// Reply to the ORIGINATING socket, not the currently-active one: a completion resolving after
+		// an A→B conductor swap must route back to the A that asked (a no-op if A is gone), never leak
+		// to whoever attached in the meantime.
 		void this.deps
 			.runCompletion(cr, controller.signal)
 			.then(
 				(res) =>
-					this.deps.sendToConductor({
+					this.deps.sendToSocket(from, {
 						type: "completeResult",
 						reqId: req.reqId,
 						ok: true,
@@ -515,7 +533,7 @@ export class LiveConductorHost implements ConductorHost {
 						inputTokens: res.inputTokens,
 						outputTokens: res.outputTokens,
 					}),
-				(err) => this.deps.sendToConductor({ type: "completeResult", reqId: req.reqId, ok: false, error: err instanceof Error ? err.message : String(err) }),
+				(err) => this.deps.sendToSocket(from, { type: "completeResult", reqId: req.reqId, ok: false, error: err instanceof Error ? err.message : String(err) }),
 			)
 			.finally(() => this.completions.delete(controller));
 	}
