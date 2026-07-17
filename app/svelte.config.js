@@ -12,6 +12,12 @@ const config = {
     adapter: adapter({
       fallback: "index.html",
     }),
+    // The framework-free `core/` package lives at the repo root, OUTSIDE this SvelteKit project
+    // (`app/`). The app reaches it through this alias. Lands in `.svelte-kit/tsconfig.json` for
+    // svelte-check; vite.config.js + vitest.config.ts mirror it for the build and for vitest.
+    alias: {
+      $core: "../core",
+    },
   },
 };
 

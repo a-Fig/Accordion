@@ -1,11 +1,23 @@
 import { defineConfig } from "vite";
 import { sveltekit } from "@sveltejs/kit/vite";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [sveltekit()],
+
+  // The framework-free `core/` package lives OUTSIDE this SvelteKit root (`app/`). The kit alias
+  // in svelte.config.js feeds svelte-check + the SvelteKit build; mirror `$core` here so the
+  // dev/build server resolves it too. `server.fs.allow: [".."]` already permits reading it.
+  resolve: {
+    alias: {
+      $core: path.resolve(__dirname, "../core"),
+    },
+  },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //

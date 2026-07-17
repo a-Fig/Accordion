@@ -88,6 +88,10 @@
 	// reflecting that, not the enforcement. The budget dial is NEVER gated (sacred tier).
 	const tailLocked = $derived(store.isLocked("tail-size"));
 	const steerLocked = $derived(store.isLocked("human-steering"));
+	// Under the tail-size lock the active strategy OWNS the tail — the enforced target is its
+	// declared `activeTailTokens`, not the human's now-stale `protectTokens` (ADR 0011 §7). The
+	// readout must show what is actually enforced.
+	const protectTarget = $derived(tailLocked ? store.activeTailTokens : store.protectTokens);
 	const lockTip = $derived(
 		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
 	);
@@ -206,7 +210,7 @@
 				class:ctl-locked={tailLocked}
 				aria-disabled={tailLocked}
 				title={tailLocked
-					? lockTip + " (the active strategy now owns the tail)"
+					? lockTip + ` (the active strategy now owns the tail — enforcing ${fmt(protectTarget)} tokens)`
 					: `Actual protected tail: ${fmt(store.protectedTokens)} tokens; target: ${fmt(store.protectTokens)} tokens — click the value or drag the handle to change it`}
 			>
 				<span class="ctl-eyebrow mono">
@@ -215,8 +219,8 @@
 				</span>
 				<span class="ctl-value mono tnum">
 					{#if tailLocked}
-						<!-- tail-size locked: a static readout, not an editable dial. -->
-						<span class="kl-val">{k(store.protectTokens)}</span>
+						<!-- tail-size locked: a static readout of the ENFORCED tail, not an editable dial. -->
+						<span class="kl-val">{k(protectTarget)}</span>
 					{:else}
 						<EditableNumber
 							value={store.protectTokens}
@@ -225,7 +229,7 @@
 							oncommit={(n) => store.setProtect(Math.max(0, Math.min(PROT_MAX, n)))}
 						/>
 					{/if}
-					{#if Math.abs(store.protectedTokens - store.protectTokens) > 500}
+					{#if Math.abs(store.protectedTokens - protectTarget) > 500}
 						<span class="kl-target tnum">({k(store.protectedTokens)})</span>
 					{/if}
 				</span>
