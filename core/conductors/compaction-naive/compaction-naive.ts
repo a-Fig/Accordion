@@ -89,10 +89,21 @@
  *      actor `"auto"`, so `by !== "auto"` reliably means "a human made this group") — instead of
  *      the blanket `ViewBlock.grouped`.
  *
+ *   6. OUTPUT-TOKEN RESERVATION against the context window (external review round, P1-7). The
+ *      original port requested a flat `maxOutputTokens: MAX_SUMMARY_TOKENS` with no regard for how
+ *      much of the window the aged-region input already consumes — at the 0.9 trigger, input ≈
+ *      0.9×budget, so `input + 8000` can exceed the model's real context window whenever the window
+ *      is not comfortably larger than the budget, and the provider rejects the call with a 400 (a
+ *      STICKY failure, since `lastAttemptKey` then blocks any retry until new content ages in). The
+ *      sibling `handoff` conductor (`core/conductors/handoff/handoff.ts`) already solved this exact
+ *      problem for its own completion call; this port copies that reservation faithfully (same
+ *      floor/margin/cap constants, same three-branch shape, same "decline outright rather than send
+ *      a doomed request" behavior) rather than reinventing it. See `launchCompletion` below.
+ *
  * Everything else — `emitSummaryGroup`'s per-run walk shape (held/foreign-grouped blocks split
  * the region into multiple groups, each carrying the same digest), `COMPACTION_SYSTEM`, both
- * `buildPrompt` branches, `MAX_SUMMARY_TOKENS`, the `lastAttemptKey` retry gate, and the
- * stale-completion guard (controller identity) — is ported unchanged.
+ * `buildPrompt` branches, the `lastAttemptKey` retry gate, and the stale-completion guard
+ * (controller identity) — is ported unchanged.
  *
  * No Svelte, no `$state`, no engine imports. Types only from `../../conductor/contract` and
  * `../../conductor/view`.
@@ -116,8 +127,32 @@ const TRIGGER = 0.9;
  * model allows is safe (it is clamped, not rejected). If the summary would exceed the (clamped)
  * ceiling, the output is TRUNCATED (finish-reason "length") and used as-is — acceptable for a
  * lossy baseline.
+ *
+ * NOTE: this is only the UPPER bound. The host clamp bounds the request to the model's own
+ * max-OUTPUT ceiling, but it does NOT bound `input + output` against the context window — so a
+ * blind `MAX_SUMMARY_TOKENS` request overflows the window whenever the aged-region input is large
+ * relative to the window (at the 0.9 trigger, input ≈ 0.9×budget, so `input + 8000` exceeds any
+ * window not comfortably larger than budget and the provider 400s). `launchCompletion` therefore
+ * RESERVES output room against the reported window; see there. Ported from the identical note on
+ * the sibling `handoff` conductor's `MAX_HANDOFF_TOKENS` (PORT FIDELITY §6).
  */
 const MAX_SUMMARY_TOKENS = 8000;
+
+/**
+ * Floor for a useful summary. If reserving output room against the window (see `launchCompletion`)
+ * leaves fewer than this many tokens, the aged-region input itself nearly fills the window — there
+ * is no room to write a summary — so the conductor declines the request with a visible status
+ * rather than sending a doomed call. Mirrors `handoff`'s `MIN_HANDOFF_TOKENS` (PORT FIDELITY §6).
+ */
+const MIN_SUMMARY_TOKENS = 1000;
+
+/**
+ * Headroom subtracted when reserving output room against the window: covers per-message role/
+ * delimiter overhead and chars/4 tokenizer drift between our estimate and the provider's count, so
+ * a reservation computed as "just fits" does not tip the real request over the window. Mirrors
+ * `handoff`'s `OUTPUT_SAFETY_MARGIN` (PORT FIDELITY §6).
+ */
+const OUTPUT_SAFETY_MARGIN = 512;
 
 /**
  * System prompt for the compaction LLM call. Ported VERBATIM from the deleted conductor (ADR
@@ -318,13 +353,17 @@ export class NaiveCompactionConductor extends ViewConductor {
 			return this.summary !== null ? this.emitSummaryGroup(view) : [];
 		}
 
-		// About to attempt — clear any previous failure status.
+		// About to attempt — clear any previous failure status. (launchCompletion may immediately
+		// overwrite this with a decline status if the context window leaves no room to reserve
+		// output — see there.)
 		this.host.setStatus(null);
 
-		// LAUNCH a background completion. Snapshot the aged ids NOW so the async resolve handler
-		// commits the summary against exactly the blocks it summarized, regardless of what the
-		// view looks like when it resolves.
-		this.launchCompletion(aged, newlyAged, attemptKey);
+		// LAUNCH a background completion (which may DECLINE if the window is too tight — see
+		// launchCompletion). Snapshot the aged ids NOW so the async resolve handler commits the
+		// summary against exactly the blocks it summarized, regardless of what the view looks like
+		// when it resolves. `view.contextWindow` is threaded in so the request reserves output room
+		// against the real window.
+		this.launchCompletion(aged, newlyAged, attemptKey, view.contextWindow);
 
 		// Hold while the completion is in-flight: re-emit the existing summary group if one is
 		// already applied, or null on the very first trip (no prior summary yet — the ONE correct
@@ -433,12 +472,15 @@ export class NaiveCompactionConductor extends ViewConductor {
 	 * calls `this.rerun()` (the adapter's local successor to the old `host.requestRerun()`) to
 	 * schedule a fresh `conduct()` pass so the summary group takes effect immediately.
 	 *
-	 * @param agedBlocks - all aged blocks at launch time (SNAPSHOT — don't use the view later).
-	 * @param newlyAged  - subset not already in compactedIds (used to build the recursive prompt).
-	 * @param attemptKey - the sorted-join key of the NEWLY AGED set being attempted; stored to
-	 *                     prevent relaunching the same newly-aged set after a rejection.
+	 * @param agedBlocks    - all aged blocks at launch time (SNAPSHOT — don't use the view later).
+	 * @param newlyAged     - subset not already in compactedIds (used to build the recursive prompt).
+	 * @param attemptKey    - the sorted-join key of the NEWLY AGED set being attempted; stored to
+	 *                        prevent relaunching the same newly-aged set after a rejection.
+	 * @param contextWindow - the model's total context window (or null if unknown), used to reserve
+	 *                        output room so `input + output` cannot overflow the window (PORT
+	 *                        FIDELITY §6, mirrors `handoff.ts`'s `launchCompletion`).
 	 */
-	private launchCompletion(agedBlocks: ViewBlock[], newlyAged: ViewBlock[], attemptKey: string): void {
+	private launchCompletion(agedBlocks: ViewBlock[], newlyAged: ViewBlock[], attemptKey: string, contextWindow: number | null): void {
 		if (this.inflight !== null) return; // defensive: should never reach here while inflight
 
 		// Snapshot the ids and count at LAUNCH TIME. The resolve handler closes over these so it
@@ -449,9 +491,33 @@ export class NaiveCompactionConductor extends ViewConductor {
 
 		const prompt = this.buildPrompt(newlyAged);
 
-		// Record the attempt key (keyed on newlyAged ids) so a rejected completion does NOT
-		// immediately relaunch for the same newly-aged set on the next conduct() tick.
+		// Record the attempt key (keyed on newlyAged ids) so a rejected OR declined completion does
+		// NOT immediately relaunch for the same newly-aged set on the next conduct() tick.
 		this.lastAttemptKey = attemptKey;
+
+		// RESERVE output room against the context window (PORT FIDELITY §6). The host clamp bounds
+		// max-OUTPUT only, not `input + output`, so a blind MAX_SUMMARY_TOKENS request overflows the
+		// window when the aged-region input is large relative to it (the 0.9 trigger puts input near
+		// the budget). Derive the cap from the actual input size. When the window is unknown (null),
+		// we cannot reserve — fall back to MAX_SUMMARY_TOKENS and rely on the host's max-output clamp
+		// (today's flat behavior, unchanged).
+		let maxOutputTokens = MAX_SUMMARY_TOKENS;
+		if (contextWindow != null && contextWindow > 0) {
+			const inputTokens = this.host.countTokens(COMPACTION_SYSTEM) + this.host.countTokens(prompt);
+			const reserve = contextWindow - inputTokens - OUTPUT_SAFETY_MARGIN;
+			if (reserve < MIN_SUMMARY_TOKENS) {
+				// The aged-region input alone nearly fills the window — there is no room to write a
+				// useful summary. Decline deliberately with a visible, sticky status instead of
+				// sending a request the provider will reject. The attempt key is already recorded
+				// above, so we do not re-attempt until genuinely new content ages in.
+				this.host.setStatus(`Naive compaction needs a bigger window — input ≈ ${inputTokens} tokens leaves no room to write in a ${contextWindow}-token window`, {
+					input: inputTokens,
+					window: contextWindow,
+				});
+				return;
+			}
+			maxOutputTokens = Math.min(MAX_SUMMARY_TOKENS, reserve);
+		}
 
 		const controller = new AbortController();
 		this.inflight = controller;
@@ -460,7 +526,7 @@ export class NaiveCompactionConductor extends ViewConductor {
 			.complete({
 				system: COMPACTION_SYSTEM,
 				prompt,
-				maxOutputTokens: MAX_SUMMARY_TOKENS,
+				maxOutputTokens,
 				signal: controller.signal,
 			})
 			.then(
