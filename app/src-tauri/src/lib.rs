@@ -126,11 +126,9 @@ fn list_sessions() -> Vec<Value> {
 /// re-spawning. A short post-spawn check surfaces an immediate crash (e.g. missing deps)
 /// as an actionable error instead of a phantom "running" state.
 ///
-/// STALE: `mock-server.mjs` still speaks the pre-v13 wire protocol (sends `sync`/`status`,
-/// listens for `plan`), while the app's live client now speaks v13 (`snapshot`/`event`/
-/// `command`). Launching it from Settings currently opens a session that never
-/// populates. See the banner comment at the top of `mock-server.mjs` for what porting
-/// it would take; this command is left as-is (UI behavior is the owner's call).
+/// `mock-server.mjs` hosts a real `core/truth.ts` Truth and speaks the current wire protocol
+/// (`core/protocol.ts`, loaded live via `jiti` so it can never drift from a version bump) — a
+/// session launched this way populates and folds for real, same as a genuine pi session.
 #[tauri::command]
 fn launch_mock_session(procs: tauri::State<'_, MockProc>) -> Result<u16, String> {
     // Already running?
