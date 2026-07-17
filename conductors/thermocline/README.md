@@ -23,7 +23,8 @@ provably terminates at "protected tail + one minimal stratum" and can never outg
 | `thermocline.ts` | The epoch machine as a conductor-v2 `Conductor`, written against `ConductorHost`: HOLD / PREPARE / COMMIT / EMERGENCY, persistence, and the scoring loop. |
 | `scorer.ts` | The temperature signal — spawns the Python probe as a child process; JSON-file I/O; graceful degradation when the probe is unavailable. |
 | `probe/` | The vendored attention probe (`probe.py` + `requirements.txt`). |
-| `runner.mjs` | The Phase-C out-of-process entry point (a documented stub until the remote SDK lands). |
+| `runner.mjs` | The out-of-process entry point the extension spawns (`node runner.mjs`). Imports `./remote-sdk.mjs`, dials the session's loopback WS, and drives the `ThermoclineConductor`. |
+| `remote-sdk.mjs` | **Generated, committed artifact** — the flat ESM bundle of `core/conductor/remote.ts` + `thermocline.ts` + their core graph (exports `runRemoteConductor`, `ThermoclineConductor`). Built by `extension/build-remote-sdk.mjs`; regenerate after touching remote.ts / thermocline.ts / core. Do NOT edit by hand. |
 
 ## The fidelity ladder
 
@@ -92,13 +93,29 @@ and graduation state (dwell + everWarm) are written atomically to
 On attach the state is restored and validated against the live block ids; any stratum whose members
 vanished is dropped.
 
-## How Phase C launches it (out of process)
+## How it launches (out of process)
 
-The owner's decision: **Thermocline runs in its own Node process.** In Phase C the pi extension
-spawns `runner.mjs` with `ACCORDION_PORT` / `ACCORDION_TOKEN` (and optionally `ACCORDION_HOME`,
-`ACCORDION_SESSION_KEY`). A remote SDK (`core/conductor/remote`, not yet built) mirrors the live
-session's Truth into a local `ConductorHost` inside that process and calls `attach(host)`. Because
-`ThermoclineConductor` is written only against `ConductorHost`, the exact same class is what today's
-in-process unit tests drive against `TestHost` — no local/remote branch in the conductor itself.
+The owner's decision: **Thermocline runs in its own Node process.** The pi extension spawns
+`node runner.mjs` with `ACCORDION_PORT` / `ACCORDION_TOKEN` (and optionally `ACCORDION_HOME`,
+`ACCORDION_SESSION_KEY`, `ATTN_PROBE_PYTHON` / `ATTN_PROBE_SCRIPT`). The runner imports the remote
+SDK from the committed `./remote-sdk.mjs` bundle (`runRemoteConductor` + `ThermoclineConductor`),
+dials `ws://127.0.0.1:${ACCORDION_PORT}/?role=conductor&token=${ACCORDION_TOKEN}`, mirrors the live
+session's Truth into a local `ConductorHost`, and calls `attach(host)`. Because `ThermoclineConductor`
+is written only against `ConductorHost`, the exact same class is what the in-process unit tests drive
+against `TestHost` — no local/remote branch in the conductor itself.
 
-See `runner.mjs` for the precise SDK surface, spawn env, and lifecycle Phase C must provide.
+### Running / rebuilding the bundle
+
+`remote-sdk.mjs` is a **generated, committed** artifact (Node can't ESM-resolve `core/`'s extensionless
+imports directly — see the runner's header). Regenerate it after touching `core/conductor/remote.ts`,
+`thermocline.ts`, or anything in their `core/` graph:
+
+```bash
+node extension/build-remote-sdk.mjs        # or: npm --prefix extension run build:remote-sdk
+```
+
+It requires no runtime deps and no `node_modules`: the SDK dials with Node 22+'s global `WebSocket`
+(the `ws` package is deliberately never bundled or required), so `node runner.mjs` runs standalone.
+This is a repo-checkout artifact only — it is **not** part of the `@a-fig/accordion` npm tarball.
+
+See `runner.mjs` for the precise spawn env and lifecycle.
