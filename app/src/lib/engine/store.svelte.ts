@@ -485,12 +485,14 @@ function actionFor(op: Op): string | null {
 			return "group unfolded";
 		case "resetAll":
 			return null; // reset is logged from the "reset" event
+		case "freeze":
+			return null; // host-only conductor-detach bookkeeping (Phase C) — never a human action to log
 	}
 }
 function opTargetId(op: Op): string | undefined {
 	if (op.kind === "replace") return op.id;
 	if (op.kind === "ungroup" || op.kind === "foldGroup" || op.kind === "unfoldGroup") return op.groupId;
-	if (op.kind === "resetAll") return undefined;
+	if (op.kind === "resetAll" || op.kind === "freeze") return undefined;
 	if (op.kind === "group") return op.ids[0];
 	return op.ids[0];
 }

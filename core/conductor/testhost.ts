@@ -7,22 +7,12 @@
  * calls, and exposes the underlying `truth` for assertions. Make it pleasant.
  */
 import { Truth } from "../truth";
-import type { Block, ParsedSession, Actor } from "../types";
+import type { Block, ParsedSession } from "../types";
 import { estTokens } from "../tokens";
 import { digest } from "../digest";
-import type {
-	ConductorHost,
-	HostEvent,
-	ViewBlock,
-	GroupInfo,
-	StateChange,
-	CompletionRequest,
-	CompletionResult,
-	Op,
-	TxnResult,
-	TruthStats,
-} from "./contract";
+import type { ConductorHost, HostEvent, ViewBlock, GroupInfo, CompletionRequest, CompletionResult, Op, TxnResult, TruthStats } from "./contract";
 import type { TruthEvent } from "../events";
+import { viewBlockOf, hostEventsFromTruthEvent, recallHostEvent, wireDepartingEvent } from "./hostAdapter";
 
 function emptyLiveSession(): ParsedSession {
 	return { meta: { format: "pi", title: "test", cwd: "", model: "test-model" }, blocks: [], lineCount: 0, skipped: 0 };
@@ -56,10 +46,10 @@ export class TestHost implements ConductorHost {
 	}
 	get(id: string): ViewBlock | undefined {
 		const b = this.truth.get(id);
-		return b ? this.view(b) : undefined;
+		return b ? viewBlockOf(this.truth, b) : undefined;
 	}
 	blocks(): readonly ViewBlock[] {
-		return this.truth.blocks.map((b) => this.view(b));
+		return this.truth.blocks.map((b) => viewBlockOf(this.truth, b));
 	}
 	groups(): readonly GroupInfo[] {
 		return this.truth.groups.map((g) => ({ id: g.id, memberIds: g.memberIds.slice(), folded: g.folded, by: g.by ?? null, summary: g.digest }));
@@ -107,11 +97,9 @@ export class TestHost implements ConductorHost {
 	 * exactly the point at which the wire has departed to the model.
 	 */
 	departWire(): void {
-		const blocks = this.truth.blocks;
-		const freshIds = blocks.filter((b) => !this.truth.sent(b)).map((b) => b.id);
-		const s = this.truth.stats();
-		this.fire({ type: "wire-departing", rev: this.truth.rev, liveTokens: s.liveTokens, budget: s.budget, freshIds });
-		if (blocks.length) this.truth.markSent(blocks[blocks.length - 1].order);
+		const { event, lastOrder } = wireDepartingEvent(this.truth);
+		this.fire(event);
+		if (lastOrder !== null) this.truth.markSent(lastOrder);
 	}
 	/** Signal a structural rebuild — subscribed conductors rebuild their tracked desired state. */
 	resync(): void {
@@ -158,74 +146,14 @@ export class TestHost implements ConductorHost {
 	 * treats "the agent reached back into this block" as a signal can observe it.
 	 */
 	agentRecall(id: string): void {
-		this.fire({ type: "state-changed", changes: [{ id, what: "recall", by: "agent" }], rev: this.truth.rev });
+		this.fire(recallHostEvent([id], "agent", this.truth.rev));
 	}
 
 	// ── internals ─────────────────────────────────────────────────────────────
 	private fire(e: HostEvent): void {
 		for (const fn of this.listeners) void fn(e);
 	}
-	private view(b: Block): ViewBlock {
-		return {
-			id: b.id,
-			messageKey: this.truth.messageKeyOf(b.id),
-			kind: b.kind,
-			turn: b.turn,
-			order: b.order,
-			tokens: b.tokens,
-			foldedTokens: this.truth.foldedTokensOf(b),
-			toolName: b.toolName,
-			callId: b.callId,
-			isError: b.isError,
-			held: this.truth.held(b),
-			folded: this.truth.isFolded(b),
-			protected: this.truth.isProtected(b),
-			grouped: this.truth.inFoldedGroup(b.id),
-			sent: this.truth.sent(b),
-			text: b.text,
-		};
-	}
 	private onTruthEvent(e: TruthEvent): void {
-		if (e.type === "appended") {
-			const s = this.truth.stats();
-			this.fire({ type: "blocks-appended", blocks: e.blocks.map((b) => this.view(b)), rev: e.rev, liveTokens: s.liveTokens, budget: s.budget });
-		} else if (e.type === "ops-applied") {
-			const changes: StateChange[] = [];
-			for (const r of e.results) if (r.applied) changes.push(this.stateChange(r.op, e.by));
-			if (changes.length) this.fire({ type: "state-changed", changes, rev: e.rev });
-		} else if (e.type === "config") {
-			const what: StateChange["what"] = e.budget !== undefined ? "budget" : "protect";
-			this.fire({ type: "state-changed", changes: [{ what, by: "you" }], rev: e.rev });
-		} else if (e.type === "reset") {
-			// A wholesale reset drops every strategy fold — subscribed conductors rebuild.
-			this.fire({ type: "resync", rev: e.rev });
-		}
-		// "locks" / "sent" are not surfaced as HostEvents in Phase A.
-	}
-	private stateChange(op: Op, by: Actor): StateChange {
-		switch (op.kind) {
-			case "fold":
-				return { id: op.ids[0], what: "fold", by };
-			case "replace":
-				return { id: op.id, what: "replace", by };
-			case "unfold":
-				return { id: op.ids[0], what: "unfold", by };
-			case "auto":
-				return { id: op.ids[0], what: "unfold", by };
-			case "pin":
-				return { id: op.ids[0], what: "pin", by };
-			case "unpin":
-				return { id: op.ids[0], what: "unpin", by };
-			case "group":
-				return { groupId: op.ids.join("|"), what: "group", by };
-			case "ungroup":
-				return { groupId: op.groupId, what: "ungroup", by };
-			case "foldGroup":
-				return { groupId: op.groupId, what: "group", by };
-			case "unfoldGroup":
-				return { groupId: op.groupId, what: "ungroup", by };
-			case "resetAll":
-				return { what: "unfold", by };
-		}
+		for (const he of hostEventsFromTruthEvent(this.truth, e)) this.fire(he);
 	}
 }

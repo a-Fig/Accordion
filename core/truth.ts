@@ -757,6 +757,8 @@ export class Truth {
 				return this.opUnfoldGroup(op, by, baseRev, touched);
 			case "resetAll":
 				return this.opReset(op, by, touched);
+			case "freeze":
+				return this.opFreeze(op, touched);
 		}
 	}
 
@@ -1006,6 +1008,39 @@ export class Truth {
 			this.groupList = [];
 		}
 		this.birthFolded.clear();
+		if (!changed) return this.clamp(op, "noop");
+		return { op, applied: true };
+	}
+
+	/**
+	 * Conductor-detach kill switch. Mirrors `opReset`'s shape (a single global op, no ids, no
+	 * `by`/lock gate, one aggregate `OpResult`) but transfers ownership instead of clearing it:
+	 * every strategy-owned fold becomes human-owned with `subst` preserved verbatim, and every
+	 * folded strategy group is reassigned to "you". Deliberately does NOT check
+	 * `isLocked("human-steering")` — see the `freeze` Op doc in ops.ts.
+	 */
+	private opFreeze(op: Extract<Op, { kind: "freeze" }>, touched: Set<string>): OpResult {
+		let changed = false;
+		for (const b of this.blockLog) {
+			if (b.override === null && b.autoFolded && !this.inFoldedGroup(b.id)) {
+				b.override = "folded";
+				b.by = "you";
+				// `subst` is deliberately left untouched — the strategy's substituted digest
+				// must survive the ownership transfer byte-identical.
+				touched.add(b.id);
+				changed = true;
+			}
+		}
+		let groupsChanged = false;
+		for (const g of this.groupList) {
+			if (g.folded && g.by === "auto") {
+				g.by = "you";
+				touched.add(g.id);
+				changed = true;
+				groupsChanged = true;
+			}
+		}
+		if (groupsChanged) this.groupList = [...this.groupList];
 		if (!changed) return this.clamp(op, "noop");
 		return { op, applied: true };
 	}

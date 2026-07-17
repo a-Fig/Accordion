@@ -45,7 +45,16 @@ export type Op =
 	/** Expand a folded group. */
 	| { kind: "unfoldGroup"; groupId: string }
 	/** Clear every override + strategy fold AND dissolve every group — back to raw. */
-	| { kind: "resetAll" };
+	| { kind: "resetAll" }
+	/** Conductor-detach kill switch (Phase C). Host-only — issued on conductor detach BEFORE
+	 *  `clearLocks()`, never from a human click. Converts every currently strategy-owned fold
+	 *  (`autoFolded === true`, `override === null`, not inside a folded group) into a
+	 *  human-owned fold (`override:"folded"`, `by:"you"`), preserving `subst` byte-identical —
+	 *  the point is that the conductor's substituted digest survives the ownership transfer.
+	 *  Every currently FOLDED group with `by === "auto"` is reassigned `by:"you"`. Idempotent
+	 *  (a second freeze is a no-op). Deliberately never gated by `isLocked("human-steering")`:
+	 *  it runs precisely while the conductor's lock is still held, immediately before release. */
+	| { kind: "freeze" };
 
 /** Why an op could not be applied verbatim. Never thrown — always reported. */
 export type ClampReason =
