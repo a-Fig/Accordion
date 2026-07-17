@@ -28,12 +28,14 @@
  * forever (see the `handled` bookkeeping below for the same guarantee belt-and-braces).
  *
  * Design carve-outs (see README.md for the human-readable version):
- *   - Only the NEWEST-appearing giant tool_results are candidates: `tokens >= MIN_SKELETON_
- *     TOKENS` (ported from the code-skeleton reference), not an error result, not held
- *     (pinned / already manually folded or unfolded), and — the one judgment call — NOT in
- *     the newest turn. A block born in the turn the user is mid-conversation with may be
- *     exactly what they just asked for; doorman leaves the current turn alone and only acts
- *     on giant results that are already at least one turn old (but still fresh — never sent).
+ *   - A candidate is a FRESH (never-sent) giant tool_result: `tokens >= MIN_SKELETON_TOKENS`
+ *     (ported from the code-skeleton reference), not an error result, not held (pinned /
+ *     already manually folded or unfolded), not inside a folded group. It acts REGARDLESS of
+ *     turn: in a real live loop the wire-departing hold fires at the continuation hook, where a
+ *     just-arrived tool_result is ALWAYS still in the current (newest) turn AND still unsent —
+ *     that continuation hook IS the birth-fold moment, so a "leave the newest turn alone" guard
+ *     would mean doorman never fires at all. Freshness (`!sent`), not turn age, is the gate: the
+ *     block is birth-folded on its very first appearance, before the sent cursor advances.
  *   - `classifyCodeRead` (ported verbatim from the deleted code-skeleton conductor, ADR 0016)
  *     decides code vs. not-code. A code classification that isn't actually WORTH skeletonizing
  *     (no elidable body, or the skeleton wouldn't shrink the block enough) is left ALONE this
@@ -117,8 +119,6 @@ export class DoormanConductor implements Conductor {
 		if (!host || !e.freshIds.length) return;
 
 		const blocks = host.blocks();
-		let latestTurn = 0;
-		for (const b of blocks) if (b.turn > latestTurn) latestTurn = b.turn;
 
 		// callId → tool_call block, so the classifier can recover each read's path/command.
 		const callById = new Map<string, ViewBlock>();
@@ -140,7 +140,6 @@ export class DoormanConductor implements Conductor {
 			if (b.held) continue; // a human override (pin/fold/unfold) already owns this block
 			if (b.grouped) continue; // a folded group's overlay owns it, not us
 			if (b.tokens < MIN_SKELETON_TOKENS) continue;
-			if (b.turn >= latestTurn) continue; // the user may have just asked for exactly this
 
 			const info = classifyCodeRead(b, callById);
 			if (info) {

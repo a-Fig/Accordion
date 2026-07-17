@@ -213,9 +213,31 @@ export class Truth {
 			b.subst = old.subst;
 			if (prev.birthFolded.has(b.id)) next.birthFolded.add(b.id);
 		}
+		// Carry the SENT FRONTIER. `new Truth(parsed)` marked every block sent (bulk-born, ADR 0018
+		// §5); that is wrong for a live rebuild — a block that was UNSENT in `prev` (a fresh
+		// tool_result mid-turn) or is genuinely NEW must stay unsent, or the rebuild silently kills
+		// its birth-fold eligibility (canFold's `!sent(b)` branch). A surviving block keeps prev's
+		// sent-state; a new block is unsent. Sent-ness is a prefix by `order`, so the frontier lands
+		// just before the earliest not-sent block regardless of the log's array order.
+		let frontier = next.blockLog.length ? next.blockLog[next.blockLog.length - 1].order : -1;
+		for (const b of next.blockLog) {
+			const old = prev.get(b.id);
+			const wasSent = old ? prev.sent(old) : false;
+			if (!wasSent) frontier = Math.min(frontier, b.order - 1);
+		}
+		next.sentThroughOrderValue = frontier;
 		const survivors = next.index;
 		next.groupList = prev.groupList
-			.filter((g) => g.memberIds.every((id) => survivors.has(id)))
+			.filter((g) => {
+				if (!g.memberIds.every((id) => survivors.has(id))) return false; // a member vanished
+				// A carried group must still be CONTIGUOUS in the new order. The wire emits one summary
+				// per contiguous run (`applyPlan`), while group accounting charges one summary for the
+				// whole group — if a rebuild reordered the surviving members apart, keeping the group
+				// would fork accounting from the wire. Drop it (don't re-snap); surviving members keep
+				// their own per-block overlay, they just no longer share a group.
+				const idxs = g.memberIds.map((id) => survivors.get(id)!).sort((a, b) => a - b);
+				return idxs.every((v, k) => k === 0 || v === idxs[k - 1] + 1);
+			})
 			.map((g) => ({ ...g, memberIds: g.memberIds.slice() }));
 		next.housekeep(new Set<string>());
 		return next;
@@ -348,6 +370,11 @@ export class Truth {
 	canFold(b: Block, by: Actor = "you"): boolean {
 		if (!wireFoldable(b)) return false;
 		if (this.inFoldedGroup(b.id)) return false;
+		// With a live wire attached, a positional (non-durable) id can't be folded: `computeFoldOps`
+		// drops it, so the model would still receive full content while the UI/accounting show it
+		// folded. Refuse it here rather than fork the two. Non-wire (demo/CC/file) sessions have no
+		// wire to diverge from, so this gate is wire-conditional — same rule as group accounting.
+		if (this.wireAttached && !isDurableId(b.id)) return false;
 		if (by === "you") {
 			if (b.override === "pinned") return false;
 			return !this.isProtected(b);
@@ -629,10 +656,33 @@ export class Truth {
 		for (const id of touched) this.lastChangedRev.set(id, rev);
 		this.emit({ type: "locks", locks: this.activeLocks, holder: this.holderLabel, tailTokens: this.activeTailTok, rev });
 	}
-	clearLocks(): void {
+	/**
+	 * Release the involvement locks. `inheritTail` (the conductor-detach path) closes the
+	 * freeze-safety hole: a `tail-size` conductor enforces a small (often zero) tail while it holds
+	 * the session; on plain detach `protectTokens` snaps BACK to the human's larger dial, and the
+	 * very next housekeep then prunes the (freeze-converted, human-owned) whole-session group and
+	 * heals the frozen folds — destroying exactly the work `freeze` promised to preserve. With
+	 * `inheritTail:true`, the enforced tail is adopted as `protectTokens` BEFORE the lock releases,
+	 * so the protected boundary does NOT snap back; the human regains the dial and re-expanding it
+	 * later is their own conscious act (normal healing then applies, and F3 makes that heal
+	 * complete). Plain `clearLocks()` keeps the legacy snap-back behavior.
+	 *
+	 * No protocol change: `protectTokens` already rides `config` events, so the inherited value is
+	 * emitted as one — a replica that later resnapshots (the config lands while its own `tail-size`
+	 * lock is momentarily still set) recovers the inherited value from the fresh snapshot. The
+	 * config event fires FIRST so any divergence surfaces as a rev mismatch (⇒ resnapshot), never a
+	 * silent state fork. Wave 2 wires `LiveConductorHost.detachActive` to pass `{inheritTail:true}`.
+	 */
+	clearLocks(opts?: { inheritTail?: boolean }): void {
+		const inheritedTail = opts?.inheritTail && this.isLocked("tail-size") ? this.activeTailTok : null;
 		this.activeLocks = [];
 		this.holderLabel = null;
 		this.activeTailTok = 0;
+		if (inheritedTail !== null) {
+			this.protectTokensTarget = inheritedTail;
+			const crev = ++this.revCounter;
+			this.emit({ type: "config", protectTokens: this.protectTokensTarget, rev: crev });
+		}
 		const touched = new Set<string>();
 		this.housekeep(touched);
 		const rev = ++this.revCounter;
@@ -674,20 +724,32 @@ export class Truth {
 		}
 	}
 	/**
-	 * Engine invariant — protection is absolute for the human. Heal a HUMAN fold the tail has
-	 * grown over, and a STRATEGY fold of a block the model already saw whole. A BIRTH-FOLD (a
-	 * strategy fold applied while the block was protected AND unsent) is skipped: the model never
-	 * saw it whole, so the tail growing over it yanks nothing.
+	 * Engine invariant — protection is absolute for the human. Heal a HUMAN fold the tail has grown
+	 * over, and a STRATEGY fold of a block the model already saw whole, in ONE coherent pass that
+	 * clears EVERY fold field so nothing half-heals.
+	 *
+	 * Never touched:
+	 *   - a PIN (`override === "pinned"`) — protection never revokes a hard pin, and clearing `by`
+	 *     underneath it would corrupt the pin's provenance;
+	 *   - a sticky UNFOLD (`override === "unfolded"`) — a human/agent decision to hold the block open
+	 *     (ADR 0005) is not a fold to heal, and it is already live;
+	 *   - a BIRTH-FOLD (strategy fold applied while protected AND unsent) — the model never saw it
+	 *     whole, so the tail growing over it yanks nothing.
+	 *
+	 * Everything else that is folded — a human fold (`override:"folded"`), a strategy fold
+	 * (`autoFolded`), a `replace` subst, OR a freeze-converted fold (which is `override:"folded"`
+	 * AND `autoFolded` AND carries a `subst`) — is fully reset in the single branch below. The old
+	 * two-branch shape left a frozen fold half-healed (cleared the override but left `autoFolded`/
+	 * `subst`, so `isFolded` stayed true) and could zero a pin's `by`; this pass fixes both.
 	 */
 	private healProtected(touched: Set<string>): void {
 		const pf = this.protectedFromIndexUncached();
 		for (let i = pf; i < this.blockLog.length; i++) {
 			const b = this.blockLog[i];
-			if (b.override === "folded") {
+			if (b.override === "pinned" || b.override === "unfolded") continue;
+			if (this.birthFolded.has(b.id)) continue;
+			if (b.override === "folded" || b.autoFolded || b.subst !== undefined) {
 				b.override = null;
-				b.by = null;
-				touched.add(b.id);
-			} else if (b.autoFolded && !this.birthFolded.has(b.id)) {
 				b.autoFolded = false;
 				b.subst = undefined;
 				b.by = null;
@@ -795,6 +857,7 @@ export class Truth {
 			if (this.stale(id, baseRev)) return "stale";
 			if (this.inFoldedGroup(id)) return "grouped";
 			if (!wireFoldable(b)) return "not-foldable";
+			if (this.wireAttached && !isDurableId(id)) return "non-durable"; // wire would silently drop it
 			if (by === "you") {
 				if (b.override === "pinned") return "human-override";
 				if (this.isProtected(b)) return "protected";
@@ -826,6 +889,7 @@ export class Truth {
 		if (this.inFoldedGroup(op.id)) return this.clamp(op, "grouped");
 		if (b.override !== null) return this.clamp(op, "human-override");
 		if (!wireFoldable(b)) return this.clamp(op, "not-foldable");
+		if (this.wireAttached && !isDurableId(op.id)) return this.clamp(op, "non-durable"); // wire would silently drop it
 		if (this.isProtected(b)) {
 			if (this.sent(b)) return this.clamp(op, "protected");
 			this.birthFolded.add(op.id);
@@ -860,9 +924,22 @@ export class Truth {
 				this.birthFolded.delete(id);
 				return null;
 			}
-			// human / strategy unfold — hold the block open
+			if (by === "auto") {
+				// A STRATEGY unfold behaves exactly like `auto`: clear the strategy's own fold with
+				// NO standing override (see the `unfold` Op doc in ops.ts). Writing an `unfolded`
+				// override here would wedge the strategy out of its own block — `canFold`/`opAuto`
+				// both refuse a non-null override, so it could never re-fold what it just opened.
+				if (b.override !== null) return "human-override"; // a human override wins
+				if (!b.autoFolded && b.subst === undefined) return "noop";
+				b.autoFolded = false;
+				b.subst = undefined;
+				b.by = null;
+				this.birthFolded.delete(id);
+				return null;
+			}
+			// human unfold — hold the block open (a sticky `unfolded` override)
 			b.override = "unfolded";
-			b.by = by;
+			b.by = "you";
 			b.subst = undefined;
 			this.birthFolded.delete(id);
 			return null;

@@ -84,25 +84,29 @@ function bigDtsSource(nInterfaces = 80): string {
 // ── (1) birth-fold: skeletonize ──────────────────────────────────────────────────────────
 
 describe("DoormanConductor — birth-fold skeletonizes a big fresh code read", () => {
-	it("Python file read from a prior turn: replaced with header+skeleton while still inside the protected tail", async () => {
+	it("Python file read in the CURRENT turn: replaced with header+skeleton at the continuation hook while still protected", async () => {
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
 
+		// The REAL live sequence: user asks, the agent's Read call returns a giant tool_result — all
+		// in the current (newest) turn — and the continuation hook (`wire-departing`) fires to send
+		// that result back to the model. There is no later turn: the block doorman must act on is, by
+		// construction, in the turn the user is mid-conversation with. (No trailing user message.)
 		const py = bigPythonSource(15);
 		host.appendBlocks([
 			userBlock("u:1", 1, 0, "read util.py for me"),
 			toolCall("c:1", 1, 1, "Read", { file_path: "src/util.py" }),
 			toolResult("r:1", 1, 2, "c:1", "Read", py),
-			userBlock("u:2", 2, 3, "thanks, now do something else"),
 		]);
 
 		// The whole tiny transcript fits comfortably inside the default 20k-token protected tail
 		// (every block is protected), and r:1 has never been sent — both conditions the birth-fold
-		// exemption (Truth.canFold's by:"auto" branch) requires.
+		// exemption (Truth.canFold's by:"auto" branch) requires. It is in the newest turn.
 		const before = host.get("r:1")!;
 		expect(before.protected).toBe(true);
 		expect(before.sent).toBe(false);
+		expect(before.turn).toBe(1); // the newest turn — where the continuation hook fires
 
 		await host.departWire();
 
@@ -131,21 +135,22 @@ describe("DoormanConductor — birth-fold skeletonizes a big fresh code read", (
 // ── (2) birth-fold: generic engine digest for a non-code giant dump ─────────────────────
 
 describe("DoormanConductor — birth-folds a non-code giant dump to the engine digest", () => {
-	it("a big fresh grep dump folds despite being protected+fresh, tagged with the engine's own digest", async () => {
+	it("a big fresh current-turn grep dump folds despite being protected+fresh, tagged with the engine's own digest", async () => {
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
 
+		// Current-turn live sequence — the grep result rides the continuation hook back to the model.
 		const grep = bigGrepDump(200);
 		host.appendBlocks([
 			userBlock("u:1", 1, 0, "grep for foo"),
 			toolCall("c:1", 1, 1, "Bash", { command: "grep -R foo src/" }),
 			toolResult("r:1", 1, 2, "c:1", "Bash", grep),
-			userBlock("u:2", 2, 3, "ok next"),
 		]);
 
 		expect(host.get("r:1")!.protected).toBe(true);
 		expect(host.get("r:1")!.sent).toBe(false);
+		expect(host.get("r:1")!.turn).toBe(1); // newest turn
 
 		await host.departWire();
 
@@ -173,7 +178,6 @@ describe("DoormanConductor — leaves untouched", () => {
 			userBlock("u:1", 1, 0),
 			toolCall("c:1", 1, 1, "Read", { file_path: "src/tiny.py" }),
 			toolResult("r:1", 1, 2, "c:1", "Read", "def f():\n    return 1\n"),
-			userBlock("u:2", 2, 3),
 		]);
 		await host.departWire();
 		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(false);
@@ -188,20 +192,23 @@ describe("DoormanConductor — leaves untouched", () => {
 			userBlock("u:1", 1, 0),
 			toolCall("c:1", 1, 1, "Read", { file_path: "src/util.py" }),
 			toolResult("r:1", 1, 2, "c:1", "Read", py, { isError: true }),
-			userBlock("u:2", 2, 3),
 		]);
 		await host.departWire();
 		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(false);
 	});
 
-	it("a huge result in the CURRENT (newest) turn stays live — the user may have just asked for it", async () => {
+	it("a huge result in the CURRENT (newest) turn IS birth-folded — that is the real live case", async () => {
+		// This replaces the old "current-turn results stay live" test, which encoded the bug: in a
+		// live loop the continuation hook fires while the giant result is still in the newest turn,
+		// so doorman MUST act there. Freshness (`!sent`), not turn age, is the only gate.
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
 		const py = bigPythonSource(15);
-		host.appendBlocks([userBlock("u:1", 1, 0), toolCall("c:1", 2, 1, "Read", { file_path: "src/util.py" }), toolResult("r:1", 2, 2, "c:1", "Read", py)]);
+		host.appendBlocks([userBlock("u:1", 1, 0), toolCall("c:1", 1, 1, "Read", { file_path: "src/util.py" }), toolResult("r:1", 1, 2, "c:1", "Read", py)]);
+		expect(host.get("r:1")!.turn).toBe(1); // the newest turn
 		await host.departWire();
-		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(false);
+		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(true); // birth-folded on first appearance
 	});
 
 	it("a pinned (held) huge result stays live", async () => {
@@ -213,7 +220,6 @@ describe("DoormanConductor — leaves untouched", () => {
 			userBlock("u:1", 1, 0),
 			toolCall("c:1", 1, 1, "Read", { file_path: "src/util.py" }),
 			toolResult("r:1", 1, 2, "c:1", "Read", py),
-			userBlock("u:2", 2, 3),
 		]);
 		host.humanPin("r:1");
 		await host.departWire();
@@ -243,19 +249,12 @@ describe("DoormanConductor — respects overrides forever", () => {
 
 		host.agentUnfold("r:1"); // the agent calls `unfold` on it
 		const afterUnfold = host.truth.get("r:1")!;
-		// `override` is the field every future clamp actually gates on (`canFold`'s
-		// `if (b.override !== null) return false`), so THIS is the guarantee that matters, and it
-		// holds. NOTE (pre-existing Truth behavior, unrelated to doorman): `by` itself comes back
-		// `null`, not `"agent"` — `opUnfold` deletes the id from the internal `birthFolded` set
-		// (correctly — it is no longer a birth-fold once overridden), but the very same `apply()`
-		// call's trailing `housekeep()` → `healProtected()` then sees an `autoFolded` block that is
-		// no longer in `birthFolded` and "heals" it as if it were an ordinary aged-out strategy
-		// fold, zeroing `by` in the process. `override` (and therefore `isFolded`/future `canFold`)
-		// is untouched by that heal, so the override still wins — only the `by` provenance label is
-		// collateral. Pinned here as-is (not asserted as "agent") since fixing it is out of scope
-		// for this conductor-only change; flagged in the doorman build report for the engine owner.
+		// The agent's unfold is sticky (ADR 0005): it writes `override:"unfolded"` / `by:"agent"`.
+		// `healProtected` (fixed) NEVER touches an `unfolded` override — it is a decision to hold the
+		// block open, not a fold to heal — so the `by:"agent"` provenance now survives intact. (The
+		// old two-branch heal used to zero `by` here as collateral; that quirk is gone.)
 		expect(afterUnfold.override).toBe("unfolded");
-		expect(afterUnfold.by).toBe(null);
+		expect(afterUnfold.by).toBe("agent");
 		expect(host.truth.isFolded(afterUnfold)).toBe(false);
 
 		const statusCallsBefore = host.statusLog.length;
@@ -356,7 +355,7 @@ describe("DoormanConductor — worth-it rejection", () => {
 		const d = new DoormanConductor();
 		d.attach(host);
 		const dts = bigDtsSource(80); // all top-level interfaces — nothing to elide
-		host.appendBlocks([userBlock("u:1", 1, 0), toolCall("c:1", 1, 1, "Read", { file_path: "src/types.ts" }), toolResult("r:1", 1, 2, "c:1", "Read", dts), userBlock("u:2", 2, 3)]);
+		host.appendBlocks([userBlock("u:1", 1, 0), toolCall("c:1", 1, 1, "Read", { file_path: "src/types.ts" }), toolResult("r:1", 1, 2, "c:1", "Read", dts)]);
 		await host.departWire();
 		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(false);
 	});

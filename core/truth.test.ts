@@ -524,3 +524,293 @@ describe("Truth — rebuildFrom (rebuild-preserving overlay)", () => {
 		expect(next.get("a:b0:p0")!.override).toBe(null);
 	});
 });
+
+// ── F2 (S5): a divergence rebuild used to construct `new Truth(...)`, whose constructor marks
+// every block sent (bulk-born) — so a rebuild silently killed birth-fold for genuinely-unsent
+// blocks. `rebuildFrom` now carries the sent frontier.
+describe("Truth — rebuildFrom carries the sent frontier (S5)", () => {
+	it("a mid-turn UNSENT block stays unsent (birth-foldable) across a rebuild; sent blocks stay sent", () => {
+		const host = live();
+		host.append(seq(3, 1000)); // live → orders 0,1,2 all unsent
+		host.markSent(1); // orders 0,1 sent; order 2 still unsent (mid-turn)
+		expect(host.sent(host.get("a:b2:p0")!)).toBe(false);
+
+		const fresh = seq(3, 1000); // same ids re-linearized, no overlay
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+
+		expect(next.sent(next.get("a:b0:p0")!)).toBe(true);
+		expect(next.sent(next.get("a:b1:p0")!)).toBe(true);
+		expect(next.sent(next.get("a:b2:p0")!)).toBe(false); // NOT marked sent by the rebuild
+
+		next.setProtect(1_000_000); // protect everything
+		expect(next.isProtected(next.get("a:b2:p0")!)).toBe(true);
+		expect(next.canFold(next.get("a:b2:p0")!, "auto")).toBe(true); // birth-fold survives
+		expect(next.canFold(next.get("a:b0:p0")!, "auto")).toBe(false); // sent → no exemption
+	});
+
+	it("a genuinely NEW block the rebuild introduces is unsent", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		host.markSent(1); // both sent
+		const fresh = seq(3, 1000); // a:b2:p0 is new
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(next.sent(next.get("a:b0:p0")!)).toBe(true);
+		expect(next.sent(next.get("a:b1:p0")!)).toBe(true);
+		expect(next.sent(next.get("a:b2:p0")!)).toBe(false); // new → unsent
+	});
+
+	// F1 × F2: a rebuild in the continuation window (another extension rewrites `event.messages`
+	// while a fresh giant tool_result is still in flight) must not strip doorman's birth-fold moment.
+	it("F1×F2: a rebuild in the continuation window preserves the birth-fold opportunity", () => {
+		const host = live();
+		host.append([blk("u:1", "user", 0, 5), blk("a:c1:p0", "tool_call", 1, 5), blk("r:big", "tool_result", 2, 8000)]);
+		expect(host.sent(host.get("r:big")!)).toBe(false);
+
+		const fresh = [blk("u:1", "user", 0, 5), blk("a:c1:p0", "tool_call", 1, 5), blk("r:big", "tool_result", 2, 8000)];
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+
+		const big = next.get("r:big")!;
+		expect(next.sent(big)).toBe(false); // survived the rebuild unsent
+		expect(next.isProtected(big)).toBe(true); // a giant fresh result is in the protected tail
+		expect(next.canFold(big, "auto")).toBe(true); // ← doorman's birth-fold is still reachable
+		const r = next.apply([{ kind: "fold", ids: ["r:big"] }], "auto");
+		expect(r.results[0].applied).toBe(true);
+		expect(next.isFolded(next.get("r:big")!)).toBe(true);
+	});
+});
+
+// ── F5 (S3): `rebuildFrom` used to keep any group whose members all survived, without revalidating
+// contiguity. The wire emits one summary per CONTIGUOUS run while accounting charges one — a
+// reordered group diverges the two. `rebuildFrom` now drops a non-contiguous carried group.
+describe("Truth — rebuildFrom drops a non-contiguous group (S3)", () => {
+	it("a reorder-rebuild that scatters a group's members drops the group", () => {
+		const host = live();
+		host.append(seq(5, 1000));
+		host.setProtect(0);
+		const gr = host.apply([{ kind: "group", ids: ["a:b1:p0", "a:b2:p0"] }], "you");
+		expect(gr.results[0].applied).toBe(true);
+		expect(host.groups.length).toBe(1);
+
+		// a:b3 slips between the two members — every member survives, but they are no longer a run.
+		const fresh = [
+			blk("a:b0:p0", "text", 0, 1000),
+			blk("a:b1:p0", "text", 1, 1000),
+			blk("a:b3:p0", "text", 2, 1000),
+			blk("a:b2:p0", "text", 3, 1000),
+			blk("a:b4:p0", "text", 4, 1000),
+		];
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+
+		expect(next.get("a:b1:p0")).toBeDefined(); // members survive as blocks
+		expect(next.get("a:b2:p0")).toBeDefined();
+		expect(next.groups.length).toBe(0); // group dropped — no longer contiguous
+		expect(next.computeGroupOps().length).toBe(0); // accounting matches the wire (no group either)
+	});
+
+	it("keeps a group whose members stay contiguous after a rebuild", () => {
+		const host = live();
+		host.append(seq(5, 1000));
+		host.setProtect(0);
+		const gr = host.apply([{ kind: "group", ids: ["a:b1:p0", "a:b2:p0"] }], "you");
+		expect(gr.results[0].applied).toBe(true);
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: seq(5, 1000), lineCount: 0, skipped: 0 });
+		expect(next.groups.length).toBe(1);
+		expect(next.groups[0].memberIds).toEqual(["a:b1:p0", "a:b2:p0"]);
+	});
+});
+
+// ── F3 (S2): `healProtected` used to run TWO branches — clearing an `override:"folded"` but leaving
+// `autoFolded`/`subst` residue (a frozen fold half-healed), and zeroing `by` for any `autoFolded`
+// block without checking `override` (corrupting a human pin's provenance). One coherent pass now.
+describe("Truth — healProtected coherent heal (S2)", () => {
+	it("fully heals a FROZEN fold (override:folded + autoFolded + subst) the tail grows over — no residue", () => {
+		const t = live();
+		t.append(seq(4, 1000));
+		t.setProtect(0);
+		t.apply([{ kind: "replace", id: "a:b0:p0", content: "recap", recoverable: false }], "auto"); // autoFolded + subst
+		t.apply([{ kind: "freeze" }], "you"); // → override:folded + autoFolded + subst
+		const frozen = t.get("a:b0:p0")!;
+		expect(frozen.override).toBe("folded");
+		expect(frozen.autoFolded).toBe(true);
+		expect(frozen.subst).toBe("recap");
+
+		t.setProtect(1_000_000); // tail grows over everything → heal
+		const healed = t.get("a:b0:p0")!;
+		expect(healed.override).toBe(null);
+		expect(healed.autoFolded).toBe(false); // NOT left as residue (the old half-heal bug)
+		expect(healed.subst).toBeUndefined();
+		expect(healed.by).toBe(null);
+		expect(t.isFolded(healed)).toBe(false); // fully live, not half-folded
+	});
+
+	it("never zeroes a PIN's provenance when the tail grows over it", () => {
+		const t = live();
+		t.append(seq(4, 1000));
+		t.setProtect(0);
+		t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "auto"); // autoFolded:true, by:auto
+		t.apply([{ kind: "pin", ids: ["a:b0:p0"] }], "you"); // override:pinned, by:you (autoFolded residue stays)
+		expect(t.get("a:b0:p0")!.override).toBe("pinned");
+		expect(t.get("a:b0:p0")!.by).toBe("you");
+
+		t.setProtect(1_000_000); // tail grows over it
+		const after = t.get("a:b0:p0")!;
+		expect(after.override).toBe("pinned"); // pin intact
+		expect(after.by).toBe("you"); // provenance NOT zeroed (the old else-if bug)
+		expect(t.isFolded(after)).toBe(false);
+	});
+
+	it("still heals an ordinary human fold and an ordinary (sent) strategy fold the tail grows over", () => {
+		const t = live();
+		t.append(seq(6, 1000));
+		t.markSent(5); // all sent — the strategy fold is NOT a birth-fold
+		t.setProtect(0);
+		t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "you");
+		t.apply([{ kind: "fold", ids: ["a:b1:p0"] }], "auto");
+		expect(t.isFolded(t.get("a:b0:p0")!)).toBe(true);
+		expect(t.isFolded(t.get("a:b1:p0")!)).toBe(true);
+		t.setProtect(1_000_000);
+		expect(t.isFolded(t.get("a:b0:p0")!)).toBe(false);
+		expect(t.get("a:b0:p0")!.override).toBe(null);
+		expect(t.isFolded(t.get("a:b1:p0")!)).toBe(false);
+	});
+});
+
+// ── F4 (S1): `opFold`/`opReplace`/`canFold` accepted a positional (non-durable) id that
+// `computeFoldOps` silently drops — UI/accounting said folded, the model got full content. Now
+// refused with a `non-durable` clamp, but only with a live wire attached (nothing to diverge from
+// otherwise), mirroring the wire-conditional group accounting.
+describe("Truth — non-durable-id fold gate (S1)", () => {
+	it("refuses a fold/replace on a positional id under a live wire; the block stays live everywhere", () => {
+		const t = live();
+		t.wireAttached = true;
+		t.append([blk("m0:p0", "text", 0, 1000), blk("a:b1:p0", "text", 1, 1000)]);
+		t.setProtect(0);
+
+		const rf = t.apply([{ kind: "fold", ids: ["m0:p0"] }], "you");
+		expect(rf.results[0].clamped).toBe("non-durable");
+		expect(t.isFolded(t.get("m0:p0")!)).toBe(false);
+
+		const rr = t.apply([{ kind: "replace", id: "m0:p0", content: "x" }], "auto");
+		expect(rr.results[0].clamped).toBe("non-durable");
+		expect(t.isFolded(t.get("m0:p0")!)).toBe(false);
+
+		expect(t.canFold(t.get("m0:p0")!, "you")).toBe(false);
+		expect(t.canFold(t.get("m0:p0")!, "auto")).toBe(false);
+		expect(t.computeFoldOps().length).toBe(0); // wire agrees — nothing folded
+
+		// a DURABLE id still folds under the same live wire (no over-blocking)
+		const rd = t.apply([{ kind: "fold", ids: ["a:b1:p0"] }], "you");
+		expect(rd.results[0].applied).toBe(true);
+		expect(t.isFolded(t.get("a:b1:p0")!)).toBe(true);
+	});
+
+	it("a non-wire (demo/CC/file) session still allows folding a positional id — no wire to diverge from", () => {
+		const t = bulk([blk("m0:p0", "text", 0, 1000)]); // wireAttached defaults false
+		t.setProtect(0);
+		const r = t.apply([{ kind: "fold", ids: ["m0:p0"] }], "you");
+		expect(r.results[0].applied).toBe(true);
+		expect(t.isFolded(t.get("m0:p0")!)).toBe(true);
+	});
+});
+
+// ── F6 (S4): a strategy `unfold` (by:"auto") used to take the human hold-open branch, writing an
+// `unfolded` override that `canFold`/`opAuto` then refuse — the strategy wedged itself out of its
+// own block. A strategy unfold now behaves exactly like `auto`.
+describe("Truth — strategy unfold behaves like auto (S4)", () => {
+	it("auto-unfold then auto-fold succeeds — a strategy can never wedge itself out", () => {
+		const t = live();
+		t.append(seq(3, 1000));
+		t.setProtect(0);
+		t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "auto");
+		expect(t.isFolded(t.get("a:b0:p0")!)).toBe(true);
+		const u = t.apply([{ kind: "unfold", ids: ["a:b0:p0"] }], "auto");
+		expect(u.results[0].applied).toBe(true);
+		expect(t.get("a:b0:p0")!.override).toBe(null); // NO standing override (unlike a human unfold)
+		expect(t.get("a:b0:p0")!.autoFolded).toBe(false);
+		expect(t.isFolded(t.get("a:b0:p0")!)).toBe(false);
+		const rf = t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "auto"); // re-fold: not wedged
+		expect(rf.results[0].applied).toBe(true);
+		expect(t.isFolded(t.get("a:b0:p0")!)).toBe(true);
+	});
+
+	it("a human unfold still writes a sticky `unfolded` override (unchanged)", () => {
+		const t = live();
+		t.append(seq(3, 1000));
+		t.setProtect(0);
+		t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "auto");
+		t.apply([{ kind: "unfold", ids: ["a:b0:p0"] }], "you");
+		expect(t.get("a:b0:p0")!.override).toBe("unfolded");
+		expect(t.get("a:b0:p0")!.by).toBe("you");
+	});
+
+	it("agent unfold stays sticky (ADR 0005) — an auto-fold after it still refuses", () => {
+		const t = live();
+		t.append(seq(3, 1000));
+		t.setProtect(0);
+		t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "auto");
+		const au = t.apply([{ kind: "unfold", ids: ["a:b0:p0"] }], "agent");
+		expect(au.results[0].applied).toBe(true);
+		expect(t.get("a:b0:p0")!.override).toBe("unfolded"); // agent override IS sticky
+		const rf = t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "auto");
+		expect(rf.results[0].clamped).toBe("human-override"); // strategy still refused
+		expect(t.isFolded(t.get("a:b0:p0")!)).toBe(false);
+	});
+});
+
+// ── F7 (P1-5): on detach, `clearLocks` dropped the enforced tail and the next housekeep pruned a
+// handoff-style whole-session group and healed freeze-converted folds — the freeze guarantee failed
+// exactly when a tail-size conductor detached with a large human tail waiting. `clearLocks({
+// inheritTail:true })` adopts the enforced tail so the protected boundary does not snap back.
+describe("Truth — clearLocks inheritTail (freeze-safe detach, P1-5)", () => {
+	it("inheritTail adopts the enforced (zero) tail so frozen work survives housekeep", () => {
+		const t = live();
+		t.append(seq(6, 1000));
+		t.setProtect(20_000); // the human dial that would otherwise snap back over everything
+		t.setLocks(["human-steering", "tail-size"], "handoff", 0); // zero-tail conductor
+		expect(t.protectedFromIndex()).toBe(6); // zero tail → nothing protected
+
+		t.apply([{ kind: "replace", id: "a:b0:p0", content: "recap", recoverable: false }], "auto");
+		const gr = t.apply([{ kind: "group", ids: ["a:b1:p0", "a:b3:p0"] }], "auto");
+		expect(gr.results[0].applied).toBe(true);
+
+		t.apply([{ kind: "freeze" }], "you"); // transfer ownership to the human
+		t.clearLocks({ inheritTail: true });
+
+		expect(t.protectTokens).toBe(0); // inherited the enforced tail — did NOT snap back to 20k
+		expect(t.locks.length).toBe(0);
+		expect(t.groups.length).toBe(1); // the whole-session group survives
+		expect(t.get("a:b0:p0")!.override).toBe("folded");
+		expect(t.get("a:b0:p0")!.subst).toBe("recap"); // byte-identical
+		expect(t.isFolded(t.get("a:b0:p0")!)).toBe(true);
+	});
+
+	it("plain clearLocks() keeps the legacy snap-back — frozen work in the re-expanded tail is pruned/healed", () => {
+		const t = live();
+		t.append(seq(6, 1000));
+		t.setProtect(1_000_000); // a big human tail that WILL snap back over everything
+		t.setLocks(["human-steering", "tail-size"], "handoff", 0);
+		t.apply([{ kind: "replace", id: "a:b0:p0", content: "recap", recoverable: false }], "auto");
+		const gr = t.apply([{ kind: "group", ids: ["a:b1:p0", "a:b3:p0"] }], "auto");
+		expect(gr.results[0].applied).toBe(true);
+		t.apply([{ kind: "freeze" }], "you");
+		t.clearLocks(); // legacy — no inherit
+
+		expect(t.protectTokens).toBe(1_000_000); // snapped back to the human dial
+		expect(t.groups.length).toBe(0); // pruned (now inside the re-expanded protected tail)
+		expect(t.isFolded(t.get("a:b0:p0")!)).toBe(false); // healed
+	});
+
+	it("inheritTail emits a config event carrying the inherited protectTokens (replicas can track it)", () => {
+		const t = live();
+		t.append(seq(3, 1000));
+		t.setProtect(20_000);
+		t.setLocks(["tail-size"], "handoff", 4000);
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+		t.clearLocks({ inheritTail: true });
+		const config = events.find((e) => e.type === "config" && e.protectTokens !== undefined);
+		expect(config).toBeDefined();
+		expect(config.protectTokens).toBe(4000);
+		expect(t.protectTokens).toBe(4000);
+	});
+});

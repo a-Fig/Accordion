@@ -19,8 +19,12 @@ export type Op =
 	 *  per-kind digest; omit it to use the engine digest. A human fold sets `override:"folded"`;
 	 *  a strategy fold (by:"auto") sets `autoFolded` and leaves `override` null. */
 	| { kind: "fold"; ids: string[]; digest?: string }
-	/** Return blocks to live/open. Human: a sticky `unfolded` override. Agent: unfold a folded
-	 *  block (cannot downgrade a human pin). */
+	/** Return blocks to live/open. Human ("you"): a sticky `unfolded` override. Agent ("agent"):
+	 *  unfold a folded block, staying sticky (cannot downgrade a human pin; ADR 0005). Strategy
+	 *  ("auto"): behaves EXACTLY like `auto` — clears its own `autoFolded`/`subst` and writes NO
+	 *  standing override. A strategy `unfold` must never leave an `unfolded` override, or it would
+	 *  wedge itself out of its own block: `canFold`/`opAuto` both refuse a non-null override, so the
+	 *  strategy could never re-fold what it just opened. */
 	| { kind: "unfold"; ids: string[] }
 	/** Human hard pin — locked full, never auto-folds. */
 	| { kind: "pin"; ids: string[] }
@@ -68,6 +72,11 @@ export type ClampReason =
 	| "protected"
 	/** The block's KIND is not foldable on the wire (user / tool_call). */
 	| "not-foldable"
+	/** The block's id is a POSITIONAL fallback (`m<i>:…`), not a durable content anchor, so the
+	 *  wire (`computeFoldOps`) would silently drop the fold and ship full content — accepting it
+	 *  would fork UI/accounting from what the model actually receives. Only enforced with a live
+	 *  wire attached (`wireAttached`), mirroring the durability-aware group accounting. */
+	| "non-durable"
 	/** The block is inside a folded group; the group overlay owns it. */
 	| "grouped"
 	/** A group op's ids were not a valid contiguous, ungrouped, ≥1-member run. */
