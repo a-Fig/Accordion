@@ -64,8 +64,10 @@ identity) are ported unchanged.
 
 ## Locks
 
-Declares `locks: ["human-steering", "agent-unfold"]` (ADR 0011) — data only. Neither `TestHost`
-nor the `ViewConductor` adapter applies a conductor's declared `locks` to the underlying `Truth`
-on attach/detach; that is the Phase-C host's job (turning `conductor.locks` into an actual
-`Truth.setLocks(...)` call). Tests that need the lock genuinely enforced should drive
-`host.truth.setLocks([...], "compaction-naive")` directly in setup.
+Declares `locks: ["human-steering", "agent-unfold"]` (ADR 0011). Neither `TestHost` nor the
+`ViewConductor` adapter applies a conductor's declared `locks` to the underlying `Truth` on
+attach/detach — those are unit-test scaffolding; a test that needs the lock genuinely enforced
+still drives `host.truth.setLocks([...], "compaction-naive")` directly in setup. The live path
+is different: `LiveConductorHost.select` (`core/conductor/liveHost.ts`) applies this
+declaration for real — eagerly, the instant the conductor attaches to a live session — and
+releases it via the freeze kill switch on detach.

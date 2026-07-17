@@ -7,8 +7,9 @@ folded to the engine's own digest. Everything it does is reversible by the agent
 (`unfold`/`recall`) and overridable by the human. It exists so the owner can watch
 [ADR 0018's birth-fold exemption](../../../docs/adr/0018-conductor-birth-fold.md) actually fire.
 
-Not wired into any registry — this directory is standalone per the workspace rule it was
-built under. Nothing outside `core/conductors/doorman/` imports it.
+Wired into `core/conductor/registry.ts`'s shipped catalog (`ENTRIES`) — `LiveConductorHost`
+(`core/conductor/liveHost.ts`) can attach it to a live session like any other in-process
+conductor. It declares no locks, so attaching it is fully collaborative — no consent gate.
 
 ## Files
 
