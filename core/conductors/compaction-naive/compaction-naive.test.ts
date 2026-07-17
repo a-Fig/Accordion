@@ -169,6 +169,79 @@ describe("NaiveCompactionConductor — hysteresis", () => {
 		expect(host.completeLog.length).toBe(1); // no relaunch
 		expect(host.truth.groups.length).toBe(1); // unchanged
 	});
+
+	// The test above passes trivially: with nothing appended, `newlyAged.length === 0` short-
+	// circuits `needSummary` before the visible-window arithmetic is ever evaluated. This test
+	// exercises a genuine PARTIAL REFILL: `newlyAged` is non-empty (the old protected tail plus one
+	// new block ages in) but the correct visible-window math still stays below the high-water mark,
+	// so the arithmetic itself — not the short-circuit — is what must decide to hold.
+	//
+	// After runPass1(), blocks 0-8 (900 raw tokens) are compacted into SUMMARY_A. summaryTokenCost
+	// = estTokens("[Compacted summary of 9 earlier messages]\n\nAlpha summary body.") = 16, so
+	// savedTokens = 900 - 16 = 884.
+	//
+	// Appending 4 more 100-token blocks (indices 12-15) makes 16 blocks total, so
+	// protectedFromIndex = 16 - 3 = 13 (Truth's uniform-100-token tail formula — see the file
+	// banner). aged = indices 0-12 (13 blocks); newlyAged = indices 9-12 (4 blocks: the old
+	// protected tail 9,10,11 aging in, plus new block 12) — non-empty, so `needSummary`'s
+	// short-circuit does NOT apply here.
+	//
+	// rawTotal = 16 * 100 = 1600. visible = 1600 - 884 = 716, comfortably under the 900 high-water
+	// mark, so the correct arithmetic must decide to STAY HELD without relaunching.
+	it("holds on a genuine partial refill — newlyAged is non-empty but the visible window stays under the high-water mark", async () => {
+		const { host } = await runPass1();
+
+		host.appendBlocks(Array.from({ length: 4 }, (_, i) => mkBlock(idOf(12 + i), 12 + i, "text", TOK, `PARTIAL-${12 + i}`)));
+		host.commitTurn();
+		await flush();
+
+		expect(host.completeLog.length).toBe(1); // no relaunch — visible (716) < 900
+		expect(host.truth.groups.length).toBe(1); // unchanged
+		const summary = host.truth.groupSummary(host.truth.groups[0]);
+		expect(summary).toBe(`[Compacted summary of 9 earlier messages]\n\n${SUMMARY_A}`); // still pass 1's summary, untouched
+	});
+});
+
+describe("NaiveCompactionConductor — trigger math uses the full raw token baseline, not view.liveTokens", () => {
+	// Regression coverage for PORT FIDELITY §3: the raw baseline MUST be `sumTokens(view.blocks)`
+	// (every block's full, un-folded token cost), never `view.liveTokens` (which already reflects
+	// this conductor's own group folding and would double-count the saving). The existing
+	// recursive-pass test above happens to add exactly 15 new blocks — a count where the two
+	// formulas agree (both trigger) — so it would NOT catch a regression back to `view.liveTokens`.
+	// This test picks 10 new blocks, inside the 6-14 range where the formulas DIVERGE.
+	//
+	// After runPass1(), blocks 0-8 (9 blocks) are compacted into SUMMARY_A, savedTokens = 884 (see
+	// the hysteresis test above for the derivation).
+	//
+	// Appending 10 more 100-token blocks makes 22 blocks total: protectedFromIndex = 22 - 3 = 19,
+	// so aged = indices 0-18 (19 blocks) and newlyAged = indices 9-18 (10 blocks).
+	//
+	// CORRECT baseline: rawTotal = sumTokens(view.blocks) = 22 * 100 = 2200.
+	//   visible = 2200 - 884 = 1316 >= 900 → TRIGGERS a second compaction.
+	//
+	// BUGGY baseline (raw = view.liveTokens): the compacted run (blocks 0-8) collapses in Truth's
+	// group-wire accounting to one carrier block costing estTokens(summary) + BLOCK_OVERHEAD
+	// = 16 + 4 = 20 tokens, with the other 8 members costing 0 — so
+	//   view.liveTokens = 20 (carrier) + 0*8 (collapsed) + 13*100 (the 13 still-ungrouped blocks) = 1320.
+	//   buggy visible = 1320 - 884 = 436 < 900 → would NOT trigger — silently stuck on the stale
+	//   pass-1 summary while 10 more blocks' worth of history ages in unaccounted for.
+	it("triggers a genuine second compaction at 10 new blocks — a count where the correct and view.liveTokens baselines diverge", async () => {
+		const { host } = await runPass1();
+
+		host.appendBlocks(
+			Array.from({ length: 10 }, (_, i) => mkBlock(idOf(12 + i), 12 + i, i % 2 === 0 ? "user" : "text", TOK, `NEW2-${12 + i}`)),
+		);
+		host.queueCompletion({ text: SUMMARY_B });
+		host.commitTurn();
+		await flush();
+
+		expect(host.completeLog.length).toBe(2); // the correct baseline triggers a genuine second pass
+		expect(host.truth.groups.length).toBe(1);
+		const g = host.truth.groups[0];
+		expect(g.memberIds[0]).toBe(idOf(0));
+		expect(g.memberIds[g.memberIds.length - 1]).toBe(idOf(18));
+		expect(host.truth.groupSummary(g)).toBe(`[Compacted summary of 19 earlier messages]\n\n${SUMMARY_B}`);
+	});
 });
 
 describe("NaiveCompactionConductor — reject path", () => {
