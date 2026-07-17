@@ -44,6 +44,10 @@ const banner = `// remote-sdk.mjs — GENERATED ARTIFACT, DO NOT EDIT BY HAND.
 // \`ws\` is intentionally NOT bundled/required. Exports: runRemoteConductor, ThermoclineConductor.`;
 
 const result = await esbuild.build({
+	// Pin the build's working directory so the bundle's source-path comments (and therefore the
+	// committed artifact's bytes) are identical no matter which directory the script is run from —
+	// drift checks diff this file against a fresh regeneration.
+	absWorkingDir: repoRoot,
 	stdin: {
 		contents:
 			'export { runRemoteConductor } from "./core/conductor/remote";\n' +

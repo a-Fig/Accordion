@@ -5,12 +5,12 @@
 // Flat ESM, runnable under plain `node` (Node 22+ ships the global WebSocket the SDK dials with).
 // `ws` is intentionally NOT bundled/required. Exports: runRemoteConductor, ThermoclineConductor.
 
-// ../core/locks.ts
+// core/locks.ts
 function hasLock(locks, name) {
   return !!locks && locks.includes(name);
 }
 
-// ../core/tokens.ts
+// core/tokens.ts
 var CHARS_PER_TOKEN = 4;
 var BLOCK_OVERHEAD = 4;
 function estTokens(s) {
@@ -27,7 +27,7 @@ function firstLine(s, n = 100) {
   return clip(line, n);
 }
 
-// ../core/digest.ts
+// core/digest.ts
 var FOLDABLE_KINDS = /* @__PURE__ */ new Set(["text", "thinking", "tool_result"]);
 function wireFoldable(b) {
   return FOLDABLE_KINDS.has(b.kind);
@@ -134,7 +134,7 @@ function groupDigestTokens(group, members) {
   return estTokens(groupDigest(group, members)) + BLOCK_OVERHEAD;
 }
 
-// ../core/wire.ts
+// core/wire.ts
 function blockId(m, i, partIndex) {
   switch (m.role) {
     case "user":
@@ -327,7 +327,7 @@ function applyPlan(messages, ops, groups = [], appliedOut) {
   return changed ? out : messages;
 }
 
-// ../core/truth.ts
+// core/truth.ts
 var PROTECT_OVERFLOW_CAP = 1.25;
 var LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
 function messageKey(id) {
@@ -1329,7 +1329,7 @@ var Truth = class _Truth {
   }
 };
 
-// ../core/replica.ts
+// core/replica.ts
 function hydrateSnapshot(meta, state) {
   const overlayById = /* @__PURE__ */ new Map();
   for (const o of state.overlay) overlayById.set(o.id, o);
@@ -1388,7 +1388,7 @@ function applyWireEvent(truth, ev) {
   }
 }
 
-// ../core/conductor/hostAdapter.ts
+// core/conductor/hostAdapter.ts
 function viewBlockOf(truth, b) {
   return {
     id: b.id,
@@ -1464,7 +1464,7 @@ function recallHostEvent(ids, by, rev) {
   return { type: "state-changed", changes: ids.map((id) => ({ id, what: "recall", by })), rev };
 }
 
-// ../core/protocol.ts
+// core/protocol.ts
 var PROTOCOL_VERSION = 14;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
@@ -1487,7 +1487,7 @@ function isServerMessage(v) {
   return SERVER_TYPES.has(v.type);
 }
 
-// ../core/conductor/remote.ts
+// core/conductor/remote.ts
 var WS_OPEN = 1;
 function defaultWsFactory(url) {
   const Ctor = globalThis.WebSocket;
@@ -1776,12 +1776,12 @@ function runRemoteConductor(conductor, opts) {
   });
 }
 
-// ../conductors/thermocline/thermocline.ts
+// conductors/thermocline/thermocline.ts
 import { mkdirSync, writeFileSync as writeFileSync2, renameSync, readFileSync as readFileSync2 } from "node:fs";
 import { homedir } from "node:os";
 import { join as join2 } from "node:path";
 
-// ../conductors/thermocline/policy.ts
+// conductors/thermocline/policy.ts
 var FOLDABLE_KINDS2 = /* @__PURE__ */ new Set(["text", "thinking", "tool_result"]);
 var DEFAULT_CFG = {
   highWater: 0.9,
@@ -2344,7 +2344,7 @@ function blockLabel(b) {
   }
 }
 
-// ../conductors/thermocline/scorer.ts
+// conductors/thermocline/scorer.ts
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -2479,7 +2479,7 @@ function tailTextFromView(blocks) {
   return text;
 }
 
-// ../conductors/thermocline/thermocline.ts
+// conductors/thermocline/thermocline.ts
 var ID = "thermocline";
 var LABEL = "Thermocline";
 function persistPath(dir, key) {
