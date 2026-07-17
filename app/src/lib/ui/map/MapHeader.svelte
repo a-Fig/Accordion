@@ -67,19 +67,22 @@
 	// What "Revert to auto" will clear: every block carrying a manual/agent override.
 	const editCount = $derived(store.blocks.filter((b) => b.override !== null).length);
 
-	// ── Wire outcome readout (issue #60, ADR 0020): "applied" acked model calls seen this
-	// connection out of the total acked. Failure causes (timeout-stale/timeout-raw/
-	// epoch-mismatch) make the numerator fall behind the denominator; an empty-plan reply
-	// counts as a SUCCESS (the GUI intentionally asked for no folds, same as applying one).
-	const wireTotal = $derived(live.planOutcomes.total);
-	const wireApplied = $derived(live.planOutcomes.applied + live.planOutcomes["empty-plan"]);
-	const wireTip = $derived(
-		`Model calls this connection: ${wireTotal}\n` +
-			`applied: ${live.planOutcomes.applied}\n` +
-			`empty-plan (intentional, no folds): ${live.planOutcomes["empty-plan"]}\n` +
-			`timeout-stale (fell back to last known plan): ${live.planOutcomes["timeout-stale"]}\n` +
-			`timeout-raw (no plan to fall back to): ${live.planOutcomes["timeout-raw"]}\n` +
-			`epoch-mismatch (view superseded mid-wait): ${live.planOutcomes["epoch-mismatch"]}`,
+	// ── Latency badge (Phase B): the extension's `context` hook is now a LOCAL operation, so we
+	// show its DURATION, not a plan round-trip outcome. Neutral/green under 250ms (the old plan
+	// timeout — a local hook should be far below it), amber ≥250ms, red ≥1000ms. The tooltip
+	// carries max / p95 / structural-rebuild counts. Monochrome per the visual grammar.
+	const LAT_AMBER = 250;
+	const LAT_RED = 1000;
+	const hookMs = $derived(live.telemetry.lastHookMs);
+	const hookCount = $derived(live.telemetry.hookCount);
+	const latClass = $derived(hookMs >= LAT_RED ? "lat-red" : hookMs >= LAT_AMBER ? "lat-amber" : "lat-ok");
+	const latTip = $derived(
+		`Local context-hook latency (no plan round trip in Phase B)\n` +
+			`last: ${hookMs} ms\n` +
+			`max: ${live.telemetry.maxHookMs} ms\n` +
+			`p95: ${live.telemetry.p95HookMs} ms\n` +
+			`hooks this connection: ${hookCount}\n` +
+			`structural rebuilds: ${live.telemetry.rebuilds}`,
 	);
 
 	// ── Involvement locks (ADR 0011) — the honest mirror of the engine's gating. A locked
@@ -186,18 +189,18 @@
 				</button>
 			{/if}
 
-			<!-- Wire outcome readout (issue #60): hidden entirely until this connection has seen
-			     at least one acked model call — browsing/read-only/demo sessions have no wire, so
-			     they must show nothing (preview is NOT a more permissive mode). Neutral/mono only —
-			     #044EFF is reserved for the user block kind, never UI chrome. -->
-			{#if live.status === "connected" && wireTotal > 0}
-				<div class="ctl-field wire-read" title={wireTip}>
+			<!-- Latency badge (Phase B): the local context-hook duration. Hidden until this
+			     connection has seen at least one hook — browsing/read-only/demo sessions have no
+			     wire, so they show nothing. Monochrome; amber/red only tint the value on a slow
+			     hook (#044EFF stays reserved for the user block kind, never UI chrome). -->
+			{#if live.status === "connected" && hookCount > 0}
+				<div class="ctl-field lat-read" title={latTip}>
 					<span class="ctl-eyebrow mono">
 						<Icon name="activity" size={10} />
-						WIRE
+						LATENCY
 					</span>
-					<span class="ctl-value mono tnum" class:wire-partial={wireApplied < wireTotal}>
-						{wireApplied}/{wireTotal}
+					<span class="ctl-value mono tnum {latClass}">
+						{hookMs}ms
 					</span>
 				</div>
 			{/if}
@@ -618,14 +621,20 @@
 		cursor: not-allowed;
 	}
 
-	/* Wire outcome readout (issue #60) — quiet, monochrome; never the reserved user-block
-	   blue. A partial ratio (some calls fell back) dims to --muted rather than alarming red -
-	   a stale-plan fallback is a graceful degradation, not an error state. */
-	.wire-read {
+	/* Latency badge (Phase B) — quiet, monochrome; never the reserved user-block blue. The value
+	   tints only when a hook runs slow: amber ≥250ms (the old plan timeout), red ≥1000ms. A fast
+	   local hook (the common case) stays neutral. */
+	.lat-read {
 		cursor: default;
 	}
-	.wire-read .wire-partial {
-		color: var(--muted);
+	.lat-read .lat-ok {
+		color: var(--fg);
+	}
+	.lat-read .lat-amber {
+		color: var(--warn, #d9a03a);
+	}
+	.lat-read .lat-red {
+		color: var(--bad, #d9534f);
 	}
 
 	/* ── Composition bar area: bar + on-bar protected control + underline ── */

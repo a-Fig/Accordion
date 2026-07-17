@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "./store.svelte";
-import { computeFoldOps } from "../live/plan";
 import type { Block, ParsedSession } from "./types";
 
 /*
@@ -164,7 +163,7 @@ describe("view↔wire agreement — the kind gate kills the lie on both sides", 
 		expect(s.isFolded(s.get("a:r1:p2")!)).toBe(false);
 		// Wire side: computeFoldOps never emits the tool_call → the agent receives it whole.
 		// View and wire AGREE (both: not folded) — the divergence is gone, not merely hidden.
-		expect(computeFoldOps(s).map((o) => o.id)).not.toContain("a:r1:p2");
+		expect(s.computeFoldOps().map((o) => o.id)).not.toContain("a:r1:p2");
 	});
 
 	it("positive control: folding the paired tool_result DOES round-trip to the wire", () => {
@@ -172,6 +171,6 @@ describe("view↔wire agreement — the kind gate kills the lie on both sides", 
 		s.setProtect(0);
 		s.fold("r:c1"); // tool_result — a foldable kind
 		expect(s.isFolded(s.get("r:c1")!)).toBe(true); // folded in the view
-		expect(computeFoldOps(s).map((o) => o.id)).toContain("r:c1"); // AND emitted to the wire
+		expect(s.computeFoldOps().map((o) => o.id)).toContain("r:c1"); // AND emitted to the wire
 	});
 });

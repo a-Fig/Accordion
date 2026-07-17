@@ -976,6 +976,9 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				if (msg?.type === "command" && typeof msg.seq === "number" && msg.cmd && typeof msg.cmd === "object") {
 					const { results, rev } = applyCommand(msg.cmd as WireCommand);
 					send(ws, { type: "commandResult", seq: msg.seq, results, rev });
+				} else if (msg?.type === "resnapshot") {
+					// The replica diverged (rev mismatch) or saw a `reset` — hand it a fresh snapshot.
+					if (truth) send(ws, { type: "snapshot", state: serializeSnapshot(truth, foldingEnabled) });
 				}
 			});
 			const drop = () => {
@@ -1037,7 +1040,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		const blocks = linearize(messages).map(wireToBlock);
 		const t = new Truth({ meta: metaForTruth(), blocks, lineCount: 0, skipped: 0 });
 		t.wireAttached = true; // a live pi session is always a live wire (durability-aware accounting)
-		if (contextWindow != null) t.setContextWindow(contextWindow);
+		if (contextWindow != null) {
+			t.setContextWindow(contextWindow);
+			t.setBudget(contextWindow); // snap the budget to the model window (was the GUI's connect-time behavior)
+		}
 		unsubTruth = t.onEvent(forwardTruthEvent);
 		truth = t;
 		lastMessages = messages;

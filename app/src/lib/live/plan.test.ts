@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "../engine/store.svelte";
 import type { Block, BlockKind, ParsedSession } from "../engine/types";
-import { computeFoldOps, computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
 import { isDurableId, applyPlan, type PiMessage } from "./mapping";
 import { foldCode } from "../engine/digest";
 
@@ -76,7 +75,7 @@ describe("computeFoldOps", () => {
 		// sanity: fixtures actually fold something
 		expect(s.foldedCount).toBeGreaterThan(0);
 
-		const ops = computeFoldOps(s);
+		const ops = s.computeFoldOps();
 		// the three foldable old blocks should appear, in block order
 		expect(ops.map((o) => o.id)).toEqual(["a:resp1:p0", "a:resp1:p1", "r:call1"]);
 		for (const op of ops) {
@@ -102,7 +101,7 @@ describe("computeFoldOps", () => {
 		s.get("a:resp1:p0")!.override = "folded";
 		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(true);
 
-		const ops = computeFoldOps(s);
+		const ops = s.computeFoldOps();
 		expect(ops.map((o) => o.id)).not.toContain("a:resp1:p0");
 	});
 
@@ -120,7 +119,7 @@ describe("computeFoldOps", () => {
 		s.get("u:500")!.override = "folded";
 		expect(s.isFolded(s.get("u:500")!)).toBe(true);
 
-		const ops = computeFoldOps(s);
+		const ops = s.computeFoldOps();
 		expect(ops.map((o) => o.id)).not.toContain("u:500");
 	});
 
@@ -136,7 +135,7 @@ describe("computeFoldOps", () => {
 		foldAllOld(s); // fold the old blocks by hand
 
 		expect(s.isFolded(s.get("m9:p0")!)).toBe(true); // it IS folded by the engine
-		const ops = computeFoldOps(s);
+		const ops = s.computeFoldOps();
 		expect(ops.map((o) => o.id)).not.toContain("m9:p0"); // but never emitted
 		expect(ops.map((o) => o.id)).toContain("a:resp1:p0"); // the durable one is
 	});
@@ -151,7 +150,7 @@ describe("computeFoldOps", () => {
 		s.setProtect(0);
 		s.setBudget(1_000_000); // far above live size → nothing folds
 		expect(s.foldedCount).toBe(0);
-		expect(computeFoldOps(s)).toEqual([]);
+		expect(s.computeFoldOps()).toEqual([]);
 	});
 
 	it("tags each op's digestText with the block's own fold code so the agent can unfold it", () => {
@@ -165,7 +164,7 @@ describe("computeFoldOps", () => {
 		s.setProtect(40);
 		foldAllOld(s);
 
-		const ops = computeFoldOps(s);
+		const ops = s.computeFoldOps();
 		expect(ops.length).toBeGreaterThan(0);
 		for (const op of ops) {
 			// the agent reads `{#<code> FOLDED}` and passes <code> back — so the op MUST carry
@@ -190,7 +189,7 @@ describe("resolveUnfold", () => {
 		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(true);
 
 		const code = foldCode("a:resp1:p0");
-		const { restored, missing } = resolveUnfold(s, [code, "zzzz"]);
+		const { restored, missing } = s.resolveUnfold([code, "zzzz"]);
 
 		// the known block is now held open, with agent provenance
 		const b = s.get("a:resp1:p0")!;
@@ -233,7 +232,7 @@ describe("resolveUnfold", () => {
 		expect(s.isFolded(s.get(idA)!)).toBe(true);
 		expect(s.isFolded(s.get(idB)!)).toBe(true);
 
-		const { restored, missing } = resolveUnfold(s, [foldCode(idA)]);
+		const { restored, missing } = s.resolveUnfold([foldCode(idA)]);
 		// both colliding blocks restored from the single code
 		expect(restored.length).toBe(2);
 		expect(s.isFolded(s.get(idA)!)).toBe(false);
@@ -256,7 +255,7 @@ describe("resolveUnfold", () => {
 		// the agent must NOT be able to convert a pin into an agent-unfold (it can request,
 		// never force). The pinned block's code resolves to no FOLDED block → missing.
 		const code = foldCode("a:resp1:p0");
-		const { restored, missing } = resolveUnfold(s, [code]);
+		const { restored, missing } = s.resolveUnfold([code]);
 		expect(restored).toEqual([]);
 		expect(missing).toEqual([code]);
 		expect(s.get("a:resp1:p0")!.override).toBe("pinned"); // pin intact
@@ -274,7 +273,7 @@ describe("resolveUnfold", () => {
 		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(false);
 
 		const code = foldCode("a:resp1:p0");
-		const { restored, missing } = resolveUnfold(s, [code]);
+		const { restored, missing } = s.resolveUnfold([code]);
 		expect(restored).toEqual([]);
 		expect(missing).toEqual([code]);
 		// it must NOT have been flipped to a sticky agent-unfold override
@@ -294,7 +293,7 @@ describe("resolveUnfold", () => {
 		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(true);
 
 		const code = foldCode("a:resp1:p0");
-		const { restored } = resolveUnfold(s, [code]);
+		const { restored } = s.resolveUnfold([code]);
 		expect(restored.length).toBeGreaterThanOrEqual(1);
 		// Every restored entry must carry a non-empty ids array with the block id
 		const entry = restored.find((r) => r.code === code)!;
@@ -311,11 +310,11 @@ describe("resolveUnfold", () => {
 		const s = makeStore(blocks);
 		s.setProtect(40);
 		foldAllOld(s);
-		expect(computeFoldOps(s).map((o) => o.id)).toContain("a:resp1:p0");
+		expect(s.computeFoldOps().map((o) => o.id)).toContain("a:resp1:p0");
 
-		resolveUnfold(s, [foldCode("a:resp1:p0")]);
+		s.resolveUnfold([foldCode("a:resp1:p0")]);
 		// next plan omits it → the extension sends it full → agent's past context changes
-		expect(computeFoldOps(s).map((o) => o.id)).not.toContain("a:resp1:p0");
+		expect(s.computeFoldOps().map((o) => o.id)).not.toContain("a:resp1:p0");
 	});
 });
 
@@ -335,7 +334,7 @@ describe("resolveRecall", () => {
 		expect(s.isFolded(b)).toBe(true);
 
 		const code = foldCode("a:resp1:p0");
-		const { restored, missing } = resolveRecall(s, [code]);
+		const { restored, missing } = s.resolveRecall([code]);
 
 		expect(restored.length).toBe(1);
 		// the FULL original text comes back — NOT the lossy folded digest
@@ -364,7 +363,7 @@ describe("resolveRecall", () => {
 		s.setProtect(40);
 		foldAllOld(s);
 
-		const { restored, missing } = resolveRecall(s, ["zzzz"]);
+		const { restored, missing } = s.resolveRecall(["zzzz"]);
 		expect(restored).toEqual([]);
 		expect(missing).toEqual(["zzzz"]);
 	});
@@ -380,7 +379,7 @@ describe("resolveRecall", () => {
 		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(false);
 
 		const code = foldCode("a:resp1:p0");
-		const { restored, missing } = resolveRecall(s, [code]);
+		const { restored, missing } = s.resolveRecall([code]);
 		expect(restored).toEqual([]);
 		expect(missing).toEqual([code]);
 		expect(s.get("a:resp1:p0")!.override).toBe(null); // untouched
@@ -403,7 +402,7 @@ describe("resolveRecall", () => {
 		expect(g!.folded).toBe(true);
 
 		const code = foldCode(g!.id);
-		const { restored, missing } = resolveRecall(s, [code]);
+		const { restored, missing } = s.resolveRecall([code]);
 
 		expect(restored.length).toBe(1);
 		// the group's members' FULL original text, joined in order
@@ -475,7 +474,7 @@ describe("regression: view↔wire divergence with newest messages folded (PR #46
 
 	it("individual FoldOps: applyPlan FOLDS the newest message when the engine folded it (no position backstop)", () => {
 		const s = makeSession();
-		const ops = computeFoldOps(s);
+		const ops = s.computeFoldOps();
 
 		// computeFoldOps must emit ops for BOTH old and newest text blocks.
 		const opIds = ops.map((o) => o.id);
@@ -518,7 +517,7 @@ describe("regression: view↔wire divergence with newest messages folded (PR #46
 		// Groups are folded by default on creation.
 		expect(g!.folded).toBe(true);
 
-		const groupOps = computeGroupOps(s);
+		const groupOps = s.computeGroupOps();
 		expect(groupOps.length).toBeGreaterThan(0);
 		expect(groupOps[0].memberIds).toContain("a:resp_new:p0"); // newest block is in the group op
 
@@ -566,7 +565,7 @@ describe("resolveUnfold under the agent-unfold lock", () => {
 		s.setLocks(["agent-unfold"], "test-host");
 
 		const code = foldCode("a:resp1:p0");
-		const { restored, missing } = resolveUnfold(s, [code]);
+		const { restored, missing } = s.resolveUnfold([code]);
 
 		expect(restored).toEqual([]); // nothing restored — the engine refused the agent unfold
 		expect(missing).toEqual([code]); // reported missing, not a false "restored"
@@ -584,7 +583,7 @@ describe("resolveUnfold under the agent-unfold lock", () => {
 		foldAllOld(s);
 		const code = foldCode("a:resp1:p0");
 
-		const { restored, missing } = resolveUnfold(s, [code]);
+		const { restored, missing } = s.resolveUnfold([code]);
 		expect(missing).toEqual([]);
 		expect(restored.map((r) => r.code)).toEqual([code]);
 		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(false);
