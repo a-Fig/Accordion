@@ -1326,13 +1326,80 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		}
 	}
 
-	/** Two messages share identity iff they emit the same durable block ids (cheap; no token work). */
+	/**
+	 * Cheap CONTENT fingerprint for one message, compared alongside `messageInfo`'s durable ids in
+	 * `sameMessageIdentity` (E1, external review round). Durable ids alone prove only the SHAPE
+	 * (which blocks exist, in what order) is unchanged — they say nothing about whether pi or a peer
+	 * extension rewrote a block's TEXT in place while keeping the same anchor (same timestamp /
+	 * responseId / toolCallId). Without this, `Truth.append`'s id-based idempotency keeps the OLD
+	 * text forever: the GUI, `recall`, and a folded block's wire digest would all silently keep
+	 * serving stale content even though the model itself now sees something new.
+	 *
+	 * Deliberately sums `string.length`, never hashes bytes. Every JS string already carries its
+	 * length precomputed, so this is one property read per text-bearing part — the SAME O(parts)
+	 * walk `messageInfo` already does to build `ids`, not an O(text size) pass over the actual
+	 * characters. A length MISMATCH is conclusive proof of a content change and short-circuits the
+	 * whole per-hook reconcile immediately, at the same cost class as the existing id comparison.
+	 *
+	 * A length MATCH is not conclusive: a same-length in-place rewrite (e.g. a fixed-width redaction
+	 * placeholder swapped in for the original text) would slip through undetected. That gap is
+	 * accepted deliberately rather than hashing full text on every hook: hashing would require
+	 * reading every character of every already-ingested message on every single `context` call, even
+	 * for the overwhelming common case where NOTHING changed — reintroducing exactly the
+	 * O(total-context-size) hot-path cost ADR 0021 eliminated (the hook must stay local, synchronous,
+	 * and sub-ms, independent of how large the session has grown). Length alone already catches every
+	 * rewrite this finding's own scenario describes — in-place redaction/summarization/truncation
+	 * changes size in virtually every real case. See smoke.mjs's "content mutation, same ids"
+	 * scenario, which also measures that the hook stays well under 100ms with this check in place.
+	 *
+	 * Deliberately EXCLUDES a `toolCall` part's `arguments` object from the sum: arguments are a
+	 * structured value, not a string, and only `JSON.stringify` would yield a length — paid on every
+	 * hook, that reintroduces the very O(size) cost this function exists to avoid, for a narrower
+	 * rewrite class (mutated tool-call arguments with an unchanged position) than the
+	 * tool_result/text/thinking rewrites the finding calls out.
+	 */
+	function contentFingerprint(m: PiMessage): number {
+		let n = 0;
+		const add = (s: unknown): void => {
+			if (typeof s === "string") n += s.length;
+		};
+		const addContent = (content: unknown): void => {
+			if (typeof content === "string") add(content);
+			else if (Array.isArray(content)) for (const p of content) add((p as { text?: unknown } | null)?.text);
+		};
+		switch (m.role) {
+			case "user":
+				addContent(m.content);
+				break;
+			case "assistant": {
+				const parts = Array.isArray(m.content) ? m.content : [];
+				for (const b of parts as Array<{ type?: string; text?: unknown; thinking?: unknown }>) {
+					if (b?.type === "text") add(b.text);
+					else if (b?.type === "thinking") add(b.thinking);
+					// toolCall arguments intentionally excluded — see the doc comment above.
+				}
+				break;
+			}
+			case "toolResult":
+				addContent(m.content);
+				break;
+			default:
+				add(m.summary);
+		}
+		return n;
+	}
+
+	/**
+	 * Two messages share identity iff they emit the same durable block ids (cheap; no token work) AND
+	 * the same content fingerprint (E1: catches a same-id in-place rewrite — see `contentFingerprint`).
+	 */
 	function sameMessageIdentity(a: PiMessage, b: PiMessage, i: number): boolean {
 		if (a.role !== b.role) return false;
 		const ia = messageInfo(a, i).ids;
 		const ib = messageInfo(b, i).ids;
 		if (ia.length !== ib.length) return false;
 		for (let k = 0; k < ia.length; k++) if (ia[k] !== ib[k]) return false;
+		if (contentFingerprint(a) !== contentFingerprint(b)) return false;
 		return true;
 	}
 
@@ -1433,6 +1500,21 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		}
 		truth = null;
 		lastMessages = [];
+		// E2 (external review round): folding is OPT-IN and OFF by default PER SESSION — reset the
+		// arm on every `session_start`, regardless of `_event.reason` ("startup"/"reload"/"new"/
+		// "resume"/"fork"). Everything else this handler touches (Truth, `lastMessages`, `meta`, the
+		// conductor, and — a few lines below — `sessionId` itself) is ALREADY unconditionally reset
+		// here for every reason, including a mere "reload": pi's own types note `previousSessionFile`
+		// is present only for "new"/"resume"/"fork", implying "reload" re-enters the SAME session, yet
+		// this handler has never special-cased it — it still tears down and rebuilds the authoritative
+		// Truth from scratch and mints a brand-new `sessionId`. Leaving `foldingEnabled` as the one
+		// piece of state that survives a reload would be an inconsistent, easy-to-miss exception to
+		// that existing behavior, and would violate the per-session opt-in invariant on the case this
+		// finding named explicitly. `setFolding` only broadcasts when the value actually changes, so an
+		// already-attached client whose GUI toggle shows "on" gets an explicit `folding:false` to
+		// resync it — connected clients are NOT dropped across a session_start, so without this a
+		// client's toggle could silently drift from the true (now-reset) internal state.
+		setFolding(false);
 		latestCtx = ctx;
 		sessionId = `s-${process.pid}-${Date.now()}`;
 		startedAt = Date.now();
@@ -1537,14 +1619,34 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				if (foldingEnabled) {
 					ret = { messages: truth.serializeWire(messages) as unknown as AgentMessage[] };
 				}
-				// (d) markSent through the last block — everything present has now reached the model.
-				const last = truth.blocks[truth.blocks.length - 1];
-				if (last) truth.markSent(last.order);
 			}
 		} catch (err) {
 			hookErrors++;
 			console.error("[accordion] context hook failed; passing messages through unmodified:", err);
 			ret = undefined;
+		} finally {
+			// (d) markSent through the last block — GUARANTEED on both the success AND the error path
+			// (E3, external review round). Invariant: whatever this hook actually let through to the
+			// model counts as sent. On the happy path `ret` may hold the serialized replacement, but
+			// either way (folding on or off) pi ends up delivering every block up to the Truth's current
+			// tail — the range markSent covers is correct regardless of which branch built `ret`. On the
+			// error path `ret` stays `undefined`, so pi sends `event.messages` RAW AND UNMODIFIED — every
+			// block in the Truth mirroring that array still departed to the model whole. Previously
+			// markSent lived only inside the try, AFTER the risky work (ingestMessages / the wire-
+			// departing hold / serializeWire) — a throw anywhere in there returned raw passthrough
+			// (those messages DO reach the model) but skipped markSent, so already-departed blocks were
+			// later misclassified as never-sent and wrongly treated as still birth-foldable (`canFold`'s
+			// `!sent(b)` exemption). Moving it to `finally` makes it run on every exit path. Guarded in
+			// its own try/catch so a throw HERE (Truth in a genuinely broken state) still can't escape
+			// and break the model call — the hook's return value is already decided either way.
+			try {
+				if (truth) {
+					const last = truth.blocks[truth.blocks.length - 1];
+					if (last) truth.markSent(last.order);
+				}
+			} catch (err) {
+				console.error("[accordion] context hook markSent (finally) failed:", err);
+			}
 		}
 		// (e) Measure the whole hook (guarded body included, hold window and all) and stream it as
 		// telemetry — lastHoldMs/holdTimeouts (from the live host) ride alongside the hook duration.

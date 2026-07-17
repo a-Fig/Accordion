@@ -280,6 +280,55 @@ await waitFor(() => a.inbox.snapshot.length > 0, 2000, "client A snapshot").catc
 		fails.push(`default path paid a hold with no conductor (lastHoldMs=${tel.lastHoldMs}, holdTimeouts=${tel.holdTimeouts})`);
 }
 
+// ── E1 (external review round): a same-id CONTENT rewrite must be visible to reconciliation ──
+// Rewrite the already-ingested assistant message's TEXT while keeping every durable id identical
+// (same responseId/timestamp) — simulates pi or a peer extension editing a message's content in
+// place. Durable-id identity ALONE (the pre-fix behavior) would call this "no change" and
+// `Truth.append`'s id-based idempotency would keep serving the STALE original text forever — the
+// GUI, `recall`, and a folded block's wire digest would all silently drift from what the model
+// actually now sees. Assert (1) the rewrite is detected as a structural divergence (telemetry's
+// `rebuilds` increments, a fresh `snapshot` broadcasts) and (2) the block Truth now serves for that
+// id is the NEW text, not the stale original.
+{
+	const fetchMeta = () =>
+		new Promise((resolve, reject) => {
+			http.get({ host: "127.0.0.1", port: PORT, path: "/__accordion/meta" }, (res) => {
+				let buf = "";
+				res.on("data", (d) => (buf += d));
+				res.on("end", () => {
+					try { resolve(JSON.parse(buf)); } catch (e) { reject(e); }
+				});
+			}).on("error", reject);
+		});
+
+	const REWRITTEN_TEXT = "REWRITTEN ASSISTANT TEXT — same durable id, different content (in-place rewrite).";
+	const rewritten = [
+		messagesPlus[0],
+		{ ...messagesPlus[1], content: [{ type: "text", text: REWRITTEN_TEXT }] },
+		messagesPlus[2],
+	];
+
+	const before = await fetchMeta();
+	a.inbox.snapshot.length = 0;
+	await Promise.resolve(handlers.context({ messages: rewritten }, ctx));
+	await waitFor(() => a.inbox.snapshot.length > 0, 2000, "rebuild snapshot after same-id content rewrite").catch(
+		() => fails.push("a same-id content rewrite did not trigger a rebuild snapshot"),
+	);
+	const after = await fetchMeta();
+	if (!(after.telemetry.rebuilds > before.telemetry.rebuilds))
+		fails.push(`same-id content rewrite did not increment telemetry.rebuilds (before=${before.telemetry.rebuilds}, after=${after.telemetry.rebuilds})`);
+
+	const snap = a.inbox.snapshot.at(-1);
+	const rewrittenBlock = snap?.state?.blocks?.find((b) => b.id === ASST_ID);
+	if (!rewrittenBlock || rewrittenBlock.text !== REWRITTEN_TEXT)
+		fails.push(`Truth did not adopt the rewritten content for ${ASST_ID} (got ${JSON.stringify(rewrittenBlock?.text)})`);
+
+	// Restore the pristine content (itself another same-id rewrite, exercising the path a second time
+	// in reverse) so everything below that depends on ASST_TEXT (recall / unfold / the fold-digest
+	// checks) sees the ORIGINAL text again, as if the rewrite above never happened.
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
+}
+
 // Client B connects AFTER more history → its snapshot carries all 3 blocks (hydration path).
 const b = connectClient();
 await waitFor(() => b.inbox.snapshot.length > 0, 2000, "client B snapshot").catch(() => fails.push("client B never received a snapshot"));
@@ -465,6 +514,92 @@ if (unfoldTool && foldCodeStr) {
 		if (typeof stillFolded !== "string" || stillFolded.length >= GIANT.length)
 			fails.push("after detach the freeze did not preserve doorman's fold as a human fold");
 	}
+}
+
+// ── E2 (external review round): folding must reset to OFF on every session_start ──
+// Folding is ARMED (true) at this point — Phase C step (0) above restored it after the folding-off
+// hold check. `foldingEnabled` is a process-level closure var, separate from the Truth this handler
+// already unconditionally tears down and rebuilds. Simulate a session swap (as pi fires for /new,
+// /resume, /fork — and, since this handler already resets Truth/lastMessages/meta/sessionId for
+// EVERY reason including "reload", a mere reload too — see accordion.ts's session_start comment for
+// the full justification) and assert: (1) the arm resets WITHOUT a fresh opt-in, and (2) the
+// already-attached clients — whose GUI toggle currently shows "on" — are told about the reset
+// rather than being left to silently drift from the now-false internal state.
+{
+	a.inbox.folding.length = 0;
+	b.inbox.folding.length = 0;
+	handlers.session_start({ type: "session_start", reason: "new" }, ctx);
+	await waitFor(
+		() => a.inbox.folding.some((f) => f.enabled === false) && b.inbox.folding.some((f) => f.enabled === false),
+		2000,
+		"folding reset broadcast on session_start",
+	).catch(() => fails.push("session_start did not broadcast folding:false to already-attached clients when folding had been armed"));
+
+	const meta = await new Promise((resolve, reject) => {
+		http.get({ host: "127.0.0.1", port: PORT, path: "/__accordion/meta" }, (res) => {
+			let buf = ""; res.on("data", (d) => (buf += d)); res.on("end", () => resolve(JSON.parse(buf)));
+		}).on("error", reject);
+	});
+	if (meta.telemetry?.foldingEnabled !== false) fails.push(`session_start did not reset foldingEnabled (meta reports ${meta.telemetry?.foldingEnabled})`);
+
+	// session_start mints a NEW sessionId but — correctly, since /new et al. never restart the shared
+	// WS/HTTP server — does not rewrite the registry file for it until the next heartbeat tick. Clean
+	// up the ORIGINAL entry ourselves so the final shutdown assertion below (which expects an EMPTY
+	// sessions dir) isn't tripped by a file orphaned by this simulated mid-test session swap — a
+	// pre-existing registry-advertisement timing gap a real heartbeat interval papers over in
+	// production, unrelated to this fix.
+	try { fs.unlinkSync(path.join(SESSIONS_DIR, `${entry.sessionId}.json`)); } catch { /* already gone */ }
+}
+
+// ── E3 (external review round): sent-state must survive a context-hook error ──
+// Append a fresh, not-yet-sent block via `message_end` — a SEPARATE hook from `context`, with no
+// try/catch of its own, so it's a clean way to get a block into Truth whose `sentThroughOrder`
+// cursor has not yet caught up to it. Then fire `context` with a deliberately messages-less event
+// so `ingestMessages(undefined)` throws (`.length` on `undefined`) inside the hook's try — forcing
+// the same passthrough/error path a real parse failure or Truth bug would take. Before the fix,
+// `markSent` lived INSIDE the try, AFTER this risky work, so the throw skipped it entirely — even
+// though pi still receives the messages it was given, RAW, on this path (the error path IS
+// passthrough, not a dropped call). Assert (1) the error is genuinely taken (`hookErrors`
+// increments) and (2) a `sent` event still reaches the client covering the newly appended block,
+// proving `markSent`'s `finally` guarantee ran despite the throw.
+{
+	const fetchMeta3 = () =>
+		new Promise((resolve, reject) => {
+			http.get({ host: "127.0.0.1", port: PORT, path: "/__accordion/meta" }, (res) => {
+				let buf = "";
+				res.on("data", (d) => (buf += d));
+				res.on("end", () => {
+					try { resolve(JSON.parse(buf)); } catch (e) { reject(e); }
+				});
+			}).on("error", reject);
+		});
+
+	const metaBefore = await fetchMeta3();
+
+	a.inbox.event.length = 0;
+	handlers.message_end({ message: { role: "user", content: "e3 sent-state probe", timestamp: Date.now() } }, ctx);
+	await waitFor(() => a.inbox.event.some((e) => e.event?.kind === "appended"), 2000, "E3 probe block appended").catch(
+		() => fails.push("message_end did not append the E3 probe block"),
+	);
+	const appended = a.inbox.event.find((e) => e.event?.kind === "appended");
+	const probeOrder = appended?.event?.blocks?.at(-1)?.order;
+	if (typeof probeOrder !== "number") fails.push("E3 probe block's appended event lacked a numeric order");
+
+	a.inbox.event.length = 0;
+	// No `messages` key at all — event.messages is undefined, so ingestMessages(undefined) throws.
+	const ret = await Promise.resolve(handlers.context({}, ctx));
+	if (ret !== undefined) fails.push("the context hook's error path should return undefined (raw passthrough), not a replacement");
+
+	await waitFor(() => a.inbox.event.some((e) => e.event?.kind === "sent"), 2000, "sent event after a hook error").catch(
+		() => fails.push("markSent did not run on the context hook's error path — no `sent` event reached the client"),
+	);
+	const sentEvent = a.inbox.event.find((e) => e.event?.kind === "sent");
+	if (sentEvent && typeof probeOrder === "number" && sentEvent.event.throughOrder < probeOrder)
+		fails.push(`markSent on the error path did not cover the newly appended block (throughOrder=${sentEvent.event.throughOrder}, expected >= ${probeOrder})`);
+
+	const metaAfter = await fetchMeta3();
+	if (!(metaAfter.telemetry.hookErrors > metaBefore.telemetry.hookErrors))
+		fails.push(`the messages-less context call did not increment hookErrors (before=${metaBefore.telemetry.hookErrors}, after=${metaAfter.telemetry.hookErrors})`);
 }
 
 a.ws.close();
