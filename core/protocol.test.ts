@@ -4,9 +4,10 @@
  * There was no dedicated protocol-guard test file before Phase C's v13 additions (the app side
  * exercises `isServerMessage`/`isWireBlock` only indirectly, through `liveClient.svelte.ts`'s
  * message pump). This file targets `isServerMessage`/`isClientMessage` directly: every message
- * `type` the v13 protocol introduces must be ACCEPTED (the guards vet only the `type` tag — an
+ * `type` the protocol introduces must be ACCEPTED (the guards vet only the `type` tag — an
  * authorized peer may still send a malformed body, which is each consumer's job to guard further),
- * and an unrecognized/malformed `type` must be REJECTED by both.
+ * and an unrecognized/malformed `type` must be REJECTED by both. v14 adds the client-side
+ * `holdRelease`/`cancelComplete` messages and a `holdId` on `wireDeparting`.
  */
 import { describe, it, expect } from "vitest";
 import { isServerMessage, isClientMessage, PROTOCOL_VERSION } from "./protocol";
@@ -23,12 +24,14 @@ import type {
 	ProposeMessage,
 	CompleteRequestMessage,
 	SetConductorStatusMessage,
+	HoldReleaseMessage,
+	CancelCompleteMessage,
 	WireCommand,
 } from "./protocol";
 
 describe("PROTOCOL_VERSION", () => {
-	it("is bumped to 13 for the Phase C additions", () => {
-		expect(PROTOCOL_VERSION).toBe(13);
+	it("is bumped to 14 for the wire-departing hold-correlation + completion-abort additions", () => {
+		expect(PROTOCOL_VERSION).toBe(14);
 	});
 });
 
@@ -75,8 +78,8 @@ describe("isServerMessage — v13 additions", () => {
 		expect(isServerMessage(msg)).toBe(true);
 	});
 
-	it("accepts wireDeparting", () => {
-		const msg: WireDepartingMessage = { type: "wireDeparting", rev: 3, liveTokens: 400, budget: 70_000, freshIds: ["a:b0:p0"], holdMs: 150 };
+	it("accepts wireDeparting (carrying the v14 holdId)", () => {
+		const msg: WireDepartingMessage = { type: "wireDeparting", rev: 3, liveTokens: 400, budget: 70_000, freshIds: ["a:b0:p0"], holdMs: 150, holdId: 1 };
 		expect(isServerMessage(msg)).toBe(true);
 	});
 
@@ -123,6 +126,16 @@ describe("isClientMessage — v13 additions", () => {
 
 	it("accepts setConductorStatus", () => {
 		const msg: SetConductorStatusMessage = { type: "setConductorStatus", text: "idle" };
+		expect(isClientMessage(msg)).toBe(true);
+	});
+
+	it("accepts holdRelease (v14 wire-departing hold release)", () => {
+		const msg: HoldReleaseMessage = { type: "holdRelease", holdId: 7 };
+		expect(isClientMessage(msg)).toBe(true);
+	});
+
+	it("accepts cancelComplete (v14 completion abort forwarding)", () => {
+		const msg: CancelCompleteMessage = { type: "cancelComplete", reqId: 3 };
 		expect(isClientMessage(msg)).toBe(true);
 	});
 

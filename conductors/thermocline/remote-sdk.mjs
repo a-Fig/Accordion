@@ -456,8 +456,19 @@ var Truth = class _Truth {
       b.subst = old.subst;
       if (prev.birthFolded.has(b.id)) next.birthFolded.add(b.id);
     }
+    let frontier = next.blockLog.length ? next.blockLog[next.blockLog.length - 1].order : -1;
+    for (const b of next.blockLog) {
+      const old = prev.get(b.id);
+      const wasSent = old ? prev.sent(old) : false;
+      if (!wasSent) frontier = Math.min(frontier, b.order - 1);
+    }
+    next.sentThroughOrderValue = frontier;
     const survivors = next.index;
-    next.groupList = prev.groupList.filter((g) => g.memberIds.every((id) => survivors.has(id))).map((g) => ({ ...g, memberIds: g.memberIds.slice() }));
+    next.groupList = prev.groupList.filter((g) => {
+      if (!g.memberIds.every((id) => survivors.has(id))) return false;
+      const idxs = g.memberIds.map((id) => survivors.get(id)).sort((a, b) => a - b);
+      return idxs.every((v, k) => k === 0 || v === idxs[k - 1] + 1);
+    }).map((g) => ({ ...g, memberIds: g.memberIds.slice() }));
     next.housekeep(/* @__PURE__ */ new Set());
     return next;
   }
@@ -582,6 +593,7 @@ var Truth = class _Truth {
   canFold(b, by = "you") {
     if (!wireFoldable(b)) return false;
     if (this.inFoldedGroup(b.id)) return false;
+    if (this.wireAttached && !isDurableId(b.id)) return false;
     if (by === "you") {
       if (b.override === "pinned") return false;
       return !this.isProtected(b);
@@ -852,10 +864,33 @@ var Truth = class _Truth {
     for (const id of touched) this.lastChangedRev.set(id, rev);
     this.emit({ type: "locks", locks: this.activeLocks, holder: this.holderLabel, tailTokens: this.activeTailTok, rev });
   }
-  clearLocks() {
+  /**
+   * Release the involvement locks. `inheritTail` (the conductor-detach path) closes the
+   * freeze-safety hole: a `tail-size` conductor enforces a small (often zero) tail while it holds
+   * the session; on plain detach `protectTokens` snaps BACK to the human's larger dial, and the
+   * very next housekeep then prunes the (freeze-converted, human-owned) whole-session group and
+   * heals the frozen folds — destroying exactly the work `freeze` promised to preserve. With
+   * `inheritTail:true`, the enforced tail is adopted as `protectTokens` BEFORE the lock releases,
+   * so the protected boundary does NOT snap back; the human regains the dial and re-expanding it
+   * later is their own conscious act (normal healing then applies, and F3 makes that heal
+   * complete). Plain `clearLocks()` keeps the legacy snap-back behavior.
+   *
+   * No protocol change: `protectTokens` already rides `config` events, so the inherited value is
+   * emitted as one — a replica that later resnapshots (the config lands while its own `tail-size`
+   * lock is momentarily still set) recovers the inherited value from the fresh snapshot. The
+   * config event fires FIRST so any divergence surfaces as a rev mismatch (⇒ resnapshot), never a
+   * silent state fork. Wave 2 wires `LiveConductorHost.detachActive` to pass `{inheritTail:true}`.
+   */
+  clearLocks(opts) {
+    const inheritedTail = opts?.inheritTail && this.isLocked("tail-size") ? this.activeTailTok : null;
     this.activeLocks = [];
     this.holderLabel = null;
     this.activeTailTok = 0;
+    if (inheritedTail !== null) {
+      this.protectTokensTarget = inheritedTail;
+      const crev = ++this.revCounter;
+      this.emit({ type: "config", protectTokens: this.protectTokensTarget, rev: crev });
+    }
     const touched = /* @__PURE__ */ new Set();
     this.housekeep(touched);
     const rev = ++this.revCounter;
@@ -896,20 +931,32 @@ var Truth = class _Truth {
     }
   }
   /**
-   * Engine invariant — protection is absolute for the human. Heal a HUMAN fold the tail has
-   * grown over, and a STRATEGY fold of a block the model already saw whole. A BIRTH-FOLD (a
-   * strategy fold applied while the block was protected AND unsent) is skipped: the model never
-   * saw it whole, so the tail growing over it yanks nothing.
+   * Engine invariant — protection is absolute for the human. Heal a HUMAN fold the tail has grown
+   * over, and a STRATEGY fold of a block the model already saw whole, in ONE coherent pass that
+   * clears EVERY fold field so nothing half-heals.
+   *
+   * Never touched:
+   *   - a PIN (`override === "pinned"`) — protection never revokes a hard pin, and clearing `by`
+   *     underneath it would corrupt the pin's provenance;
+   *   - a sticky UNFOLD (`override === "unfolded"`) — a human/agent decision to hold the block open
+   *     (ADR 0005) is not a fold to heal, and it is already live;
+   *   - a BIRTH-FOLD (strategy fold applied while protected AND unsent) — the model never saw it
+   *     whole, so the tail growing over it yanks nothing.
+   *
+   * Everything else that is folded — a human fold (`override:"folded"`), a strategy fold
+   * (`autoFolded`), a `replace` subst, OR a freeze-converted fold (which is `override:"folded"`
+   * AND `autoFolded` AND carries a `subst`) — is fully reset in the single branch below. The old
+   * two-branch shape left a frozen fold half-healed (cleared the override but left `autoFolded`/
+   * `subst`, so `isFolded` stayed true) and could zero a pin's `by`; this pass fixes both.
    */
   healProtected(touched) {
     const pf = this.protectedFromIndexUncached();
     for (let i = pf; i < this.blockLog.length; i++) {
       const b = this.blockLog[i];
-      if (b.override === "folded") {
+      if (b.override === "pinned" || b.override === "unfolded") continue;
+      if (this.birthFolded.has(b.id)) continue;
+      if (b.override === "folded" || b.autoFolded || b.subst !== void 0) {
         b.override = null;
-        b.by = null;
-        touched.add(b.id);
-      } else if (b.autoFolded && !this.birthFolded.has(b.id)) {
         b.autoFolded = false;
         b.subst = void 0;
         b.by = null;
@@ -1009,6 +1056,7 @@ var Truth = class _Truth {
       if (this.stale(id, baseRev)) return "stale";
       if (this.inFoldedGroup(id)) return "grouped";
       if (!wireFoldable(b)) return "not-foldable";
+      if (this.wireAttached && !isDurableId(id)) return "non-durable";
       if (by === "you") {
         if (b.override === "pinned") return "human-override";
         if (this.isProtected(b)) return "protected";
@@ -1037,6 +1085,7 @@ var Truth = class _Truth {
     if (this.inFoldedGroup(op.id)) return this.clamp(op, "grouped");
     if (b.override !== null) return this.clamp(op, "human-override");
     if (!wireFoldable(b)) return this.clamp(op, "not-foldable");
+    if (this.wireAttached && !isDurableId(op.id)) return this.clamp(op, "non-durable");
     if (this.isProtected(b)) {
       if (this.sent(b)) return this.clamp(op, "protected");
       this.birthFolded.add(op.id);
@@ -1069,8 +1118,17 @@ var Truth = class _Truth {
         this.birthFolded.delete(id);
         return null;
       }
+      if (by === "auto") {
+        if (b.override !== null) return "human-override";
+        if (!b.autoFolded && b.subst === void 0) return "noop";
+        b.autoFolded = false;
+        b.subst = void 0;
+        b.by = null;
+        this.birthFolded.delete(id);
+        return null;
+      }
       b.override = "unfolded";
-      b.by = by;
+      b.by = "you";
       b.subst = void 0;
       this.birthFolded.delete(id);
       return null;
@@ -1407,7 +1465,7 @@ function recallHostEvent(ids, by, rev) {
 }
 
 // ../core/protocol.ts
-var PROTOCOL_VERSION = 13;
+var PROTOCOL_VERSION = 14;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
   "snapshot",
@@ -1457,7 +1515,6 @@ function runRemoteConductor(conductor, opts) {
     const listeners = /* @__PURE__ */ new Set();
     const pendingProposes = /* @__PURE__ */ new Map();
     const pendingCompletes = /* @__PURE__ */ new Map();
-    let proposedSinceDispatch = false;
     let ws;
     try {
       ws = wsFactory(url);
@@ -1494,7 +1551,6 @@ function runRemoteConductor(conductor, opts) {
       });
     }
     function sendPropose(baseRev, ops) {
-      proposedSinceDispatch = true;
       return new Promise((resolve) => {
         const seq = ++proposeSeq;
         pendingProposes.set(seq, { ops, resolve });
@@ -1513,6 +1569,17 @@ function runRemoteConductor(conductor, opts) {
           maxOutputTokens: req.maxOutputTokens,
           model: req.model && req.model !== "current" ? req.model : void 0
         });
+        const signal = req.signal;
+        if (signal) {
+          const onAbort2 = () => {
+            if (!pendingCompletes.has(id)) return;
+            pendingCompletes.delete(id);
+            send({ type: "cancelComplete", reqId: id });
+            reject(signal.reason instanceof Error ? signal.reason : new Error("remote conductor: completion aborted"));
+          };
+          if (signal.aborted) onAbort2();
+          else signal.addEventListener("abort", onAbort2, { once: true });
+        }
       });
     }
     function buildHost() {
@@ -1658,11 +1725,9 @@ function runRemoteConductor(conductor, opts) {
         }
         case "wireDeparting": {
           if (!replica) return;
-          const event = { type: "wire-departing", rev: msg.rev, liveTokens: msg.liveTokens, budget: msg.budget, freshIds: msg.freshIds };
-          proposedSinceDispatch = false;
-          void dispatch(event).then(() => {
-            if (!proposedSinceDispatch) send({ type: "propose", seq: ++proposeSeq, baseRev: msg.rev, ops: [] });
-          });
+          const holdId = msg.holdId;
+          const event = { type: "wire-departing", rev: msg.rev, liveTokens: msg.liveTokens, budget: msg.budget, freshIds: msg.freshIds, holdId };
+          void dispatch(event).finally(() => send({ type: "holdRelease", holdId }));
           break;
         }
         case "turnCommitted": {
@@ -2038,12 +2103,17 @@ function planEpoch(view, scores, _state, cfg = DEFAULT_CFG, opts = {}) {
       if (!droppedAny) break;
     }
   }
+  const projected = project(view, applied());
   return {
     folds,
     strata,
     targetTokens,
     cap,
-    projected: project(view, applied())
+    projected,
+    // The Rung-5 loop above is gated on `project(...) > cap`; if it still is here (either break —
+    // the no-progress guard at its top, or the `!droppedAny` exhaustion floor inside branch (c) —
+    // left it unsatisfied), the floor genuinely cannot reach cap. See the Plan.irreducible doc.
+    irreducible: projected > cap
   };
 }
 function dropStrataOldestFirst(strata, view, applied, bound) {
@@ -2473,6 +2543,15 @@ var ThermoclineConductor = class {
   lastFill = 0;
   lastStatusText = "";
   abort = new AbortController();
+  // ── IRREDUCIBLE OVERFLOW (P1-4) ── re-derived fresh every epoch from `Plan.irreducible` (never
+  // cached across a config change) by `commit()`, the ONE place both the deterministic emergency
+  // path and the LLM-prepared path converge. Gates PREPARE in `runTick` so an un-winnable plan
+  // doesn't burn a `host.complete` call every event; cleared the instant `commit()` (or a
+  // still-under-cap tick) observes the projection fits again. See `setOverflowState`/`sendStatus`.
+  irreducibleOverflow = false;
+  overflowTokens = 0;
+  overflowCapTokens = 0;
+  overflowProtectedTokens = 0;
   constructor(opts = {}) {
     this.cfg = { ...DEFAULT_CFG, ...opts.cfg ?? {} };
     this.scorer = opts.scorer ?? scoreCandidates;
@@ -2628,9 +2707,12 @@ var ThermoclineConductor = class {
     if (fill > 1) {
       await this.runEmergency(view);
       fill = cap > 0 ? project(view, this.appliedForProject()) / cap : fill;
+    } else {
+      this.irreducibleOverflow = false;
+      this.overflowTokens = 0;
     }
     this.lastFill = fill;
-    if (fill >= this.cfg.warmWater && !this.preparing && this.needNewEpoch(fill)) {
+    if (fill >= this.cfg.warmWater && !this.preparing && !this.irreducibleOverflow && this.needNewEpoch(fill)) {
       this.preparing = true;
       this.advanceGraduationOnce(view);
       const token = ++this.prepareToken;
@@ -2717,7 +2799,9 @@ var ThermoclineConductor = class {
     working = planWithRealStratumTokens(working, digests);
     working = this.topUpToCap(working, view, working.cap || capOf(view));
     const finalProjected = project(view, appliedShapeOf(working));
+    const finalCap = working.cap || capOf(view);
     working = { ...working, projected: finalProjected };
+    this.setOverflowState(working.irreducible === true, finalProjected, finalCap, view);
     const desired = this.desiredFromPlan(working, digests, view);
     await this.applyDesired(desired);
     this.appliedPlan = working;
@@ -2728,6 +2812,17 @@ var ThermoclineConductor = class {
     this.rescoreNeeded = true;
     this.sendStatus();
   }
+  /** Record (or clear) the irreducible-overflow signal so `sendStatus` can surface it with the exact
+   *  numbers and `runTick` can gate PREPARE off an un-winnable plan. Always overwrites — there is no
+   *  latching to a stale `true`, so a config change that makes the projection fit again clears it on
+   *  the very next `commit()` (see also the `runTick` `fill <= 1.0` reset for the case where a change
+   *  drops fill under 1.0 before an emergency/commit even runs). */
+  setOverflowState(irreducible, projected, cap, view) {
+    this.irreducibleOverflow = irreducible;
+    this.overflowTokens = irreducible ? Math.max(0, projected - cap) : 0;
+    this.overflowCapTokens = cap;
+    if (irreducible) this.overflowProtectedTokens = protectedTailTokens(view);
+  }
   /**
    * BLOCKER 1 — guarantee the agent NEVER receives a batch whose projected live exceeds cap, using
    * the REAL summary token counts. Deterministically merges extra folds/age-strata into the plan
@@ -2736,14 +2831,18 @@ var ThermoclineConductor = class {
    * hard-cap guarantee. Mutates + returns `plan`.
    */
   topUpToCap(plan, view, cap) {
-    if (project(view, appliedShapeOf(plan)) <= cap) return plan;
+    const settle = () => {
+      plan.irreducible = project(view, appliedShapeOf(plan)) > cap;
+      return plan;
+    };
+    if (project(view, appliedShapeOf(plan)) <= cap) return settle();
     const liveUnits = buildUnits(view.blocks);
     const memberIdsOfUnit = new Map(liveUnits.map((u) => [u.id, u.ids]));
     const claimedUnits = /* @__PURE__ */ new Set([...plan.folds.map((f) => f.unitId), ...plan.strata.flatMap((s) => s.unitIds)]);
     const foldedMembers = /* @__PURE__ */ new Set([...plan.folds.flatMap((f) => f.ids), ...plan.strata.flatMap((s) => s.memberIds)]);
     const MAX_PASSES = 3;
     for (let pass = 0; pass < MAX_PASSES; pass++) {
-      if (project(view, appliedShapeOf(plan)) <= cap) return plan;
+      if (project(view, appliedShapeOf(plan)) <= cap) return settle();
       const det = planEpoch(view, this.scores, this.gradState(), this.cfg, { deterministic: true, graduated: this.grad.graduated });
       let added = false;
       for (const f of det.folds) {
@@ -2770,11 +2869,11 @@ var ThermoclineConductor = class {
         for (const uid of units) for (const mid of memberIdsOfUnit.get(uid) ?? []) foldedMembers.add(mid);
         added = true;
       }
-      if (project(view, appliedShapeOf(plan)) <= cap) return plan;
+      if (project(view, appliedShapeOf(plan)) <= cap) return settle();
       if (!added) break;
     }
     dropOwnStrataOldestFirst(plan, view, cap);
-    return plan;
+    return settle();
   }
   /** HOLD — re-derive the desired state from the committed plan against the CURRENT view and
    *  propose only the delta. An unchanged desired state yields an empty transaction (the diff IS
@@ -3008,9 +3107,9 @@ var ThermoclineConductor = class {
     const pct = Math.round((Number.isFinite(this.lastFill) ? this.lastFill : 0) * 100);
     const folded = this.appliedFolds.size;
     const strata = this.appliedStrata.length;
-    const action = this.preparing ? "PREPARE" : this.lastAction === "emergency" ? "EMERGENCY" : "HOLD";
     const scoring = this.scoringInFlight ? " \xB7 scoring\u2026" : "";
-    const text = `${action} ${pct}% \xB7 ${folded} folded \xB7 ${strata} strata${scoring}`;
+    const action = this.irreducibleOverflow ? "OVERFLOW" : this.preparing ? "PREPARE" : this.lastAction === "emergency" ? "EMERGENCY" : "HOLD";
+    const text = this.irreducibleOverflow ? `over budget and irreducible: protected tail \u2248 ${fmtK(this.overflowProtectedTokens)}k > cap ${fmtK(this.overflowCapTokens)}k \u2014 raise the budget or shrink the protected tail` : `${action} ${pct}% \xB7 ${folded} folded \xB7 ${strata} strata${scoring}`;
     if (text === this.lastStatusText) return;
     this.lastStatusText = text;
     this.host.setStatus(text, {
@@ -3020,10 +3119,21 @@ var ThermoclineConductor = class {
       strata,
       scoring: this.scoringInFlight,
       lowWater: Math.round(this.cfg.lowWater * 100),
-      highWater: Math.round(this.cfg.highWater * 100)
+      highWater: Math.round(this.cfg.highWater * 100),
+      irreducibleOverflow: this.irreducibleOverflow,
+      overflowTokens: this.overflowTokens
     });
   }
 };
+function protectedTailTokens(view) {
+  const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
+  let t = 0;
+  for (let i = pfi; i < view.blocks.length; i++) t += view.blocks[i].tokens;
+  return t;
+}
+function fmtK(tokens) {
+  return String(Math.round(tokens / 1e3));
+}
 function stripTag(s) {
   return s.replace(/^\s*\{#[0-9a-z]{6} FOLDED\}\s*/, "");
 }

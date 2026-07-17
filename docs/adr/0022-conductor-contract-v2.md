@@ -197,3 +197,38 @@ any conductor-selection UI on this branch.
 - **Separate wire and in-process command vocabularies.** Rejected for the same reason ADR 0007
   rejected it the first time: importing one `Op`/`ClampReason` definition everywhere is what keeps
   the wire and the engine from drifting.
+
+## Amendment (protocol v14) — wire-departing hold correlation + completion abort
+
+Two additive wire refinements landed after the initial Phase-C cut, both tightening the *remote*
+seam so an out-of-process conductor behaves exactly like an in-process one. Neither touches the
+frozen v2 `Conductor`/`ConductorHost` contract; the only contract change is one optional field.
+
+- **Hold release is tied to the handler settling, not to a `propose` (P1-2).** The first cut released
+  a remote conductor's wire-departing hold on the *first `propose`* it saw after `wireDeparting`. With
+  no correlation, a conductor whose background work also proposes (thermocline's prepare-epoch tick)
+  could release the hold with an *unrelated* transaction before its wire-departing handler's
+  last-moment fold had landed. v14 mints a unique `holdId` per hold, carries it on `wireDeparting`
+  (and, additively/optionally, on the in-process `wire-departing` HostEvent for symmetry), and adds a
+  dedicated `holdRelease { holdId }` client→server message. The remote SDK sends `holdRelease` the
+  instant its wire-departing handler *settles* (resolve or reject) — exactly mirroring the in-process
+  host, which has always resolved on the handler's returned promise settling. A `propose` no longer
+  releases a hold at all (an empty-ops `propose` is now just an empty proposal); the host releases
+  only on a `holdRelease` carrying the current `holdId`, ignores a stale/unknown one, and a late
+  release after a timeout is a no-op. Conductor implementations need no change — the SDK and host
+  handle the correlation transparently.
+
+- **Completion abort is forwarded (S7).** `CompletionRequest.signal` was honored in-process but
+  dropped by the remote SDK, so a conductor aborting a `complete()` (detach, swap, its own timeout)
+  left the host's model call running. v14 adds a `cancelComplete { reqId }` client→server message: the
+  SDK wires the request's `AbortSignal` to send it (and reject locally with an abort error); the host
+  aborts the in-flight completion's per-`reqId` `AbortController`. An unknown/settled `reqId` is
+  ignored. (Detach already aborted every in-flight completion; this covers a single targeted abort.)
+
+Also on this wave: the host fires an **initial `turn-committed`** the moment a conductor attaches
+(in-process: after `attach` returns; remote: after its first `snapshot` is dispatched, so its
+listener is live), so a freshly selected conductor evaluates existing state at once instead of idling
+until the next real turn (P1-6); and conductor *detach* now calls `Truth.clearLocks({ inheritTail:
+true })` so a `tail-size` conductor's enforced tail is adopted as the human's `protectTokens` before
+the lock releases, rather than snapping back and healing/pruning the freeze-preserved folds (P1-5).
+`PROTOCOL_VERSION` is bumped 13 → 14 for the `holdId`/`holdRelease`/`cancelComplete` additions.

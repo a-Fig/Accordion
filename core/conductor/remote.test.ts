@@ -1,6 +1,6 @@
 /*
  * remote.test.ts — the out-of-process conductor SDK (`./remote`) against a REAL loopback WebSocket
- * server speaking exact v13 wire shapes.
+ * server speaking exact v14 wire shapes.
  *
  * `ws` (the extension's runtime dependency) is not resolvable from this test file: `core/` has no
  * node_modules of its own, and vitest's module resolution walks up from `core/conductor/` — it
@@ -34,6 +34,8 @@ import type {
 	RecallObservationMessage,
 	ResnapshotMessage,
 	SetConductorStatusMessage,
+	HoldReleaseMessage,
+	CancelCompleteMessage,
 	SessionMetaWire,
 } from "../protocol";
 
@@ -477,16 +479,64 @@ describe("runRemoteConductor — completeRequest round trip", () => {
 	});
 });
 
-describe("runRemoteConductor — wireDeparting hold-release contract", () => {
-	it("a handler that proposes during handling suppresses the automatic empty propose", async () => {
+describe("runRemoteConductor — completeRequest abort forwarding (S7)", () => {
+	it("aborting the signal sends cancelComplete for that reqId and rejects the local complete()", async () => {
+		const { server, host, run } = await attachedFixture();
+
+		const controller = new AbortController();
+		const pending = host.complete({ prompt: "a long summary", signal: controller.signal });
+		// Attach the rejection expectation BEFORE aborting so the (imminent) rejection is never unhandled.
+		const rejected = expect(pending).rejects.toThrow();
+		const wireMsg = await server.next<CompleteRequestMessage>();
+		expect(wireMsg.type).toBe("completeRequest");
+
+		// The conductor aborts (detach / swap / timeout on its side): the SDK forwards cancelComplete
+		// for the SAME reqId and rejects the local promise rather than silently awaiting a discarded result.
+		controller.abort();
+		const cancel = await server.next<CancelCompleteMessage>();
+		expect(cancel.type).toBe("cancelComplete");
+		expect(cancel.reqId).toBe(wireMsg.reqId);
+		await rejected;
+
+		// A late completeResult for the already-aborted reqId is ignored (the pending entry is gone).
+		server.send({ type: "completeResult", reqId: wireMsg.reqId, ok: true, text: "late", model: "m" } satisfies CompleteResultMessage);
+		await delay(20);
+
+		server.closeClient();
+		await run;
+	});
+
+	it("an already-aborted signal forwards cancelComplete immediately", async () => {
+		const { server, host, run } = await attachedFixture();
+
+		const controller = new AbortController();
+		controller.abort();
+		const pending = host.complete({ prompt: "doomed", signal: controller.signal });
+		// Handler attached synchronously right after the (already-rejected) promise is created.
+		const rejected = expect(pending).rejects.toThrow();
+
+		// The completeRequest still goes out (reqId is minted on send), immediately followed by the
+		// cancelComplete for it — the abort listener fires synchronously for an already-aborted signal.
+		const req = await server.next<CompleteRequestMessage>();
+		expect(req.type).toBe("completeRequest");
+		const cancel = await server.next<CancelCompleteMessage>();
+		expect(cancel.type).toBe("cancelComplete");
+		expect(cancel.reqId).toBe(req.reqId);
+		await rejected;
+
+		server.closeClient();
+		await run;
+	});
+});
+
+describe("runRemoteConductor — wireDeparting hold-release contract (v14)", () => {
+	it("a handler that proposes during handling still sends a holdRelease after it settles — a propose no longer doubles as the release (P1-2)", async () => {
 		const server = newServer();
 		const port = await server.portReady;
-		let proposeCount = 0;
 		const stub = makeStub(async (e, host) => {
 			if (e.type !== "wire-departing") return;
 			const p = host.propose({ baseRev: e.rev, ops: [{ kind: "fold", ids: ["x"] }] });
-			// Let the propose reach the wire before the handler resolves (still counts as "during
-			// handling" — the flag is set the instant `propose` is INVOKED, not when it settles).
+			// Let the propose reach the wire before the handler resolves.
 			await delay(10);
 			void p;
 		});
@@ -496,29 +546,34 @@ describe("runRemoteConductor — wireDeparting hold-release contract", () => {
 		server.send(snapshotMsg(emptySnapshot(0)));
 		await stub.attached;
 
-		server.send({ type: "wireDeparting", rev: 0, liveTokens: 10, budget: 70_000, freshIds: [], holdMs: 200 } satisfies WireDepartingMessage);
+		server.send({ type: "wireDeparting", rev: 0, liveTokens: 10, budget: 70_000, freshIds: [], holdMs: 200, holdId: 11 } satisfies WireDepartingMessage);
 
-		// Count every propose the server receives for a settling window, then assert exactly one —
-		// the handler's own real propose, never a second automatic empty one.
-		const seenProposes: ProposeMessage[] = [];
+		// Collect client→server messages for a settling window: exactly ONE propose (the handler's own
+		// real fold, NOT a hold-release) plus ONE holdRelease carrying this hold's id.
+		let proposeCount = 0;
+		let release: HoldReleaseMessage | null = null;
 		const collect = async () => {
 			for (;;) {
-				const msg = await server.next<ProposeMessage>();
-				seenProposes.push(msg);
-				proposeCount++;
-				server.send({ type: "proposeResult", seq: msg.seq, rev: msg.baseRev + 1, results: [{ op: msg.ops[0] ?? { kind: "resetAll" }, applied: true }] } satisfies ProposeResultMessage);
+				const msg = await server.next<ProposeMessage | HoldReleaseMessage>();
+				if (msg.type === "propose") {
+					proposeCount++;
+					const p = msg as ProposeMessage;
+					server.send({ type: "proposeResult", seq: p.seq, rev: p.baseRev + 1, results: [{ op: p.ops[0] ?? { kind: "resetAll" }, applied: true }] } satisfies ProposeResultMessage);
+				} else if (msg.type === "holdRelease") {
+					release = msg as HoldReleaseMessage;
+				}
 			}
 		};
 		void collect();
 		await delay(80);
 		expect(proposeCount).toBe(1);
-		expect(seenProposes[0].ops.length).toBe(1);
+		expect(release && (release as HoldReleaseMessage).holdId).toBe(11);
 
 		server.closeClient();
 		await run;
 	});
 
-	it("a handler that never proposes gets exactly one automatic empty propose after it settles", async () => {
+	it("a handler that never proposes still sends exactly one holdRelease after it settles (no automatic empty propose)", async () => {
 		const server = newServer();
 		const port = await server.portReady;
 		const stub = makeStub((e) => {
@@ -530,18 +585,17 @@ describe("runRemoteConductor — wireDeparting hold-release contract", () => {
 		server.send(snapshotMsg(emptySnapshot(0)));
 		await stub.attached;
 
-		server.send({ type: "wireDeparting", rev: 3, liveTokens: 10, budget: 70_000, freshIds: [], holdMs: 200 } satisfies WireDepartingMessage);
+		server.send({ type: "wireDeparting", rev: 3, liveTokens: 10, budget: 70_000, freshIds: [], holdMs: 200, holdId: 22 } satisfies WireDepartingMessage);
 
-		const msg = await server.next<ProposeMessage>();
-		expect(msg.type).toBe("propose");
-		expect(msg.baseRev).toBe(3);
-		expect(msg.ops).toEqual([]);
+		const msg = await server.next<HoldReleaseMessage>();
+		expect(msg.type).toBe("holdRelease");
+		expect(msg.holdId).toBe(22);
 
 		server.closeClient();
 		await run;
 	});
 
-	it("an async handler's release is deferred until it actually settles", async () => {
+	it("an async handler's holdRelease is deferred until it actually settles", async () => {
 		const server = newServer();
 		const port = await server.portReady;
 		let settleHandler!: () => void;
@@ -558,16 +612,16 @@ describe("runRemoteConductor — wireDeparting hold-release contract", () => {
 		server.send(snapshotMsg(emptySnapshot(0)));
 		await stub.attached;
 
-		server.send({ type: "wireDeparting", rev: 5, liveTokens: 10, budget: 70_000, freshIds: [], holdMs: 200 } satisfies WireDepartingMessage);
+		server.send({ type: "wireDeparting", rev: 5, liveTokens: 10, budget: 70_000, freshIds: [], holdMs: 200, holdId: 33 } satisfies WireDepartingMessage);
 
-		// Before the handler settles, no propose (empty or otherwise) should have been sent yet.
+		// Before the handler settles, no holdRelease (or anything else) should have been sent yet.
 		await delay(40);
 		expect(server.hasPending()).toBe(false);
 
 		settleHandler();
-		const msg = await server.next<ProposeMessage>();
-		expect(msg.ops).toEqual([]);
-		expect(msg.baseRev).toBe(5);
+		const msg = await server.next<HoldReleaseMessage>();
+		expect(msg.type).toBe("holdRelease");
+		expect(msg.holdId).toBe(33);
 
 		server.closeClient();
 		await run;

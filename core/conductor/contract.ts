@@ -98,8 +98,12 @@ export type HostEvent =
 	/** A human/agent edit changed the standing view (provenance included). */
 	| { type: "state-changed"; changes: readonly StateChange[]; rev: number }
 	/** The wire is about to depart to the model. A strategy that declares `holdWireUpToMs > 0` may
-	 *  propose a last-moment fold; `freshIds` are blocks never yet sent whole. */
-	| { type: "wire-departing"; rev: number; liveTokens: number; budget: number; freshIds: readonly string[] }
+	 *  propose a last-moment fold; `freshIds` are blocks never yet sent whole. `holdId` (v14,
+	 *  optional/additive) uniquely tags this hold — the host mints it and, on the REMOTE seam, the SDK
+	 *  echoes it in `holdRelease` when the handler settles; an in-process host resolves on handler
+	 *  settle regardless, so the field is informational there. Absent (e.g. `TestHost.departWire`,
+	 *  which resolves purely on the returned promise) means the host isn't using id correlation. */
+	| { type: "wire-departing"; rev: number; liveTokens: number; budget: number; freshIds: readonly string[]; holdId?: number }
 	/** The host state was rebuilt (structural reset / reconnect); rebuild any tracked desired state. */
 	| { type: "resync"; rev: number };
 

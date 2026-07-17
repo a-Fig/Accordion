@@ -2,14 +2,17 @@
  * liveHost.test.ts — `LiveConductorHost` (the in-extension live conductor host, Phase C) driven
  * against a REAL `Truth` with mocked sockets / spawn / completion. Covers: select→detach ordering
  * (freeze BEFORE clearLocks), eager `setLocks`, single-use attach token, non-active-socket
- * rejection, the wire-departing hold (in-process sync/async + remote empty-propose/timeout with the
- * generation token), the spawn pending-attach timeout, shutdown teardown, completion abort on
- * detach, and the human-override clamp of a conductor propose. Plus the registry catalog.
+ * rejection, the wire-departing hold (in-process sync/async + remote holdRelease/timeout with the
+ * holdId generation guard), the P1-6 initial pass on select (in-process + remote), the P1-5 detach
+ * tail-inheritance (freeze survives, protectTokens adopts the enforced tail) and its replica replay,
+ * the spawn pending-attach timeout, shutdown teardown, completion abort on detach, S7 cancelComplete
+ * forwarding, and the human-override clamp of a conductor propose. Plus the registry catalog.
  */
 import { describe, it, expect, vi } from "vitest";
 import { Truth } from "../truth";
 import type { Block, ParsedSession } from "../types";
-import type { ServerMessage } from "../protocol";
+import type { ServerMessage, WireEvent } from "../protocol";
+import { serializeSnapshot, hydrateSnapshot, applyWireEvent, wireEventFromTruthEvent } from "../replica";
 import { LiveConductorHost, type LiveHostDeps, type SpawnedRunner } from "./liveHost";
 import { catalogMeta, entryById } from "./registry";
 
@@ -96,6 +99,14 @@ function makeDeps(truth: Truth | null, overrides: Partial<LiveHostDeps> = {}): H
 	return { deps, broadcastLog, conductorLog, socketLog, spawned, runCompletion };
 }
 const flush = () => new Promise((r) => setTimeout(r, 0));
+/** Poll `pred` until true (real timers), for async chains that settle over several microtask hops. */
+async function until(pred: () => boolean, ms = 2000): Promise<void> {
+	const start = Date.now();
+	while (!pred()) {
+		if (Date.now() - start > ms) throw new Error("until: timed out");
+		await new Promise((r) => setTimeout(r, 5));
+	}
+}
 
 // ── registry ──────────────────────────────────────────────────────────────────
 describe("registry", () => {
@@ -156,6 +167,112 @@ describe("detach — freeze BEFORE clearLocks", () => {
 		const freezeIdx = applySpy.mock.calls.findIndex((c) => Array.isArray(c[0]) && (c[0] as Array<{ kind?: string }>)[0]?.kind === "freeze");
 		expect(freezeIdx).toBeGreaterThanOrEqual(0);
 		expect(applySpy.mock.invocationCallOrder[freezeIdx]).toBeLessThan(clearSpy.mock.invocationCallOrder[0]);
+	});
+});
+
+// ── P1-6: initial pass on select ────────────────────────────────────────────────
+describe("initial pass on select (P1-6)", () => {
+	it("an in-process conductor gets an immediate turn-committed and compacts without waiting for a turn", async () => {
+		const t = bulk(textSeq(10)); // 10 × 1000 = 10k raw
+		t.setProtect(0); // whole session aged
+		t.setBudget(3000); // 10k ≫ 0.9 × 3000, so compaction-naive triggers on the very first pass
+		const h = makeDeps(t);
+		const host = new LiveConductorHost(h.deps);
+		host.select("compaction-naive");
+		// No turn_end has fired. ONLY the P1-6 initial turn-committed drives the first pass →
+		// launchCompletion → (mock) resolves → rerun → a summary group lands in Truth. Without the
+		// initial pass the conductor would idle with zero groups.
+		await until(() => t.groups.length > 0);
+		expect(t.groups.length).toBeGreaterThan(0);
+		expect(t.groups.every((g) => g.by === "auto")).toBe(true);
+		expect(h.runCompletion).toHaveBeenCalled();
+	});
+
+	it("a freshly attached remote conductor is sent an initial turnCommitted", () => {
+		const t = liveTruth();
+		t.append(textSeq(3));
+		const h = makeDeps(t);
+		const host = new LiveConductorHost(h.deps);
+		host.select("thermocline");
+		host.acceptConductorSocket({}, host.pendingAttachToken);
+		h.conductorLog.length = 0;
+		// The extension calls this AFTER dispatching the conductor's first snapshot (once the SDK has
+		// hydrated + attached), so the message actually drives a pass instead of idling until a turn.
+		host.fireInitialTurnCommitted();
+		const tc = h.conductorLog.filter((m) => m.type === "turnCommitted").pop();
+		expect(tc && tc.type === "turnCommitted").toBe(true);
+		expect(tc && tc.type === "turnCommitted" && tc.rev).toBe(t.rev);
+	});
+});
+
+// ── P1-5: detach inherits the conductor-enforced tail ────────────────────────────
+describe("detach — inherit the conductor's tail (P1-5)", () => {
+	it("adopts the tail-size conductor's enforced tail as protectTokens so the frozen fold isn't healed back", () => {
+		const t = bulk(textSeq(6)); // 6 × 1000; the default 20k tail would cover the whole session
+		const host = new LiveConductorHost(makeDeps(t).deps);
+		host.select("handoff"); // locks human-steering + agent-unfold + tail-size, tailTokens 0
+		expect(t.locks).toContain("tail-size");
+		expect(t.protectTokens).toBe(20_000); // the human's dial is untouched while the lock is held
+
+		// A strategy fold near the tail — under tailTokens 0 nothing is protected, so it lands.
+		t.apply([{ kind: "replace", id: "a:b5:p0", content: "SUB", recoverable: false }], "auto");
+		expect(t.get("a:b5:p0")!.subst).toBe("SUB");
+
+		host.select("none"); // detach → freeze → clearLocks({ inheritTail: true })
+
+		// The enforced tail (0) is now the human's protectTokens — it did NOT snap back to 20k.
+		expect(t.protectTokens).toBe(0);
+		expect(t.locks).toEqual([]);
+		// The frozen fold survives as a human fold, subst byte-identical — NOT healed by a snapped-back tail.
+		const b = t.get("a:b5:p0")!;
+		expect(b.override).toBe("folded");
+		expect(b.by).toBe("you");
+		expect(b.subst).toBe("SUB");
+		expect(t.isFolded(b)).toBe(true);
+	});
+
+	it("a replica replaying the detach sequence (freeze → inherit-tail config → locks) surfaces the config divergence as a rev mismatch, never a silent fork", () => {
+		// The exact Truth state at detach: a tail-size lock (tailTokens 0) with a strategy fold.
+		const t = bulk(textSeq(6));
+		t.setLocks(["human-steering", "tail-size"], "Handoff", 0);
+		t.apply([{ kind: "replace", id: "a:b5:p0", content: "SUB", recoverable: false }], "auto");
+
+		// A rev-aligned replica hydrated from the pre-detach snapshot.
+		const replica = hydrateSnapshot(META, serializeSnapshot(t, false));
+		expect(replica.rev).toBe(t.rev);
+
+		// Capture the WireEvents the real detach sequence emits.
+		const events: WireEvent[] = [];
+		const off = t.onEvent((e) => {
+			const ev = wireEventFromTruthEvent(e);
+			if (ev) events.push(ev);
+		});
+		t.apply([{ kind: "freeze" }], "you");
+		t.clearLocks({ inheritTail: true });
+		off();
+
+		// Exactly: ops(freeze) → config(protectTokens) → locks — each rev-stamped.
+		expect(events.map((e) => e.kind)).toEqual(["ops", "config", "locks"]);
+
+		// Replay onto the replica. The freeze ops event replays cleanly (rev aligns). The config event
+		// carries the inherited protectTokens, but the replica's tail-size lock is STILL held then (the
+		// locks event hasn't replayed yet), so its `setProtect` is refused — a genuine, DETECTABLE
+		// divergence (rev mismatch) that in the live client triggers a resnapshot. Prefer clean replay,
+		// but this rev-mismatch fallback is acceptable precisely because it is NOT a silent state fork.
+		let divergedAt: WireEvent["kind"] | null = null;
+		for (const ev of events) {
+			applyWireEvent(replica, ev);
+			if (replica.rev !== ev.rev && divergedAt === null) divergedAt = ev.kind;
+		}
+		expect(divergedAt).toBe("config"); // the divergence is caught at the config event, not silent
+
+		// A fresh post-detach snapshot recovers the replica exactly: inherited tail + the frozen fold.
+		const recovered = hydrateSnapshot(META, serializeSnapshot(t, false));
+		expect(recovered.rev).toBe(t.rev);
+		expect(recovered.protectTokens).toBe(0);
+		const rb = recovered.get("a:b5:p0")!;
+		expect(rb.override).toBe("folded");
+		expect(rb.subst).toBe("SUB");
 	});
 });
 
@@ -236,8 +353,14 @@ describe("hold — in-process", () => {
 	});
 });
 
-describe("hold — remote", () => {
-	it("resolves on the first propose (empty ops = release ack)", async () => {
+describe("hold — remote (v14 holdRelease)", () => {
+	/** The holdId the host stamped on its most recent `wireDeparting` message. */
+	function lastHoldId(log: ServerMessage[]): number {
+		const wd = log.filter((m) => m.type === "wireDeparting").pop();
+		return wd && wd.type === "wireDeparting" ? wd.holdId : -1;
+	}
+
+	it("resolves on the matching holdRelease — a propose no longer releases the hold (P1-2)", async () => {
 		const t = liveTruth();
 		t.append(textSeq(2));
 		const h = makeDeps(t);
@@ -245,14 +368,25 @@ describe("hold — remote", () => {
 		host.select("thermocline");
 		const sock = {};
 		host.acceptConductorSocket(sock, host.pendingAttachToken);
-		const p = host.fireWireDepartingAndAwaitHold();
-		expect(h.conductorLog.some((m) => m.type === "wireDeparting")).toBe(true);
+		let resolved = false;
+		const p = host.fireWireDepartingAndAwaitHold().then(() => {
+			resolved = true;
+		});
+		const holdId = lastHoldId(h.conductorLog);
+		expect(holdId).toBeGreaterThan(0);
+		// A propose during the hold must NOT release it (the P1-2 regression: a background-tick propose
+		// racing the hold would otherwise release it before the handler's last-moment fold lands).
 		host.handleConductorMessage(sock, { type: "propose", seq: 1, baseRev: t.rev, ops: [] });
+		await flush();
+		expect(resolved).toBe(false);
+		// The dedicated holdRelease carrying the CURRENT holdId is what actually releases it.
+		host.handleConductorMessage(sock, { type: "holdRelease", holdId });
 		await p;
+		expect(resolved).toBe(true);
 		expect(host.holdTimeouts).toBe(0);
 	});
 
-	it("times out, counts it, and a LATE propose does not resolve a future hold (generation token)", async () => {
+	it("times out, counts it, and a stale holdRelease never resolves a later hold (holdId generation guard)", async () => {
 		vi.useFakeTimers();
 		try {
 			const t = liveTruth();
@@ -263,14 +397,19 @@ describe("hold — remote", () => {
 			const sock = {};
 			host.acceptConductorSocket(sock, host.pendingAttachToken);
 			const p1 = host.fireWireDepartingAndAwaitHold();
+			const holdId1 = lastHoldId(h.conductorLog);
 			await vi.advanceTimersByTimeAsync(200);
 			await p1;
 			expect(host.holdTimeouts).toBe(1);
-			// A propose arriving after the timeout finds no pending hold — ignored (still applied+replied).
-			host.handleConductorMessage(sock, { type: "propose", seq: 9, baseRev: t.rev, ops: [] });
+			// A holdRelease for the already-timed-out hold is a no-op (no pending hold to match).
+			host.handleConductorMessage(sock, { type: "holdRelease", holdId: holdId1 });
 			expect(host.holdTimeouts).toBe(1);
-			// A fresh hold is NOT resolved by that earlier late propose — it times out on its own.
+			// A fresh hold gets a DISTINCT holdId; the stale one must not resolve it — it times out itself.
+			h.conductorLog.length = 0;
 			const p2 = host.fireWireDepartingAndAwaitHold();
+			const holdId2 = lastHoldId(h.conductorLog);
+			expect(holdId2).not.toBe(holdId1);
+			host.handleConductorMessage(sock, { type: "holdRelease", holdId: holdId1 }); // stale — ignored
 			await vi.advanceTimersByTimeAsync(200);
 			await p2;
 			expect(host.holdTimeouts).toBe(2);
@@ -342,6 +481,38 @@ describe("completion — aborted on detach", () => {
 		await flush();
 		expect(captured!.aborted).toBe(true);
 		// The completeResult routes to the ORIGINATING socket (sendToSocket), bound to `sock`.
+		const done = h.socketLog.filter((e) => e.socket === sock && e.msg.type === "completeResult").pop();
+		expect(done && done.msg.type === "completeResult" && done.msg.ok).toBe(false);
+	});
+});
+
+// ── S7: a conductor's completion abort is forwarded to the in-flight completion ──
+describe("completeRequest — cancelComplete aborts the matching completion (S7)", () => {
+	it("aborts the completion for a given reqId, ignores an unknown reqId, and routes the failure back", async () => {
+		let captured: AbortSignal | null = null;
+		const t = bulk(textSeq(2));
+		const h = makeDeps(t, {
+			runCompletion: (_req, signal) =>
+				new Promise((_res, rej) => {
+					captured = signal;
+					signal.addEventListener("abort", () => rej(new Error("aborted")));
+				}),
+		});
+		const host = new LiveConductorHost(h.deps);
+		host.select("thermocline");
+		const sock = {};
+		host.acceptConductorSocket(sock, host.pendingAttachToken);
+		host.handleConductorMessage(sock, { type: "completeRequest", reqId: 42, prompt: "summarize the aged region" });
+		expect(captured).not.toBeNull();
+
+		// An unknown/settled reqId is a no-op — the in-flight completion is untouched.
+		host.handleConductorMessage(sock, { type: "cancelComplete", reqId: 999 });
+		expect(captured!.aborted).toBe(false);
+
+		// The matching reqId aborts the in-flight completion's controller.
+		host.handleConductorMessage(sock, { type: "cancelComplete", reqId: 42 });
+		expect(captured!.aborted).toBe(true);
+		await flush();
 		const done = h.socketLog.filter((e) => e.socket === sock && e.msg.type === "completeResult").pop();
 		expect(done && done.msg.type === "completeResult" && done.msg.ok).toBe(false);
 	});

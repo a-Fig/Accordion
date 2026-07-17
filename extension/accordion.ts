@@ -1187,6 +1187,11 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			// hello advertises the conductor catalog (thermocline only if its runner resolves on disk).
 			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta, conductors: catalogMeta((entryFile) => resolveRunnerPath(entryFile) !== null) });
 			if (truth) send(ws, { type: "snapshot", state: serializeSnapshot(truth, foldingEnabled) });
+			// P1-6: a freshly attached REMOTE conductor gets an initial turn-committed right AFTER its
+			// snapshot — by now the spawned SDK has hydrated its replica and run `conductor.attach`, so its
+			// listener is live and this drives an immediate pass over existing state instead of idling
+			// until the next real turn. (The in-process seam fires its own initial pass inside `select`.)
+			if (role === "conductor" && truth) liveHost.fireInitialTurnCommitted();
 			// After the snapshot, a (re)connecting client learns who — if anyone — is driving, plus any
 			// cached conductor status line, so it never renders from a locally tracked guess.
 			const activeMeta = liveHost.activeMeta();
