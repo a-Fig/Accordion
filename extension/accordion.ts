@@ -58,12 +58,11 @@ import { Truth } from "../core/truth";
 import { linearize, messageInfo, contentFingerprint, wireToBlock, type PiMessage } from "../core/wire";
 import { serializeSnapshot, wireEventFromTruthEvent } from "../core/replica";
 import { resolveUnfold, resolveRecall } from "../core/agentView";
-import type { SessionMeta } from "../core/types";
-import { applyGuardingHostOnly, type OpResult } from "../core/ops";
+import { applyGuardingHostOnly, sanitizeOps, type OpResult } from "../core/ops";
 import type { TruthEvent } from "../core/events";
 import {
-	DEFAULT_PORT,
 	PROTOCOL_VERSION,
+	sanitizeCommand,
 	type Role,
 	type ServerMessage,
 	type StreamMessage,
@@ -98,15 +97,9 @@ const SIBLING_ORIGIN_META_MAX_BYTES = 16 * 1024;
 const MAX_PENDING_SIBLING_ORIGIN_PROBES = 8;
 // Phase C: an attached conductor's out-of-band `complete()` launches real provider work. Keep the
 // spend bound process-wide (across in-process + spawned conductors) and finish before the wire's own
-// safety timeout. `envPositiveInt` keeps smoke/CI fast; invalid values retain the production default.
+// safety timeout.
 const MAX_CONCURRENT_COMPLETIONS = 4;
-function envPositiveInt(name: string, fallback: number): number {
-	const raw = process.env[name];
-	if (typeof raw !== "string") return fallback;
-	const n = Number(raw.trim());
-	return Number.isInteger(n) && n > 0 ? n : fallback;
-}
-const COMPLETION_TIMEOUT_MS = envPositiveInt("ACCORDION_COMPLETION_TIMEOUT_MS", 110_000);
+const COMPLETION_TIMEOUT_MS = 110_000;
 
 /** Test seam mirroring dc037bc: production resolves pi-ai lazily through pi's package alias. */
 type CompletionFunction = (
@@ -352,6 +345,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	let maxHookMs = 0; // worst hook duration
 	let rebuilds = 0; // structural-divergence Truth rebuilds
 	let hookErrors = 0; // `context` hook throws caught by the passthrough guard (should stay 0)
+	let ingressErrors = 0; // unexpected throws caught at the WS message boundary (should stay 0 — a buggy peer must not crash us)
 	const hookDurations: number[] = []; // bounded ring for the p95 readout
 	const HOOK_RING = 256;
 
@@ -394,6 +388,17 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (ev) broadcast({ type: "event", event: ev });
 	}
 
+	/**
+	 * Send the current Truth snapshot to one client, or — with `ws` omitted — broadcast it to every
+	 * client (the forced resnapshot after a divergence rebuild). A no-op until the Truth exists.
+	 */
+	function sendSnapshot(ws?: WebSocket): void {
+		if (!truth) return;
+		const m: ServerMessage = { type: "snapshot", state: serializeSnapshot(truth, foldingEnabled) };
+		if (ws) send(ws, m);
+		else broadcast(m);
+	}
+
 	/** Broadcast a stream lifecycle frame to every attached client (presentation-only ghosts). */
 	function sendStream(frame: StreamMessage): void {
 		broadcast(frame);
@@ -405,7 +410,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// this session's state. It makes NO folding decisions of its own on the hook path.
 	const liveHost = new LiveConductorHost({
 		truth: () => truth,
-		broadcast: (m) => broadcast(m),
+		broadcast,
 		sendToConductor: (m) => {
 			if (conductorWs && conductorWs.readyState === 1) send(conductorWs, m);
 		},
@@ -414,8 +419,8 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			if (ws && ws.readyState === 1) send(ws, m);
 		},
 		mintToken: () => crypto.randomBytes(16).toString("hex"),
-		spawnRunner: (entryFile, env) => spawnRunner(entryFile, env),
-		runCompletion: (req, signal) => runCompletion(req, signal),
+		spawnRunner,
+		runCompletion,
 		spawnEnv: () => ({ port, sessionKey: sessionId, home: HOME }),
 		now: () => Date.now(),
 	});
@@ -556,12 +561,16 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		const sorted = [...hookDurations].sort((a, b) => a - b);
 		return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
 	}
-	function broadcastTelemetry(): void {
+	/** The current telemetry frame — one builder for the per-connection seed + the per-hook broadcast. */
+	function telemetryMsg(): ServerMessage {
 		// lastHoldMs/holdTimeouts (protocol v13) are the REAL wire-departing hold telemetry now: how
 		// long the host held the departing wire for the attached conductor's last-moment proposal on
 		// the most recent hook, and how many holds have timed out over the session. Both stay 0 while
 		// no conductor is attached (no hold is ever fired), so a no-conductor session is unchanged.
-		broadcast({ type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: liveHost.lastHoldMs, holdTimeouts: liveHost.holdTimeouts });
+		return { type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: liveHost.lastHoldMs, holdTimeouts: liveHost.holdTimeouts };
+	}
+	function broadcastTelemetry(): void {
+		broadcast(telemetryMsg());
 	}
 
 	// ── registry file: advertise this session for the app to discover ───────────
@@ -854,7 +863,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 						served: true,
 						sessionId,
 						protocolVersion: PROTOCOL_VERSION,
-						telemetry: { hookCount, lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookErrors, foldingEnabled },
+						telemetry: { hookCount, lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookErrors, ingressErrors, foldingEnabled },
 					}),
 				);
 				return;
@@ -1198,7 +1207,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 
 			// hello advertises the conductor catalog (thermocline only if its runner resolves on disk).
 			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta, conductors: catalogMeta((entryFile) => resolveRunnerPath(entryFile) !== null) });
-			if (truth) send(ws, { type: "snapshot", state: serializeSnapshot(truth, foldingEnabled) });
+			sendSnapshot(ws);
 			// P1-6: a freshly attached REMOTE conductor gets an initial turn-committed right AFTER its
 			// snapshot — by now the spawned SDK has hydrated its replica and run `conductor.attach`, so its
 			// listener is live and this drives an immediate pass over existing state instead of idling
@@ -1211,7 +1220,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			const cachedStatus = liveHost.cachedStatus();
 			if (cachedStatus) send(ws, cachedStatus);
 			// Seed the client's latency badge with current telemetry (blank until the first hook otherwise).
-			send(ws, { type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: liveHost.lastHoldMs, holdTimeouts: liveHost.holdTimeouts });
+			send(ws, telemetryMsg());
 			// Register only AFTER the snapshot so no event can precede the replica it must replay onto.
 			clients.set(ws, { role });
 
@@ -1223,26 +1232,55 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				} catch {
 					return;
 				}
-				if (role === "conductor") {
-					// A conductor replica: propose / completeRequest / setConductorStatus route to the
-					// live host (which verifies this is the ACTIVE conductor socket), plus resnapshot.
-					if (msg?.type === "resnapshot") {
-						if (truth) send(ws, { type: "snapshot", state: serializeSnapshot(truth, foldingEnabled) });
-					} else {
-						liveHost.handleConductorMessage(ws, msg);
+				// ── ingress boundary: authorized ≠ well-formed ─────────────────────────────
+				// Clearing WS authorization proves a peer may REACH us, never that its frames are
+				// well-formed. An authorized-but-buggy client can send `setBudget:"hello"` (→ NaN budget
+				// → JSON-null on the wire → forked replicas) or `ops:[null]` (a raw `op.kind` deref that
+				// would throw). Sanitize every inbound command/ops HERE, before it can touch the
+				// authoritative Truth, and wrap the whole dispatch so an unexpected throw is caught +
+				// counted at this seam — never allowed to escape the WS callback, where an uncaught throw
+				// would tear down the live session for every other connected client.
+				try {
+					if (role === "conductor") {
+						// A conductor replica: propose / completeRequest / setConductorStatus route to the
+						// live host (which verifies this is the ACTIVE conductor socket), plus resnapshot.
+						if (msg?.type === "resnapshot") {
+							sendSnapshot(ws);
+						} else {
+							// Defense-in-depth mirror of the GUI `ops` guard: a `propose`'s ops reach
+							// `Truth.apply` inside handleConductorMessage, so scrub structurally-invalid
+							// elements (`[null]`, bad kinds) at the boundary before they get there. `null`
+							// (not an array) collapses to an empty batch — an honest no-op proposal.
+							if (msg?.type === "propose") msg.ops = sanitizeOps(msg.ops) ?? [];
+							liveHost.handleConductorMessage(ws, msg);
+						}
+						return;
 					}
-					return;
-				}
-				// The GUI client→server message: a remote-control command. The host applies it to the
-				// authoritative Truth (emitting events to ALL clients) and replies with the per-op
-				// results + resulting rev. There is NO optimistic apply on the client — the replica
-				// mutates only via the echoed event stream, so a command and its events can't race.
-				if (msg?.type === "command" && typeof msg.seq === "number" && msg.cmd && typeof msg.cmd === "object") {
-					const { results, rev } = applyCommand(msg.cmd as WireCommand);
-					send(ws, { type: "commandResult", seq: msg.seq, results, rev });
-				} else if (msg?.type === "resnapshot") {
-					// The replica diverged (rev mismatch) or saw a `reset` — hand it a fresh snapshot.
-					if (truth) send(ws, { type: "snapshot", state: serializeSnapshot(truth, foldingEnabled) });
+					// The GUI client→server message: a remote-control command. The host applies it to the
+					// authoritative Truth (emitting events to ALL clients) and replies with the per-op
+					// results + resulting rev. There is NO optimistic apply on the client — the replica
+					// mutates only via the echoed event stream, so a command and its events can't race.
+					if (msg?.type === "command" && typeof msg.seq === "number") {
+						// `sanitizeCommand` returns a safe, applyable WireCommand or null (a NaN/negative
+						// dial coerced finite, malformed `ops` dropped). A null result is unusable: refuse
+						// it with an empty-results `commandResult` (the clamp-UX shape the GUI already
+						// reads) that acks the client's `seq` WITHOUT mutating the Truth (rev unchanged).
+						const cmd = sanitizeCommand(msg.cmd);
+						if (!cmd) {
+							send(ws, { type: "commandResult", seq: msg.seq, results: [], rev: truth ? truth.rev : 0 });
+						} else {
+							const { results, rev } = applyCommand(cmd);
+							send(ws, { type: "commandResult", seq: msg.seq, results, rev });
+						}
+					} else if (msg?.type === "resnapshot") {
+						// The replica diverged (rev mismatch) or saw a `reset` — hand it a fresh snapshot.
+						sendSnapshot(ws);
+					}
+				} catch {
+					// A malformed peer must never crash the process (an uncaught throw in a `ws` message
+					// listener surfaces as an uncaughtException). Count it (surfaced in /meta telemetry)
+					// and drop the frame; the session and every other client stay live.
+					ingressErrors++;
 				}
 			});
 			const drop = () => {
@@ -1276,11 +1314,6 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		}
 	}
 
-	/** SessionMeta for a Truth built from the current discovery meta. */
-	function metaForTruth(): SessionMeta {
-		return { format: "pi", title: meta.title, cwd: meta.cwd, model: meta.model };
-	}
-
 	/** The current folding arm, echoed in snapshots + on toggle. Only broadcasts on a real change. */
 	function setFolding(on: boolean): void {
 		if (foldingEnabled === on) return;
@@ -1306,7 +1339,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		}
 		const prev = truth;
 		const blocks = linearize(messages).map(wireToBlock);
-		const t = Truth.rebuildFrom(prev, { meta: metaForTruth(), blocks, lineCount: 0, skipped: 0 });
+		const t = Truth.rebuildFrom(prev, { meta: { format: "pi", title: meta.title, cwd: meta.cwd, model: meta.model }, blocks, lineCount: 0, skipped: 0 });
 		t.wireAttached = true; // a live pi session is always a live wire (durability-aware accounting)
 		if (contextWindow != null) {
 			t.setContextWindow(contextWindow);
@@ -1336,7 +1369,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		buildTruth(messages);
 		if (isDivergence) {
 			rebuilds++;
-			broadcast({ type: "snapshot", state: serializeSnapshot(truth!, foldingEnabled) });
+			sendSnapshot();
 			// The Truth object was replaced — an in-process conductor rebuilds its tracked desired
 			// state from resync; a remote replica gets the forced resnapshot broadcast above.
 			liveHost.dispatchResync();
@@ -1875,8 +1908,3 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		return {};
 	});
 }
-
-// DEFAULT_PORT is retained in protocol.ts only as the browser dev-loop fallback
-// (the desktop app discovers ephemeral ports via the registry); reference it so
-// the import graph and the constant's purpose stay explicit.
-export const BROWSER_FALLBACK_PORT = DEFAULT_PORT;
