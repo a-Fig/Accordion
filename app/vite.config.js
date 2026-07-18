@@ -10,13 +10,12 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [sveltekit()],
 
-  // The top-level `conductors/` dir lives OUTSIDE this SvelteKit root (`app/`). The kit
-  // alias in svelte.config.js feeds svelte-check + the SvelteKit build, but vitest reads
-  // THIS config directly and may skip kit's alias injection — so mirror `$conductors` here
-  // and allow the dev/build server to read the parent dir.
+  // The framework-free `core/` package lives OUTSIDE this SvelteKit root (`app/`). The kit alias
+  // in svelte.config.js feeds svelte-check + the SvelteKit build; mirror `$core` here so the
+  // dev/build server resolves it too. `server.fs.allow: [".."]` already permits reading it.
   resolve: {
     alias: {
-      $conductors: path.resolve(__dirname, "../conductors"),
+      $core: path.resolve(__dirname, "../core"),
     },
   },
 
@@ -29,7 +28,7 @@ export default defineConfig(async () => ({
     port: 1420,
     strictPort: true,
     host: host || false,
-    // Let the dev/build server read `../conductors` (one level above the SvelteKit root).
+    // Allow the dev/build server to read one level above the SvelteKit root (the repo root).
     fs: {
       allow: [".."],
     },

@@ -4,11 +4,9 @@
 	import AnimatedNumber from "$lib/ui/AnimatedNumber.svelte";
 	import EditableNumber from "$lib/ui/EditableNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
-	import ConductorMenu from "./ConductorMenu.svelte";
 	import { folding } from "$lib/live/folding.svelte";
-	import { live, setArmed } from "$lib/live/liveClient.svelte";
-	import { conductorStatus } from "$lib/live/conductorClient.svelte";
-	import type { JSONValue } from "$conductors/contract";
+	import { live, setArmed, conductorState, conductorStatus } from "$lib/live/liveClient.svelte";
+	import ConductorMenu from "./ConductorMenu.svelte";
 
 	let { store, readOnly = false }: { store: AccordionStore; readOnly?: boolean } = $props();
 
@@ -28,8 +26,6 @@
 	});
 
 	const denom = $derived(Math.max(store.fullTokens, store.budget, 1));
-	const conductorStatusText = $derived(store.conductorStatus.text || conductorStatus.text);
-	const conductorStatusDetails = $derived(store.conductorStatus.text ? store.conductorStatus.details : conductorStatus.details);
 	// fmt/k formatters must round their input because AnimatedNumber passes a float mid-tween
 	const fmt = (n: number) => Math.round(n).toLocaleString();
 	const k = (n: number) => {
@@ -40,37 +36,26 @@
 		}
 		return r >= 1000 ? `${(r / 1000).toFixed(r >= 10000 ? 0 : 1)}k` : `${r}`;
 	};
-	const fmtOverBy = (n: number) => k(Math.round(n));
-	function formatStatusDetails(value: JSONValue | undefined): string {
-		if (value == null) return "";
-		const lines: string[] = [];
-		const pushList = (title: string, items: JSONValue | undefined) => {
-			if (!Array.isArray(items) || items.length === 0) return;
-			lines.push(title);
-			for (const item of items.slice(0, 8)) {
-				if (item && typeof item === "object" && !Array.isArray(item)) {
-					const obj = item as Record<string, JSONValue>;
-					const turn = typeof obj.turn === "number" ? `t${obj.turn}: ` : "";
-					const cat = typeof obj.cat === "string" ? `[${obj.cat}] ` : "";
-					const label = typeof obj.label === "string" ? obj.label : typeof obj.value === "string" ? obj.value : JSON.stringify(item);
-					lines.push(`  ${turn}${cat}${label}`);
-				} else {
-					lines.push(`  ${String(item)}`);
-				}
-			}
-		};
-		if (typeof value === "object" && !Array.isArray(value)) {
-			const obj = value as Record<string, JSONValue>;
-			pushList("facts", obj.factLedger);
-			pushList("folded TOC", obj.relevanceTOC);
-			const summary = obj.summary;
-			if (summary && typeof summary === "object" && !Array.isArray(summary)) {
-				lines.push(`summaries ${JSON.stringify(summary)}`);
-			}
-			if (lines.length) return lines.join("\n");
-		}
-		return JSON.stringify(value, null, 2);
-	}
+	const fmtOverBy = (n: number) => k(n);
+
+	// ── Involvement locks (ADR 0011) — the honest mirror of the engine's gating. A locked
+	// control LOOKS locked in every mode (preview/demo/read-only included), driven purely off
+	// `store.isLocked(...)`. The engine already no-ops the underlying action; this is the UI
+	// reflecting that, not the enforcement. The budget dial is NEVER gated (sacred tier).
+	//
+	// Declared ABOVE the protected-tail bar math below because protPct/handlePct/targetTokens
+	// all need to key off the same enforced value the PROTECT readout uses (`protectTarget`) —
+	// under a tail-size lock the active strategy owns the tail, so every chrome element (bar
+	// tint, grip position, underline, ARIA) must agree with the text, not just the text (S11).
+	const tailLocked = $derived(store.isLocked("tail-size"));
+	const steerLocked = $derived(store.isLocked("human-steering"));
+	// Under the tail-size lock the active strategy OWNS the tail — the enforced target is its
+	// declared `activeTailTokens`, not the human's now-stale `protectTokens` (ADR 0011 §7). Every
+	// PROTECT-related readout/visual must show what is actually enforced.
+	const protectTarget = $derived(tailLocked ? store.activeTailTokens : store.protectTokens);
+	const lockTip = $derived(
+		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
+	);
 
 	// ── Protected tail: an on-bar handle (left = 0, drag right to protect more) ──
 	const PROT_MAX = 60_000;
@@ -83,11 +68,15 @@
 	let barEl = $state<HTMLDivElement>();
 	// Everything on the bar is scaled to `denom` so the protected handle/tint share
 	// the composition bar's token axis. Clamp the readout to the bar so a tiny session
-	// (protect target > whole context) never paints past the right edge.
-	const protPct = $derived(Math.min(100, (store.protectTokens / denom) * 100));
+	// (protect target > whole context) never paints past the right edge. Keyed off
+	// `protectTarget` (not the raw `store.protectTokens`) so the bar tint agrees with the
+	// numeric readout under a tail-size lock (S11) — unlocked, protectTarget === protectTokens.
+	const protPct = $derived(Math.min(100, (protectTarget / denom) * 100));
 	// While dragging, the handle follows the cursor continuously (smooth) and the
 	// expensive fold commit is throttled to one per frame. `dragTokens` is non-null
-	// only mid-drag; otherwise the handle tracks the committed target.
+	// only mid-drag; otherwise the handle tracks the committed target. Dragging is already
+	// impossible while tail-locked (onProtPointerDown bails out), so `dragTokens` stays null
+	// and this always falls through to `protPct` in that state.
 	let dragTokens = $state<number | null>(null);
 	const handlePct = $derived(
 		dragTokens != null ? Math.min(100, (dragTokens / denom) * 100) : protPct,
@@ -95,36 +84,56 @@
 	// The TARGET protected size the user is dialing in. The underline + its label echo
 	// this (smooth, matches the grip), NOT the actual protected tail — `protectedTokens`
 	// snaps to whole-block boundaries, so it differs slightly and jitters as you drag.
-	const targetTokens = $derived(dragTokens ?? store.protectTokens);
+	// Falls back to `protectTarget` (not `store.protectTokens`) so the underline label
+	// agrees with the readout under a tail-size lock (S11).
+	const targetTokens = $derived(dragTokens ?? protectTarget);
 	// Headroom: the slack between what's used and the budget ceiling. Only present when
 	// the budget exceeds the full (unfolded) size — i.e. denom === budget.
 	const headroomPct = $derived(Math.max(0, ((denom - store.fullTokens) / denom) * 100));
 	// What "Revert to auto" will clear: every block carrying a manual/agent override.
 	const editCount = $derived(store.blocks.filter((b) => b.override !== null).length);
 
-	// ── Wire outcome readout (issue #60, ADR 0020): "applied" acked model calls seen this
-	// connection out of the total acked. Failure causes (timeout-stale/timeout-raw/
-	// epoch-mismatch) make the numerator fall behind the denominator; an empty-plan reply
-	// counts as a SUCCESS (the GUI intentionally asked for no folds, same as applying one).
-	const wireTotal = $derived(live.planOutcomes.total);
-	const wireApplied = $derived(live.planOutcomes.applied + live.planOutcomes["empty-plan"]);
-	const wireTip = $derived(
-		`Model calls this connection: ${wireTotal}\n` +
-			`applied: ${live.planOutcomes.applied}\n` +
-			`empty-plan (intentional, no folds): ${live.planOutcomes["empty-plan"]}\n` +
-			`timeout-stale (fell back to last known plan): ${live.planOutcomes["timeout-stale"]}\n` +
-			`timeout-raw (no plan to fall back to): ${live.planOutcomes["timeout-raw"]}\n` +
-			`epoch-mismatch (view superseded mid-wait): ${live.planOutcomes["epoch-mismatch"]}`,
+	// ── Latency badge (Phase B): the extension's `context` hook is now a LOCAL operation, so we
+	// show its DURATION, not a plan round-trip outcome. Neutral/green under 250ms (the old plan
+	// timeout — a local hook should be far below it), amber ≥250ms, red ≥1000ms. The tooltip
+	// carries max / p95 / structural-rebuild counts. Monochrome per the visual grammar.
+	//
+	// Phase C (v13): an attached conductor can legitimately spend up to `holdWireUpToMs` of that
+	// same hook holding the departing wire for a last-moment proposal (`telemetry.lastHoldMs`).
+	// That hold is DECLARED, wanted latency, not a slow hook — so the amber/red thresholds are
+	// re-keyed off `lastHookMs - lastHoldMs` (the hook's own work, hold excluded). The displayed
+	// number stays the honest total; only the COLOR ignores a conductor spending its own budget.
+	const LAT_AMBER = 250;
+	const LAT_RED = 1000;
+	const hookMs = $derived(live.telemetry.lastHookMs);
+	const hookCount = $derived(live.telemetry.hookCount);
+	const holdMs = $derived(live.telemetry.lastHoldMs);
+	const netHookMs = $derived(Math.max(0, hookMs - holdMs));
+	const latClass = $derived(netHookMs >= LAT_RED ? "lat-red" : netHookMs >= LAT_AMBER ? "lat-amber" : "lat-ok");
+	const latTip = $derived(
+		`Local context-hook latency (no plan round trip in Phase B)\n` +
+			`last: ${hookMs} ms` +
+			(holdMs > 0 ? ` (of which ${holdMs} ms was a conductor's wire-departing hold — net ${netHookMs} ms)\n` : `\n`) +
+			`max: ${live.telemetry.maxHookMs} ms\n` +
+			`p95: ${live.telemetry.p95HookMs} ms\n` +
+			`hooks this connection: ${hookCount}\n` +
+			`structural rebuilds: ${live.telemetry.rebuilds}`,
 	);
 
-	// ── Involvement locks (ADR 0011) — the honest mirror of the engine's gating. A locked
-	// control LOOKS locked in every mode (preview/demo/read-only included), driven purely off
-	// `store.isLocked(...)`. The engine already no-ops the underlying action; this is the UI
-	// reflecting that, not the enforcement. The budget dial is NEVER gated (sacred tier).
-	const tailLocked = $derived(store.isLocked("tail-size"));
-	const steerLocked = $derived(store.isLocked("human-steering"));
-	const lockedBy = $derived(store.lockingConductorLabel);
-	const lockTip = $derived(`Locked by ${lockedBy ?? "the active conductor"} — detach to take back control`);
+	// ── HOLD chip (Phase C): the host's most recent wire-departing hold for the attached
+	// conductor's last-moment proposal — its own neutral chip, distinct from LATENCY, so a
+	// conductor legitimately using its declared hold budget reads as informational, never a
+	// warning. Hidden until a hold has actually happened this connection.
+	const holdTip = $derived(
+		`Wire-departing hold for the attached conductor's last-moment proposal\n` +
+			`last: ${holdMs} ms\n` +
+			`timeouts this connection: ${live.telemetry.holdTimeouts} (passed through unchanged when the hold ran out)`,
+	);
+
+	// ── Conductor status readout (Phase C): the attached conductor's own display-only status
+	// line (`conductorStatus.text`), shown only while a conductor is actually attached and has
+	// published non-empty text — mirrors the PROTECT/BUDGET ctl-field visual pattern.
+	const showCondStatus = $derived(live.status === "connected" && !!conductorState.active && !!conductorStatus.text);
 
 	function protectFromClientX(clientX: number): number {
 		if (!barEl) return store.protectTokens;
@@ -140,7 +149,7 @@
 		if (snapped !== store.protectTokens) store.setProtect(snapped);
 	}
 	function onProtPointerDown(e: PointerEvent) {
-		if (tailLocked) return; // tail-size locked by the conductor — the handle is inert
+		if (tailLocked) return; // tail-size locked by the active strategy — the handle is inert
 		e.preventDefault();
 		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 		dragTokens = protectFromClientX(e.clientX); // visual only — no refold yet
@@ -187,10 +196,6 @@
 
 		<!-- ── Right: controls cluster ── -->
 		<div class="ctl">
-			<!-- Active conductor (ADR 0007): which strategy is managing this context. The store
-			     drives the lock-aware affordances (ADR 0011: consent gate + kill switch). -->
-			<ConductorMenu {store} />
-
 			{#if readOnly}
 				<span
 					class="ro-badge mono"
@@ -220,29 +225,65 @@
 				</button>
 			{/if}
 
-			<!-- Wire outcome readout (issue #60): hidden entirely until this connection has seen
-			     at least one acked model call — browsing/read-only/demo sessions have no wire, so
-			     they must show nothing (preview is NOT a more permissive mode). Neutral/mono only —
-			     #044EFF is reserved for the user block kind, never UI chrome. -->
-			{#if live.status === "connected" && wireTotal > 0}
-				<div class="ctl-field wire-read" title={wireTip}>
+			<!-- Conductor picker (Phase C): hidden entirely when not connected live or the host's
+			     catalog is empty (see ConductorMenu's own gate). -->
+			<ConductorMenu />
+
+			<!-- Attached conductor's own display-only status line (Phase C) — same ctl-field
+			     visual pattern as PROTECT/BUDGET below. Shown only while a conductor is actually
+			     attached and has published non-empty text. -->
+			{#if showCondStatus}
+				<div class="ctl-field cond-status-read" title={conductorStatus.text ?? ""}>
 					<span class="ctl-eyebrow mono">
 						<Icon name="activity" size={10} />
-						WIRE
+						STATUS
 					</span>
-					<span class="ctl-value mono tnum" class:wire-partial={wireApplied < wireTotal}>
-						{wireApplied}/{wireTotal}
+					<span class="ctl-value mono">{conductorStatus.text}</span>
+				</div>
+			{/if}
+
+			<!-- Latency badge (Phase B): the local context-hook duration. Hidden until this
+			     connection has seen at least one hook — browsing/read-only/demo sessions have no
+			     wire, so they show nothing. Monochrome; amber/red only tint the value on a slow
+			     hook (#044EFF stays reserved for the user block kind, never UI chrome). Phase C:
+			     the amber/red thresholds are re-keyed off (lastHookMs - lastHoldMs) — see latClass. -->
+			{#if live.status === "connected" && hookCount > 0}
+				<div class="ctl-field lat-read" title={latTip}>
+					<span class="ctl-eyebrow mono">
+						<Icon name="activity" size={10} />
+						LATENCY
+					</span>
+					<span class="ctl-value mono tnum {latClass}">
+						{hookMs}ms
 					</span>
 				</div>
 			{/if}
 
-			<!-- Protect readout: eyebrow + editable mono value (the dial lives on the bar). -->
+			<!-- HOLD chip (Phase C): the host's last wire-departing hold for the attached
+			     conductor's proposal. Its OWN neutral chip, visually distinct from LATENCY (no
+			     amber/red tinting — using the declared hold budget is expected, not a warning).
+			     Hidden until a hold has actually happened this connection. -->
+			{#if live.status === "connected" && holdMs > 0}
+				<div class="ctl-field hold-read" title={holdTip}>
+					<span class="ctl-eyebrow mono">
+						<Icon name="square" size={10} />
+						HOLD
+					</span>
+					<span class="ctl-value mono tnum">
+						{holdMs}ms
+					</span>
+				</div>
+			{/if}
+
+			<!-- Protect readout: eyebrow + editable mono value (the dial lives on the bar).
+			     Under the tail-size lock the active strategy owns the tail — the dial becomes a
+			     static readout and the field shows locked (ADR 0011 §7). -->
 			<div
 				class="ctl-field protect-read"
 				class:ctl-locked={tailLocked}
 				aria-disabled={tailLocked}
 				title={tailLocked
-					? lockTip + " (the conductor now owns the tail)"
+					? lockTip + ` (the active strategy now owns the tail — enforcing ${fmt(protectTarget)} tokens)`
 					: `Actual protected tail: ${fmt(store.protectedTokens)} tokens; target: ${fmt(store.protectTokens)} tokens — click the value or drag the handle to change it`}
 			>
 				<span class="ctl-eyebrow mono">
@@ -251,8 +292,8 @@
 				</span>
 				<span class="ctl-value mono tnum">
 					{#if tailLocked}
-						<!-- tail-size locked: a static readout, not an editable dial. -->
-						<span class="kl-val">{k(store.protectTokens)}</span>
+						<!-- tail-size locked: a static readout of the ENFORCED tail, not an editable dial. -->
+						<span class="kl-val">{k(protectTarget)}</span>
 					{:else}
 						<EditableNumber
 							value={store.protectTokens}
@@ -261,7 +302,7 @@
 							oncommit={(n) => store.setProtect(Math.max(0, Math.min(PROT_MAX, n)))}
 						/>
 					{/if}
-					{#if Math.abs(store.protectedTokens - store.protectTokens) > 500}
+					{#if Math.abs(store.protectedTokens - protectTarget) > 500}
 						<span class="kl-target tnum">({k(store.protectedTokens)})</span>
 					{/if}
 				</span>
@@ -311,22 +352,6 @@
 		</div>
 	</div>
 
-	<!-- ── Conductor telemetry (display-only): one-line status from the active conductor. -->
-	{#if conductorStatusText}
-		<div class="cond-telemetry-wrap">
-			<div class="cond-telemetry" role="status" title={conductorStatusText}>
-				<Icon name="activity" size={11} />
-				<span class="cond-telemetry-text mono">{conductorStatusText}</span>
-			</div>
-			{#if conductorStatusDetails}
-				<details class="cond-detail">
-					<summary class="cond-detail-trigger mono">details</summary>
-					<pre class="cond-detail-body mono">{formatStatusDetails(conductorStatusDetails)}</pre>
-				</details>
-			{/if}
-		</div>
-	{/if}
-
 	<!-- ── Composition bar + on-bar protected control ── -->
 	<div class="bar-area">
 		<div class="bar" bind:this={barEl} role="img" aria-label="Context composition">
@@ -352,7 +377,7 @@
 		</span>
 
 		<!-- draggable protected handle (floats above the clipped bar). Inert under the
-		     tail-size lock — the conductor owns the tail (ADR 0011 §7). -->
+		     tail-size lock — the active strategy owns the tail (ADR 0011 §7). -->
 		<div
 			class="prot-grip"
 			class:dragging={dragTokens != null}
@@ -364,8 +389,8 @@
 			aria-disabled={tailLocked}
 			aria-valuemin="0"
 			aria-valuemax={PROT_MAX}
-			aria-valuenow={store.protectTokens}
-			aria-valuetext="{fmt(store.protectTokens)} tokens protected"
+			aria-valuenow={protectTarget}
+			aria-valuetext="{fmt(protectTarget)} tokens protected"
 			title={tailLocked ? lockTip : undefined}
 			onpointerdown={onProtPointerDown}
 			onpointermove={onProtPointerMove}
@@ -659,73 +684,48 @@
 		cursor: default;
 	}
 
-	/* Wire outcome readout (issue #60) — quiet, monochrome; never the reserved user-block
-	   blue. A partial ratio (some calls fell back) dims to --muted rather than alarming red -
-	   a stale-plan fallback is a graceful degradation, not an error state. */
-	.wire-read {
-		cursor: default;
-	}
-	.wire-read .wire-partial {
-		color: var(--muted);
-	}
-
 	/* A control gated by an involvement lock (ADR 0011): greyed, reduced affordance. The
-	   honest mirror of the engine's server-side gating — looks locked in every mode. */
+	   honest mirror of the engine's gating — looks locked in every mode. */
 	.ctl-locked {
 		opacity: 0.5;
 		cursor: not-allowed;
 	}
 
-	/* ── Conductor telemetry line: one muted, mono status from the active conductor ──
-	   Right-aligned so it sits under the conductor switcher in the controls cluster. */
-	.cond-telemetry-wrap {
-		display: flex;
-		flex-direction: column;
-		align-items: flex-end;
-		gap: 3px;
-		min-width: 0;
+	/* Latency badge (Phase B) — quiet, monochrome; never the reserved user-block blue. The value
+	   tints only when a hook runs slow: amber ≥250ms (the old plan timeout), red ≥1000ms. A fast
+	   local hook (the common case) stays neutral. */
+	.lat-read {
+		cursor: default;
 	}
-	.cond-telemetry {
-		display: flex;
-		align-items: center;
-		justify-content: flex-end;
-		gap: 5px;
-		margin-top: -2px;
-		min-width: 0;
-		color: var(--faint);
+	.lat-read .lat-ok {
+		color: var(--text);
 	}
-	.cond-telemetry-text {
-		font-size: var(--fs-2xs);
-		letter-spacing: 0.01em;
-		color: var(--muted);
+	.lat-read .lat-amber {
+		color: var(--warn, #d9a03a);
+	}
+	.lat-read .lat-red {
+		color: var(--bad, #d9534f);
+	}
+
+	/* Conductor status readout — same ctl-field shape as PROTECT/BUDGET; the value truncates
+	   rather than wrapping/pushing the header (the conductor's status text has no length limit). */
+	.cond-status-read {
+		cursor: default;
+		max-width: 220px;
+	}
+	.cond-status-read .ctl-value {
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
-		min-width: 0;
+		display: block;
 	}
-	.cond-detail {
-		max-width: min(760px, 100%);
-		color: var(--muted);
-		font-size: var(--fs-2xs);
-	}
-	.cond-detail-trigger {
-		cursor: pointer;
-		color: var(--faint);
-		list-style: none;
-		text-align: right;
-	}
-	.cond-detail-trigger::-webkit-details-marker {
-		display: none;
-	}
-	.cond-detail-body {
-		margin: 2px 0 0;
-		padding: var(--sp-2);
-		max-height: 180px;
-		overflow: auto;
-		white-space: pre-wrap;
-		border: 1px solid var(--line-soft);
-		background: var(--panel-2);
-		color: var(--muted);
+
+	/* HOLD chip — its own neutral chip, deliberately DISTINCT from LATENCY: no amber/red tint (no
+	   override rule at all — it keeps the plain `.ctl-value` --text color in every case). A
+	   conductor spending its declared wire-departing hold budget is expected behavior, not a
+	   warning. */
+	.hold-read {
+		cursor: default;
 	}
 
 	/* ── Composition bar area: bar + on-bar protected control + underline ── */
@@ -800,7 +800,7 @@
 		outline: none;
 	}
 
-	/* tail-size locked: the handle is inert and dimmed (the conductor owns the tail). */
+	/* tail-size locked: the handle is inert and dimmed (the active strategy owns the tail). */
 	.prot-grip.locked {
 		cursor: not-allowed;
 		opacity: 0.4;

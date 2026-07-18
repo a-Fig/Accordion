@@ -1,131 +1,131 @@
-# thermocline
+# Thermocline
 
-An external WebSocket conductor that combines two parents: **attention-folder** (a
-Qwen2.5-0.5B probe scores each block's "temperature" — how much the working tail attends
-back to it) and **compaction-naive** (real LLM prose summaries via the agent's own model
-through `cap/request complete`), under a **hard budget invariant**, in deliberate
-double-buffered epochs. The headline commitment: the agent is never over budget, guaranteed
-by a move that always frees tokens. Attention decides order; the budget decides depth.
+An **out-of-process** context-management conductor for Accordion: attention-gated, LLM-quality
+compression staged in deliberate double-buffered epochs, holding the agent **at or under budget**
+whenever the configuration is winnable. When the protected tail and/or human-pinned content alone
+already exceed the cap, no ladder can close that gap — Thermocline surfaces it explicitly as
+**OVERFLOW** rather than silently blowing the budget.
 
-See [docs/thermocline-design.html](../../docs/thermocline-design.html) for the full design
-rationale and [ADR 0015](../../docs/adr/0015-thermocline-conductor.md) for the decision record.
+Thermocline is the synthesis of two earlier conductors:
 
-## The model
+- **attention-folder** — a small Qwen2.5-0.5B "probe" scores each block's *temperature* (how much
+  the current working tail attends back to it). Cold = unattended = safe to compress. This gives
+  compression an *order*.
+- **compaction-naive** — real LLM prose summaries via `host.complete`, with user messages kept
+  verbatim. This gives compression *depth* and a way to always free tokens.
 
-Every block sits at the highest fidelity its attention earns under the current budget
-pressure. The **fidelity ladder**:
+…combined under a deterministic budget ladder whose last rung is a hard delete, so the planner
+provably terminates at "protected tail + held content + one minimal stratum" — under cap whenever
+that floor itself fits, and surfaced as **OVERFLOW** (never silent) when it doesn't.
 
-| Level | Name | What the agent sees |
-|---|---|---|
-| L0 | Full | original text — protected tail and attended blocks |
-| L1 | Trim | deterministic extractive excerpt (~25%), instant; keeps paths, errors, decisions |
-| L2 | Digest | faithful 1–3 line LLM summary via `host.complete`, content-hash cached; prefixed with `{#code FOLDED}` so the agent can `unfold`/`recall` it |
-| L3 | Stratum | a contiguous cold run summarized holistically into one `group`; user messages verbatim; `recall` returns original text by construction |
-| L4 | Merged / drop | oldest strata fuse into a coarser super-stratum; the floor is `group(digest: null)` — a hard delete that always frees tokens |
+## Layout
 
-**Attention decides order, budget decides depth.** The probe scores "temperature"; coldest
-units compress first. The budget invariant decides how deep the epoch must reach.
+| file | what |
+|------|------|
+| `policy.ts` | The PURE policy core — `buildUnits`, the L0–L4 fidelity ladder, `planEpoch`'s cheapest-first budget ladder, double-gate graduation, age-based safety net, hard-cap floor, deterministic tiers, prompt builders, and `emitOps`. No I/O, no host, no probe — a function of its arguments. |
+| `thermocline.ts` | The epoch machine as a conductor-v2 `Conductor`, written against `ConductorHost`: HOLD / PREPARE / COMMIT / EMERGENCY, persistence, and the scoring loop. |
+| `scorer.ts` | The temperature signal — spawns the Python probe as a child process; JSON-file I/O; graceful degradation when the probe is unavailable. |
+| `probe/` | The vendored attention probe (`probe.py` + `requirements.txt`). |
+| `runner.mjs` | The out-of-process entry point the extension spawns (`node runner.mjs`). Imports `./remote-sdk.mjs`, dials the session's loopback WS, and drives the `ThermoclineConductor`. |
+| `remote-sdk.mjs` | **Generated, committed artifact** — the flat ESM bundle of `core/conductor/remote.ts` + `thermocline.ts` + their core graph (exports `runRemoteConductor`, `ThermoclineConductor`). Built by `extension/build-remote-sdk.mjs`; regenerate after touching remote.ts / thermocline.ts / core. Do NOT edit by hand. |
 
-**Double-buffered epochs.** The conductor runs in three phases:
+## The fidelity ladder
 
-1. **HOLD** — below ~80% full. Byte-stable applied state re-sent each turn. Cache warm. No LLM calls.
-2. **PREPARE** — crossing ~80%: compute the entire next state off to the side, firing every LLM digest and stratum summary in parallel while the agent keeps seeing the current stable state.
-3. **COMMIT** — atomic swap in one update. One deliberate cache miss. Back to HOLD.
+Every block sits at the highest fidelity budget pressure and attention allow:
 
-If a burst outruns PREPARE, an **emergency epoch** applies instantly (deterministic
-tier only, no LLM), and the planned epoch still lands after.
+- **L0 Full** — original text (the protected tail and any attended block).
+- **L1 Trim** — deterministic extractive excerpt (~head + tail + salient lines). Instant; the no-LLM
+  placeholder / emergency fallback.
+- **L2 Digest** — a faithful 1–3 line LLM summary, content-cached. Emitted as a `replace` op with
+  `recoverable:true`; the **engine** prepends the canonical `{#code FOLDED}` tag.
+- **L3 Stratum** — a contiguous cold *run* summarized holistically into one `group`. User messages
+  reproduced verbatim. **Recall-able because every run is snapped inward to message atoms** before it
+  is emitted (`policy.ts → safeRunFromUnits`): the run's member set is a fixed point of the engine's
+  group snap (`core/truth.ts → snappedRange`), so the group id Truth assigns — and thus the baked
+  `foldTag("g:"+firstId)` recall handle — is exactly what the plan intended, and no sibling block is
+  absorbed. A belt-and-braces check in the conductor repairs any residual mismatch rather than ship
+  an unresolvable tag.
+- **L4 Merged / drop** — graded forgetting of the deep zone; `group(summary:null)` is the floor.
 
-**Double-gate graduation.** A unit may not descend to a stratum until BOTH gates hold,
-sustained for K epochs: ① the probe temperature is cold (< `coldThreshold`), re-scored
-fresh this epoch, AND ② the agent did not `recall`/`unfold` it while it sat folded (a
-behavioral veto — the agent had the digest and the recovery tag and chose not to pull it
-back). Any re-warm (fresh hot score, agent touch, or human hold) resets the dwell clock.
-A unit that has ever been warm needs 2K epochs, not K.
+## How the probe works
 
-**Per-run sedimentation.** A `tool_call` + its `tool_result` (same `callId`) are one
-atomic unit and move together everywhere — a fold or group never orphans a result.
-Graduated units are partitioned into maximal contiguous runs bounded by hot, held,
-protected, or grouped "buoy" units; a run shorter than `minRunUnits` stays merely folded,
-never becoming a stratum.
+`scorer.ts` spawns `python3 probe/probe.py --in in.json --out out.json` as a **child process**
+(never on any hook path). Input is `{ tail, blocks:[{id,text}] }` — the protected-tail text plus the
+candidate blocks (tail capped at ~12k chars, each block head+tail capped at ~3k). The probe loads
+Qwen2.5-0.5B, reads how much attention the final readout token pays to each earlier block, and
+writes `{ scores:{id:0..1}, meta:{…} }`. Higher = hotter = keep live longer; the policy folds the
+**coldest** first. Install the probe's deps with `pip install -r probe/requirements.txt` (a CUDA
+GPU is ideal; CPU works, slower).
 
-**Bounded, re-compressible deep zone.** The total tokens held in strata are capped at
-`ceilingFrac` of budget. When a new stratum would overflow the ceiling, the oldest strata
-merge into a coarser super-stratum (graded forgetting); the hard floor drops the oldest
-stratum (`digest: null`) when the budget is still not met. This keeps the deep zone
-constant in size regardless of session length. Immutable strata were rejected: they
-accumulate without bound and break the budget invariant over long sessions.
+## Graceful degradation (mandatory)
 
-**Recoverable LLM digests.** Every fold/stratum digest is prefixed with
-`{#<foldCode(id)> FOLDED}`, copied byte-for-byte from the engine's `digest.ts`. The
-agent can call `unfold` or `recall` on any L2 block exactly as a normal fold. `recall`
-on a stratum group returns members' original `.text` regardless of the group summary —
-strata are recall-able by construction.
+If the probe binary, `python3`, or `torch`/`transformers` is absent — or the spawn fails, or it
+times out — the scoring promise **rejects**, the conductor catches it, and the score map simply
+stays empty. The policy's **age-based rung 3.5** and the **hard-cap floor** are probe-independent,
+so the budget invariant still holds over reducible content; the strategy just compacts by age
+instead of by attention (irreducible overflow is surfaced the same way either way).
+This is a first-class path, unit-tested, not an afterthought.
 
-**Size is first-class.** Within each coldness tier, units are sorted biggest-cold-first
-(tokens saved descending) so the fewest commits achieve the most headroom. Units whose
-saving is below `minFoldTokens` are skipped — not worth a cache slot.
+## The epoch lifecycle
 
-**Persistence across reconnect.** The deep zone (strata + their actual LLM summary text)
-and the dwell/everWarm graduation state are written to
-`~/.accordion/conductors/thermocline-state-<sessionKey>.json` after each commit. On
-reconnect the deep zone is restored with no new LLM call needed.
+- **HOLD** (below `warmWater`≈80%) — re-derive the committed plan against the current view; propose
+  only the delta. No LLM.
+- **PREPARE** (crossing `warmWater`) — plan the next epoch and fire every L2/L3 `host.complete` in
+  parallel, off to the side. A `prepareToken` generation guard discards a superseded prepare.
+- **COMMIT** — reconcile against agent recalls/unfolds during prepare, substitute the *real* summary
+  token counts, top up deterministically to ≤ cap, and propose **one** transaction.
+- **EMERGENCY** (over the hard cap) — a deterministic plan (no LLM), proposed immediately. Also
+  enforced on the `wire-departing` hook as the last-line guarantee (strictly deterministic).
 
-## Run
+### Governance
 
-**Prerequisites:** Node.js, and the `attention-folder` Python venv set up (the probe is
-shared — see [`../attention-folder/README.md`](../attention-folder/README.md) for the
-Python/venv install steps). No separate API key needed for summaries: they run on the
-agent's own model via `host.complete`.
+`locks: ["human-steering"]` only. `agent-unfold` is deliberately **unlocked** — the agent's `unfold`
+IS graduation gate ②: a folded block the agent chose *not* to pull back is a signal it is safe to
+compress. `recall` is never lockable.
+
+A human can still raise `setProtect` mid-session — it isn't gated by `human-steering`. If that heals
+an already-applied fold or prunes an already-applied stratum's group, the conductor reconciles its
+`appliedFolds`/`appliedStrata` bookkeeping against the live view (both on the `state-changed{what:
+"protect"}` event, which also kicks an immediate re-evaluation tick, and on every tick thereafter) so
+`project()`/fill never keeps crediting a saving that no longer exists.
+
+## Double-gate graduation
+
+A unit descends to a stratum only when **both** gates hold for K consecutive compaction epochs
+(2K if it was ever warm): ① the probe temperature is cold, re-scored fresh, AND ② the agent did not
+`recall`/`unfold` it while it sat folded. Any re-warm resets the dwell clock.
+
+## Persistence
+
+After each commit (deferred off every hook path), the deep zone (strata + their LLM summary text)
+and graduation state (dwell + everWarm) are written atomically to
+`<persistDir>/thermocline-state-<sessionKey>.json` (default `persistDir` = `~/.accordion/conductors`).
+On attach the state is restored and validated against the live block ids; any stratum whose members
+vanished is dropped.
+
+## How it launches (out of process)
+
+The owner's decision: **Thermocline runs in its own Node process.** The pi extension spawns
+`node runner.mjs` with `ACCORDION_PORT` / `ACCORDION_TOKEN` (and optionally `ACCORDION_HOME`,
+`ACCORDION_SESSION_KEY`, `ATTN_PROBE_PYTHON` / `ATTN_PROBE_SCRIPT`). The runner imports the remote
+SDK from the committed `./remote-sdk.mjs` bundle (`runRemoteConductor` + `ThermoclineConductor`),
+dials `ws://127.0.0.1:${ACCORDION_PORT}/?role=conductor&token=${ACCORDION_TOKEN}`, mirrors the live
+session's Truth into a local `ConductorHost`, and calls `attach(host)`. Because `ThermoclineConductor`
+is written only against `ConductorHost`, the exact same class is what the in-process unit tests drive
+against `TestHost` — no local/remote branch in the conductor itself.
+
+### Running / rebuilding the bundle
+
+`remote-sdk.mjs` is a **generated, committed** artifact (Node can't ESM-resolve `core/`'s extensionless
+imports directly — see the runner's header). Regenerate it after touching `core/conductor/remote.ts`,
+`thermocline.ts`, or anything in their `core/` graph:
 
 ```bash
-cd conductors/thermocline
-npm install       # only ws
-npm start         # node thermocline.mjs — listens on ws://127.0.0.1:7703
+node extension/build-remote-sdk.mjs        # or: npm --prefix extension run build:remote-sdk
 ```
 
-The conductor advertises a heartbeat file at `~/.accordion/conductors/thermocline.json`
-and is auto-discovered by the Accordion desktop app (not the browser dev server — live
-discovery requires the native layer). Open the desktop app, load a session, and pick
-**Thermocline** from the conductor dropdown in the map header.
+It requires no runtime deps and no `node_modules`: the SDK dials with Node 22+'s global `WebSocket`
+(the `ws` package is deliberately never bundled or required), so `node runner.mjs` runs standalone.
+This is a repo-checkout artifact only — it is **not** part of the `@a-fig/accordion` npm tarball.
 
-```bash
-npm test          # node --test — the pure policy (no GPU, no Python, no WS)
-```
-
-The unit tests cover `policy.mjs` exclusively and require no probe, no GPU, and no
-running Accordion instance.
-
-## Config
-
-The port and all tuning knobs can be overridden via environment variables. Defaults from
-`policy.mjs DEFAULT_CFG`:
-
-| Variable | Default | What it does |
-|---|---|---|
-| `THERMO_PORT` | `7703` | WebSocket port |
-| `THERMO_HIGH_WATER` | `0.9` | a planned epoch must have finished before this fraction of cap |
-| `THERMO_LOW_WATER` | `0.7` | `planEpoch` composes moves until projected tokens ≤ this fraction of cap |
-| `THERMO_WARM_WATER` | `0.8` | begin PREPARE around this fraction of cap |
-| `THERMO_CEILING_FRAC` | `0.2` | stratum tokens may not exceed this fraction of cap |
-| `THERMO_COLD_THRESHOLD` | `0.35` | temperature below which a unit counts as cold (0..1, higher = hotter) |
-| `THERMO_K` | `3` | dwell epochs a unit must stay cold+untouched before graduating to a stratum (2K if ever-warm) |
-| `THERMO_MIN_RUN_UNITS` | `3` | a run shorter than this stays merely folded, never becomes a stratum |
-| `THERMO_MIN_FOLD_TOKENS` | `200` | a fold whose saving is below this is skipped (not worth a cache slot) |
-
-## Files
-
-- `thermocline.mjs` — WS server: epoch machine, HOLD/PREPARE/COMMIT/EMERGENCY, cap/request bridge, persistence, heartbeat. `node thermocline.mjs --smoke` runs an inline, dependency-free smoke harness (no `ws`, no probe) covering the budget-at-commit top-up and per-epoch dwell.
-- `policy.mjs` — pure policy core: `planEpoch`, `updateGraduation`, `sedimentRuns`, `emitCommands`, prompt builders, deterministic fallbacks. No I/O, no `Date.now()`, fully unit-testable.
-- `scorer.mjs` — thin re-export shim: delegates to `../attention-folder/scorer.mjs` so the probe path is always correct regardless of invocation cwd.
-- `policy.test.mjs` — unit tests for the pure policy (`node --test`, no GPU, no Python, no WS).
-- `package.json` — `start` / `test` scripts; single dep: `ws`.
-- `launch.json` — launcher manifest (`{ id, label, command, args, portEnv }`) used by hosts to spawn thermocline directly.
-
-## Governance
-
-Thermocline locks **`human-steering`** (strata + dwell bookkeeping need a single owner to
-stay wire-valid — the same reason `compaction-naive` locks it; consent gate on attach).
-**`agent-unfold` is deliberately kept open**: the agent's `unfold` is gate ② of the
-double-gate, a real compaction veto. Locking the agent out (as `compaction-naive` does)
-would defeat that veto. **`recall` always works** — ADR 0011 floor; `recall` on a stratum
-exhumes original block text even from a compacted group.
+See `runner.mjs` for the precise spawn env and lifecycle.

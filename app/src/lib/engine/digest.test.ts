@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { Block, BlockKind, Group } from "./types";
-import { digest, digestTokens, foldTag, foldCode, groupDigest, groupDigestTokens } from "./digest";
-import { estTokens, BLOCK_OVERHEAD } from "./tokens";
+import { digest, digestTokens, foldTag, foldCode, groupDigest, groupDigestTokens } from "$core/digest";
+import { estTokens, BLOCK_OVERHEAD } from "$core/tokens";
 
 // The folded digest carries a leading `{#<code> FOLDED}` tag, where <code> is a short
 // stable hash of the durable id. This is the engine's single source of truth: the same

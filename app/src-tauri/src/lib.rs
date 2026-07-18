@@ -53,44 +53,6 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
-/// Locate the `conductors/` directory relative to the running binary.
-///
-/// Resolution order:
-/// 1. If `ACCORDION_CONDUCTORS_DIR` is set and points at a real directory, use it.
-/// 2. Walk upward from `std::env::current_exe()`. The first ancestor that is the REPO ROOT —
-///    i.e. it contains BOTH a `conductors/` and a sibling `app/` dir (this repo's signature) —
-///    wins; return `<ancestor>/conductors`. Requiring `app/` too prevents matching an unrelated
-///    `conductors/` folder higher in the tree and spawning an arbitrary binary from a foreign
-///    `launch.json`.
-///    (In a dev build the exe lives at `<repo>/app/src-tauri/target/{profile}/app.exe`,
-///    so the walk lands on `<repo>/`, which contains both `conductors/` and `app/`.)
-fn conductors_root() -> Option<PathBuf> {
-    // 1. Env-var override — must be a real directory, not just any existing path.
-    if let Ok(val) = std::env::var("ACCORDION_CONDUCTORS_DIR") {
-        let p = PathBuf::from(&val);
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-
-    // 2. Walk up from the binary, looking for the repo root (conductors/ + app/ siblings).
-    let exe = std::env::current_exe().ok()?;
-    let mut dir = exe.parent()?;
-    loop {
-        let candidate = dir.join("conductors");
-        if candidate.is_dir() && dir.join("app").is_dir() {
-            return Some(candidate);
-        }
-        match dir.parent() {
-            Some(p) => dir = p,
-            None => return None,
-        }
-    }
-}
-
-/// Managed state: map of conductor id → spawned child process handle.
-struct ConductorProcs(std::sync::Mutex<std::collections::HashMap<String, std::process::Child>>);
-
 /// Managed state: the single fake-pi mock-server child, if running. Launched from
 /// Settings ("Fake pi session") so the desktop app can be exercised without real pi.
 struct MockProc(std::sync::Mutex<Option<std::process::Child>>);
@@ -101,7 +63,7 @@ const MOCK_CONTROL_PORT: u16 = 4318;
 
 /// Locate the repo's `extension/` directory (home of `mock-server.mjs`).
 ///
-/// Resolution mirrors `conductors_root()`:
+/// Resolution order:
 /// 1. `ACCORDION_EXTENSION_DIR` if it points at a real directory.
 /// 2. Walk upward from `current_exe()`; the first ancestor whose `extension/` holds
 ///    `mock-server.mjs` AND which has a sibling `app/` dir (the repo-root signature)
@@ -156,223 +118,6 @@ fn list_sessions() -> Vec<Value> {
     out
 }
 
-/// Read every conductor descriptor. Returns raw JSON values; the app validates the
-/// protocol/staleness (registry.ts `isLiveConductor`) so the rules live in one place.
-#[tauri::command]
-fn list_conductors() -> Vec<Value> {
-    let mut out = Vec::new();
-    let Some(root) = registry_root() else {
-        return out;
-    };
-    let dir = root.join("conductors");
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        if let Ok(text) = fs::read_to_string(&path) {
-            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                out.push(value);
-            }
-        }
-    }
-    out
-}
-
-/// List conductors that can be launched from the app.
-///
-/// Scans each immediate subdirectory of `conductors_root()` for a `launch.json`
-/// manifest. The parsed manifest (containing `id`, `label`, `command`, `args`) is
-/// returned as-is. Dirs without a valid `launch.json` are silently skipped.
-#[tauri::command]
-fn list_launchable_conductors() -> Vec<Value> {
-    let mut out = Vec::new();
-    let Some(root) = conductors_root() else {
-        return out;
-    };
-    let Ok(entries) = fs::read_dir(&root) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let manifest_path = path.join("launch.json");
-        if let Ok(text) = fs::read_to_string(&manifest_path) {
-            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                out.push(value);
-            }
-        }
-    }
-    out
-}
-
-/// Launch a conductor child process by id.
-///
-/// Reads `<conductors_root>/<id>/launch.json` for `command` and `args`, then
-/// spawns the process in that directory. On Windows the child window is suppressed
-/// (`CREATE_NO_WINDOW`). Stdio is redirected to null so child logs don't spam the
-/// app's console. Idempotent: if the child for `id` is already running, returns Ok.
-#[tauri::command]
-fn launch_conductor(
-    id: String,
-    procs: tauri::State<'_, ConductorProcs>,
-) -> Result<(), String> {
-    // Check if already running.
-    // Fix #6: if try_wait() returns Err (state unknown), treat the existing child as
-    // possibly alive — do NOT remove-and-respawn (risks double process / port conflict).
-    // Return Ok as if it's still running; this is the conservative safe choice.
-    {
-        let mut map = procs.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(child) = map.get_mut(&id) {
-            match child.try_wait() {
-                Ok(None) => return Ok(()), // still running
-                Ok(Some(_)) => {
-                    map.remove(&id); // cleanly exited — fall through to re-launch
-                }
-                Err(_) => return Ok(()), // state unknown — treat as alive, don't respawn
-            }
-        }
-    }
-
-    let root = conductors_root().ok_or_else(|| {
-        "Could not locate the conductors directory. Set ACCORDION_CONDUCTORS_DIR to your checkout's conductors/ folder.".to_string()
-    })?;
-
-    let dir = root.join(&id);
-    let manifest_path = dir.join("launch.json");
-    let manifest_text = fs::read_to_string(&manifest_path)
-        .map_err(|_| format!("No launch manifest for conductor '{id}'."))?;
-    let manifest: Value = serde_json::from_str(&manifest_text)
-        .map_err(|_| format!("No launch manifest for conductor '{id}'."))?;
-
-    let command = manifest
-        .get("command")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("launch.json for '{id}' is missing 'command'."))?
-        .to_string();
-
-    let args: Vec<String> = manifest
-        .get("args")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Pre-flight: a Node conductor with a package.json but no installed node_modules will
-    // crash the instant it tries to `import "ws"`. Catch that here with an actionable error
-    // instead of spawning a process that dies in <400ms. Gate only when there IS a package.json
-    // (declaring deps) so a future dependency-free conductor isn't blocked on a node_modules
-    // that never exists; the `command == "node"` signal is implied — a deps-declaring conductor
-    // is the case we care about regardless of how it's launched.
-    // NOTE: checks only the leaf node_modules dir; hoisted deps in a workspace root won't be
-    // caught, but the common single-package case is covered.
-    if dir.join("package.json").is_file() && !dir.join("node_modules").is_dir() {
-        return Err(format!(
-            "Conductor '{id}' isn't set up yet. Run `npm install` in conductors/{id}/ first (attention-folder also needs the Python probe venv — see its README)."
-        ));
-    }
-
-    let mut cmd = std::process::Command::new(&command);
-    cmd.args(&args)
-        .current_dir(&dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    // On Windows: suppress any console window the child might open.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!(
-                "Could not start '{id}': '{command}' was not found on PATH. Install Node.js or add it to PATH."
-            )
-        } else {
-            format!("Could not start '{id}': {e}")
-        }
-    })?;
-
-    // Fix #5: insert the child into the map IMMEDIATELY after a successful spawn, BEFORE
-    // the 400ms sleep. This way a concurrent RunEvent::Exit can find and kill it; without
-    // this, a child that spawns during the sleep window would be orphaned on app exit.
-    // Fix #4: if map.insert returns a previous Child for this id (concurrent launch TOCTOU),
-    // kill and best-effort reap the OLD one so it can't hold the WS port as an orphan.
-    {
-        let mut map = procs.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(mut old) = map.insert(id.clone(), child) {
-            let _ = old.kill();
-            let _ = old.try_wait();
-        }
-    }
-    // Lock is released here — we do NOT hold the mutex across the sleep.
-
-    // Early-exit detection: a conductor that crashes on startup (e.g. an `import` that throws,
-    // or deps that pre-flight didn't catch) dies almost immediately. Give it a brief moment,
-    // then check whether it already exited — if so, surface that and remove the dead handle
-    // instead of leaving the GUI to time out waiting for a heartbeat.
-    // The crash happens in well under 400ms; this short block in a sync command is fine.
-    std::thread::sleep(std::time::Duration::from_millis(400));
-
-    let mut map = procs.0.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(child) = map.get_mut(&id) {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // Already exited — startup crash. Remove the dead handle.
-                map.remove(&id);
-                return Err(format!(
-                    "Conductor '{id}' started but exited immediately ({status}). Check that its dependencies are installed (npm install in conductors/{id}/)."
-                ));
-            }
-            // Fix #6 (post-spawn site): still running, or try_wait errored — treat as alive.
-            // This matches the existing comment; state is preserved as-is.
-            Ok(None) | Err(_) => {}
-        }
-    }
-    // If the entry was removed by a concurrent stop_conductor during the sleep, that's fine —
-    // the process was killed externally and we simply return Ok (the stop already handled it).
-    Ok(())
-}
-
-/// Stop a running conductor child process.
-///
-/// Kills the child (if present), reaps it, and best-effort removes its heartbeat
-/// file from the registry. Idempotent — stopping an unknown id is fine.
-#[tauri::command]
-fn stop_conductor(
-    id: String,
-    procs: tauri::State<'_, ConductorProcs>,
-) -> Result<(), String> {
-    let child = {
-        let mut map = procs.0.lock().unwrap_or_else(|e| e.into_inner());
-        map.remove(&id)
-    };
-    if let Some(mut c) = child {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
-
-    // Best-effort: remove the heartbeat file so discovery doesn't see a stale entry.
-    if let Some(root) = registry_root() {
-        let hb = root.join("conductors").join(format!("{id}.json"));
-        let _ = fs::remove_file(hb);
-    }
-
-    Ok(())
-}
-
 /// Launch the fake-pi mock server (`node extension/mock-server.mjs`).
 ///
 /// Spawns the process detached (CREATE_NO_WINDOW on Windows, stdio → null), tracks the
@@ -380,9 +125,13 @@ fn stop_conductor(
 /// can open it. Idempotent: if a child is already alive, returns the port without
 /// re-spawning. A short post-spawn check surfaces an immediate crash (e.g. missing deps)
 /// as an actionable error instead of a phantom "running" state.
+///
+/// `mock-server.mjs` hosts a real `core/truth.ts` Truth and speaks the current wire protocol
+/// (`core/protocol.ts`, loaded live via `jiti` so it can never drift from a version bump) — a
+/// session launched this way populates and folds for real, same as a genuine pi session.
 #[tauri::command]
 fn launch_mock_session(procs: tauri::State<'_, MockProc>) -> Result<u16, String> {
-    // Already running? (Mirrors launch_conductor's try_wait handling.)
+    // Already running?
     {
         let mut slot = procs.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(child) = slot.as_mut() {
@@ -769,73 +518,6 @@ fn list_claude_sessions() -> Vec<Value> {
     out
 }
 
-/// Extractive prose compression via The Token Company's Bear-2 model. This backs the
-/// in-process conductor host's optional `compress` capability (see the `ConductorHost`
-/// contract): a conductor calls `host.compress(text)`, the app `invoke`s this command,
-/// and we make the HTTPS call here so the API key never leaves native code in a form a
-/// webview can leak (and so the engine stays network-free / pure).
-///
-/// Wire shape verified against the `thetokencompany` SDK source (`_client.py` / `_types.py`):
-///   request  → POST /v1/compress  `{ "model": "bear-2", "input": <text>,
-///              "compression_settings": { "aggressiveness": <f64> } }`
-///   response → `{ "output": <str>, "output_tokens": <int>, "original_input_tokens": <int> }`
-/// We extract the top-level string `output`. Anything else is reported as an unexpected
-/// shape, with a short body snippet for debugging.
-///
-/// SECURITY: `api_key` is NEVER logged or echoed into any error message — only the request
-/// body's `input`/`output` and HTTP status/snippet ever appear in returns.
-#[tauri::command]
-async fn compress_text(text: String, api_key: String, aggressiveness: f64) -> Result<String, String> {
-    // A bounded request timeout: without it a hung call permanently consumes one of the
-    // conductor's concurrency slots and its retry/freeze machine never fires.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("client build failed: {e}"))?;
-    let resp = client
-        .post("https://api.thetokencompany.com/v1/compress")
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "bear-2",
-            "input": text,
-            "compression_settings": { "aggressiveness": aggressiveness },
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("compress request failed: {e}"))?;
-
-    let status = resp.status();
-    // Read the body once; we need it for both the success path and error snippets.
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("compress response read failed (status {status}): {e}"))?;
-
-    if !status.is_success() {
-        // Cap the snippet so a huge error page doesn't flood the log. Body never contains the key.
-        let snippet: String = body.chars().take(300).collect();
-        return Err(format!("compress failed (status {status}): {snippet}"));
-    }
-
-    let parsed: Value = serde_json::from_str(&body)
-        .map_err(|e| {
-            let snippet: String = body.chars().take(300).collect();
-            format!("compress response was not JSON: {e}: {snippet}")
-        })?;
-
-    // The REST response is a JSON object with a string `output` field. Any other shape is
-    // unexpected and reported as an error (no real Bear-2 response is a bare JSON string).
-    if let Some(out) = parsed.get("output").and_then(|v| v.as_str()) {
-        return Ok(out.to_string());
-    }
-
-    let snippet: String = body.chars().take(300).collect();
-    Err(format!(
-        "compress response missing string `output` field: {snippet}"
-    ))
-}
-
 /// Read a Claude Code transcript's full text. Rust owns `~/.claude` access (the JS fs
 /// plugin's scope does not cover programmatic reads of `~/.claude/projects/**`, only
 /// dialog-picked files), so the file load + tail goes through here. The path is
@@ -880,20 +562,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .manage(ConductorProcs(Default::default()))
         .manage(MockProc(Default::default()))
         .invoke_handler(tauri::generate_handler![
             list_sessions,
-            list_conductors,
             reap_session,
             take_focus_request,
             focus_window,
             list_claude_sessions,
             read_claude_session,
-            compress_text,
-            list_launchable_conductors,
-            launch_conductor,
-            stop_conductor,
             launch_mock_session,
             stop_mock_session,
             mock_session_running
@@ -902,19 +578,15 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             if let tauri::RunEvent::Exit = event {
-                // Kill all conductor child processes on app exit to avoid orphaned nodes.
+                // Kill the fake-pi mock child process (if any) on app exit to avoid an
+                // orphaned node process.
                 //
                 // Fix #3: kill ALL children first (before any waiting) so one stuck child
                 // can't block the kill signals to the rest. Then do a bounded reap — loop
                 // try_wait() with short sleeps rather than calling blocking wait(). If a
                 // child still hasn't exited after ~500ms we move on; a hung child must not
                 // prevent the app from shutting down.
-                let state = app_handle.state::<ConductorProcs>();
-                let mut map = state.0.lock().unwrap_or_else(|e| e.into_inner());
-                let mut children: Vec<std::process::Child> = map.drain().map(|(_, c)| c).collect();
-                drop(map); // release the lock; no callers remain during Exit
-
-                // Fold the fake-pi mock child (if any) into the same kill+reap pass.
+                let mut children: Vec<std::process::Child> = Vec::new();
                 let mock = app_handle.state::<MockProc>();
                 if let Some(c) = mock.0.lock().unwrap_or_else(|e| e.into_inner()).take() {
                     children.push(c);
