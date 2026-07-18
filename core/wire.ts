@@ -498,9 +498,17 @@ export function computeDegradedDropRuns(
 			if (leadingProblem || adjacencyProblem) {
 				degradeStart.add(i);
 				stable = false;
-			} else {
-				prevRole = undefined; // the whole run still vanishes — nothing survives from it
+				// The degraded run now survives as one synthesized recap, so later runs on THIS
+				// pass must resolve against ITS role — leaving the stale pre-degrade survivor role
+				// here made a cascade of adjacent drop runs over-degrade, welding the second recap
+				// against the next survivor: the exact same-role adjacency this floor exists to
+				// prevent (repro: two drop groups splitting a tool_call/tool_result turn between
+				// two user survivors).
+				prevRole = msgs[i].role === "assistant" ? "assistant" : "user";
 			}
+			// else: the run truly vanishes — it emits nothing, so the closest-survivor role is
+			// UNCHANGED. (Nulling it treated mid-wire positions as wire-start, misfiring the
+			// leading check and disabling the adjacency check for the following run.)
 			i = j;
 		}
 	}

@@ -176,6 +176,27 @@ describe("core/wire — applyPlan role-validity floor", () => {
 		expect(recapText).not.toContain("reply1");
 	});
 
+	it("cascade: two adjacent drop groups degrade only the FIRST run; the second resolves against the recap's role", () => {
+		// Review-caught P1: after degrading a run, the pass must advance prevRole to the recap's
+		// role. With the stale pre-degrade role, G2 below was ALSO degraded, and its toolResult
+		// recap (role "user") welded against the surviving user turn — the exact same-role
+		// adjacency the floor exists to prevent ([user, assistant, user, user] on the wire).
+		const ms: PiMessage[] = [
+			{ role: "user", content: "q1", timestamp: 1 }, // m0 u:1 — survives
+			{ role: "assistant", responseId: "r1", timestamp: 2, content: [{ type: "toolCall", id: "c1", name: "read", arguments: { path: "/x" } }] as any }, // m1 a:r1:p0 — G1's run
+			{ role: "toolResult", toolCallId: "c1", toolName: "read", content: "file contents", timestamp: 3 }, // m2 r:c1 — G2's run
+			{ role: "user", content: "q2", timestamp: 4 }, // m3 u:4 — survives
+		];
+		const out = applyPlan(ms, [], [drop(["a:r1:p0"]), drop(["r:c1"])]);
+		// G1 must degrade (a full drop of both runs would weld u:1 against u:4); G2 must then
+		// resolve against the ASSISTANT recap and drop verbatim.
+		expect(out.length).toBe(3);
+		expect(out.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+		const recapText = (out[1].content as any[])[0].text as string;
+		expect(recapText).toMatch(/^\{#[0-9a-z]{6} FOLDED\}/);
+		expect(JSON.stringify(out)).not.toContain("file contents"); // G2's run truly dropped, no second recap
+	});
+
 	it("no-repair-needed: a drop whose surrounding roles are already safe still removes the run verbatim", () => {
 		const ms: PiMessage[] = [
 			{ role: "user", content: "hi", timestamp: 1 }, // m0 u:1 — dropped
