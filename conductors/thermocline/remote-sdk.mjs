@@ -373,6 +373,16 @@ var Truth = class _Truth {
    * block is NOT here, so it heals when the tail grows over it, exactly as a human fold does.
    */
   birthFolded = /* @__PURE__ */ new Set();
+  /**
+   * Ids of surviving blocks that were ALREADY sent whole but a divergence rebuild pushed ABOVE the
+   * scalar `sentThroughOrder` frontier — a fresh block inserted BEFORE them drags the frontier back
+   * (the frontier is a prefix by `order`, so ONE early unsent block reclassifies every later block
+   * never-sent). Without this set a rebuild makes blocks the model already saw whole look fresh
+   * again: birth-fold-eligible, re-listed in `freshIds`. The effective "is this block sent?"
+   * predicate (`sent`) is therefore the UNION `(order <= sentThroughOrder) OR (id in carriedSent)`.
+   * Populated only by `rebuildFrom`; rides the snapshot so replicas agree (v15).
+   */
+  carriedSent = /* @__PURE__ */ new Set();
   /** Monotonic; bumps on every state change. Every event carries the post-change value. */
   revCounter = 0;
   /** Per block/group id → the rev at which it last changed (for `baseRev` stale detection). */
@@ -398,10 +408,13 @@ var Truth = class _Truth {
    * The GUI builds a replica Truth this way so replayed events stay rev-aligned with the
    * authoritative extension-side Truth: after adopting, `rev === snapshot.rev`, and each
    * subsequent replayed input bumps rev in lockstep — a mismatch after replay ⇒ resnapshot.
-   * `blocks` arrive with overlay already applied; groups/locks/config/sent/`birthFolded` are set
-   * verbatim — `birthFolded` MUST round-trip (v12) or `healProtected` diverges from the host: a
-   * replica that lost the set heals a block on its next housekeep that the host still keeps
-   * folded, and both sides bump `rev` by exactly one, so the mismatch is otherwise invisible.
+   * `blocks` arrive with overlay already applied; groups/locks/config/sent/`birthFolded`/
+   * `carriedSent` are set verbatim — `birthFolded` MUST round-trip (v12) or `healProtected`
+   * diverges from the host: a replica that lost the set heals a block on its next housekeep that
+   * the host still keeps folded, and both sides bump `rev` by exactly one, so the mismatch is
+   * otherwise invisible. `carriedSent` MUST round-trip (v15) for the same silent-divergence reason:
+   * a replica that lost it reclassifies a block the host recorded as already-sent back to fresh
+   * (birth-fold-eligible / re-listed in `freshIds`), again with both revs still advancing in step.
    */
   adoptSnapshot(s) {
     this.blockLog = s.blocks.slice();
@@ -416,6 +429,7 @@ var Truth = class _Truth {
     this.wireAttachedFlag = s.wireAttached;
     this.sentThroughOrderValue = s.sentThroughOrder;
     this.birthFolded = new Set(s.birthFolded);
+    this.carriedSent = new Set(s.carriedSent);
     this.lastChangedRev.clear();
     this.revCounter = s.rev;
     this.pfiCache = { rev: -1, value: 0 };
@@ -453,7 +467,7 @@ var Truth = class _Truth {
       b.override = old.override;
       b.autoFolded = old.autoFolded;
       b.by = old.by;
-      b.subst = old.subst;
+      b.subst = b.text === old.text ? old.subst : void 0;
       if (prev.birthFolded.has(b.id)) next.birthFolded.add(b.id);
     }
     let frontier = next.blockLog.length ? next.blockLog[next.blockLog.length - 1].order : -1;
@@ -463,12 +477,17 @@ var Truth = class _Truth {
       if (!wasSent) frontier = Math.min(frontier, b.order - 1);
     }
     next.sentThroughOrderValue = frontier;
+    for (const b of next.blockLog) {
+      if (b.order <= frontier) continue;
+      const old = prev.get(b.id);
+      if (old && prev.sent(old)) next.carriedSent.add(b.id);
+    }
     const survivors = next.index;
     next.groupList = prev.groupList.filter((g) => {
       if (!g.memberIds.every((id) => survivors.has(id))) return false;
       const idxs = g.memberIds.map((id) => survivors.get(id)).sort((a, b) => a - b);
       return idxs.every((v, k) => k === 0 || v === idxs[k - 1] + 1);
-    }).map((g) => ({ ...g, memberIds: g.memberIds.slice() }));
+    }).map((g) => ({ ...g, memberIds: g.memberIds.slice().sort((a, b) => survivors.get(a) - survivors.get(b)) }));
     next.housekeep(/* @__PURE__ */ new Set());
     return next;
   }
@@ -513,6 +532,10 @@ var Truth = class _Truth {
   get birthFoldedIds() {
     return [...this.birthFolded];
   }
+  /** Ids in the carried-sent set (see `carriedSent`). A snapshot must carry this verbatim (v15). */
+  get carriedSentIds() {
+    return [...this.carriedSent];
+  }
   /** The tail target the holder enforces while holding `tail-size` (0 when not held). */
   get activeTailTokens() {
     return this.isLocked("tail-size") ? this.activeTailTok : 0;
@@ -520,13 +543,27 @@ var Truth = class _Truth {
   isLocked(name) {
     return hasLock(this.activeLocks, name);
   }
-  /** The highest block `order` whose content has reached the model (serialized wire). */
+  /** The highest block `order` whose content has reached the model (serialized wire). The scalar
+   *  frontier ONLY — `carriedSent` (a rebuild's per-id preserved sent-ness) is separate; use
+   *  `sent(b)`/`isSent(id)` for the effective predicate. */
   get sentThroughOrder() {
     return this.sentThroughOrderValue;
   }
-  /** Has this block's content reached the model in an applied plan? */
+  /**
+   * Has this block's content reached the model in an applied plan? The UNION of the scalar
+   * `order`-prefix frontier and the per-id `carriedSent` set a divergence rebuild preserves (see
+   * `carriedSent`) — so a block the model saw whole stays "sent" even after a fresh earlier block
+   * drags the frontier back below it. Every consumer of sent-ness (birth-fold eligibility,
+   * `canFold`'s wire guard, the host adapter's `freshIds`) reads this predicate, so they all agree.
+   */
   sent(b) {
-    return b.order <= this.sentThroughOrderValue;
+    return b.order <= this.sentThroughOrderValue || this.carriedSent.has(b.id);
+  }
+  /** Id form of `sent` — for a caller holding an id but not the `Block` (the extension ingress
+   *  will switch to this). Unknown id ⇒ false (a block we don't hold was never sent from here). */
+  isSent(id) {
+    const b = this.get(id);
+    return b ? this.sent(b) : false;
   }
   /** A human override owns this block (pin / manual fold / manual unfold). */
   held(b) {
@@ -825,6 +862,7 @@ var Truth = class _Truth {
   }
   // ── config dials ────────────────────────────────────────────────────────
   setBudget(n) {
+    if (!Number.isFinite(n)) return;
     this.budgetTok = Math.max(1e3, Math.round(n));
     const touched = /* @__PURE__ */ new Set();
     this.housekeep(touched);
@@ -833,12 +871,14 @@ var Truth = class _Truth {
     this.emit({ type: "config", budget: this.budgetTok, rev });
   }
   setContextWindow(n) {
+    if (!Number.isFinite(n)) return;
     this.contextWindowTok = n;
     const rev = ++this.revCounter;
     this.emit({ type: "config", contextWindow: this.contextWindowTok, rev });
   }
   setProtect(n) {
     if (this.isLocked("tail-size")) return;
+    if (!Number.isFinite(n)) return;
     this.protectTokensTarget = Math.max(0, Math.round(n));
     const touched = /* @__PURE__ */ new Set();
     this.housekeep(touched);
@@ -1033,8 +1073,13 @@ var Truth = class _Truth {
   clamp(op, reason, detail) {
     return { op, applied: false, clamped: reason, detail };
   }
-  // Multi-id ops fold their per-id outcome into one result (applied iff ANY id applied).
+  // Multi-id ops fold their per-id outcome into one result (applied iff ANY id applied). The batch
+  // `applied`/`clamped` stay what existing callers read; `perId` records EACH id's outcome so the
+  // replica-facing event can forward only the ids that actually applied (see the `perId` doc in
+  // ops.ts and `wireEventFromTruthEvent`) — a per-id clamp must never replay on a baseRev-less
+  // replica and diverge it while both revs still advance in lockstep.
   eachId(op, touched, fn) {
+    const perId = [];
     let applied = false;
     let lastClamp;
     for (const id of op.ids) {
@@ -1042,11 +1087,13 @@ var Truth = class _Truth {
       if (c === null) {
         applied = true;
         touched.add(id);
+        perId.push({ id, applied: true });
       } else {
         lastClamp = c;
+        perId.push({ id, applied: false, reason: c });
       }
     }
-    return applied ? { op, applied: true } : { op, applied: false, clamped: lastClamp ?? "noop" };
+    return applied ? { op, applied: true, perId } : { op, applied: false, clamped: lastClamp ?? "noop", perId };
   }
   opFold(op, by, baseRev, touched) {
     if (by === "you" && this.isLocked("human-steering")) return this.clamp(op, "locked");
@@ -1358,6 +1405,10 @@ function hydrateSnapshot(meta, state) {
     sentThroughOrder: state.sentThroughOrder,
     wireAttached: state.wireAttached,
     birthFolded: state.birthFolded,
+    // Optional on the wire (v15) so a peer/test constructing a `SnapshotState` literal without it
+    // still type-checks — the version bump is the real cross-version gate; the host serializer
+    // always emits it. Default `[]` (a session that never rebuilt has no carried sent-ness).
+    carriedSent: state.carriedSent ?? [],
     rev: state.rev
   });
   return truth;
@@ -1465,7 +1516,7 @@ function recallHostEvent(ids, by, rev) {
 }
 
 // core/protocol.ts
-var PROTOCOL_VERSION = 14;
+var PROTOCOL_VERSION = 15;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
   "snapshot",
@@ -2488,7 +2539,7 @@ function persistPath(dir, key) {
 var ThermoclineConductor = class {
   id = ID;
   label = LABEL;
-  description = "Attention-gated LLM compression in deliberate epochs, under a hard budget invariant.";
+  description = "Attention-gated LLM compression in deliberate epochs; live tokens stay at or under budget whenever protected/held content leaves room to compress, else the shortfall is surfaced as OVERFLOW \u2014 never silent.";
   // human-steering ONLY — agent-unfold stays open (the agent's unfold is graduation gate ②).
   locks = ["human-steering"];
   // Small hold: the pre-model-call wire-departing hook runs a strictly deterministic emergency.
@@ -2552,6 +2603,7 @@ var ThermoclineConductor = class {
   overflowTokens = 0;
   overflowCapTokens = 0;
   overflowProtectedTokens = 0;
+  overflowHeldTokens = 0;
   constructor(opts = {}) {
     this.cfg = { ...DEFAULT_CFG, ...opts.cfg ?? {} };
     this.scorer = opts.scorer ?? scoreCandidates;
@@ -2583,8 +2635,7 @@ var ThermoclineConductor = class {
       case "turn-committed":
         return this.enqueueTick();
       case "state-changed":
-        this.onStateChanged(e.changes);
-        return;
+        return this.onStateChanged(e.changes);
       case "wire-departing":
         return this.onWireDeparting();
       case "resync":
@@ -2592,9 +2643,23 @@ var ThermoclineConductor = class {
         return;
     }
   }
-  /** Agent recall/unfold is graduation gate ②; a human edit resets graduation via `held` next tick. */
+  /**
+   * Agent recall/unfold is graduation gate ②; a human edit resets graduation via `held` next tick.
+   *
+   * P2 FIX — a human raising `setProtect` (a `what:"protect"` change) can HEAL an already-applied
+   * fold, or PRUNE an already-applied stratum's group, UNDERNEATH the conductor: Truth's
+   * `healProtected`/`pruneProtectedGroups` run synchronously inside `setProtect`, BEFORE this
+   * event even fires — and the event itself carries NO block ids (see `StateChange`), so nothing
+   * else would ever surface which id(s) healed. Because thermocline locks `human-steering` (the
+   * ONLY other channel through which a human could directly fold/unfold/pin a block), a `protect`
+   * heal is the ONE remaining way `appliedFolds`/`appliedStrata` can silently drift from reality.
+   * React to it the same tick: reconcile our applied-state bookkeeping against the live view (see
+   * `reconcileAppliedAgainstView`) and kick a tick so `project()`/fill catches up PROMPTLY, rather
+   * than sitting stale until the next natural blocks-appended/turn-committed event.
+   */
   onStateChanged(changes) {
     let sawAgentTouch = false;
+    let sawProtectChange = false;
     for (const c of changes) {
       if (c.by === "agent" && (c.what === "recall" || c.what === "unfold") && c.id) {
         this.agentTouched.add(c.id);
@@ -2602,10 +2667,14 @@ var ThermoclineConductor = class {
         sawAgentTouch = true;
         if (c.what === "unfold") this.appliedFolds.delete(c.id);
       }
+      if (c.what === "protect") sawProtectChange = true;
     }
     if (sawAgentTouch && this.preparing) {
       ++this.prepareToken;
       this.preparing = false;
+    }
+    if (sawProtectChange && this.reconcileAppliedAgainstView()) {
+      return this.enqueueTick();
     }
   }
   /** The host state was rebuilt — drop tracked desired state and re-restore from disk. */
@@ -2637,6 +2706,7 @@ var ThermoclineConductor = class {
   async onWireDeparting() {
     const view = this.materialize();
     this.lastView = view;
+    this.reconcileAppliedAgainstView();
     if (project(view, this.appliedForProject()) > capOf(view)) {
       await this.runEmergency(view);
     }
@@ -2674,6 +2744,61 @@ var ThermoclineConductor = class {
       strata: this.appliedStrata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens }))
     };
   }
+  /**
+   * VIEW-DERIVED RECONCILIATION (P2 fix) — a human raising `setProtect` mid-session can HEAL an
+   * already-applied fold (Truth's `healProtected`) or PRUNE an already-applied stratum's group
+   * (`pruneProtectedGroups`) UNDERNEATH the conductor: both run synchronously inside `setProtect`,
+   * BEFORE the `state-changed{what:"protect"}` event even fires, and that event carries NO block
+   * ids — so nothing tells us WHICH id(s) healed. `project()` doesn't re-derive its own savings
+   * from live fold state either: for a fold it subtracts `tokens − foldedTokens` for every id in
+   * `appliedFolds` unconditionally, and for a stratum it subtracts `Σ member tokens − summaryTokens`
+   * for every entry in `appliedStrata` unconditionally — so a STALE entry keeps crediting a saving
+   * that no longer exists on the wire, fill under-reports, and the hard-budget invariant is
+   * defeated with NO overflow status. Because thermocline locks `human-steering` (a human can't
+   * directly fold/unfold/pin while it's held), a `protect` heal is the ONE remaining channel this
+   * can happen through.
+   *
+   * The fix: re-derive both applied sets from the ACTUAL current view/groups rather than trusting
+   * our own memory of what we last applied.
+   *   - an `appliedFolds` entry whose block no longer renders `folded` (healed, or vanished) is
+   *     dropped;
+   *   - an `appliedStrata` entry whose engine group id no longer exists is dropped (a restored-but-
+   *     not-yet-grouped entry — `groupId == null` — is left alone; there is nothing in the engine
+   *     to check yet).
+   *
+   * Dropping an entry never re-folds it here: the freed block/members simply fall OUT of our
+   * bookkeeping and become visible to `project()`/`planEpoch` again through the NORMAL epoch
+   * machinery (HOLD/PREPARE/EMERGENCY) on its own schedule, which already refuses to fold/group
+   * inside the (now possibly larger) protected tail via the engine's own protected clamp — forcing
+   * an immediate re-fold here would just be clamped right back. Cheap (two small-map scans + one
+   * `host.groups()` read) and self-contained: no new host event, no disk I/O, safe on every tick.
+   *
+   * Returns whether anything was actually dropped, so `onStateChanged` can kick a tick ONLY when
+   * there was real drift to react to — a `protect` change that heals/prunes nothing (e.g. the
+   * routine `setProtect` call during initial setup, before any epoch has ever applied anything) must
+   * stay a complete no-op, exactly as before this fix, rather than spuriously firing a tick against
+   * an empty/pre-epoch view (which could, for one, trip `validateRestoredStrata` before the first
+   * real blocks have even landed).
+   */
+  reconcileAppliedAgainstView() {
+    let changed = false;
+    for (const [id] of this.appliedFolds) {
+      const b = this.host.get(id);
+      if (!b || !b.folded) {
+        this.appliedFolds.delete(id);
+        changed = true;
+      }
+    }
+    if (this.appliedStrata.length) {
+      const liveGroupIds = new Set(this.host.groups().map((g) => g.id));
+      const kept = this.appliedStrata.filter((s) => s.groupId == null || liveGroupIds.has(s.groupId));
+      if (kept.length !== this.appliedStrata.length) {
+        this.appliedStrata = kept;
+        changed = true;
+      }
+    }
+    return changed;
+  }
   // ── the main steady-state tick ─────────────────────────────────────────────────
   /** Run a tick, serialized: if one is already in flight/queued, chain behind it (deferred — it must
    *  wait); if the chain is idle, START NOW so the tick's synchronous prefix executes during this
@@ -2696,6 +2821,7 @@ var ThermoclineConductor = class {
     this.lastView = view;
     this.gradAdvanced = false;
     this.validateRestoredStrata(view);
+    this.reconcileAppliedAgainstView();
     const cap = capOf(view);
     let fill = cap > 0 ? project(view, this.appliedForProject()) / cap : 0;
     const units = buildUnits(view.blocks);
@@ -2821,7 +2947,10 @@ var ThermoclineConductor = class {
     this.irreducibleOverflow = irreducible;
     this.overflowTokens = irreducible ? Math.max(0, projected - cap) : 0;
     this.overflowCapTokens = cap;
-    if (irreducible) this.overflowProtectedTokens = protectedTailTokens(view);
+    if (irreducible) {
+      this.overflowProtectedTokens = protectedTailTokens(view);
+      this.overflowHeldTokens = heldOutsideTailTokens(view);
+    }
   }
   /**
    * BLOCKER 1 — guarantee the agent NEVER receives a batch whose projected live exceeds cap, using
@@ -3109,7 +3238,7 @@ var ThermoclineConductor = class {
     const strata = this.appliedStrata.length;
     const scoring = this.scoringInFlight ? " \xB7 scoring\u2026" : "";
     const action = this.irreducibleOverflow ? "OVERFLOW" : this.preparing ? "PREPARE" : this.lastAction === "emergency" ? "EMERGENCY" : "HOLD";
-    const text = this.irreducibleOverflow ? `over budget and irreducible: protected tail \u2248 ${fmtK(this.overflowProtectedTokens)}k > cap ${fmtK(this.overflowCapTokens)}k \u2014 raise the budget or shrink the protected tail` : `${action} ${pct}% \xB7 ${folded} folded \xB7 ${strata} strata${scoring}`;
+    const text = this.irreducibleOverflow ? this.overflowHeldTokens > 0 ? `over budget and irreducible: protected tail \u2248 ${fmtK(this.overflowProtectedTokens)}k + held content \u2248 ${fmtK(this.overflowHeldTokens)}k > cap ${fmtK(this.overflowCapTokens)}k \u2014 raise the budget, shrink the protected tail, or unpin held content` : `over budget and irreducible: protected tail \u2248 ${fmtK(this.overflowProtectedTokens)}k > cap ${fmtK(this.overflowCapTokens)}k \u2014 raise the budget or shrink the protected tail` : `${action} ${pct}% \xB7 ${folded} folded \xB7 ${strata} strata${scoring}`;
     if (text === this.lastStatusText) return;
     this.lastStatusText = text;
     this.host.setStatus(text, {
@@ -3121,7 +3250,8 @@ var ThermoclineConductor = class {
       lowWater: Math.round(this.cfg.lowWater * 100),
       highWater: Math.round(this.cfg.highWater * 100),
       irreducibleOverflow: this.irreducibleOverflow,
-      overflowTokens: this.overflowTokens
+      overflowTokens: this.overflowTokens,
+      overflowHeldTokens: this.overflowHeldTokens
     });
   }
 };
@@ -3129,6 +3259,12 @@ function protectedTailTokens(view) {
   const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
   let t = 0;
   for (let i = pfi; i < view.blocks.length; i++) t += view.blocks[i].tokens;
+  return t;
+}
+function heldOutsideTailTokens(view) {
+  const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
+  let t = 0;
+  for (let i = 0; i < pfi; i++) if (view.blocks[i].held) t += view.blocks[i].tokens;
   return t;
 }
 function fmtK(tokens) {

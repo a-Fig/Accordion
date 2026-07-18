@@ -6,10 +6,14 @@
 //     working tail attends back to it). Cold = unattended = safe to compress.
 //   • compaction-naive — real LLM prose summaries via host.complete, user messages verbatim.
 //
-// …combined under a HARD BUDGET INVARIANT, in deliberate double-buffered EPOCHS. The whole
-// product commitment, above relevance and above cache: the agent is NEVER over budget. That is
-// guaranteed by a budget LADDER (planEpoch) whose last rung is a hard delete that always frees
-// tokens, so the planner provably terminates at "protected tail + one minimal stratum".
+// …combined under a budget LADDER, in deliberate double-buffered EPOCHS. The whole product
+// commitment, above relevance and above cache: the agent stays AT OR UNDER budget whenever the
+// configuration is winnable. planEpoch composes moves cheapest-first down to a hard delete that
+// always frees tokens, so the planner provably TERMINATES at "protected tail + held content + one
+// minimal stratum" — that floor is a CONFIGURATION guarantee, not an unconditional one: when the
+// protected tail and/or human-pinned content alone already exceed the cap, no combination of
+// folds/groups/drops can ever close the gap (see `Plan.irreducible`), and the conductor surfaces
+// that explicitly as OVERFLOW — never a silently over-budget wire.
 //
 // This module owns ONE thing: given a view, the probe's temperatures (passed IN as plain data),
 // and prior dwell/strata state, decide WHICH blocks to compress and HOW DEEP — and produce the
