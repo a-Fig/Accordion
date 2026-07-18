@@ -29,13 +29,13 @@ Guidance for AI coding sessions. [VISION.md](VISION.md) = product north star · 
 
 | path | what |
 |------|------|
-| `core/` | Framework-free shared model: `Truth` (canonical context state, `truth.ts`), the v14 wire protocol (`protocol.ts`), replica (de)serialization (`replica.ts`), agent unfold/recall resolution (`agentView.ts`). Imported by the extension (relative `../core`) and the app (`$core` alias) — no Svelte, no Node-only deps |
+| `core/` | Framework-free shared model: `Truth` (canonical context state, `truth.ts`), the v15 wire protocol (`protocol.ts`), replica (de)serialization (`replica.ts`), agent unfold/recall resolution (`agentView.ts`). Imported by the extension (relative `../core`) and the app (`$core` alias) — no Svelte, no Node-only deps |
 | `core/conductor/` | The conductor-v2 contract (`contract.ts`), the in-extension host (`liveHost.ts`), the shipped-conductor catalog (`registry.ts`), the out-of-process remote SDK (`remote.ts`), test scaffolding (`testhost.ts`, `hostAdapter.ts`, the `ViewConductor` adapter in `view.ts`) |
 | `core/conductors/` | The three in-process shipped conductors — `compaction-naive/`, `handoff/`, `doorman/` — each with its own README |
 | `conductors/thermocline/` | The one out-of-process shipped conductor: policy/epoch engine, Python attention probe, the spawned `runner.mjs`, and the committed `remote-sdk.mjs` bundle |
 | `app/` | Tauri 2 + SvelteKit desktop app — the active surface |
 | `app/src/lib/engine/` | App-side Svelte adapter over `core/truth.ts`: `store.svelte.ts` (reactive mirror), `parse.ts` (transcript → blocks), `display.ts` (grid render rows). `types.ts`/`tokens.ts`/`digest.ts`/`locks.ts` are re-export shims to `core/` |
-| `app/src/lib/live/` | WS client (replica + remote control over protocol v14), session discovery, CC transcript browsing |
+| `app/src/lib/live/` | WS client (replica + remote control over protocol v15), session discovery, CC transcript browsing |
 | `app/src-tauri/src/lib.rs` | Native Rust: session discovery + `~/.claude` reads |
 | `extension/accordion.ts` | The live pi extension — hosts the authoritative `Truth` + `LiveConductorHost` per session, the WS server (roles `gui`/`conductor`), and the HTTP server (browser-served mode) |
 | `docs/` | ADRs + developer references |
@@ -59,7 +59,7 @@ Guidance for AI coding sessions. [VISION.md](VISION.md) = product north star · 
 
 ## Live link
 
-`app/src/lib/live/` + `extension/accordion.ts`, over `core/protocol.ts` (protocol **v14**; `app/src/lib/live/protocol.ts` is a re-export shim). **The extension is authoritative, the client is a replica + remote control** (ADR 0021) — the inverse of the pre-Phase-B "GUI drives" model. The extension hosts one `Truth` per live session, and pi's `context` hook is a **local, synchronous, sub-millisecond** operation against it: no IPC, no round trip, no timeout to tune. `message_end` appends each finished assistant/tool message to the Truth **immediately** — the old one-turn view lag is gone; `agent_end` reconciles the full array as a backstop for anything `message_end` missed.
+`app/src/lib/live/` + `extension/accordion.ts`, over `core/protocol.ts` (protocol **v15**; app code imports `$core/protocol` directly). **The extension is authoritative, the client is a replica + remote control** (ADR 0021) — the inverse of the pre-Phase-B "GUI drives" model. The extension hosts one `Truth` per live session, and pi's `context` hook is a **local, synchronous, sub-millisecond** operation against it: no IPC, no round trip, no timeout to tune. `message_end` appends each finished assistant/tool message to the Truth **immediately** — the old one-turn view lag is gone; `agent_end` reconciles the full array as a backstop for anything `message_end` missed.
 
 A connecting client declares a **role** (`?role=gui`, the default, or `?role=conductor`) and receives `hello` (protocol version, session meta, the host's advertised conductor catalog) → a full `snapshot` (a rev-stamped `SnapshotState` the client builds a rev-aligned replica `Truth` from) → a stream of `event` messages (replayable `WireEvent`s — `appended`/`ops`/`config`/`locks`/`sent`/`reset` — each stamped with the host's post-mutation `rev`). The client replays each event through its own replica and asserts a matching `rev`; a mismatch (or a `reset` event) triggers a `resnapshot` request rather than patching around the gap. Human steering (fold/unfold/pin/setBudget/setProtect/the folding arm/`selectConductor`) is sent as a `command`; the host applies it to the authoritative Truth (which emits the resulting events to **every** connected client, including the sender) and replies `commandResult` for clamp UX only — **there is no optimistic apply**, the replica only ever moves via the echoed event.
 
@@ -114,7 +114,7 @@ README surfaces:
 - If install instructions or package behavior change, update both surfaces where relevant.
 
 **Shared contract** (dependency-free, no Svelte — imported by both sides):
-- `core/protocol.ts` — the v14 wire messages (`hello`/`snapshot`/`event`/`telemetry`/`commandResult`/`stream`/`conductorState`/`conductorStatus`/`wireDeparting`/`turnCommitted`/`proposeResult`/`completeResult` server→client; `command`/`resnapshot`/`propose`/`completeRequest`/`setConductorStatus`/`holdRelease`/`cancelComplete` client→server), `WireBlock`, `FoldOp`/`GroupOp`, `PROTOCOL_VERSION`. `app/src/lib/live/protocol.ts` is a re-export shim
+- `core/protocol.ts` — the v15 wire messages (`hello`/`snapshot`/`event`/`telemetry`/`commandResult`/`stream`/`conductorState`/`conductorStatus`/`wireDeparting`/`turnCommitted`/`proposeResult`/`completeResult` server→client; `command`/`resnapshot`/`propose`/`completeRequest`/`setConductorStatus`/`holdRelease`/`cancelComplete` client→server), `WireBlock`, `FoldOp`/`GroupOp`, `PROTOCOL_VERSION`, and the `sanitizeCommand`/`sanitizeOps` ingress validators (v15 added `SnapshotState.carriedSent` — per-id sent-state carried across rebuilds — and per-id `OpResult.perId` outcomes so replicas replay only the ids that actually applied)
 - `core/wire.ts` — `linearize(messages)` and pure `applyPlan(messages, ops)`. `tool_call` is never folded — can never orphan its result. `app/src/lib/live/mapping.ts` is a re-export shim (kept its old name for import-site stability)
 - `app/src/lib/live/registry.ts` — the **session-discovery** registry: `~/.accordion/` layout and session/focus shapes. Not to be confused with `core/conductor/registry.ts` (the conductor catalog) — same filename, two unrelated files. **The Tauri Rust layer mirrors these constants — change them in lockstep**
 

@@ -49,7 +49,7 @@
  */
 import type { AccordionStore } from "../engine/store.svelte";
 import type { Block } from "../engine/types";
-import { wireFoldable } from "../engine/digest";
+import { wireFoldable } from "$core/digest";
 
 /** Indicator-only alarm state. `active` drives the header dot; `detail` names the first divergence. */
 export const foldAlarm = $state<{ active: boolean; detail: string }>({ active: false, detail: "" });

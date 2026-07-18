@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "./store.svelte";
-import { wireFoldable } from "./digest";
+import { wireFoldable } from "$core/digest";
 import type { Block, BlockKind, ParsedSession } from "./types";
 
 /*

@@ -19,17 +19,12 @@ import type { TruthStats } from "../truth";
 
 export type { LockName, Op, TxnResult, TruthStats, Actor };
 
-/** JSON-shaped telemetry payloads a conductor may attach to display-only status. */
-export type JSONValue = null | boolean | number | string | JSONValue[] | { [key: string]: JSONValue };
-
 /**
  * One block as every conductor sees it — pure serializable data, identical in-process and (in
  * Phase B) on the wire. This is the old contract's `ViewBlock` plus `sent`.
  */
 export interface ViewBlock {
 	id: string;
-	/** Stable provider-message grouping key. Blocks with the same key snap together in groups. */
-	messageKey?: string;
 	kind: "user" | "text" | "thinking" | "tool_call" | "tool_result";
 	turn: number;
 	order: number;
@@ -56,8 +51,6 @@ export interface ViewBlock {
 	sent: boolean;
 	/** Full content (always present in-process). */
 	text?: string;
-	/** One-line taste (present when the host serves shape-only). */
-	preview?: string;
 }
 
 /**

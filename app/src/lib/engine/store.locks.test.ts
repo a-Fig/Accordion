@@ -3,7 +3,7 @@ import { AccordionStore } from "./store.svelte";
 import type { LockName } from "./locks";
 import { LOCK_NAMES, LOCK_LABELS, hasLock, isExclusive } from "./locks";
 import type { Block, ParsedSession } from "./types";
-import { foldCode } from "./digest";
+import { foldCode } from "$core/digest";
 
 /*
  * ADR 0011 — involvement locks, restored as an ENGINE capability.

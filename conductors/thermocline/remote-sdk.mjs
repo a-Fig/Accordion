@@ -207,7 +207,95 @@ function messageInfo(m, i) {
   }
   return { ids, calls, results, hasNonDurable };
 }
-function foldOne(m, i, byId, mark, onApplied) {
+function computeDegradedDropRuns(msgs, groups) {
+  const owner = new Array(msgs.length).fill(null);
+  const degradeStart = /* @__PURE__ */ new Set();
+  if (!groups.length) return { owner, degradeStart };
+  const memberToGroup = /* @__PURE__ */ new Map();
+  for (const g of groups) for (const id of g.memberIds) if (isDurableId(id)) memberToGroup.set(id, g);
+  for (let i = 0; i < msgs.length; i++) {
+    const info = msgs[i];
+    if (!info.ids.length || info.hasNonDurable) continue;
+    let g = null;
+    let ok = true;
+    for (const id of info.ids) {
+      const gg = memberToGroup.get(id);
+      if (!gg || g && gg !== g) {
+        ok = false;
+        break;
+      }
+      g = gg;
+    }
+    if (ok && g) owner[i] = g;
+  }
+  for (let changedSet = true; changedSet; ) {
+    changedSet = false;
+    const calls = /* @__PURE__ */ new Set();
+    const results = /* @__PURE__ */ new Set();
+    for (let i = 0; i < msgs.length; i++) {
+      if (!owner[i]) continue;
+      for (const c of msgs[i].calls) calls.add(c);
+      for (const c of msgs[i].results) results.add(c);
+    }
+    for (let i = 0; i < msgs.length; i++) {
+      if (!owner[i]) continue;
+      const info = msgs[i];
+      if (info.calls.some((c) => !results.has(c)) || info.results.some((c) => !calls.has(c))) {
+        owner[i] = null;
+        changedSet = true;
+      }
+    }
+  }
+  for (let stable = false; !stable; ) {
+    stable = true;
+    let prevRole;
+    let i = 0;
+    while (i < msgs.length) {
+      const g = owner[i];
+      if (!g) {
+        prevRole = msgs[i].role;
+        i++;
+        continue;
+      }
+      let j = i + 1;
+      while (j < msgs.length && owner[j] === g) j++;
+      const pureDrop = g.summaryText === null && !degradeStart.has(i);
+      if (!pureDrop) {
+        prevRole = msgs[i].role === "assistant" ? "assistant" : "user";
+        i = j;
+        continue;
+      }
+      let k = j;
+      let nextRole;
+      while (k < msgs.length) {
+        const g2 = owner[k];
+        if (!g2) {
+          nextRole = msgs[k].role;
+          break;
+        }
+        let kj = k + 1;
+        while (kj < msgs.length && owner[kj] === g2) kj++;
+        if (g2.summaryText === null && !degradeStart.has(k)) {
+          k = kj;
+          continue;
+        }
+        nextRole = msgs[k].role === "assistant" ? "assistant" : "user";
+        break;
+      }
+      const leadingProblem = prevRole === void 0 && nextRole !== void 0 && nextRole !== "user";
+      const adjacencyProblem = prevRole !== void 0 && prevRole === nextRole;
+      if (leadingProblem || adjacencyProblem) {
+        degradeStart.add(i);
+        stable = false;
+      } else {
+        prevRole = void 0;
+      }
+      i = j;
+    }
+  }
+  return { owner, degradeStart };
+}
+function foldOne(m, i, byId, mark) {
   if (m.role === "assistant" && Array.isArray(m.content)) {
     let parts = null;
     m.content.forEach((b, j) => {
@@ -217,11 +305,9 @@ function foldOne(m, i, byId, mark, onApplied) {
       if (b?.type === "text") {
         parts ??= m.content.slice();
         parts[j] = { ...b, text: op.digestText };
-        onApplied(id);
       } else if (b?.type === "thinking") {
         parts ??= m.content.slice();
         parts[j] = { ...b, thinking: op.digestText };
-        onApplied(id);
       }
     });
     if (parts) {
@@ -235,68 +321,23 @@ function foldOne(m, i, byId, mark, onApplied) {
     const op = byId.get(id);
     if (op && op.digestText) {
       mark();
-      onApplied(id);
       return { ...m, content: [{ type: "text", text: op.digestText }] };
     }
     return m;
   }
   return m;
 }
-function applyPlan(messages, ops, groups = [], appliedOut) {
+function applyPlan(messages, ops, groups = []) {
   const safeOps = (ops ?? []).filter((o) => o && typeof o.id === "string" && isDurableId(o.id) && typeof o.digestText === "string" && o.digestText);
   const safeGroups = (groups ?? []).filter(
     (g) => g && Array.isArray(g.memberIds) && g.memberIds.length && g.memberIds.every((m) => typeof m === "string") && (g.summaryText === null || typeof g.summaryText === "string" && g.summaryText.trim())
   );
-  if (!safeOps.length && !safeGroups.length) {
-    if (appliedOut) {
-      appliedOut.ops = 0;
-      appliedOut.groups = 0;
-    }
-    return messages;
-  }
+  if (!safeOps.length && !safeGroups.length) return messages;
   const byId = new Map(safeOps.map((o) => [o.id, o]));
-  const appliedOpIds = /* @__PURE__ */ new Set();
-  const owner = new Array(messages.length).fill(null);
-  if (safeGroups.length) {
-    const memberToGroup = /* @__PURE__ */ new Map();
-    for (const g of safeGroups) for (const id of g.memberIds) if (isDurableId(id)) memberToGroup.set(id, g);
-    const infos = messages.map((m, i) => messageInfo(m, i));
-    for (let i = 0; i < messages.length; i++) {
-      const info = infos[i];
-      if (!info.ids.length || info.hasNonDurable) continue;
-      let g = null;
-      let ok = true;
-      for (const id of info.ids) {
-        const gg = memberToGroup.get(id);
-        if (!gg || g && gg !== g) {
-          ok = false;
-          break;
-        }
-        g = gg;
-      }
-      if (ok && g) owner[i] = g;
-    }
-    for (let changedSet = true; changedSet; ) {
-      changedSet = false;
-      const calls = /* @__PURE__ */ new Set();
-      const results = /* @__PURE__ */ new Set();
-      for (let i = 0; i < messages.length; i++) {
-        if (!owner[i]) continue;
-        for (const c of infos[i].calls) calls.add(c);
-        for (const c of infos[i].results) results.add(c);
-      }
-      for (let i = 0; i < messages.length; i++) {
-        if (!owner[i]) continue;
-        const info = infos[i];
-        if (info.calls.some((c) => !results.has(c)) || info.results.some((c) => !calls.has(c))) {
-          owner[i] = null;
-          changedSet = true;
-        }
-      }
-    }
-  }
-  const appliedGroups = /* @__PURE__ */ new Set();
-  for (const g of owner) if (g) appliedGroups.add(g);
+  const { owner, degradeStart } = safeGroups.length ? computeDegradedDropRuns(
+    messages.map((m, i) => ({ ...messageInfo(m, i), role: m.role })),
+    safeGroups
+  ) : { owner: new Array(messages.length).fill(null), degradeStart: /* @__PURE__ */ new Set() };
   let changed = false;
   const mark = () => {
     changed = true;
@@ -307,24 +348,24 @@ function applyPlan(messages, ops, groups = [], appliedOut) {
     if (g) {
       let j = i + 1;
       while (j < messages.length && owner[j] === g) j++;
-      if (g.summaryText === null) {
+      if (g.summaryText === null && !degradeStart.has(i)) {
         changed = true;
       } else {
         const role = messages[i].role === "assistant" ? "assistant" : "user";
-        out.push({ role, content: [{ type: "text", text: g.summaryText }] });
+        const text = g.summaryText !== null ? g.summaryText : roleFloorRecap(g.id, j - i);
+        out.push({ role, content: [{ type: "text", text }] });
         changed = true;
       }
       i = j;
       continue;
     }
-    out.push(foldOne(messages[i], i, byId, mark, (id) => appliedOpIds.add(id)));
+    out.push(foldOne(messages[i], i, byId, mark));
     i++;
   }
-  if (appliedOut) {
-    appliedOut.ops = appliedOpIds.size;
-    appliedOut.groups = appliedGroups.size;
-  }
   return changed ? out : messages;
+}
+function roleFloorRecap(groupId, runLength) {
+  return `${foldTag(groupId)} group \xB7 ${runLength} message${runLength === 1 ? "" : "s"} dropped (kept live as a stub for wire validity)`;
 }
 
 // core/truth.ts
@@ -336,6 +377,24 @@ function messageKey(id) {
   const parsed = id.match(/^(.+):\d+$/);
   if (parsed && !/^[a-z]:\d+$/.test(id)) return parsed[1];
   return id;
+}
+function wireRoleOfId(id) {
+  if (id.startsWith("u:") || /^m\d+:u$/.test(id)) return "user";
+  if (id.startsWith("a:") || /^m\d+:p/.test(id)) return "assistant";
+  if (id.startsWith("r:") || /^m\d+:r$/.test(id)) return "toolResult";
+  return "other";
+}
+function messageCountOfRun(run) {
+  let n = 0;
+  let prevKey = null;
+  for (const b of run) {
+    const k = messageKey(b.id);
+    if (k !== prevKey) {
+      n++;
+      prevKey = k;
+    }
+  }
+  return n;
 }
 var Truth = class _Truth {
   meta;
@@ -392,6 +451,8 @@ var Truth = class _Truth {
   // ── rev-keyed read caches (recomputed lazily when rev changes) ───────────
   pfiCache = { rev: -1, value: 0 };
   groupWireCache = { rev: -1, map: /* @__PURE__ */ new Map() };
+  /** `degradedRunKeys()`'s memo — see that method's doc comment. */
+  degradeCache = { rev: -1, keys: /* @__PURE__ */ new Set() };
   constructor(parsed) {
     this.meta = parsed.meta;
     this.blockLog = parsed.blocks.slice();
@@ -434,6 +495,7 @@ var Truth = class _Truth {
     this.revCounter = s.rev;
     this.pfiCache = { rev: -1, value: 0 };
     this.groupWireCache = { rev: -1, map: /* @__PURE__ */ new Map() };
+    this.degradeCache = { rev: -1, keys: /* @__PURE__ */ new Set() };
   }
   /**
    * Structural-DIVERGENCE rebuild (tree-nav / compaction / another extension rewriting
@@ -712,7 +774,8 @@ var Truth = class _Truth {
       return n2;
     }
     const c = this.classifyGroup(g);
-    let n = c.collapsedRuns.length * this.groupSummaryTok(g, c);
+    let n = 0;
+    for (const run of c.collapsedRuns) n += this.runWireTok(g, c, run);
     for (const id of c.stragglers) n += this.get(id)?.tokens ?? 0;
     return n;
   }
@@ -728,21 +791,120 @@ var Truth = class _Truth {
     for (const g of this.groupList) {
       if (!g.folded) continue;
       const c = this.classifyGroup(g);
-      const summaryTok = this.groupSummaryTok(g, c);
-      const runFirsts = new Set(c.collapsedRuns.map((r) => r[0].id));
+      const runTok = /* @__PURE__ */ new Map();
+      for (const run of c.collapsedRuns) runTok.set(run[0].id, this.runWireTok(g, c, run));
       for (const b of c.members) {
-        if (c.collapsed.has(b.id)) m.set(b.id, { tokens: runFirsts.has(b.id) ? summaryTok : 0, collapsed: true });
+        if (c.collapsed.has(b.id)) m.set(b.id, { tokens: runTok.get(b.id) ?? 0, collapsed: true });
         else m.set(b.id, { tokens: b.tokens, collapsed: false });
       }
     }
     this.groupWireCache = { rev: this.revCounter, map: m };
     return m;
   }
-  groupSummaryTok(g, c) {
+  /**
+   * The wire cost of ONE collapsed run within a folded group. A REPLACE group (`g.digest` a
+   * string, or `undefined` → auto-recap) inserts the SAME summary text for every run of that
+   * group (`applyPlan`'s Phase B reuses `g.summaryText`/the auto-digest verbatim per run — see
+   * the "INTERIOR straggler (TWO runs)" cross-validation test), so charging every run the same
+   * scalar is correct and unchanged from before.
+   *
+   * A DROP group (`isDropGroup`) is NOT uniform across runs: `applyPlan`'s role-validity floor
+   * (ADR 0006's open watch item, closed by `computeDegradedDropRuns`) can independently degrade
+   * ONE run of a drop group to a one-message recap while its siblings still vanish for free — a
+   * single "0 for every run" shortcut would under-count a degraded run's real cost and make the
+   * GUI's savings readout LIE about what the model actually receives (the one thing this repo
+   * promises never happens). `degradedRunKeys()` re-derives the EXACT same verdict `applyPlan`
+   * would reach for this run — via the SAME exported `computeDegradedDropRuns` function, not a
+   * parallel re-implementation of the role-adjacency check — so this can never silently drift
+   * from the wire. A degraded run's cost is the recap's OWN token estimate, built from the exact
+   * SAME text `applyPlan` synthesizes (`roleFloorRecap`, exported from `wire.ts` for this reason)
+   * so the number matches token-for-token, not just in shape.
+   */
+  runWireTok(g, c, run) {
     if (!c.carrier) return 0;
-    if (this.isDropGroup(g)) return 0;
+    if (this.isDropGroup(g)) {
+      if (!this.degradedRunKeys().has(messageKey(run[0].id))) return 0;
+      return estTokens(roleFloorRecap(g.id, messageCountOfRun(run))) + BLOCK_OVERHEAD;
+    }
     if (typeof g.digest === "string" && g.digest) return estTokens(g.digest) + BLOCK_OVERHEAD;
     return groupDigestTokens(g, c.collapsedMembers);
+  }
+  /**
+   * Which collapsed runs (identified by their carrier block's `messageKey`) `applyPlan`'s
+   * role-validity floor would degrade to a recap RIGHT NOW, across every folded group at once —
+   * memoized per `rev` (like `groupWire`/`protectedFromIndex`) since every group's accounting
+   * reads it.
+   *
+   * WHY this must call the wire's OWN function and never a re-derived approximation: the floor's
+   * verdict for one run depends on global context — which OTHER runs (this group's or another
+   * group's) survive, degrade, or vanish right next to it — exactly the cross-run cascade
+   * `computeDegradedDropRuns` already implements for `applyPlan`. Re-deriving an "equivalent"
+   * check here would inevitably diverge on some edge case (a second folded group nearby, a
+   * cascaded chain of drops), and drift between the wire and the accounting is precisely the bug
+   * this method exists to close — the UI's claimed savings would once again lie about what the
+   * model actually received. Calling the SAME function makes drift structurally impossible: same
+   * inputs in, same verdict out, whether that function runs inside `applyPlan` (host, real
+   * `PiMessage[]`) or here (host OR replica, reconstructed from `Block`s).
+   *
+   * `Truth` never holds pi's real messages (only the extension does, and only transiently, as
+   * `serializeWire`'s parameter) — but a live `Block`'s own id already encodes which wire-role
+   * class produced it (`wireRoleOfId`, the inverse of `blockId`'s prefix scheme), so the needed
+   * `WireMsgShape[]` is reconstructed from `blockLog` alone (`buildWireShapes`), same for the
+   * host and a replica that only ever adopted a snapshot.
+   *
+   * PERFORMANCE: one O(blockCount) pass to reconstruct `WireMsgShape[]` plus `computeGroupOps()`
+   * (O(foldedGroups), already paid by `serializeWire` on the host) — no worse an order than the
+   * O(blockCount) `liveTokens()`/`fullTokens()` passes this same rev change already triggers, and
+   * skipped entirely (no reconstruction at all) when no group is folded.
+   */
+  degradedRunKeys() {
+    if (this.degradeCache.rev === this.revCounter) return this.degradeCache.keys;
+    const groups = this.computeGroupOps();
+    const keys = /* @__PURE__ */ new Set();
+    if (groups.length) {
+      const { shapes, keys: msgKeys } = this.buildWireShapes();
+      const { degradeStart } = computeDegradedDropRuns(shapes, groups);
+      for (const idx of degradeStart) keys.add(msgKeys[idx]);
+    }
+    this.degradeCache = { rev: this.revCounter, keys };
+    return keys;
+  }
+  /** Reconstruct one `WireMsgShape` per logical message in `blockLog`, grouped by `messageKey`
+   *  (blocks sharing a key are always contiguous — see `messageCountOfRun`) — the `Block`-only
+   *  equivalent of `messages.map((m,i) => ({...messageInfo(m,i), role: m.role}))`, which is all
+   *  `applyPlan` itself builds from real `PiMessage[]` before calling `computeDegradedDropRuns`. */
+  buildWireShapes() {
+    const shapes = [];
+    const keys = [];
+    let curKey = null;
+    let ids = [];
+    let calls = [];
+    let results = [];
+    let hasNonDurable = false;
+    const flush = () => {
+      if (curKey === null) return;
+      shapes.push({ role: wireRoleOfId(ids[0]), ids, calls, results, hasNonDurable });
+      keys.push(curKey);
+    };
+    for (const b of this.blockLog) {
+      const k = messageKey(b.id);
+      if (k !== curKey) {
+        flush();
+        curKey = k;
+        ids = [];
+        calls = [];
+        results = [];
+        hasNonDurable = false;
+      }
+      ids.push(b.id);
+      if (!isDurableId(b.id)) hasNonDurable = true;
+      if (b.callId) {
+        if (b.kind === "tool_call") calls.push(b.callId);
+        else if (b.kind === "tool_result") results.push(b.callId);
+      }
+    }
+    flush();
+    return { shapes, keys };
   }
   classifyGroup(g) {
     const members = [];
@@ -1443,7 +1605,6 @@ function applyWireEvent(truth, ev) {
 function viewBlockOf(truth, b) {
   return {
     id: b.id,
-    messageKey: truth.messageKeyOf(b.id),
     kind: b.kind,
     turn: b.turn,
     order: b.order,

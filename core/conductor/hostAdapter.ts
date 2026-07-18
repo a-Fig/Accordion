@@ -26,7 +26,6 @@ import type { HostEvent, ViewBlock, StateChange } from "./contract";
 export function viewBlockOf(truth: Truth, b: Block): ViewBlock {
 	return {
 		id: b.id,
-		messageKey: truth.messageKeyOf(b.id),
 		kind: b.kind,
 		turn: b.turn,
 		order: b.order,

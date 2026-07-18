@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parse } from "./parse";
-import { estTokens, BLOCK_OVERHEAD } from "./tokens";
+import { estTokens, BLOCK_OVERHEAD } from "$core/tokens";
 
 // parse() turns raw pi / Claude Code JSONL into typed Blocks. These tests pin the
 // current behavior: format sniffing, assistant-message splitting, call/result

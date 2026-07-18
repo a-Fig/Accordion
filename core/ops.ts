@@ -114,11 +114,6 @@ export interface TxnResult {
 	results: OpResult[];
 }
 
-/** Convenience: did any op in the transaction actually change state? */
-export function anyApplied(r: TxnResult): boolean {
-	return r.results.some((x) => x.applied);
-}
-
 /**
  * Op kinds that are HOST-ONLY — issued solely by the host's own conductor-detach kill switch,
  * NEVER accepted from a wire client (a GUI `ops` command or a conductor `propose`). Today only

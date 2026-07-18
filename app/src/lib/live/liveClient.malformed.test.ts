@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { connectLive, disconnectLive, live } from "./liveClient.svelte";
 import { session } from "../session.svelte";
-import { PROTOCOL_VERSION } from "./protocol";
+import { PROTOCOL_VERSION } from "$core/protocol";
 
 /*
  * Malformed-frame hardening (Phase B). Browser upgrades are authenticated, but native/Tauri
