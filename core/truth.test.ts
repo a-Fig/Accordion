@@ -814,3 +814,184 @@ describe("Truth — clearLocks inheritTail (freeze-safe detach, P1-5)", () => {
 		expect(t.protectTokens).toBe(4000);
 	});
 });
+
+// ── Fix #1: per-id op outcomes. `eachId` used to collapse a multi-id op into ONE `{applied:true}`
+// result, and `wireEventFromTruthEvent` forwarded the WHOLE op (including ids the host individually
+// clamped) to a baseRev-less replica, which then applied an id the host refused. Both sides still
+// bump `rev` by exactly one, so the rev assertion never catches the state fork.
+describe("Truth — per-id op outcomes (fix #1)", () => {
+	it("a multi-id op records each id's outcome; batch applied/clamped stay backward-compatible", () => {
+		const t = live();
+		t.append(seq(3, 1000));
+		t.setProtect(0);
+		const base = t.rev;
+		t.apply([{ kind: "pin", ids: ["a:b1:p0"] }], "you"); // touch B → stale relative to base; A untouched
+		const r = t.apply([{ kind: "fold", ids: ["a:b0:p0", "a:b1:p0"] }], "you", base);
+		expect(r.results[0].applied).toBe(true); // batch-level: ANY id applied (unchanged for old callers)
+		expect(r.results[0].clamped).toBeUndefined();
+		expect(r.results[0].perId).toEqual([
+			{ id: "a:b0:p0", applied: true },
+			{ id: "a:b1:p0", applied: false, reason: "stale" },
+		]);
+		expect(t.isFolded(t.get("a:b0:p0")!)).toBe(true); // A folded
+		expect(t.get("a:b1:p0")!.override).toBe("pinned"); // B stale-refused, unchanged
+	});
+
+	it("a fully-clamped multi-id op reports applied:false with per-id reasons", () => {
+		const t = live();
+		t.append(seq(3, 1000));
+		t.setProtect(0);
+		const r = t.apply([{ kind: "unpin", ids: ["a:b0:p0", "a:b1:p0"] }], "you"); // nothing pinned → all noop
+		expect(r.results[0].applied).toBe(false);
+		expect(r.results[0].clamped).toBe("noop");
+		expect(r.results[0].perId).toEqual([
+			{ id: "a:b0:p0", applied: false, reason: "noop" },
+			{ id: "a:b1:p0", applied: false, reason: "noop" },
+		]);
+	});
+
+	// The silent-divergence repro through the actual replica replay: the host clamps ONE id `stale`
+	// (a baseRev-only refusal a baseRev-less replica cannot reproduce). Pre-fix the whole op was
+	// forwarded, so the replica unfolded a PINNED block the host left pinned — diverging while both
+	// revs still advanced by one. This assertion FAILS pre-fix (replica B would be "unfolded").
+	it("forwards only the applied ids so a per-id stale clamp cannot diverge a baseRev-less replica", () => {
+		const host = live();
+		const events: WireEvent[] = [];
+		host.onEvent((e) => {
+			const w = wireEventFromTruthEvent(e);
+			if (w) events.push(w);
+		});
+		host.append(seq(3, 1000));
+		host.setProtect(0);
+		host.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "auto"); // A strategy-folded (override null, unfoldable)
+		const base = host.rev;
+		host.apply([{ kind: "pin", ids: ["a:b1:p0"] }], "you"); // B pinned; touched since base → stale vs base
+		const r = host.apply([{ kind: "unfold", ids: ["a:b0:p0", "a:b1:p0"] }], "you", base);
+		expect(r.results[0].perId).toEqual([
+			{ id: "a:b0:p0", applied: true },
+			{ id: "a:b1:p0", applied: false, reason: "stale" },
+		]);
+		expect(host.get("a:b1:p0")!.override).toBe("pinned"); // host kept B pinned
+
+		const replica = live();
+		for (const w of events) applyWireEvent(replica, w);
+
+		expect(replica.rev).toBe(host.rev); // rev aligned — it was even PRE-fix, which is the trap
+		expect(replica.get("a:b0:p0")!.override).toBe(host.get("a:b0:p0")!.override); // both unfolded
+		expect(replica.get("a:b1:p0")!.override).toBe("pinned"); // NOT unfolded — pre-fix diverged here
+	});
+});
+
+// ── Fix #2: sent-frontier carry across a rebuild. The scalar `sentThroughOrder` is an `order`
+// prefix, so a fresh block inserted BEFORE already-sent blocks drags the frontier back and, by the
+// prefix alone, reclassifies those sent blocks never-sent (birth-fold-eligible again). `rebuildFrom`
+// now carries per-id sent-ness in `carriedSent`; `sent` is the union of the two.
+describe("Truth — rebuildFrom carries per-id sent-ness across an insert-before rebuild (fix #2)", () => {
+	it("a fresh block inserted BEFORE sent blocks does not reclassify them never-sent", () => {
+		const host = live();
+		host.append(seq(2, 1000)); // A(order0), B(order1)
+		host.markSent(1); // both sent
+		expect(host.sent(host.get("a:b0:p0")!)).toBe(true);
+		expect(host.sent(host.get("a:b1:p0")!)).toBe(true);
+
+		// Divergence rebuild inserts X BEFORE A and B; A/B keep their durable ids but shift to orders 1,2.
+		const fresh = [
+			blk("a:new:p0", "text", 0, 1000), // X — brand new, unsent
+			blk("a:b0:p0", "text", 1, 1000), // A — was sent
+			blk("a:b1:p0", "text", 2, 1000), // B — was sent
+		];
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+
+		expect(next.sentThroughOrder).toBe(-1); // the scalar frontier IS dragged back to -1 by X…
+		expect(next.sent(next.get("a:b0:p0")!)).toBe(true); // …but A stays sent (carried) — pre-fix: false
+		expect(next.sent(next.get("a:b1:p0")!)).toBe(true); // …and B stays sent (carried)  — pre-fix: false
+		expect(next.sent(next.get("a:new:p0")!)).toBe(false); // X is genuinely unsent
+		expect(next.carriedSentIds).toEqual(expect.arrayContaining(["a:b0:p0", "a:b1:p0"]));
+
+		next.setProtect(1_000_000); // protect everything
+		expect(next.canFold(next.get("a:b0:p0")!, "auto")).toBe(false); // sent → NOT birth-foldable
+		expect(next.canFold(next.get("a:new:p0")!, "auto")).toBe(true); // genuinely fresh → birth-foldable
+	});
+});
+
+// ── Fix #3: `rebuildFrom` carried `old.subst` unconditionally. When a rebuild is triggered by a
+// same-id CONTENT rewrite (pi replaced the text under a stable id), the carried subst is a summary
+// of the OLD text — the wire keeps emitting a stale digest. Drop the subst on a text change; the
+// fold survives and re-digests from the fresh text.
+describe("Truth — rebuildFrom drops a stale subst on a content rewrite (fix #3)", () => {
+	it("a same-id CONTENT rewrite drops the carried custom subst; the fold re-digests from fresh text", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		host.setProtect(0);
+		host.apply([{ kind: "replace", id: "a:b0:p0", content: "OLD summary of old text", recoverable: false }], "auto");
+		expect(host.get("a:b0:p0")!.subst).toBe("OLD summary of old text");
+
+		// Rebuild where a:b0:p0 keeps its id but its TEXT changed (pi rewrote the block content).
+		const fresh = [blk("a:b0:p0", "text", 0, 1000, { text: "brand new different content" }), blk("a:b1:p0", "text", 1, 1000)];
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+
+		const b = next.get("a:b0:p0")!;
+		expect(b.subst).toBeUndefined(); // stale custom subst dropped
+		expect(b.autoFolded).toBe(true); // still a strategy fold — it re-digests from fresh text
+		expect(next.isFolded(b)).toBe(true);
+		expect(next.digestOf(b)).not.toBe("OLD summary of old text");
+		expect(next.digestOf(b)).toMatch(/^\{#[0-9a-z]{6} FOLDED\}/); // the engine digest, freshly computed
+
+		// Contrast: an IDENTICAL-text rebuild carries the subst unchanged (the pre-existing behavior).
+		const same = Truth.rebuildFrom(host, { meta: META, blocks: seq(2, 1000), lineCount: 0, skipped: 0 });
+		expect(same.get("a:b0:p0")!.subst).toBe("OLD summary of old text");
+	});
+});
+
+// ── Fix #4: `rebuildFrom` kept a contiguous carried group's OLD `memberIds` array order even when
+// the rebuild reordered the surviving members. `memberIds` is documented "in conversation order"
+// (the wire and `classifyGroup` both iterate it), so it must be re-derived from the new block order.
+describe("Truth — rebuildFrom re-derives reordered group member order (fix #4)", () => {
+	it("a group kept across a rebuild that reorders its (still-contiguous) members re-derives memberIds", () => {
+		const host = live();
+		host.append(seq(4, 1000)); // A B C D
+		host.setProtect(0);
+		const gr = host.apply([{ kind: "group", ids: ["a:b1:p0", "a:b2:p0"] }], "you"); // members [B, C]
+		expect(gr.results[0].applied).toBe(true);
+		expect(host.groups[0].memberIds).toEqual(["a:b1:p0", "a:b2:p0"]);
+
+		// Rebuild reorders B and C — they stay ADJACENT (so the group is kept): new order [A, C, B, D].
+		const fresh = [
+			blk("a:b0:p0", "text", 0, 1000),
+			blk("a:b2:p0", "text", 1, 1000), // C now before B
+			blk("a:b1:p0", "text", 2, 1000), // B
+			blk("a:b3:p0", "text", 3, 1000),
+		];
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+
+		expect(next.groups.length).toBe(1); // still contiguous → kept
+		// Pre-fix kept the STALE ["a:b1:p0","a:b2:p0"]; the fix re-derives to the new block order [C, B].
+		expect(next.groups[0].memberIds).toEqual(["a:b2:p0", "a:b1:p0"]);
+	});
+});
+
+// ── Fix #5: the config dials used to accept non-finite input. NaN survives `Math.max`/`Math.round`
+// and JSON serializes NaN/Infinity as `null` on the wire — poisoning the dial and forking replicas.
+describe("Truth — config dials refuse non-finite input (fix #5)", () => {
+	it("setBudget / setProtect / setContextWindow ignore NaN and Infinity (no poison, no rev bump, no event)", () => {
+		const t = bulk(seq(3));
+		const budget0 = t.budget;
+		const protect0 = t.protectTokens;
+		const rev0 = t.rev;
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+
+		t.setBudget(NaN);
+		t.setBudget(Infinity);
+		t.setProtect(NaN);
+		t.setContextWindow(NaN);
+		expect(t.budget).toBe(budget0); // unchanged, not NaN
+		expect(t.protectTokens).toBe(protect0);
+		expect(t.contextWindow).toBe(null);
+		expect(t.rev).toBe(rev0); // no rev bump
+		expect(events.length).toBe(0); // no config event to fork replicas
+
+		t.setBudget(50_000); // a real value still applies
+		expect(t.budget).toBe(50_000);
+	});
+});

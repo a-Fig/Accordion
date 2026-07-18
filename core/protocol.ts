@@ -62,13 +62,21 @@
  *        completion's controller for that `reqId` (unknown/settled reqIds are ignored).
  *    Bumped so a pre-v14 peer (which has neither the `holdId` correlation nor the new client messages)
  *    cannot pair with a v14 host/client that assumes them.
+ *  - v15: `SnapshotState` gained `carriedSent` (optional). A divergence rebuild that inserts a fresh
+ *    block BEFORE already-sent blocks drags the scalar `sentThroughOrder` prefix frontier back,
+ *    which by the `order`-prefix alone reclassifies those sent blocks never-sent; `carriedSent`
+ *    preserves their sent-ness per-id, and the effective `Truth.sent` predicate is the union of the
+ *    frontier and this set. Must round-trip or a replica reclassifies a sent block as fresh
+ *    (birth-fold-eligible / back in `freshIds`) while both revs advance in lockstep — the same
+ *    invisible-divergence class v12's `birthFolded` closed. Bumped so a pre-v15 peer (which neither
+ *    sends nor expects the field) cannot pair with a v15 host/client that assumes it.
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
-import type { Op, OpResult } from "./ops";
+import { sanitizeOps, type Op, type OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 14;
+export const PROTOCOL_VERSION = 15;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi session binds an
@@ -184,6 +192,16 @@ export interface SnapshotState {
 	 * heal a block the host still keeps folded (v12; see the History note above).
 	 */
 	birthFolded: string[];
+	/**
+	 * Ids of blocks a divergence rebuild carried as ALREADY-sent even though they now sit above the
+	 * scalar `sentThroughOrder` frontier (a freshly-inserted-earlier block dragged the prefix back) —
+	 * see `Truth`'s `carriedSent`. Optional so a peer/test constructing a `SnapshotState` literal
+	 * without it still type-checks (the v15 version bump is the real cross-version gate); a hydrating
+	 * replica defaults it to `[]`, and the host serializer always emits it. Missing it would let a
+	 * replica reclassify a sent block as fresh — birth-fold-eligible / back in `freshIds` — diverging
+	 * from the host while both revs still advance in lockstep (the same class as v12's `birthFolded`).
+	 */
+	carriedSent?: string[];
 	rev: number;
 }
 
@@ -524,4 +542,46 @@ export function isWireBlock(v: unknown): v is WireBlock {
 		typeof b.text === "string" &&
 		typeof b.tokens === "number"
 	);
+}
+
+/** A finite, ≥0 numeric dial value (`setBudget`/`setProtect`), or null if it isn't a usable number. */
+function sanitizeDialValue(v: unknown): number | null {
+	return typeof v === "number" && Number.isFinite(v) ? Math.max(0, v) : null;
+}
+
+/**
+ * Validate + clamp a `WireCommand` arriving from a client into a safe, applyable command — or
+ * `null` when it is unusable and the ingress should ignore it. `isClientMessage` vets only the
+ * message `type` tag, so a `command` frame from an authorized-but-buggy client can still carry a
+ * malformed `cmd`: a `setBudget`/`setProtect` with a NaN/Infinity/negative value poisons `Truth`'s
+ * budget/protect state and forks replicas (JSON serializes NaN/Infinity as `null`), and an `ops`
+ * command with a malformed array throws inside `Truth.apply`. This is the single ingress gate that
+ * closes both: numeric dials are coerced to finite ≥0, and `ops` is passed through `sanitizeOps`
+ * (dropping structurally invalid elements). Additive primitive for the extension's WS ingress;
+ * nothing on this branch wires it yet (Wave 2). `Truth.setBudget` still floors budget to 1000
+ * itself — this only guarantees the value is a real, non-poisoning number first.
+ */
+export function sanitizeCommand(cmd: unknown): WireCommand | null {
+	if (!cmd || typeof cmd !== "object") return null;
+	const c = cmd as Record<string, unknown>;
+	switch (c.kind) {
+		case "ops": {
+			const ops = sanitizeOps(c.ops);
+			return ops ? { kind: "ops", ops } : null;
+		}
+		case "setBudget": {
+			const value = sanitizeDialValue(c.value);
+			return value === null ? null : { kind: "setBudget", value };
+		}
+		case "setProtect": {
+			const value = sanitizeDialValue(c.value);
+			return value === null ? null : { kind: "setProtect", value };
+		}
+		case "setFolding":
+			return typeof c.value === "boolean" ? { kind: "setFolding", value: c.value } : null;
+		case "selectConductor":
+			return c.id === null || typeof c.id === "string" ? { kind: "selectConductor", id: c.id } : null;
+		default:
+			return null;
+	}
 }

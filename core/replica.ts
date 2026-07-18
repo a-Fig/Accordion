@@ -13,6 +13,7 @@
 import type { Block, Group, SessionMeta } from "./types";
 import { Truth } from "./truth";
 import type { TruthEvent } from "./events";
+import type { Op, OpResult } from "./ops";
 import { wireToBlock } from "./wire";
 import type { WireBlock, WireOverlay, SnapshotState, WireEvent } from "./protocol";
 
@@ -57,6 +58,7 @@ export function serializeSnapshot(truth: Truth, foldingEnabled: boolean): Snapsh
 		wireAttached: truth.wireAttached,
 		foldingEnabled,
 		birthFolded: [...truth.birthFoldedIds],
+		carriedSent: [...truth.carriedSentIds],
 		rev: truth.rev,
 	};
 }
@@ -90,24 +92,48 @@ export function hydrateSnapshot(meta: SessionMeta, state: SnapshotState): Truth 
 		sentThroughOrder: state.sentThroughOrder,
 		wireAttached: state.wireAttached,
 		birthFolded: state.birthFolded,
+		// Optional on the wire (v15) so a peer/test constructing a `SnapshotState` literal without it
+		// still type-checks — the version bump is the real cross-version gate; the host serializer
+		// always emits it. Default `[]` (a session that never rebuilt has no carried sent-ness).
+		carriedSent: state.carriedSent ?? [],
 		rev: state.rev,
 	});
 	return truth;
 }
 
 /**
+ * The op a replica should replay for one host `OpResult`, or null when it carries no wire effect.
+ * A CLAMPED op (`applied:false`) is dropped. A MULTI-ID op that applied is rewritten to carry ONLY
+ * the ids that actually applied on the host (its `perId`): the replica replays WITHOUT a `baseRev`,
+ * so a per-id clamp (e.g. one `stale` id in a `fold [A,B]` batch) that the host refused would
+ * otherwise re-apply on the replica and silently diverge it — both sides still bump `rev` by exactly
+ * one, so the rev assertion never catches it. An all-or-nothing op (no `perId`) is forwarded verbatim.
+ */
+function appliedOpForWire(r: OpResult): Op | null {
+	if (!r.applied) return null;
+	if (!r.perId) return r.op; // all-or-nothing op (replace/group/…): applied whole
+	const ids = r.perId.filter((p) => p.applied).map((p) => p.id);
+	if (!ids.length) return null; // defensive — a true `applied` implies ≥1 perId applied
+	return { ...r.op, ids } as Op;
+}
+
+/**
  * Map a host TruthEvent to the REPLAYABLE INPUT the replica needs, or null when nothing needs to
- * ride the wire. For `ops-applied` we forward ONLY the ops that actually applied — the replica
- * replays without a baseRev, so a clamped/stale op must never be re-offered (it would apply on the
- * replica and diverge). `reset` is attributed to "you" (the only actor that triggers resetAll in
- * Phase B); resetAll clears every provenance to null anyway.
+ * ride the wire. For `ops-applied` we forward ONLY what actually applied — the replica replays
+ * without a baseRev, so a clamped/stale op (or a clamped id WITHIN a multi-id op) must never be
+ * re-offered (it would apply on the replica and diverge). `reset` is attributed to "you" (the only
+ * actor that triggers resetAll in Phase B); resetAll clears every provenance to null anyway.
  */
 export function wireEventFromTruthEvent(e: TruthEvent): WireEvent | null {
 	switch (e.type) {
 		case "appended":
 			return { kind: "appended", blocks: e.blocks.map(blockToWire), rev: e.rev };
 		case "ops-applied": {
-			const ops = e.results.filter((r) => r.applied).map((r) => r.op);
+			const ops: Op[] = [];
+			for (const r of e.results) {
+				const forwarded = appliedOpForWire(r);
+				if (forwarded) ops.push(forwarded);
+			}
 			if (!ops.length) return null;
 			return { kind: "ops", by: e.by, ops, rev: e.rev };
 		}
