@@ -15,6 +15,9 @@ import type { ServerMessage, WireEvent } from "../protocol";
 import { serializeSnapshot, hydrateSnapshot, applyWireEvent, wireEventFromTruthEvent } from "../replica";
 import { LiveConductorHost, type LiveHostDeps, type SpawnedRunner } from "./liveHost";
 import { catalogMeta, entryById } from "./registry";
+import type { ConductorHost } from "./contract";
+import { DoormanConductor } from "../conductors/doorman/doorman";
+import { NaiveCompactionConductor } from "../conductors/compaction-naive/compaction-naive";
 
 const META = { format: "pi" as const, title: "t", cwd: "", model: "" };
 
@@ -139,6 +142,97 @@ describe("select — eager locks + attach broadcast", () => {
 		expect(t.lockHolder).toBe("Naive compaction");
 		const cs = h.broadcastLog.filter((m) => m.type === "conductorState").pop();
 		expect(cs && cs.type === "conductorState" && cs.active?.id).toBe("compaction-naive");
+	});
+});
+
+// ── fix 2: transactional attach — a failed create()/attach() must never strand a lock ──────────
+describe("select — a throwing create() never acquires a lock (fix 2a)", () => {
+	it("leaves Truth completely unlocked and nothing advertised active when the factory throws", () => {
+		const t = bulk(textSeq(2));
+		const h = makeDeps(t);
+		const host = new LiveConductorHost(h.deps);
+		const entry = entryById("compaction-naive")!;
+		const createSpy = vi.spyOn(entry, "create").mockImplementation(() => {
+			throw new Error("boom");
+		});
+		try {
+			host.select("compaction-naive");
+			// Pre-fix, `setLocks` ran BEFORE `create()`, so a throwing factory left the lock acquired
+			// with no conductor behind it. Post-fix, nothing is locked and nothing is active.
+			expect(t.locks).toEqual([]);
+			expect(host.activeMeta()).toBeNull();
+			const status = h.broadcastLog.filter((m) => m.type === "conductorStatus").pop();
+			expect(status && status.type === "conductorStatus" && status.text).toMatch(/failed to start/);
+		} finally {
+			createSpy.mockRestore();
+		}
+	});
+});
+
+describe("select — a throwing attach() cleans up instead of stranding a lock (fix 2b)", () => {
+	it("detaches the half-attached conductor and leaves Truth unlocked when attach() throws", () => {
+		const t = bulk(textSeq(2));
+		const h = makeDeps(t);
+		const host = new LiveConductorHost(h.deps);
+		// compaction-naive (NOT doorman) — it declares NON-EMPTY locks (["human-steering",
+		// "agent-unfold"]), so a stuck lock is actually observable; doorman is collaborative
+		// (no locks), so `setLocks([])` would trivially look "unlocked" either way.
+		const attachSpy = vi.spyOn(NaiveCompactionConductor.prototype, "attach").mockImplementation(() => {
+			throw new Error("attach boom");
+		});
+		try {
+			host.select("compaction-naive");
+			// Pre-fix, `setLocks` (and `active`/`mode`) were already committed before `attach()` ran, so a
+			// throwing attach left a dead conductor advertised active with its lock stuck. Post-fix, the
+			// whole attach attempt is rolled back: no lock, nothing active.
+			expect(t.locks).toEqual([]);
+			expect(host.activeMeta()).toBeNull();
+			const status = h.broadcastLog.filter((m) => m.type === "conductorStatus").pop();
+			expect(status && status.type === "conductorStatus" && status.text).toMatch(/failed to attach/);
+		} finally {
+			attachSpy.mockRestore();
+		}
+	});
+});
+
+describe("select — a spawn conductor's locks are deferred to accept, not select (fix 2c)", () => {
+	it("does not touch Truth's locks at select time, only once the runner's socket is accepted", () => {
+		const t = bulk(textSeq(6));
+		t.setProtect(20_000); // the human's dial covers the whole 6k-token session
+		const h = makeDeps(t);
+		const host = new LiveConductorHost(h.deps);
+		const setLocksSpy = vi.spyOn(t, "setLocks");
+
+		host.select("thermocline"); // spawn conductor — runner spawned but not yet dialed in
+		// Pre-fix, `setLocks` ran synchronously right here (housekeep could already prune/heal folds to
+		// fit a shrunk tail for a conductor that might never actually attach). Post-fix, nothing happens
+		// to Truth until the runner's socket is accepted.
+		expect(setLocksSpy).not.toHaveBeenCalled();
+		expect(t.locks).toEqual([]);
+
+		host.acceptConductorSocket({}, host.pendingAttachToken);
+		// NOW — and only now — the declared locks engage.
+		expect(setLocksSpy).toHaveBeenCalledTimes(1);
+		expect(t.locks).toEqual(["human-steering"]);
+	});
+
+	it("a runner that never dials in and times out never mutated Truth's locks at all", async () => {
+		vi.useFakeTimers();
+		try {
+			const t = bulk(textSeq(6));
+			const h = makeDeps(t);
+			const host = new LiveConductorHost(h.deps);
+			const setLocksSpy = vi.spyOn(t, "setLocks");
+			host.select("thermocline");
+			await vi.advanceTimersByTimeAsync(10_000); // pending-attach timeout — auto-detach, no accept ever happened
+			expect(host.activeMeta()).toBeNull();
+			// The conductor never actually attached, so `setLocks` must never have been called for it —
+			// there was nothing to (irreversibly) heal/prune back out.
+			expect(setLocksSpy).not.toHaveBeenCalled();
+			expect(t.locks).toEqual([]);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
@@ -419,6 +513,30 @@ describe("hold — remote (v14 holdRelease)", () => {
 	});
 });
 
+// ── fix 4: detach mid-hold must unblock the IN-PROCESS hold immediately, not wait out holdWireUpToMs ──
+describe("hold — detach mid-hold releases the in-process hold immediately (fix 4)", () => {
+	it("select(\"none\") mid-hold resolves the pending wire-departing hold without waiting out holdWireUpToMs", async () => {
+		vi.useFakeTimers();
+		try {
+			const t = liveTruth();
+			t.append(textSeq(2));
+			const host = new LiveConductorHost(makeDeps(t).deps);
+			host.select("doorman"); // holdWireUpToMs = 150
+			host.on((e) => (e.type === "wire-departing" ? new Promise<void>(() => {}) : undefined)); // never settles
+			const p = host.fireWireDepartingAndAwaitHold();
+			host.select("none"); // detach mid-hold, with 150ms still on the clock
+			// Pre-fix: the in-process hold only raced the handler settling vs. the 150ms timer — neither
+			// of which we ever advance here — so `p` would hang forever and this test would time out.
+			// Post-fix: `detachActive` fires `inProcessHoldRelease`, so `p` resolves right away.
+			await p;
+			expect(host.holdTimeouts).toBe(0); // resolved via detach, not the timeout path
+			expect(host.lastHoldMs).toBe(0); // the detach reset stands — this resumed call must not clobber it
+		} finally {
+			vi.useRealTimers();
+		}
+	}, 1000);
+});
+
 // ── spawn lifecycle ──────────────────────────────────────────────────────────────
 describe("spawn — pending-attach timeout auto-detaches", () => {
 	it("auto-detaches, kills the child, and surfaces a status when the runner never dials in", async () => {
@@ -518,6 +636,50 @@ describe("completeRequest — cancelComplete aborts the matching completion (S7)
 	});
 });
 
+// ── fix 1 (P1): a stale generation's completion settling late must not delete a NEW generation's
+// live entry of the SAME reqId — every spawned SDK numbers its own requests from 1, so reqId alone
+// is not a safe cross-generation key ────────────────────────────────────────────────────────────
+describe("completeRequest — reqId aliasing across generations (fix 1)", () => {
+	it("A's stale completion settling after detach must not delete B's live entry of the same reqId", async () => {
+		const t = bulk(textSeq(2));
+		const pending: Array<{ resolve: (r: { text: string; model: string }) => void; signal: AbortSignal }> = [];
+		const h = makeDeps(t, {
+			// Deliberately does NOT wire `signal` → reject: this simulates a provider call that
+			// "ignores its abort" and keeps running (and eventually settling) after detach.
+			runCompletion: (_req, signal) =>
+				new Promise((res) => {
+					pending.push({ resolve: res as (r: { text: string; model: string }) => void, signal });
+				}),
+		});
+		const host = new LiveConductorHost(h.deps);
+
+		// Generation A attaches and issues reqId 1; it stays in flight (the mock ignores abort).
+		host.select("thermocline");
+		const sockA = {};
+		host.acceptConductorSocket(sockA, host.pendingAttachToken);
+		host.handleConductorMessage(sockA, { type: "completeRequest", reqId: 1, prompt: "a" });
+		expect(pending.length).toBe(1);
+		host.select("none"); // detach: aborts A's controller, but the mock ignores the signal
+
+		// Generation B attaches; its (fresh) spawned SDK numbers requests from 1 again.
+		host.select("thermocline");
+		const sockB = {};
+		host.acceptConductorSocket(sockB, host.pendingAttachToken);
+		host.handleConductorMessage(sockB, { type: "completeRequest", reqId: 1, prompt: "b" });
+		expect(pending.length).toBe(2);
+
+		// A's stale completion FINALLY settles — its `.finally()` must NOT delete B's live reqId-1 entry.
+		pending[0].resolve({ text: "STALE-A", model: "m" });
+		await flush();
+
+		// B's cancelComplete for reqId 1 must still find and abort B's controller — pre-fix, A's
+		// unconditional `completionsByReqId.delete(1)` already wiped this out, so B's abort would be a
+		// silent no-op and the stale spend would run unbounded.
+		host.handleConductorMessage(sockB, { type: "cancelComplete", reqId: 1 });
+		expect(pending[1].signal.aborted).toBe(true);
+	});
+});
+
 describe("propose — human override clamps a conductor op (pin mid-completion)", () => {
 	it("a conductor fold of a human-pinned block is clamped human-override and the pin stands", async () => {
 		const t = bulk(textSeq(3));
@@ -569,6 +731,35 @@ describe("propose — a host-only freeze op is refused at the wire entry", () =>
 		host.select("none"); // detach → internal freeze
 		expect(t.get("a:b0:p0")!.override).toBe("folded");
 		expect(t.get("a:b0:p0")!.by).toBe("you");
+	});
+});
+
+// ── fix 3: an in-process conductor's `propose` is refused once it's no longer the attached one ──
+describe("propose — a detached in-process conductor's stray callback is refused, not applied (fix 3)", () => {
+	it("a propose issued through the facade handed to a since-detached conductor mutates nothing", async () => {
+		const t = bulk(textSeq(3));
+		t.setProtect(0); // no protected tail — nothing else would stop the fold from landing
+		const host = new LiveConductorHost(makeDeps(t).deps);
+
+		// Capture the ACTUAL `ConductorHost` doorman was handed at attach (the generation-scoped
+		// facade, post-fix) by spying on its `attach` — the spy still calls through, so doorman
+		// attaches normally.
+		const attachSpy = vi.spyOn(DoormanConductor.prototype, "attach");
+		host.select("doorman");
+		const staleHost: ConductorHost = attachSpy.mock.calls[0][0];
+		attachSpy.mockRestore();
+
+		// A different conductor attaches in doorman's place. Doorman's OWN `detach()` unsubscribes
+		// from events, but this simulates the bug's shape exactly: a stray async callback that never
+		// let go of the host reference it captured at attach time (e.g. a timer doorman failed to
+		// cancel in its own `detach()`) still holds `staleHost` and could call `propose` on it.
+		host.select("compaction-naive");
+
+		const r = await staleHost.propose({ baseRev: t.rev, ops: [{ kind: "fold", ids: ["a:b0:p0"] }] });
+
+		// Refused, not thrown — and Truth is untouched: the stale propose never landed.
+		expect(r.results[0].applied).toBe(false);
+		expect(t.get("a:b0:p0")!.autoFolded).toBe(false);
 	});
 });
 

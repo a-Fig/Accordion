@@ -106,6 +106,16 @@ export class LiveConductorHost implements ConductorHost {
 	private active: RegistryEntry | null = null;
 	private mode: "in-process" | "spawn" | null = null;
 	private inProcessConductor: Conductor | null = null;
+	// Bumped once per attach ATTEMPT (select() call that actually reaches an entry with a live Truth).
+	// Two things are keyed off it: (1) the `ConductorHost` facade handed to an in-process conductor at
+	// attach (`hostFacade`) closes over the generation it was minted with, so a `propose` reaching the
+	// host through a stale facade — a detached conductor's stray async callback that never let go of
+	// its reference — is refused instead of silently mutating Truth (fix 3); (2) a spawn conductor's
+	// per-`reqId` completion bookkeeping (`completionsByReqId`) tags each entry with the generation live
+	// when it was created, so a stale generation's completion settling late can never be confused for
+	// the current generation's own request of the same number (fix 1 — every spawned SDK numbers its
+	// requests from 1, so reqId alone is not a safe key across an A→B swap).
+	private attachGeneration = 0;
 
 	// ── in-process listener set (the ConductorHost.on subscribers) ────────────────
 	private listeners = new Set<(e: HostEvent) => void | Promise<void>>();
@@ -118,9 +128,12 @@ export class LiveConductorHost implements ConductorHost {
 
 	// ── in-flight completions (abortable on detach) ──────────────────────────────
 	private completions = new Set<AbortController>();
-	// Per-reqId completion controllers, so a conductor's `cancelComplete { reqId }` (v14, S7) can abort
-	// the exact completion it started. Cleared alongside `completions` on detach.
-	private completionsByReqId = new Map<number, AbortController>();
+	// Per-reqId completion bookkeeping, so a conductor's `cancelComplete { reqId }` (v14, S7) can abort
+	// the exact completion it started. Cleared alongside `completions` on detach. Tagged with the
+	// `attachGeneration` live when the request was issued (fix 1): a stale generation's completion
+	// whose abort a slow/buggy provider call ignored can still settle long after detach — its unguarded
+	// `.finally()` must not delete a DIFFERENT (current) generation's live entry of the same reqId.
+	private completionsByReqId = new Map<number, { generation: number; controller: AbortController }>();
 
 	// ── conductor display status (broadcast + cached for late-joining clients) ────
 	private cachedStatusMsg: ConductorStatusMessage | null = null;
@@ -134,6 +147,12 @@ export class LiveConductorHost implements ConductorHost {
 	private holdSeq = 0;
 	private lastHoldMsValue = 0;
 	private holdTimeoutsValue = 0;
+	// A pending IN-PROCESS wire-departing hold's early-release hook (fix 4). The remote hold already
+	// unblocks on detach via `holdWaiter`/`releaseHold`; the in-process hold used to be a bare
+	// `Promise.race` against only the handler settling and the timeout, so detaching mid-hold left the
+	// `context` hook blocked for up to `holdWireUpToMs` even though nothing was listening anymore. Set
+	// while `fireWireDepartingAndAwaitHold` is racing an in-process hold; `releaseHold()` fires it.
+	private inProcessHoldRelease: (() => void) | null = null;
 
 	constructor(deps: LiveHostDeps) {
 		this.deps = deps;
@@ -219,15 +238,77 @@ export class LiveConductorHost implements ConductorHost {
 		// live Truth SYNCHRONOUSLY on invocation (via `applyPropose`) — only the return wraps in a
 		// resolved Promise. The remote-conductor wire path calls `applyPropose` directly instead
 		// (`handleConductorMessage`), returning a `TxnResult` synchronously to echo over the socket.
+		//
+		// NOTE: this method itself is UNGUARDED by design (also exercised directly by tests as the
+		// "trusted internal" entry point). The attach-identity guard lives one layer up, in the
+		// per-attach facade `hostFacade` hands to an in-process conductor (fix 3) — mirroring how the
+		// remote path's guard lives in `handleConductorMessage` (`from === this.conductorSocket`), not
+		// inside `applyPropose` itself.
 		return Promise.resolve(this.applyPropose(txn.baseRev, txn.ops));
+	}
+
+	/**
+	 * Fix 3: a generation-scoped `ConductorHost` facade handed to an in-process conductor at attach
+	 * (instead of `this` directly). Every member delegates straight through EXCEPT `propose`, which is
+	 * refused once this conductor's generation is no longer the currently-attached one — closing the
+	 * hole where the remote path already had a guard (`from === this.conductorSocket` in
+	 * `handleConductorMessage`) but the in-process path had none: `applyPropose` would happily mutate
+	 * the live Truth from a detached conductor's stray async callback (a timer or promise chain it
+	 * failed to cancel in its own `detach()`), attributed identically to a legitimate current-conductor
+	 * proposal. `this.mode !== "in-process"` alone would catch "detached to none" or "a spawn conductor
+	 * attached in its place"; the generation check additionally catches "a DIFFERENT in-process
+	 * conductor attached in its place" (mode stays `"in-process"` but it is not the same attach).
+	 */
+	private hostFacade(generation: number): ConductorHost {
+		return {
+			on: (fn) => this.on(fn),
+			get: (id) => this.get(id),
+			blocks: () => this.blocks(),
+			groups: () => this.groups(),
+			textOf: (id) => this.textOf(id),
+			stats: () => this.stats(),
+			countTokens: (text) => this.countTokens(text),
+			digestOf: (id) => this.digestOf(id),
+			complete: (req) => this.complete(req),
+			setStatus: (text, metrics) => this.setStatus(text, metrics),
+			propose: (txn) => {
+				if (this.mode !== "in-process" || this.attachGeneration !== generation) {
+					return Promise.resolve(this.refusedTxn(txn.ops));
+				}
+				return this.propose(txn);
+			},
+		};
+	}
+
+	/** A propose refused because it arrived from a conductor generation no longer attached (fix 3). */
+	private refusedTxn(ops: Op[]): TxnResult {
+		return {
+			rev: this.deps.truth()?.rev ?? 0,
+			results: ops.map((op) => ({ op, applied: false, clamped: "stale" as const, detail: "propose from a detached conductor generation" })),
+		};
 	}
 
 	// ── select / attach / detach ──────────────────────────────────────────────────
 	/**
 	 * The `selectConductor` command handler. Detach-first (freeze→clearLocks→teardown→abort), then
-	 * attach the chosen conductor: eager `setLocks` (ADR 0011 consent→baseline), then in-process
-	 * `create()`+`attach(host)` OR spawn (mint token, launch runner, arm a 10s pending-attach guard).
-	 * `id === null` / `"none"` detaches only.
+	 * attach the chosen conductor. `id === null` / `"none"` detaches only.
+	 *
+	 * Fix 2 — TRANSACTIONAL attach: state-mutating lock application happens only at the LAST
+	 * responsible moment, never before we know the conductor is actually going to be live, so a
+	 * failed attach never strands a lock with nothing behind it:
+	 *   - in-process: `create()` and `attach(host)` run FIRST. Either throwing is caught here and
+	 *     treated as a failed select — no lock is ever acquired, nothing is advertised active. Only
+	 *     once attach has genuinely succeeded do we set `active`/`mode`, acquire the eager `setLocks`
+	 *     (ADR 0011 consent→baseline), and fire the P1-6 initial turn-committed — in that order, so the
+	 *     conductor's very first observation of the world already reflects the locked state. `attach`
+	 *     handlers only ever receive EVENTS after they subscribe (never synchronously inside `attach`
+	 *     itself for any shipped conductor), so reordering `setLocks` after `attach` is safe.
+	 *   - spawn: locks are NOT applied here at all. `setLocks` has a real side effect (`Truth.housekeep`
+	 *     can prune/heal folds to fit a shrunk tail) that is not reliably undoable, so engaging it for a
+	 *     runner that may take up to 10s to dial in — or may never dial in, or may fail to spawn at all
+	 *     — risks that irreversible housekeep for a conductor that was never actually live. Locks defer
+	 *     to `acceptConductorSocket`, the moment the runner's socket is actually accepted — see the
+	 *     comment there for why that keeps the accept→locks→snapshot→initial-pass sequencing intact.
 	 */
 	select(id: string | null): void {
 		this.detachActive();
@@ -241,32 +322,52 @@ export class LiveConductorHost implements ConductorHost {
 			this.deps.broadcast({ type: "conductorState", active: null });
 			return;
 		}
-		// Eager lock acquisition — the conductor owns its declared controls the moment it attaches.
-		t.setLocks(entry.locks, entry.label, entry.tailTokens ?? 0);
-		this.active = entry;
+		// A fresh generation for this attach attempt (fix 1 + fix 3 — see the field comments).
+		this.attachGeneration++;
+		const generation = this.attachGeneration;
 		if (entry.kind === "in-process") {
-			this.mode = "in-process";
-			const c = entry.create!();
-			this.inProcessConductor = c;
+			let c: Conductor;
 			try {
-				c.attach(this);
+				c = entry.create!();
 			} catch {
-				/* a throwing attach must not crash select */
+				this.setAndBroadcastStatus(`${entry.label} failed to start.`);
+				this.deps.broadcast({ type: "conductorState", active: null });
+				return;
 			}
+			try {
+				c.attach(this.hostFacade(generation));
+			} catch {
+				// A throwing attach must not crash select, nor leave a half-attached conductor advertised
+				// active with a lock stuck behind it. Best-effort let it clean up its own partial state.
+				try {
+					c.detach();
+				} catch {
+					/* ignore */
+				}
+				this.setAndBroadcastStatus(`${entry.label} failed to attach.`);
+				this.deps.broadcast({ type: "conductorState", active: null });
+				return;
+			}
+			this.mode = "in-process";
+			this.inProcessConductor = c;
+			this.active = entry;
+			// Eager lock acquisition — NOW that attach has actually succeeded, the conductor owns its
+			// declared controls.
+			t.setLocks(entry.locks, entry.label, entry.tailTokens ?? 0);
 			// P1-6: give the freshly attached conductor an immediate pass over the EXISTING state so it
-			// doesn't idle until the next real turn settles. (The remote seam fires its initial
-			// turnCommitted from the extension AFTER the conductor's snapshot is dispatched — see
-			// `fireInitialTurnCommitted`.)
+			// doesn't idle until the next real turn settles, AFTER the locks so this first observation
+			// already reflects the locked state. (The remote seam fires its initial turnCommitted from
+			// the extension AFTER the conductor's snapshot is dispatched — see `fireInitialTurnCommitted`.)
 			this.fireInitialTurnCommitted();
 		} else {
 			this.mode = "spawn";
+			this.active = entry;
 			const token = this.deps.mintToken();
 			this.pendingToken = token;
 			const child = this.deps.spawnRunner(entry.spawn!.entryFile, this.spawnEnvRecord(token));
 			if (!child) {
-				// Runner unavailable — undo the eager attach and report why.
+				// Runner unavailable. Locks were never applied (deferred to accept) — nothing to undo.
 				this.setAndBroadcastStatus(`${entry.label} runner is unavailable on this install.`);
-				t.clearLocks();
 				this.active = null;
 				this.mode = null;
 				this.pendingToken = null;
@@ -291,7 +392,19 @@ export class LiveConductorHost implements ConductorHost {
 		this.deps.broadcast({ type: "conductorState", active: this.activeMeta() });
 	}
 
-	/** Consume the single-use attach token for a dialing spawn runner. Second use is rejected. */
+	/**
+	 * Consume the single-use attach token for a dialing spawn runner. Second use is rejected.
+	 *
+	 * Fix 2(c): the spawn conductor's locks engage HERE — not at `select` — the last responsible
+	 * moment at which the runner is confirmed live. `setLocks` has a real, not-cleanly-undoable side
+	 * effect (`Truth.housekeep` may prune/heal folds to fit a shrunk `tail-size` tail); engaging it at
+	 * `select` for a runner that might take up to 10s to dial in, or never dial in, or fail to spawn at
+	 * all, risked that irreversible housekeep running for a conductor that was never actually live. The
+	 * caller (the extension's WS upgrade handler) sends the `snapshot` and then `fireInitialTurnCommitted`
+	 * immediately after this returns true, so applying locks synchronously here — before either — keeps
+	 * the sequencing accept → locks → snapshot → initial pass, exactly mirroring the in-process ordering
+	 * in `select`.
+	 */
 	acceptConductorSocket(from: unknown, token: string | null): boolean {
 		if (this.mode !== "spawn") return false;
 		if (!this.pendingToken || token !== this.pendingToken) return false;
@@ -301,6 +414,8 @@ export class LiveConductorHost implements ConductorHost {
 			this.pendingAttachTimer = null;
 		}
 		this.conductorSocket = from;
+		const t = this.deps.truth();
+		if (t && this.active) t.setLocks(this.active.locks, this.active.label, this.active.tailTokens ?? 0);
 		return true;
 	}
 
@@ -334,8 +449,11 @@ export class LiveConductorHost implements ConductorHost {
 		} else if (m.type === "cancelComplete" && Number.isSafeInteger((msg as CancelCompleteMessage).reqId)) {
 			// S7: forward the conductor's `complete()` abort to the in-flight completion for this reqId.
 			// An unknown/settled reqId is a no-op (it already resolved, or never existed on this socket).
-			const controller = this.completionsByReqId.get((msg as CancelCompleteMessage).reqId);
-			if (controller) controller.abort();
+			// The generation check (fix 1) is belt-and-suspenders alongside the socket check above: this
+			// socket is already `this.conductorSocket` (the current generation's own), so a mismatch here
+			// would mean some other bookkeeping slipped — refuse to abort a stranger's completion either way.
+			const entry = this.completionsByReqId.get((msg as CancelCompleteMessage).reqId);
+			if (entry && entry.generation === this.attachGeneration) entry.controller.abort();
 		} else if (m.type === "setConductorStatus") {
 			const sm = msg as SetConductorStatusMessage;
 			this.setAndBroadcastStatus(typeof sm.text === "string" ? sm.text : null, sm.metrics);
@@ -498,6 +616,14 @@ export class LiveConductorHost implements ConductorHost {
 	 * The `holdId` doubles as the generation guard: a stale/unknown `holdRelease` (or a timed-out
 	 * hold's late release) never resolves a later hold. `lastHoldMs` is recorded each call; a timeout
 	 * increments `holdTimeouts`.
+	 *
+	 * Fix 4: the IN-PROCESS race now has a THIRD arm — `inProcessHoldRelease` — that `detachActive`
+	 * fires unconditionally (via `releaseHold`, same as the remote path already did through
+	 * `holdWaiter`). Previously a detach mid-hold left this function blocked until the handler's promise
+	 * settled or `holdWireUpToMs` elapsed, even though nothing was listening anymore. A detach that wins
+	 * the race is not a timeout (no `holdTimeouts` bump) — see the `this.active` guard on `lastHoldMs`
+	 * below, which stops a hold that resumes AFTER detach from clobbering the 0 `detachActive` already
+	 * set there (the same "no phantom hold" invariant `detachActive`'s own comment documents).
 	 */
 	async fireWireDepartingAndAwaitHold(): Promise<void> {
 		const t = this.deps.truth();
@@ -513,7 +639,11 @@ export class LiveConductorHost implements ConductorHost {
 			const promises = rets.filter(isThenable);
 			if (promises.length && holdMs > 0) {
 				const timer = timeoutMarker(holdMs);
-				const outcome = await Promise.race([Promise.allSettled(promises).then(() => "settled" as const), timer.promise]);
+				const detached = new Promise<"detached">((resolve) => {
+					this.inProcessHoldRelease = () => resolve("detached");
+				});
+				const outcome = await Promise.race([Promise.allSettled(promises).then(() => "settled" as const), timer.promise, detached]);
+				this.inProcessHoldRelease = null;
 				timer.cancel();
 				if (outcome === "timeout") this.holdTimeoutsValue++;
 			}
@@ -529,7 +659,10 @@ export class LiveConductorHost implements ConductorHost {
 			});
 			if (holdMs > 0 && this.conductorSocket) await this.awaitRemoteHold(holdId, holdMs);
 		}
-		this.lastHoldMsValue = this.deps.now() - start;
+		// A detach mid-hold already reset `lastHoldMs` to 0 (see `detachActive`); if THIS call is what
+		// was suspended when that happened, don't let it resume and clobber that reset with a stale
+		// post-detach duration once the race above settles via `inProcessHoldRelease`/`holdWaiter`.
+		if (this.active) this.lastHoldMsValue = this.deps.now() - start;
 	}
 
 	private awaitRemoteHold(holdId: number, holdMs: number): Promise<void> {
@@ -556,13 +689,25 @@ export class LiveConductorHost implements ConductorHost {
 		w.resolve();
 	}
 
-	/** Unconditionally release any pending wire-departing hold (detach path — unblock a stalled hook). */
+	/**
+	 * Unconditionally release any pending wire-departing hold (detach path — unblock a stalled hook).
+	 * Fix 4: this now covers BOTH the remote hold (`holdWaiter`, pre-existing) and the in-process hold
+	 * (`inProcessHoldRelease`) — previously only the remote path had a detach short-circuit, so
+	 * detaching an in-process conductor mid-hold left `fireWireDepartingAndAwaitHold` blocked for up to
+	 * `holdWireUpToMs` even though nothing was listening anymore.
+	 */
 	private releaseHold(): void {
 		const w = this.holdWaiter;
-		if (!w) return;
-		this.holdWaiter = null;
-		clearTimeout(w.timer);
-		w.resolve();
+		if (w) {
+			this.holdWaiter = null;
+			clearTimeout(w.timer);
+			w.resolve();
+		}
+		if (this.inProcessHoldRelease) {
+			const release = this.inProcessHoldRelease;
+			this.inProcessHoldRelease = null;
+			release();
+		}
 	}
 
 	// ── internals ─────────────────────────────────────────────────────────────────
@@ -580,8 +725,9 @@ export class LiveConductorHost implements ConductorHost {
 
 	private handleCompleteRequest(from: unknown, req: CompleteRequestMessage): void {
 		const controller = new AbortController();
+		const generation = this.attachGeneration; // fix 1: tag this request with ITS generation
 		this.completions.add(controller);
-		this.completionsByReqId.set(req.reqId, controller); // so a `cancelComplete { reqId }` (S7) can abort it
+		this.completionsByReqId.set(req.reqId, { generation, controller }); // so a `cancelComplete { reqId }` (S7) can abort it
 		const cr: CompletionRequest = { prompt: req.prompt, system: req.system, maxOutputTokens: req.maxOutputTokens, model: req.model, signal: controller.signal };
 		// Reply to the ORIGINATING socket, not the currently-active one: a completion resolving after
 		// an A→B conductor swap must route back to the A that asked (a no-op if A is gone), never leak
@@ -603,7 +749,19 @@ export class LiveConductorHost implements ConductorHost {
 			)
 			.finally(() => {
 				this.completions.delete(controller);
-				this.completionsByReqId.delete(req.reqId);
+				// Fix 1 (P1): delete the reqId entry ONLY if it is still THIS request's own — a stale
+				// generation's completion (whose abort a slow/buggy provider call ignored, so it keeps
+				// running after detach) can settle long after a NEWER conductor attached and reused the
+				// same reqId (every spawned SDK numbers its own requests from 1). An unconditional delete
+				// here would wipe the live entry out from under the new generation, so its own
+				// `cancelComplete` would find nothing and the stale spend would run unbounded. The
+				// generation check is redundant with the controller-identity check in practice (a fresh
+				// `AbortController` is minted per request), but keeps the invariant explicit rather than
+				// relying solely on object identity.
+				const stored = this.completionsByReqId.get(req.reqId);
+				if (stored && stored.controller === controller && stored.generation === generation) {
+					this.completionsByReqId.delete(req.reqId);
+				}
 			});
 	}
 
