@@ -434,10 +434,6 @@ export class Truth {
 	foldedTokensOf(b: Block): number {
 		return b.subst !== undefined ? substTokens(b.subst) : digestTokens(b);
 	}
-	messageKeyOf(id: string): string {
-		return messageKey(id);
-	}
-
 	liveTokens(): number {
 		let n = 0;
 		for (const b of this.blockLog) n += this.effTokens(b);

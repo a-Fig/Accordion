@@ -287,8 +287,7 @@ function computeDegradedDropRuns(msgs, groups) {
       if (leadingProblem || adjacencyProblem) {
         degradeStart.add(i);
         stable = false;
-      } else {
-        prevRole = void 0;
+        prevRole = msgs[i].role === "assistant" ? "assistant" : "user";
       }
       i = j;
     }
@@ -653,9 +652,6 @@ var Truth = class _Truth {
   /** The folded-token cost of a block (its digest/subst size). */
   foldedTokensOf(b) {
     return b.subst !== void 0 ? substTokens(b.subst) : digestTokens(b);
-  }
-  messageKeyOf(id) {
-    return messageKey(id);
   }
   liveTokens() {
     let n = 0;

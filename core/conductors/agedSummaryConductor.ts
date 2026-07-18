@@ -429,7 +429,10 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// commits the result against exactly the blocks it summarized, regardless of what the view
 		// looks like when it resolves.
 		const launchedAgedIds = new Set(agedBlocks.map((b) => b.id));
-		const count = agedBlocks.length;
+		// The count preamble claims "N earlier messages" FOLDED — count only blocks eligible for
+		// the group (compaction excludes `user` blocks, which stay live on the wire; counting them
+		// here overstated what the summary replaced).
+		const count = agedBlocks.filter((b) => this.includeInGroup(b)).length;
 
 		const prompt = this.buildPrompt(newlyAged);
 

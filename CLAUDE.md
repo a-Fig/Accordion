@@ -115,7 +115,7 @@ README surfaces:
 
 **Shared contract** (dependency-free, no Svelte — imported by both sides):
 - `core/protocol.ts` — the v15 wire messages (`hello`/`snapshot`/`event`/`telemetry`/`commandResult`/`stream`/`conductorState`/`conductorStatus`/`wireDeparting`/`turnCommitted`/`proposeResult`/`completeResult` server→client; `command`/`resnapshot`/`propose`/`completeRequest`/`setConductorStatus`/`holdRelease`/`cancelComplete` client→server), `WireBlock`, `FoldOp`/`GroupOp`, `PROTOCOL_VERSION`, and the `sanitizeCommand`/`sanitizeOps` ingress validators (v15 added `SnapshotState.carriedSent` — per-id sent-state carried across rebuilds — and per-id `OpResult.perId` outcomes so replicas replay only the ids that actually applied)
-- `core/wire.ts` — `linearize(messages)` and pure `applyPlan(messages, ops)`. `tool_call` is never folded — can never orphan its result. `app/src/lib/live/mapping.ts` is a re-export shim (kept its old name for import-site stability)
+- `core/wire.ts` — `linearize(messages)` and pure `applyPlan(messages, ops)`. `tool_call` is never folded — can never orphan its result. The role-validity floor (`computeDegradedDropRuns`) degrades any drop that would produce a leading non-user or same-role-adjacent wire to a tagged recap; `Truth`'s accounting consumes the same function so the readout can't diverge from the wire
 - `app/src/lib/live/registry.ts` — the **session-discovery** registry: `~/.accordion/` layout and session/focus shapes. Not to be confused with `core/conductor/registry.ts` (the conductor catalog) — same filename, two unrelated files. **The Tauri Rust layer mirrors these constants — change them in lockstep**
 
 **Invariants (don't break):**
