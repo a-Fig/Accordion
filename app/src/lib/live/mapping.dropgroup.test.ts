@@ -1,10 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { applyPlan, type PiMessage } from "./mapping";
-import type { GroupOp } from "./protocol";
+import { applyPlan, type PiMessage } from "$core/wire";
+import type { GroupOp } from "$core/protocol";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// applyPlan — DROP GroupOp (summaryText === null): the run is removed and
-// NO replacement message is inserted.
+// applyPlan — DROP GroupOp (summaryText === null): the run is removed and, when the
+// surrounding roles are already wire-safe, NO replacement message is inserted. When removal
+// would instead leave a non-"user" leading message or weld two same-role survivors together,
+// the role-validity floor DEGRADES the run to a one-message `{#code FOLDED}` recap instead
+// (see `applyPlan`'s doc comment) — this file's `msgs()` fixture alternates user/assistant
+// turns, so dropping an assistant turn between two user turns is exactly that unsafe shape.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function msgs(): PiMessage[] {
@@ -52,20 +56,30 @@ function toolBalance(arr: PiMessage[]): { calls: Set<string>; results: Set<strin
 }
 
 describe("applyPlan — drop group (summaryText: null)", () => {
-	it("removes the run entirely — no replacement message inserted; surrounding messages intact", () => {
-		// Drop the balanced m1+m2 run (2 messages). Message count drops from 7 to 5.
+	it("degraded by the role-validity floor: m0 (user) and m3 (user) would weld together, so a recap is inserted instead of vanishing", () => {
+		// Drop the balanced m1+m2 run (2 messages). m0 and m3 are BOTH "user" — removing the run
+		// verbatim would weld two same-role survivors together, so the floor degrades it to ONE
+		// synthetic recap message. Message count: 7 - 2 dropped + 1 recap = 6.
 		const out = applyPlan(msgs(), [], [G(["a:resp_a:p0", "a:resp_a:p1", "a:resp_a:p2", "r:call_1"])]);
-		expect(out.length).toBe(5); // 7 - 2 = 5
-		// m0 and m3..m6 are untouched
+		expect(out.length).toBe(6); // 7 - 2 + 1 (recap)
+		// m0 is untouched
 		expect(out[0]).toMatchObject({ role: "user" });
 		expect((out[0].content as string)).toBe("fix the bug");
-		// The run's content must not appear anywhere
+		// The run's own content must never ride the wire — only the recap stands in for it
 		const flat = JSON.stringify(out);
 		expect(flat).not.toContain("reading the file");
 		expect(flat).not.toContain("file body");
-		// No summary message with that text either — nothing inserted
-		expect(out.some((m) => Array.isArray(m.content) && (m.content as any[]).some((p: any) => p?.text?.includes("FOLDED")))).toBe(false);
-		// Surrounding messages are intact
+		// The recap sits right after m0, carries the recovery tag, and does not leak the dropped text.
+		// Its role mirrors the dropped run's FIRST message (m1, "assistant") — the same role mapping
+		// an ordinary REPLACE run already uses (Phase B: assistant iff the run started assistant).
+		const recap = out[1];
+		expect(recap.role).toBe("assistant");
+		const recapText = (recap.content as any[])[0].text as string;
+		expect(recapText).toMatch(/^\{#[0-9a-z]{6} FOLDED\}/);
+		// m3 (also "user") survives right after the recap — no same-role weld
+		expect(out[2]).toMatchObject({ role: "user" });
+		expect((out[2].content as string)).toBe("now refactor it");
+		// Surrounding messages stay balanced
 		expect(toolBalance(out).balanced).toBe(true);
 		// call_1 is gone entirely; call_2 remains
 		expect(toolBalance(out).calls).toEqual(new Set(["call_2"]));
@@ -97,12 +111,15 @@ describe("applyPlan — drop group (summaryText: null)", () => {
 		expect(toolBalance(out).balanced).toBe(true);
 	});
 
-	it("a 1-member drop group — that single message is removed", () => {
-		// Drop the standalone user message m3 (u:2000). It has no tool pairs.
+	it("a 1-member drop group — that single message is removed, no recap (valid drop: surrounding roles already differ)", () => {
+		// Drop the standalone user message m3 (u:2000). It has no tool pairs. m2 (toolResult) and
+		// m4 (assistant) are NOT the same role, so removing m3 creates no adjacency problem — the
+		// role-validity floor does not fire, and the run vanishes verbatim (no recap synthesized).
 		const out = applyPlan(msgs(), [], [G(["u:2000"])]);
 		expect(out.length).toBe(msgs().length - 1);
 		const flat = JSON.stringify(out);
 		expect(flat).not.toContain("now refactor it");
+		expect(flat).not.toContain("FOLDED"); // nothing synthesized — a true drop, not a degraded recap
 		expect(toolBalance(out).balanced).toBe(true);
 	});
 
@@ -122,12 +139,18 @@ describe("applyPlan — drop group (summaryText: null)", () => {
 			summaryText: "{#abc FOLDED} refactor done",
 		};
 		const out = applyPlan(msgs(), [], [dropOp, summaryOp]);
-		// m0, [m1+m2 dropped], m3, [m4+m5 → one summary], m6 → 4 messages
-		expect(out.length).toBe(4);
+		// m0 (user) survives, then m3 (user) would directly follow a verbatim drop of m1+m2 — same
+		// role adjacency — so the role-validity floor degrades that run to a recap instead of
+		// vanishing: m0, [m1+m2 → recap], m3, [m4+m5 → one summary], m6 → 5 messages.
+		expect(out.length).toBe(5);
 		const flat = JSON.stringify(out);
 		expect(flat).not.toContain("reading the file");
 		expect(flat).not.toContain("file body");
 		expect(out.some((m) => Array.isArray(m.content) && (m.content as any[]).some((p: any) => p?.text === "{#abc FOLDED} refactor done"))).toBe(true);
+		// The degraded drop's own recap is also present, carrying the recovery tag.
+		expect(out.some((m) => Array.isArray(m.content) && (m.content as any[]).some((p: any) => /^\{#[0-9a-z]{6} FOLDED\}/.test(p?.text ?? "")))).toBe(
+			true,
+		);
 		expect(toolBalance(out).balanced).toBe(true);
 	});
 

@@ -23,6 +23,7 @@
 import type { WireBlock, FoldOp, GroupOp } from "./protocol";
 import type { Block } from "./types";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
+import { foldTag } from "./digest";
 
 // ── Minimal structural types for pi's in-memory AgentMessage ─────────────────
 // (We only model the fields we read; pi owns the real types.)
@@ -199,17 +200,6 @@ export function wireToBlock(w: WireBlock): Block {
 	};
 }
 
-/**
- * Optional out-param for `applyPlan` (additive — omitting it changes nothing). Populated with
- * the counts of ops/groups ACTUALLY applied to the returned messages, as distinct from
- * merely SUBMITTED in the plan: a shape-valid op/group whose id(s) match nothing live in
- * `messages` has zero wire effect and must not be counted (see `applyPlan`'s doc comment).
- */
-export interface AppliedCounts {
-	ops: number;
-	groups: number;
-}
-
 /** The durable block ids a single message emits + its tool-pair callIds (mirrors `linearize`). */
 export interface MsgInfo {
 	ids: string[];
@@ -375,16 +365,156 @@ export function contentFingerprint(m: PiMessage): number {
 	return h >>> 0;
 }
 
+/**
+ * One logical wire message's role + tool-pairing shape (`MsgInfo` plus its wire `role`) — the
+ * exact fields the role-validity floor and Phase A ownership cascade need, abstracted away from
+ * the concrete representation so BOTH `applyPlan` (real `PiMessage[]`) and `Truth`'s group-token
+ * accounting (which only ever holds `Block`s — the GUI/replica never sees pi's live messages) can
+ * build the identical input and land on the identical verdict.
+ *
+ * `role` is the message's RAW role string (e.g. `"user" | "assistant" | "toolResult" | …`) —
+ * deliberately NOT pre-collapsed to just assistant/non-assistant, because the floor below only
+ * does that collapsing at specific points (a synthesized survivor's role vs. a genuine survivor's
+ * own role); a caller that pre-collapsed everything would silently change which messages compare
+ * equal and could mask a real same-role adjacency.
+ */
+export interface WireMsgShape extends MsgInfo {
+	role: string;
+}
+
+/**
+ * The role-validity floor's decision, extracted to ONE function so `applyPlan` and `Truth`'s
+ * group-token accounting can never drift apart. Drift here is not cosmetic: it would mean the
+ * UI's claimed savings lies about what the model actually receives — the one thing this repo
+ * promises never happens (CLAUDE.md). Two things come out:
+ *
+ *   • `owner` — Phase A's message→group cascade (a message may be removed by at most ONE group,
+ *     and only if every tool-call/tool_result pair it holds is fully inside the removal set — see
+ *     the fixpoint below). `applyPlan`'s Phase B needs this to know which messages one group's
+ *     run spans; `Truth` does not (it already has each group's own `memberIds`), so it only reads
+ *     `degradeStart`.
+ *   • `degradeStart` — indices (into `msgs`) of a PURE DROP run (`summaryText === null`) whose
+ *     removal would leave the surviving wire structurally invalid (a non-"user" leading message,
+ *     or two adjacent same-role survivors) and must therefore synthesize a one-message recap
+ *     instead of vanishing (see `applyPlan`'s doc comment for the full rationale).
+ *
+ * Pure function of `msgs`/`groups` — no I/O, no randomness: same shapes in, same verdict out,
+ * on the host AND on a replica that reconstructs `msgs` from its own `Block`s (see
+ * `Truth.degradedRunKeys`).
+ */
+export function computeDegradedDropRuns(
+	msgs: readonly WireMsgShape[],
+	groups: readonly GroupOp[],
+): { owner: (GroupOp | null)[]; degradeStart: Set<number> } {
+	const owner: (GroupOp | null)[] = new Array(msgs.length).fill(null);
+	const degradeStart = new Set<number>();
+	if (!groups.length) return { owner, degradeStart };
+
+	const memberToGroup = new Map<string, GroupOp>();
+	for (const g of groups) for (const id of g.memberIds) if (isDurableId(id)) memberToGroup.set(id, g);
+	// Initial: a message all of whose emitted ids are durable and members of ONE group.
+	for (let i = 0; i < msgs.length; i++) {
+		const info = msgs[i];
+		if (!info.ids.length || info.hasNonDurable) continue;
+		let g: GroupOp | null = null;
+		let ok = true;
+		for (const id of info.ids) {
+			const gg = memberToGroup.get(id);
+			if (!gg || (g && gg !== g)) {
+				ok = false;
+				break;
+			}
+			g = gg;
+		}
+		if (ok && g) owner[i] = g;
+	}
+	// Fixpoint: keep a removal only if its tool pairs are fully inside the removal set.
+	for (let changedSet = true; changedSet; ) {
+		changedSet = false;
+		const calls = new Set<string>();
+		const results = new Set<string>();
+		for (let i = 0; i < msgs.length; i++) {
+			if (!owner[i]) continue;
+			for (const c of msgs[i].calls) calls.add(c);
+			for (const c of msgs[i].results) results.add(c);
+		}
+		for (let i = 0; i < msgs.length; i++) {
+			if (!owner[i]) continue;
+			const info = msgs[i];
+			if (info.calls.some((c) => !results.has(c)) || info.results.some((c) => !calls.has(c))) {
+				owner[i] = null; // straggler: a tool-pair half is outside → keep this message live
+				changedSet = true;
+			}
+		}
+	}
+
+	// ── Role-validity floor ── re-scan left to right until stable: an EARLIER run's verdict can
+	// depend on whether a LATER run also degrades (a degraded run survives as a synthesized
+	// message, changing what "the next survivor's role" is for anything peeking past it), so one
+	// pass is not always enough. `degradeStart` only ever grows, so this always terminates.
+	for (let stable = false; !stable; ) {
+		stable = true;
+		let prevRole: string | undefined; // role of the closest survivor seen so far (undefined = wire start)
+		let i = 0;
+		while (i < msgs.length) {
+			const g = owner[i];
+			if (!g) {
+				prevRole = msgs[i].role;
+				i++;
+				continue;
+			}
+			let j = i + 1;
+			while (j < msgs.length && owner[j] === g) j++;
+			const pureDrop = g.summaryText === null && !degradeStart.has(i);
+			if (!pureDrop) {
+				// A REPLACE run, or a drop already degraded on a prior pass — both survive as
+				// one synthesized message (mirrors Phase B's role mapping exactly).
+				prevRole = msgs[i].role === "assistant" ? "assistant" : "user";
+				i = j;
+				continue;
+			}
+			// Still a pure-drop candidate: peek the next SURVIVING role, skipping over any
+			// further pure-drop runs (from this or another group) so cascaded drops resolve
+			// against whatever actually ends up adjacent.
+			let k = j;
+			let nextRole: string | undefined;
+			while (k < msgs.length) {
+				const g2 = owner[k];
+				if (!g2) {
+					nextRole = msgs[k].role;
+					break;
+				}
+				let kj = k + 1;
+				while (kj < msgs.length && owner[kj] === g2) kj++;
+				if (g2.summaryText === null && !degradeStart.has(k)) {
+					k = kj; // another pure drop — keep looking past it
+					continue;
+				}
+				nextRole = msgs[k].role === "assistant" ? "assistant" : "user";
+				break;
+			}
+			const leadingProblem = prevRole === undefined && nextRole !== undefined && nextRole !== "user";
+			const adjacencyProblem = prevRole !== undefined && prevRole === nextRole;
+			if (leadingProblem || adjacencyProblem) {
+				degradeStart.add(i);
+				stable = false;
+			} else {
+				prevRole = undefined; // the whole run still vanishes — nothing survives from it
+			}
+			i = j;
+		}
+	}
+	return { owner, degradeStart };
+}
+
 /** Apply one message's in-place FoldOps (the original substitution path). Returns the same
  *  message by reference when nothing folds; clones lazily otherwise. `mark()` flags a change.
- *  `onApplied(id)` is called for each op ACTUALLY substituted (not merely present in `byId`) —
- *  an op whose id matches a `tool_call` part (or any non-text/thinking kind) is deliberately
- *  never applied, and an op whose id matches no part at all is never even looked at again after
- *  the `.get()` miss. Both cases must NOT be counted as applied (see `applyPlan`'s `appliedOut`).
- *  The wire trusts the engine's plan: the engine is the single foldability gate and it never
- *  folds a protected block, so no separate wire-side position protection is needed here.
- *  The durable-id + structural guards (kind checks, non-empty digest) remain the safety floor. */
-function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () => void, onApplied: (id: string) => void): PiMessage {
+ *  An op whose id matches a `tool_call` part (or any non-text/thinking kind) is deliberately
+ *  never applied — substituting it would orphan its result. The wire trusts the engine's plan:
+ *  the engine is the single foldability gate and it never folds a protected block, so no
+ *  separate wire-side position protection is needed here. The durable-id + structural guards
+ *  (kind checks, non-empty digest) remain the safety floor. */
+function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () => void): PiMessage {
 	if (m.role === "assistant" && Array.isArray(m.content)) {
 		let parts: PiPart[] | null = null; // lazily cloned only if we actually fold
 		(m.content as PiPart[]).forEach((b, j) => {
@@ -394,13 +524,11 @@ function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () =>
 			if (b?.type === "text") {
 				parts ??= (m.content as PiPart[]).slice();
 				parts[j] = { ...(b as PiTextPart), text: op.digestText };
-				onApplied(id);
 			} else if (b?.type === "thinking") {
 				parts ??= (m.content as PiPart[]).slice();
 				parts[j] = { ...(b as PiThinkingPart), thinking: op.digestText };
-				onApplied(id);
 			}
-			// tool_call or any other kind → ignored (never fold / id mis-map) — NOT applied
+			// tool_call or any other kind → ignored (never fold / id mis-map)
 		});
 		if (parts) {
 			mark();
@@ -413,7 +541,6 @@ function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () =>
 		const op = byId.get(id);
 		if (op && op.digestText) {
 			mark();
-			onApplied(id);
 			return { ...m, content: [{ type: "text", text: op.digestText }] };
 		}
 		return m;
@@ -443,26 +570,50 @@ function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () =>
  *     The wire trusts the engine's plan: the engine is the single foldability gate and never
  *     folds a protected block, so no separate wire-side position backstop is needed.
  *     Each maximal run of same-group removable messages becomes one message (role = the
- *     run's first message's role, mapped to user/assistant; content = the summary text).
+ *     run's first message's role, mapped to user/assistant; content = the summary text) —
+ *     UNLESS `summaryText === null` (DROP: consume the run, push nothing), subject to the
+ *     role-validity floor immediately below.
+ *
+ * ── Role-validity floor (P3, review-confirmed; ADR 0006 named this as an open watch item) ──
+ * A DROP run pushes NOTHING onto the wire, so it can silently build a message array a provider
+ * rejects: (a) if the run sits at the very front of the surviving wire, the first message left
+ * may not be `role: "user"` (Anthropic requires `messages[0].role === "user"`); (b) if it sits
+ * between two survivors of the SAME role, removing it welds them into an adjacent same-role
+ * pair (`user_k` directly followed by `user_k+1`) that some providers reject or mis-merge. This
+ * floor is unconditional: it runs for every caller (conductor, GUI command, replica), not just
+ * Thermocline's stratum drops — the same shape a raw GUI command can send.
+ *
+ * The repair DEGRADES the offending run from a true drop to a one-message recap — the same
+ * shape as the `summary: undefined` default-recap (the `Group.digest` three-state contract:
+ * undefined → recap, null/"" → drop, string → verbatim), just synthesized HERE instead of by
+ * `Truth.groupSummary` (which needs `Block[]`; this function only has `PiMessage[]`). The
+ * recap's role follows the exact mapping an ordinary REPLACE run already uses (`assistant` if
+ * the run's first message was `assistant`, else `user`), and its tag is `foldTag(g.id)` — the
+ * IDENTICAL code `resolveUnfold` already matches against `truth.groups` (a drop group is a
+ * folded `Group` too), so an agent that unfolds this recap genuinely restores the group (Truth
+ * flips `folded:false`; the next `serializeWire` stops dropping it) — no new plumbing needed.
+ *
+ * REJECTED ALTERNATIVE: refuse to drop just the run's boundary message (keep it live in place)
+ * instead of synthesizing a recap. Simpler, but it cascades: if that boundary message holds one
+ * half of a tool-call/tool_result pair whose OTHER half is deeper in the same run, keeping it
+ * live orphans the pair, forcing the tool-pair fixpoint above to un-own the rest of the run too
+ * — a small balanced-pair run can unwind to a complete no-op just to keep one message alive. The
+ * recap avoids this: the WHOLE run (calls and results alike) is still removed exactly as Phase A
+ * decided; only what Phase B EMITS in its place changes, so it can never re-open an orphan.
+ *
+ * ACCOUNTING (`core/truth.ts`): `Truth.groupLiveTokens` charges a DROP group's collapsed run(s)
+ * per-RUN, not a single 0-for-everything shortcut, precisely BECAUSE this floor can degrade one
+ * run of a group while its siblings still vanish for free. `Truth.degradedRunKeys` reconstructs
+ * `WireMsgShape[]` from its own `Block` log and feeds the SAME `computeDegradedDropRuns` this
+ * function calls below — the identical decision, not a re-derived approximation — so the GUI's
+ * live-token readout matches what the model actually receives even for a degraded run.
  *
  * On ANY doubt a message passes through untouched; the output is never structurally invalid
- * (no orphaned tool pair, no emptied message). Safe because this output feeds the model only
- * — the GUI's block sync/cursor run off the un-collapsed `linearize`, so removals never
- * desync the view (ADR 0006 §4).
- *
- * `appliedOut` (optional, additive — every pre-existing caller omits it and is unaffected) is
- * populated with the counts ACTUALLY applied, as opposed to merely SUBMITTED: a shape-valid
- * `FoldOp`/`GroupOp` whose id(s) match nothing in `messages` (e.g. a stale plan re-applied on
- * timeout against messages that have since moved on) has zero effect here and must not be
- * counted as applied — callers (the extension's plan-applied ack, ADR 0020) promise counts of
- * what actually rode the wire, not what the plan merely asked for.
+ * (no orphaned tool pair, no emptied message, no role-invalid leading or adjacent message). Safe
+ * because this output feeds the model only — the GUI's block sync/cursor run off the
+ * un-collapsed `linearize`, so removals never desync the view (ADR 0006 §4).
  */
-export function applyPlan(
-	messages: PiMessage[],
-	ops: FoldOp[],
-	groups: GroupOp[] = [],
-	appliedOut?: AppliedCounts,
-): PiMessage[] {
+export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[] = []): PiMessage[] {
 	// Defense in depth (matches the GUI's `computeFoldOps`/`computeGroupOps`): refuse any op
 	// whose id is NOT durable or whose digest is empty, and any group with no summary/members.
 	// This is the shared safety boundary on the path that feeds the real model, so it cannot
@@ -483,66 +634,21 @@ export function applyPlan(
 			g.memberIds.every((m) => typeof m === "string") &&
 			(g.summaryText === null || (typeof g.summaryText === "string" && g.summaryText.trim())),
 	);
-	if (!safeOps.length && !safeGroups.length) {
-		if (appliedOut) { appliedOut.ops = 0; appliedOut.groups = 0; }
-		return messages;
-	}
+	if (!safeOps.length && !safeGroups.length) return messages;
 
 	const byId = new Map(safeOps.map((o) => [o.id, o] as const));
-	// Ids ACTUALLY substituted by foldOne (a subset of byId's keys: an id present in the plan
-	// but matching no part in `messages`, or matching a non-foldable part kind like tool_call,
-	// is never added here). Size = the real applied-ops count for `appliedOut`.
-	const appliedOpIds = new Set<string>();
 
-	// ── Phase A: decide which whole messages each group may remove ───────────────
-	const owner: (GroupOp | null)[] = new Array(messages.length).fill(null);
-	if (safeGroups.length) {
-		const memberToGroup = new Map<string, GroupOp>();
-		for (const g of safeGroups) for (const id of g.memberIds) if (isDurableId(id)) memberToGroup.set(id, g);
-		const infos = messages.map((m, i) => messageInfo(m, i));
-		// Initial: a message all of whose emitted ids are durable and members of ONE group.
-		// The wire trusts the engine's plan (the engine never folds a protected block), so
-		// no position-based backstop is applied here.
-		for (let i = 0; i < messages.length; i++) {
-			const info = infos[i];
-			if (!info.ids.length || info.hasNonDurable) continue;
-			let g: GroupOp | null = null;
-			let ok = true;
-			for (const id of info.ids) {
-				const gg = memberToGroup.get(id);
-				if (!gg || (g && gg !== g)) {
-					ok = false;
-					break;
-				}
-				g = gg;
-			}
-			if (ok && g) owner[i] = g;
-		}
-		// Fixpoint: keep a removal only if its tool pairs are fully inside the removal set.
-		for (let changedSet = true; changedSet; ) {
-			changedSet = false;
-			const calls = new Set<string>();
-			const results = new Set<string>();
-			for (let i = 0; i < messages.length; i++) {
-				if (!owner[i]) continue;
-				for (const c of infos[i].calls) calls.add(c);
-				for (const c of infos[i].results) results.add(c);
-			}
-			for (let i = 0; i < messages.length; i++) {
-				if (!owner[i]) continue;
-				const info = infos[i];
-				if (info.calls.some((c) => !results.has(c)) || info.results.some((c) => !calls.has(c))) {
-					owner[i] = null; // straggler: a tool-pair half is outside → keep this message live
-					changedSet = true;
-				}
-			}
-		}
-	}
-	// Groups ACTUALLY applied: a safe (shape-valid) group whose member ids matched no message
-	// (or lost every member to the straggler fixpoint above) never appears in `owner` and must
-	// not be counted — only groups that own at least one surviving message really changed output.
-	const appliedGroups = new Set<GroupOp>();
-	for (const g of owner) if (g) appliedGroups.add(g);
+	// ── Phase A: decide which whole messages each group may remove, AND which resulting runs
+	// the role-validity floor must degrade to a recap — both computed by ONE shared function so
+	// `Truth`'s accounting can call the identical decision (see `computeDegradedDropRuns`'s doc
+	// comment). Building `WireMsgShape[]` costs a `messageInfo` call per message, so it stays
+	// gated behind `safeGroups.length` exactly like the inline computation it replaces.
+	const { owner, degradeStart } = safeGroups.length
+		? computeDegradedDropRuns(
+				messages.map((m, i): WireMsgShape => ({ ...messageInfo(m, i), role: m.role })),
+				safeGroups,
+			)
+		: { owner: new Array<GroupOp | null>(messages.length).fill(null), degradeStart: new Set<number>() };
 
 	// ── Phase B: build the output — collapse runs, fold survivors in place ────────
 	let changed = false;
@@ -557,25 +663,40 @@ export function applyPlan(
 			// an interior straggler yields one entry per run (same group object, same decision).
 			let j = i + 1;
 			while (j < messages.length && owner[j] === g) j++;
-			if (g.summaryText === null) {
+			if (g.summaryText === null && !degradeStart.has(i)) {
 				// DROP: consume the run and push nothing — the agent never sees these messages.
 				changed = true;
 			} else {
-				// REPLACE: insert ONE synthetic summary message (existing behavior).
+				// REPLACE (existing behavior), OR a DROP degraded by the role-validity floor:
+				// insert ONE synthetic message so the wire never starts non-"user" or welds two
+				// same-role survivors together.
 				const role = messages[i].role === "assistant" ? "assistant" : "user";
-				out.push({ role, content: [{ type: "text", text: g.summaryText }] } as PiMessage);
+				const text = g.summaryText !== null ? g.summaryText : roleFloorRecap(g.id, j - i);
+				out.push({ role, content: [{ type: "text", text }] } as PiMessage);
 				changed = true;
 			}
 			i = j;
 			continue;
 		}
-		out.push(foldOne(messages[i], i, byId, mark, (id) => appliedOpIds.add(id)));
+		out.push(foldOne(messages[i], i, byId, mark));
 		i++;
 	}
 
-	if (appliedOut) {
-		appliedOut.ops = appliedOpIds.size;
-		appliedOut.groups = appliedGroups.size;
-	}
 	return changed ? out : messages;
+}
+
+/**
+ * The role-validity floor's fallback recap for a DROP run it had to degrade (see `applyPlan`'s
+ * doc comment). Same `{#code FOLDED}` tag convention as a real group summary, and the SAME code
+ * (`foldTag(groupId)`) — so an agent `unfold` of it hits the real group via `resolveUnfold`'s
+ * existing `foldCode(g.id) === code` match (a drop group is a folded `Group` too) and genuinely
+ * restores it. No new recall/unfold plumbing needed; this just reuses the existing group path.
+ *
+ * Exported (not just used by `applyPlan`) so `Truth.groupLiveTokens` can estimate a degraded
+ * run's REAL wire cost from the EXACT text the wire will emit, rather than duplicating this
+ * string format and risking the two silently drifting apart. Takes a bare `groupId: string`
+ * (not a whole `GroupOp`/`Group`) so either caller's own group shape works with no coupling.
+ */
+export function roleFloorRecap(groupId: string, runLength: number): string {
+	return `${foldTag(groupId)} group · ${runLength} message${runLength === 1 ? "" : "s"} dropped (kept live as a stub for wire validity)`;
 }
