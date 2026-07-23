@@ -300,8 +300,12 @@ holes:
 - **Stale-invalid recovery**: a file that exists but is *invalid* and whose mtime is older than 10s
   (no legitimate writer holds it invalid for anywhere near that long) is treated as a crash artifact,
   unlinked, and re-created — two extensions both recovering converge via the link/`EEXIST` primitive
-  rather than fighting. The retry budget (~22s) deliberately exceeds the staleness threshold, so a
-  young invalid file always ages into reapability within the budget.
+  rather than fighting; a re-stat/re-validate immediately before the unlink shrinks the reap-vs-
+  recreate TOCTOU to microseconds (the residual is accepted). The retry budget (~22s) deliberately
+  exceeds the staleness threshold, so a young invalid file always ages into reapability within the
+  budget. The mtime threshold assumes `~/.accordion` lives on a **local filesystem** (the norm for a
+  home directory) — writer/reader clock skew enters only on network mounts, which are outside the
+  door's supported layout.
 - **The door is gated on a valid secret**: `tryBindDoor` refuses to bind (and `/accordion` never
   prints the door URL) while the secret is unresolved; the retry timer re-kicks the bind the moment
   it resolves. A door with no bearer to serve is never up.

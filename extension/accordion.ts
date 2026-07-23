@@ -432,6 +432,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	let doorRetryTimer: ReturnType<typeof setTimeout> | null = null; // slow re-attempt while an Accordion door holds it
 	let doorSecretRetryTimer: ReturnType<typeof setTimeout> | null = null; // re-attempt the secret ensure (absent/invalid file)
 	let doorSecretTries = 0;   // bounded retry counter for the secret ensure (DOOR_SECRET_MAX_TRIES)
+	let doorSecretGaveUp = false; // exhaustion warned once (parity with the foreign-occupant warn)
 
 	// -- the controller lease (ADR 0024) --
 	// In-memory view of the GLOBAL controller.json lease, kept current by our own claim writes and a
@@ -1369,6 +1370,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			const st = fs.statSync(DOOR_SECRET_PATH);
 			if (Date.now() - st.mtimeMs <= DOOR_SECRET_STALE_MS) return;
 			if (readValidDoorSecret() !== null) return; // valid -- never reap a good secret
+			// Decision made: stale + invalid. Re-stat + re-validate IMMEDIATELY before the unlink to
+			// shrink the TOCTOU against a racer that reaped + re-created a VALID file inside our gap --
+			// a fresh mtime or now-valid content means a racer just acted, so stand down. The residual
+			// window is now just validate->unlink (microseconds) and remains accepted (ADR 0024 par. 8).
+			const again = fs.statSync(DOOR_SECRET_PATH);
+			if (Date.now() - again.mtimeMs <= DOOR_SECRET_STALE_MS) return;
+			if (readValidDoorSecret() !== null) return;
 			fs.unlinkSync(DOOR_SECRET_PATH);
 		} catch {
 			/* absent or unreadable -- nothing to reap */
@@ -1394,7 +1402,16 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			if (again !== null) doorSecret = again;
 		}
 		if (doorSecret) { doorSecretTries = 0; return; }
-		if (doorSecretRetryTimer || doorSecretTries >= DOOR_SECRET_MAX_TRIES) return;
+		if (doorSecretRetryTimer) return;
+		if (doorSecretTries >= DOOR_SECRET_MAX_TRIES) {
+			// P3: exhaustion must not be silent (parity with the foreign-occupant warn). One line, once:
+			// e.g. a persistently-invalid file we may not unlink, or EACCES on every create attempt.
+			if (!doorSecretGaveUp) {
+				doorSecretGaveUp = true;
+				console.warn(`[accordion] door secret could not be created or read after ${DOOR_SECRET_MAX_TRIES} attempts (${DOOR_SECRET_PATH}); the stable door URL is unavailable this run`);
+			}
+			return;
+		}
 		doorSecretTries++;
 		doorSecretRetryTimer = setTimeout(() => {
 			doorSecretRetryTimer = null;
@@ -1555,6 +1572,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (doorRetryTimer) { clearTimeout(doorRetryTimer); doorRetryTimer = null; }
 		if (doorSecretRetryTimer) { clearTimeout(doorSecretRetryTimer); doorSecretRetryTimer = null; }
 		doorSecretTries = 0;
+		doorSecretGaveUp = false;
 		try { doorWss?.close(); } catch { /* ignore */ }
 		try { doorServer?.close(); } catch { /* ignore */ }
 		doorServer = null; doorWss = null; doorHeld = false; doorBinding = false;
