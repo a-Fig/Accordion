@@ -58,6 +58,7 @@ import { REGISTRY_PROTOCOL, type SessionEntry } from "./registry";
 import { live as liveConn } from "./liveClient.svelte";
 import { PROTOCOL_VERSION } from "$core/protocol";
 import { session } from "../session.svelte";
+import { servedToken } from "./servedToken";
 
 const POLL_MS = 1000;
 
@@ -77,16 +78,16 @@ let _polling = false;
 let _consecutiveFailures = 0;
 
 /**
- * Read the per-session token the page was opened with (`/?token=...` — see +page.svelte's
- * `readServedToken()`, which does the same lookup for the WS dial). The poll fetch relies on
- * the ambient `accordion_token` cookie by default, but that cookie is shared per-origin: if a
- * sibling session's tab (or a reload) mints a DIFFERENT session's cookie on the same origin,
- * this tab's cookie gets clobbered and the poll starts 403ing. Forwarding the URL token as a
- * query param survives that — the server accepts either (see accordion.ts's isWebAuthed).
+ * The per-session token the page was opened with (`/?token=...`). The poll fetch relies on the
+ * ambient `accordion_token` cookie by default, but that cookie is shared per-origin: if a sibling
+ * session's tab (or a reload) mints a DIFFERENT session's cookie on the same origin, this tab's cookie
+ * gets clobbered and the poll starts 403ing. Forwarding the token as a query param survives that — the
+ * server accepts either (see accordion.ts's isWebAuthed). Read via the shared `servedToken()` (which
+ * captures it ONCE and scrubs it from the address bar — S1b) so forwarding keeps working AFTER the
+ * strip; the WS dial (+page.svelte's `readServedToken()`) reads the same memoized value.
  */
 function urlToken(): string | null {
-	if (typeof window === "undefined") return null;
-	return new URLSearchParams(window.location.search).get("token");
+	return servedToken();
 }
 
 /**
