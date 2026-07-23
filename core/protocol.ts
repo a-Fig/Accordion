@@ -663,11 +663,11 @@ export const MAX_SURFACE_ID_LEN = 64;
 export const MAX_SURFACE_LABEL_LEN = 48;
 
 /**
- * Validate + clamp a surface-id dial param (v16, ADR 0024). Each surface mints a persistent UUID in
- * localStorage and sends it as `?surface=`; this is the SAME "authorized ≠ well-formed" ingress gate
+ * Validate + clamp a surface-id dial param (v16, ADR 0024). Each surface mints a per-tab UUID in
+ * sessionStorage and sends it as `?surface=`; this is the SAME "authorized ≠ well-formed" ingress gate
  * `sanitizeCommand` is — a malformed/hostile value must never reach the `controller.json` lease file
  * or a `controller` broadcast. Accept only a bounded `[A-Za-z0-9._-]` token (covers a UUID and any
- * reasonable persistent id); anything else → `null` (the socket is then treated as having no
+ * reasonable surface id); anything else → `null` (the socket is then treated as having no
  * identity and can never hold the lease).
  */
 export function sanitizeSurfaceId(v: unknown): string | null {

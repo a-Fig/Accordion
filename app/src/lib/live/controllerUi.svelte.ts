@@ -51,8 +51,7 @@ export function someoneElseControls(info: ControllerInfo | null, mySurfaceId: st
 const POPUP_SEEN_KEY = "accordion_takeover_popup_seen";
 
 // Read through `window.sessionStorage` (not the bare global) — the same seam `mySurfaceId()`
-// uses for `localStorage` in liveClient.svelte.ts, so tests shim `globalThis.window` once and
-// both modules pick it up identically.
+// uses (surfaceId.ts), so tests shim `globalThis.window` once and both modules pick it up identically.
 function sessionFlagSet(key: string): boolean {
 	try {
 		return typeof window !== "undefined" && window.sessionStorage?.getItem(key) === "1";

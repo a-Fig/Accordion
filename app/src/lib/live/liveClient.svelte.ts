@@ -30,6 +30,11 @@ import {
 } from "$core/protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import { evaluateHelloController, noteControllerBroadcast, flashBlockedHintCenter, resetControllerUi, someoneElseControls } from "./controllerUi.svelte";
+import { mySurfaceId, markSurfaceDialed } from "./surfaceId";
+
+// Re-export so existing importers keep a stable path (`mySurfaceId` moved to surfaceId.ts to add the
+// sessionStorage + BroadcastChannel-dedupe machinery without bloating this module — ADR 0024 §5).
+export { mySurfaceId };
 
 let socket: WebSocket | null = null;
 let manualClose = false;
@@ -108,27 +113,8 @@ export const conductorStatus = $state<{ text: string | null; metrics?: Record<st
  */
 export const controllerState = $state<{ info: ControllerInfo | null }>({ info: null });
 
-const SURFACE_ID_KEY = "accordion_surface_id";
-
-/** This surface's persistent id (a UUID minted once in localStorage; stable across reloads). The
- *  Tauri webview uses localStorage too, so both surfaces get a durable id. Falls back to a volatile
- *  id when storage is unavailable (SSR / private mode) — such a surface simply can't hold the lease
- *  across reloads, which is acceptable. */
-export function mySurfaceId(): string {
-	if (typeof window === "undefined") return "ephemeral";
-	try {
-		let id = window.localStorage.getItem(SURFACE_ID_KEY);
-		if (!id) {
-			id = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-				? crypto.randomUUID()
-				: `s-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-			window.localStorage.setItem(SURFACE_ID_KEY, id);
-		}
-		return id;
-	} catch {
-		return "ephemeral";
-	}
-}
+/** This surface's per-tab id (sessionStorage-backed, with a duplicate-tab BroadcastChannel dedupe
+ *  guard) lives in `surfaceId.ts` and is re-exported above. */
 
 /** This surface's human label: "Desktop app" (Tauri) or "Browser tab" (served page). */
 export function mySurfaceLabel(): string {
@@ -287,7 +273,10 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 	// also recognizes exact-origin cookies and verified sibling Accordion Origins.
 	const host = opts.host ?? "127.0.0.1";
 	// v16 (ADR 0024): always carry this surface's identity so the host knows who is connecting for the
-	// single-controller lease; the token (when present) rides the same query string.
+	// single-controller lease; the token (when present) rides the same query string. Marking the
+	// surface "dialed" here FREEZES its id — from this point the duplicate-tab dedupe never re-mints
+	// it out from under a live connection (surfaceId.ts).
+	markSurfaceDialed();
 	const params = new URLSearchParams();
 	if (opts.token) params.set("token", opts.token);
 	params.set("surface", mySurfaceId());

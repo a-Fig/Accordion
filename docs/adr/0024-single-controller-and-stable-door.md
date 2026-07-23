@@ -113,11 +113,24 @@ write-rename pattern every other registry file uses (`writeControllerLease`, `ac
 write to a `.tmp` sibling, then rename over the destination, so no reader ever observes a half-written
 lease.
 
-- **Surface identity.** Each client surface mints a persistent UUID (`localStorage`) plus a human
-  label ("Desktop app" / "Browser tab") and sends both as `?surface=`/`?label=` dial params, which
-  the extension sanitizes at connect (`sanitizeSurfaceId`/`sanitizeSurfaceLabel`,
-  `core/protocol.ts:673-697` — bounded charset/length; a socket with no valid surface id can never
-  hold the lease at all). The `label` is **display-only** — it names the current controller in the
+- **Surface identity.** Each client surface mints a **per-tab** UUID in **`sessionStorage`** (not
+  `localStorage`) plus a human label ("Desktop app" / "Browser tab") and sends both as
+  `?surface=`/`?label=` dial params, which the extension sanitizes at connect
+  (`sanitizeSurfaceId`/`sanitizeSurfaceLabel`, `core/protocol.ts:673-697` — bounded charset/length; a
+  socket with no valid surface id can never hold the lease at all). `sessionStorage`, not
+  `localStorage`, is deliberate and load-bearing: the door (§7) collapses every surface onto one
+  fixed origin, so a `localStorage` id — shared across all same-origin tabs — would give two door
+  tabs the **same** surface id, and both would render steerable and both would pass `isControllerSocket`
+  (§6), defeating the whole arbitration. `sessionStorage` is per-tab, so two door tabs get distinct
+  ids. It survives a tab's own reloads (so a controller that reloads reclaims its own lease); a
+  tab that is closed and reopened is a **new** surface by design. Browsers copy `sessionStorage` on
+  tab-**duplicate**, which would recreate the shared-id hole, so on startup — before a surface dials
+  — it announces its id on a `BroadcastChannel` ("accordion-surface-id") and briefly listens: any
+  other live context that already owns the id answers "in-use", and the not-yet-dialed newcomer
+  re-mints a fresh id into its own `sessionStorage`. An established/dialed context never re-mints (it
+  defends its id); the whole guard is failure-open (no `BroadcastChannel` support / any error ⇒
+  proceed with the `sessionStorage` id). See `app/src/lib/live/surfaceId.ts`. The `label` is
+  **display-only** — it names the current controller in the
   READ-ONLY chip and the takeover copy and is **never an authorization input**. A spoofed label is
   therefore purely cosmetic: it cannot grant or deny control (only the `surfaceId` plus the
   fresh-lease check gate anything), and it is sanitized (charset/length + control-char stripping,
@@ -157,6 +170,15 @@ lease.
   no client is ever told the lease went stale (no clearing frame). The escape hatch — TAKE CONTROL is
   always one unconditional click (§4) — is deemed sufficient, and a background "the controller went
   quiet, promote myself" path is deliberately not built.
+  - **Micro-edge, accepted:** because the surface id is per-tab `sessionStorage`, closing the
+    controller tab and reopening it *within* the 6s staleness window arrives as a **new** surface
+    while the old lease is still fresh — so another already-open surface briefly shows the contested
+    takeover popup naming a now-dead tab. One click of **TAKE CONTROL** resolves it. We chose this
+    over server-side stale-stamping the lease on socket disconnect, which would have to distinguish
+    "the controller tab really went away" from "the controller is mid-session-switch, dialing a
+    different session's extension" — and getting that wrong risks clobbering a fresh lease the very
+    surface just re-established. A one-click resolution of a rare, self-inflicted micro-edge is the
+    better trade than a disconnect-time write that can stomp a legitimate hand-off.
 
 ### 6. Enforcement lives at the WS command ingress, not inside `Truth`
 

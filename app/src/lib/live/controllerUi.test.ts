@@ -33,8 +33,8 @@ function info(over: Partial<ControllerInfo> = {}): ControllerInfo {
 }
 
 /** A minimal in-memory Storage stand-in — vitest's "node" environment has no real
- *  `sessionStorage`, and the module reads it via `window.sessionStorage` (see liveClient.svelte.ts's
- *  `mySurfaceId()` for the same convention with `localStorage`). */
+ *  `sessionStorage`, and the module reads it via `window.sessionStorage` (see surfaceId.ts's
+ *  `mySurfaceId()` for the same sessionStorage convention). */
 function fakeStorage(): Storage {
 	const m = new Map<string, string>();
 	return {

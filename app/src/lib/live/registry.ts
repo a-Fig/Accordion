@@ -113,7 +113,7 @@ export interface FocusRequest {
 export interface ControllerLease {
 	/** REGISTRY_PROTOCOL at write time — the reader rejects mismatches. */
 	registryProtocol: number;
-	/** The controlling surface's persistent id (a UUID minted in localStorage). */
+	/** The controlling surface's per-tab id (a UUID minted in sessionStorage; see surfaceId.ts). */
 	surfaceId: string;
 	/** Human label for the controlling surface, e.g. "Desktop app" / "Browser tab". */
 	label: string;
