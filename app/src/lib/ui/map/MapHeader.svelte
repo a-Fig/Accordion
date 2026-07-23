@@ -5,10 +5,35 @@
 	import EditableNumber from "$lib/ui/EditableNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import { folding } from "$lib/live/folding.svelte";
-	import { live, setArmed, conductorState, conductorStatus } from "$lib/live/liveClient.svelte";
+	import { live, setArmed, conductorState, conductorStatus, controllerState, isController, claimController } from "$lib/live/liveClient.svelte";
+	import { attemptSteer, flashBlockedHint, readOnlyTip } from "$lib/live/controllerUi.svelte";
 	import ConductorMenu from "./ConductorMenu.svelte";
 
 	let { store, readOnly = false }: { store: AccordionStore; readOnly?: boolean } = $props();
+
+	// ── single-controller READ-ONLY gate (v16, ADR 0024, spec Part 3) ──
+	// Distinct from the `readOnly` prop above (that one is the CC-transcript / orphaned-wire badge —
+	// untouched by this feature). This is "live and steerable in principle, but SOME OTHER surface
+	// currently holds the lease" — the "whisper" treatment: steering controls dim, a chip names the
+	// actual controller, and TAKE CONTROL is always one click away.
+	const notController = $derived(live.status === "connected" && !isController());
+	const controllerLabel = $derived(controllerState.info?.label ?? "");
+	// Exactly the two spec-approved chip strings — "another tab" disambiguates when THIS surface is
+	// also a browser tab (saying "browser tab steers" would be ambiguous about which one).
+	const chipSuffix = $derived(controllerLabel === "Desktop app" ? "DESKTOP APP STEERS" : "ANOTHER TAB STEERS");
+	const readOnlyChipTitle = $derived(
+		controllerLabel ? `${controllerLabel} holds the controls — every other surface is a live mirror` : "Another surface holds the controls",
+	);
+	// Element-anchored fallback for a blocked interaction with no natural pointer coordinates
+	// (an EditableNumber commit via Enter/blur, a keyboard nudge) — anchors the hint under the
+	// control itself rather than at (0,0).
+	function anchorOf(el: HTMLElement | undefined): { x: number; y: number } {
+		if (!el) return { x: 0, y: 0 };
+		const r = el.getBoundingClientRect();
+		return { x: r.left + r.width / 2, y: r.bottom };
+	}
+	let budgetFieldEl = $state<HTMLDivElement>();
+	let protectFieldEl = $state<HTMLDivElement>();
 
 	const LADDER: { kind: BlockKind; label: string }[] = [
 		{ kind: "tool_result", label: "tool results" },
@@ -150,6 +175,10 @@
 	}
 	function onProtPointerDown(e: PointerEvent) {
 		if (tailLocked) return; // tail-size locked by the active strategy — the handle is inert
+		if (notController) {
+			flashBlockedHint("steer", e.clientX, e.clientY);
+			return; // read-only — never even start the drag
+		}
 		e.preventDefault();
 		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 		dragTokens = protectFromClientX(e.clientX); // visual only — no refold yet
@@ -172,7 +201,11 @@
 		else if (e.key === "End") v = PROT_MAX;
 		else return;
 		e.preventDefault();
-		store.setProtect(Math.max(0, Math.min(PROT_MAX, v)));
+		const target = Math.max(0, Math.min(PROT_MAX, v));
+		attemptSteer(
+			{ live: true, isController: !notController, verb: "steer", ...anchorOf(protectFieldEl) },
+			() => store.setProtect(target),
+		);
 	}
 </script>
 
@@ -212,12 +245,16 @@
 				<button
 					class="fold-arm"
 					class:on={folding.enabled}
+					class:ro-dim={notController}
 					aria-pressed={folding.enabled}
+					aria-disabled={notController}
 					aria-label="Apply folds to the live agent"
-					title={folding.enabled
-						? "Accordion is applying folds to the live agent's context. Takes effect on the agent's next turn."
-						: "Folds are previewed in the view only. The agent's context is unchanged."}
-					onclick={() => setArmed(!folding.enabled)}
+					title={notController
+						? readOnlyTip("arm")
+						: folding.enabled
+							? "Accordion is applying folds to the live agent's context. Takes effect on the agent's next turn."
+							: "Folds are previewed in the view only. The agent's context is unchanged."}
+					onclick={(e) => attemptSteer({ live: true, isController: !notController, verb: "arm", x: e.clientX, y: e.clientY }, () => setArmed(!folding.enabled))}
 				>
 					<span class="fold-arm-dot" aria-hidden="true"></span>
 					<span class="fold-arm-eyebrow mono">FOLDING</span>
@@ -281,10 +318,14 @@
 			<div
 				class="ctl-field protect-read"
 				class:ctl-locked={tailLocked}
-				aria-disabled={tailLocked}
+				class:ro-dim={notController && !tailLocked}
+				aria-disabled={tailLocked || notController}
+				bind:this={protectFieldEl}
 				title={tailLocked
 					? lockTip + ` (the active strategy now owns the tail — enforcing ${fmt(protectTarget)} tokens)`
-					: `Actual protected tail: ${fmt(store.protectedTokens)} tokens; target: ${fmt(store.protectTokens)} tokens — click the value or drag the handle to change it`}
+					: notController
+						? readOnlyTip("steer")
+						: `Actual protected tail: ${fmt(store.protectedTokens)} tokens; target: ${fmt(store.protectTokens)} tokens — click the value or drag the handle to change it`}
 			>
 				<span class="ctl-eyebrow mono">
 					<Icon name="lock" size={10} />
@@ -299,7 +340,11 @@
 							value={store.protectTokens}
 							format={k}
 							label="Protected tail target in thousands of tokens"
-							oncommit={(n) => store.setProtect(Math.max(0, Math.min(PROT_MAX, n)))}
+							oncommit={(n) =>
+								attemptSteer(
+									{ live: true, isController: !notController, verb: "steer", ...anchorOf(protectFieldEl) },
+									() => store.setProtect(Math.max(0, Math.min(PROT_MAX, n))),
+								)}
 						/>
 					{/if}
 					{#if Math.abs(store.protectedTokens - protectTarget) > 500}
@@ -309,7 +354,7 @@
 			</div>
 
 			<!-- Budget: eyebrow + editable mono value + fill slider. -->
-			<div class="ctl-field knob">
+			<div class="ctl-field knob" class:ro-dim={notController} aria-disabled={notController} bind:this={budgetFieldEl} title={notController ? readOnlyTip("set budget") : undefined}>
 				<span class="ctl-eyebrow mono">
 					<Icon name="target" size={10} />
 					BUDGET
@@ -319,7 +364,11 @@
 						value={store.budget}
 						format={k}
 						label="Context budget in thousands of tokens"
-						oncommit={(n) => store.setBudget(Math.max(BUDGET_MIN, Math.min(budgetMax, n)))}
+						oncommit={(n) =>
+							attemptSteer(
+								{ live: true, isController: !notController, verb: "set budget", ...anchorOf(budgetFieldEl) },
+								() => store.setBudget(Math.max(BUDGET_MIN, Math.min(budgetMax, n))),
+							)}
 					/>
 				</span>
 				<input
@@ -328,7 +377,11 @@
 					max={budgetMax}
 					step="2000"
 					value={store.budget}
-					oninput={(e) => store.setBudget(+e.currentTarget.value)}
+					oninput={(e) =>
+						attemptSteer(
+							{ live: true, isController: !notController, verb: "set budget", ...anchorOf(budgetFieldEl) },
+							() => store.setBudget(+e.currentTarget.value),
+						)}
 					aria-label="Context budget"
 					style:background-size="{budgetPct}% 100%"
 				/>
@@ -337,18 +390,31 @@
 			<button
 				class="btn-secondary reset-btn"
 				onclick={() => store.resetAll()}
-				disabled={editCount === 0 || steerLocked}
-				aria-disabled={steerLocked}
-				title={steerLocked
-					? lockTip
-					: editCount === 0
-						? "No manual edits — the view is already automatic"
-						: `Clear ${editCount} manual edit${editCount === 1 ? "" : "s"} and return to the automatic fold view`}
+				disabled={editCount === 0 || steerLocked || notController}
+				aria-disabled={steerLocked || notController}
+				title={notController
+					? readOnlyTip("steer")
+					: steerLocked
+						? lockTip
+						: editCount === 0
+							? "No manual edits — the view is already automatic"
+							: `Clear ${editCount} manual edit${editCount === 1 ? "" : "s"} and return to the automatic fold view`}
 			>
 				<Icon name="rotate-ccw" size={13} />
 				Revert to auto
 				{#if editCount > 0}<span class="reset-cnt mono tnum">{editCount}</span>{/if}
 			</button>
+
+			<!-- READ-ONLY (v16, ADR 0024, spec Part 3, "whisper" variant): steering controls above
+			     dim; this chip names who actually steers, and TAKE CONTROL is always one click away.
+			     Stays fully bright — the escape hatch is never itself dimmed. -->
+			{#if notController}
+				<span class="ro-chip mono" title={readOnlyChipTitle}>
+					<span class="ro-chip-ring" aria-hidden="true"></span>
+					READ-ONLY · {chipSuffix}
+				</span>
+				<button class="take-control-btn" onclick={() => claimController()}>TAKE CONTROL</button>
+			{/if}
 		</div>
 	</div>
 
@@ -382,16 +448,17 @@
 			class="prot-grip"
 			class:dragging={dragTokens != null}
 			class:locked={tailLocked}
+			class:ro-dim={notController && !tailLocked}
 			style:left="{handlePct}%"
 			role="slider"
 			tabindex={tailLocked ? -1 : 0}
 			aria-label="Protected tail in tokens"
-			aria-disabled={tailLocked}
+			aria-disabled={tailLocked || notController}
 			aria-valuemin="0"
 			aria-valuemax={PROT_MAX}
 			aria-valuenow={protectTarget}
 			aria-valuetext="{fmt(protectTarget)} tokens protected"
-			title={tailLocked ? lockTip : undefined}
+			title={tailLocked ? lockTip : notController ? readOnlyTip("steer") : undefined}
 			onpointerdown={onProtPointerDown}
 			onpointermove={onProtPointerMove}
 			onpointerup={onProtPointerUp}
@@ -691,6 +758,64 @@
 		cursor: not-allowed;
 	}
 
+	/* READ-ONLY "whisper" treatment (v16, ADR 0024): a steering control while some OTHER surface
+	   holds the controller lease. Deliberately quiet — opacity + cursor only, no hatch/recessed
+	   chrome (variant 2 was rejected). The control stays CLICKABLE (not natively `disabled`) so a
+	   click still runs its handler and can flash the blocked-interaction hint. */
+	.ro-dim {
+		opacity: 0.35;
+		cursor: not-allowed;
+	}
+
+	/* The READ-ONLY chip: mono, dashed neutral outline, hollow-ring glyph — never the reserved
+	   #044EFF user-block blue, never a warning color. Names the actual controller. */
+	.ro-chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font-size: var(--fs-2xs);
+		letter-spacing: 0.12em;
+		white-space: nowrap;
+		color: var(--muted);
+		background: transparent;
+		border: 1px dashed var(--line-strong);
+		border-radius: var(--radius-pill);
+		padding: 4px 10px 4px 8px;
+		user-select: none;
+	}
+	.ro-chip-ring {
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		border: 1.5px solid var(--muted);
+		flex: 0 0 auto;
+		box-sizing: border-box;
+	}
+
+	/* TAKE CONTROL — the single escape hatch. Solid neutral (Cloud/Paper), dark text; NEVER blue
+	   (that's reserved for user blocks). Always fully bright, never dimmed. */
+	.take-control-btn {
+		font-family: var(--mono);
+		font-size: var(--fs-2xs);
+		font-weight: 600;
+		letter-spacing: 0.1em;
+		white-space: nowrap;
+		background: var(--paper);
+		color: var(--ink);
+		border: none;
+		border-radius: var(--radius-sm);
+		padding: 6px 12px;
+		cursor: pointer;
+		transition: background var(--dur-fast) var(--ease-out);
+	}
+	.take-control-btn:hover {
+		background: #ffffff;
+	}
+	.take-control-btn:focus-visible {
+		outline: none;
+		box-shadow: var(--focus-ring);
+	}
+
 	/* Latency badge (Phase B) — quiet, monochrome; never the reserved user-block blue. The value
 	   tints only when a hook runs slow: amber ≥250ms (the old plan timeout), red ≥1000ms. A fast
 	   local hook (the common case) stays neutral. */
@@ -810,6 +935,21 @@
 		box-shadow: none;
 	}
 	.prot-grip.locked:hover::before {
+		box-shadow: none;
+	}
+
+	/* READ-ONLY (v16, ADR 0024): some OTHER surface holds the controller lease. A dedicated
+	   two-class override (mirroring `.locked` above) — the generic `.ro-dim` rule alone can't
+	   reliably beat this file's later `cursor: ew-resize` base rule at equal specificity. */
+	.prot-grip.ro-dim {
+		cursor: not-allowed;
+		opacity: 0.35;
+	}
+	.prot-grip.ro-dim::before {
+		background: var(--faint);
+		box-shadow: none;
+	}
+	.prot-grip.ro-dim:hover::before {
 		box-shadow: none;
 	}
 
