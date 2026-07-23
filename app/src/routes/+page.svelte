@@ -1,16 +1,20 @@
 <script lang="ts">
 	import { onMount } from "svelte";
 	import { session, isTauriEnv, loadSample, openFile, loadFilePath } from "$lib/session.svelte.ts";
-	import { connectLive, disconnectLive, live } from "$lib/live/liveClient.svelte";
+	import { connectLive, disconnectLive, live, claimController } from "$lib/live/liveClient.svelte";
 	import { discovery, startDiscovery, stopDiscovery, DEMO_ID } from "$lib/live/discovery.svelte";
 	import { startBrowserDiscovery, stopBrowserDiscovery } from "$lib/live/browserDiscovery.svelte";
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery } from "$lib/live/claudeDiscovery.svelte";
 	import { folding } from "$lib/live/folding.svelte";
 	import { foldAlarm, runFoldCheck } from "$lib/live/foldAlarm.svelte";
+	import { takeoverPopup, demotionToast, dismissTakeoverPopup, dismissDemotionToast } from "$lib/live/controllerUi.svelte";
 	import { DEFAULT_PORT } from "$core/protocol";
 	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
 	import SessionsSidebar from "$lib/ui/live/SessionsSidebar.svelte";
+	import TakeoverPopup from "$lib/ui/live/TakeoverPopup.svelte";
+	import DemotionToast from "$lib/ui/live/DemotionToast.svelte";
+	import ReadOnlyHint from "$lib/ui/live/ReadOnlyHint.svelte";
 	import MapHeader from "$lib/ui/map/MapHeader.svelte";
 	import ContextMap from "$lib/ui/map/ContextMap.svelte";
 	import Inspector from "$lib/ui/map/Inspector.svelte";
@@ -338,6 +342,32 @@
 		{/if}
 	</div>
 </div>
+
+<!-- Single-controller UX (v16, ADR 0024, spec Part 3) — global overlays, independent of which
+     session view is on screen. At most one of popup/toast is ever relevant at a time (the popup
+     only fires on a fresh hello; the toast only fires when we're demoted from an already-held
+     lease), but both read their own `$state` so there's nothing to coordinate here. -->
+{#if takeoverPopup.show}
+	<TakeoverPopup
+		label={takeoverPopup.label}
+		onconfirm={() => {
+			claimController();
+			dismissTakeoverPopup();
+		}}
+		ondecline={dismissTakeoverPopup}
+	/>
+{/if}
+{#if demotionToast.show}
+	<DemotionToast
+		label={demotionToast.label}
+		onclose={dismissDemotionToast}
+		ontakeback={() => {
+			claimController();
+			dismissDemotionToast();
+		}}
+	/>
+{/if}
+<ReadOnlyHint />
 
 <style>
 	/* ── Layout shell ─────────────────────────────────────────── */
