@@ -23,13 +23,16 @@
 	import ConsentDialog from "./ConsentDialog.svelte";
 	import { isExclusive } from "$core/locks";
 	import type { ActiveConductorMeta } from "$core/protocol";
-	import { live, conductors, conductorState, selectConductor, isController } from "$lib/live/liveClient.svelte";
+	import { live, conductors, conductorState, selectConductor, anotherSurfaceControls } from "$lib/live/liveClient.svelte";
 	import { attemptSteer, readOnlyTip } from "$lib/live/controllerUi.svelte";
 
 	// READ-ONLY gate (v16, ADR 0024, spec Part 3): some OTHER surface holds the controller lease.
 	// This component is only ever mounted while `live.status === "connected"` (see its own gate at
 	// the bottom), so "not controller" here always means "read-only", never "no wire at all".
-	const notController = $derived(!isController());
+	// U1: gated on `anotherSurfaceControls()` (a NON-null FRESH foreign lease), NOT `!isController()`,
+	// so an uncontested connect (null/stale lease this surface silently auto-claims) never flashes the
+	// picker read-only while the claim round-trips.
+	const notController = $derived(anotherSurfaceControls());
 
 	let open = $state(false);
 	// Held selection behind the consent gate (ADR 0011 §6) — nothing is sent to the wire until

@@ -29,7 +29,7 @@ import {
 	type ControllerInfo,
 } from "$core/protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
-import { evaluateHelloController, noteControllerBroadcast, flashBlockedHintCenter, resetControllerUi } from "./controllerUi.svelte";
+import { evaluateHelloController, noteControllerBroadcast, flashBlockedHintCenter, resetControllerUi, someoneElseControls } from "./controllerUi.svelte";
 
 let socket: WebSocket | null = null;
 let manualClose = false;
@@ -139,6 +139,13 @@ export function mySurfaceLabel(): string {
 export function isController(): boolean {
 	const info = controllerState.info;
 	return !!info && info.fresh && info.surfaceId === mySurfaceId();
+}
+
+/** True iff a DIFFERENT surface currently holds a FRESH lease (someone else is actively steering). The
+ *  gate for the READ-ONLY "whisper" chrome — a null/stale lease is uncontested (this surface silently
+ *  auto-claims it), so it must NOT paint read-only chrome (U1). See `someoneElseControls`. */
+export function anotherSurfaceControls(): boolean {
+	return someoneElseControls(controllerState.info, mySurfaceId());
 }
 
 /** Claim the global controller lease for this surface (v16). Sent to the host, which writes the lease

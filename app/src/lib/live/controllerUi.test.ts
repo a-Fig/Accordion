@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
 	decideAutoClaim,
+	someoneElseControls,
 	evaluateHelloController,
 	noteControllerBroadcast,
 	attemptSteer,
@@ -79,6 +80,37 @@ describe("decideAutoClaim — the pure auto-claim/popup/no-op predicate", () => 
 
 	it("does nothing when the lease is fresh and already held by US", () => {
 		expect(decideAutoClaim(info({ fresh: true, surfaceId: ME }), ME)).toBe("noop");
+	});
+});
+
+describe("someoneElseControls — the READ-ONLY chrome gate (U1: no false flash on uncontested connect)", () => {
+	it("is FALSE for a null lease (uncontested — this surface silently auto-claims, no read-only chrome)", () => {
+		// The everyday uncontested open: an empty lease must NOT render as someone-else-steers at any point.
+		expect(someoneElseControls(null, ME)).toBe(false);
+	});
+
+	it("is FALSE for a STALE lease held by another surface (uncontested — auto-claim, no read-only chrome)", () => {
+		expect(someoneElseControls(info({ fresh: false, surfaceId: OTHER }), ME)).toBe(false);
+	});
+
+	it("is FALSE when the fresh lease is already ours (we ARE the controller)", () => {
+		expect(someoneElseControls(info({ fresh: true, surfaceId: ME }), ME)).toBe(false);
+	});
+
+	it("is TRUE only when a DIFFERENT surface holds a FRESH lease (someone else really is steering)", () => {
+		expect(someoneElseControls(info({ fresh: true, surfaceId: OTHER }), ME)).toBe(true);
+	});
+
+	it("agrees with decideAutoClaim: whenever we auto-claim ('claim'/'noop'), nobody-else-controls", () => {
+		// The invariant U1 rests on — the two never disagree about "is this contested". If decideAutoClaim
+		// says claim or noop (uncontested / already ours), someoneElseControls must be false (no chrome).
+		for (const lease of [null, info({ fresh: false, surfaceId: OTHER }), info({ fresh: true, surfaceId: ME })]) {
+			const decision = decideAutoClaim(lease, ME);
+			if (decision !== "popup") expect(someoneElseControls(lease, ME)).toBe(false);
+		}
+		// And the one contested case (popup) is exactly the one that paints read-only chrome.
+		expect(decideAutoClaim(info({ fresh: true, surfaceId: OTHER }), ME)).toBe("popup");
+		expect(someoneElseControls(info({ fresh: true, surfaceId: OTHER }), ME)).toBe(true);
 	});
 });
 

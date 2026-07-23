@@ -7,7 +7,7 @@
 	import { nextVacated } from "./drain";
 	import { buildDisplay, segmentDisplay, buildLane, type DisplayRow } from "$lib/engine/display";
 	import { settings } from "$lib/settings.svelte";
-	import { isController } from "$lib/live/liveClient.svelte";
+	import { anotherSurfaceControls } from "$lib/live/liveClient.svelte";
 	import { attemptSteer, readOnlyTip } from "$lib/live/controllerUi.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import SegControl from "$lib/ui/SegControl.svelte";
@@ -52,7 +52,10 @@
 	// "can a fold/group mutation happen right now", except a blocked ATTEMPT (a double-click) also
 	// flashes the read-only hint near the cursor — steerLocked stays a silent no-op (unrelated,
 	// pre-existing conductor-lock behavior, out of scope here).
-	const notController = $derived(store.wireControlled && !isController());
+	// U1: gated on `anotherSurfaceControls()` (a non-null FRESH foreign lease), NOT `!isController()` —
+	// a null/stale lease is uncontested (this surface silently auto-claims it) and must never render
+	// read-only chrome while that claim round-trips.
+	const notController = $derived(store.wireControlled && anotherSurfaceControls());
 
 	// ---- weight as dice faces: every tile is the same square; token weight is
 	//      read as a die face 1–6 (more pips = heavier block). -----------------
