@@ -11,7 +11,7 @@
  *
  * It drives the SAME `session.store` the rest of the UI renders, so "live mode" needs no new view.
  */
-import { session, cancelPendingLoad } from "../session.svelte";
+import { session, cancelPendingLoad, isTauriEnv } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
 import { hydrateSnapshot } from "$core/replica";
 import type { SessionMeta } from "$core/types";
@@ -26,6 +26,7 @@ import {
 	type SnapshotState,
 	type WireCommand,
 	type ActiveConductorMeta,
+	type ControllerInfo,
 } from "$core/protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 
@@ -97,6 +98,68 @@ export const conductorStatus = $state<{ text: string | null; metrics?: Record<st
 	text: null,
 });
 
+/**
+ * The current global controller lease as the host reports it (v16, ADR 0024) — from `hello.controller`
+ * on connect, then updated by every `controller` broadcast. `null` = no lease exists (or not fresh at
+ * connect). This is minimal plumbing: the store/UI layer (spec Part 3) derives `isController`, silent
+ * auto-claim, the takeover popup, and the READ-ONLY chip from this + `mySurfaceId()`. `fresh` is true
+ * for a broadcast holder (a claim/heartbeat just wrote it) and mirrors the host's flag on connect.
+ */
+export const controllerState = $state<{ info: ControllerInfo | null }>({ info: null });
+
+const SURFACE_ID_KEY = "accordion_surface_id";
+
+/** This surface's persistent id (a UUID minted once in localStorage; stable across reloads). The
+ *  Tauri webview uses localStorage too, so both surfaces get a durable id. Falls back to a volatile
+ *  id when storage is unavailable (SSR / private mode) — such a surface simply can't hold the lease
+ *  across reloads, which is acceptable. */
+export function mySurfaceId(): string {
+	if (typeof window === "undefined") return "ephemeral";
+	try {
+		let id = window.localStorage.getItem(SURFACE_ID_KEY);
+		if (!id) {
+			id = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+				? crypto.randomUUID()
+				: `s-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+			window.localStorage.setItem(SURFACE_ID_KEY, id);
+		}
+		return id;
+	} catch {
+		return "ephemeral";
+	}
+}
+
+/** This surface's human label: "Desktop app" (Tauri) or "Browser tab" (served page). */
+export function mySurfaceLabel(): string {
+	return isTauriEnv ? "Desktop app" : "Browser tab";
+}
+
+/** True iff this surface currently holds the fresh controller lease. */
+export function isController(): boolean {
+	const info = controllerState.info;
+	return !!info && info.fresh && info.surfaceId === mySurfaceId();
+}
+
+/** Claim the global controller lease for this surface (v16). Sent to the host, which writes the lease
+ *  and broadcasts the change to every client. Never optimistic — `controllerState` updates only when
+ *  the host echoes it back (or via the next hello). */
+export function claimController(): void {
+	const ws = socket;
+	if (!ws || ws.readyState !== WebSocket.OPEN) return;
+	try {
+		ws.send(JSON.stringify({ type: "claimController" }));
+	} catch {
+		/* socket gone — the next attach re-snapshots and re-claims */
+	}
+}
+
+/** Defensive guard for a hello's `controller` field (authorized ≠ well-formed). */
+function isControllerInfo(v: unknown): v is ControllerInfo {
+	if (!v || typeof v !== "object") return false;
+	const c = v as Record<string, unknown>;
+	return typeof c.surfaceId === "string" && typeof c.label === "string" && typeof c.fresh === "boolean";
+}
+
 /** Defensive element guard for a hello's `conductors` catalog — same "authorized but maybe
  *  malformed" caution as `isWireBlock`: a bad entry must be dropped, not thrown or fed into the
  *  picker as an unusable id/label. */
@@ -113,13 +176,15 @@ function isConductorMeta(v: unknown): v is ActiveConductorMeta {
 	);
 }
 
-/** Clear the conductor catalog/active/status state — a fresh connection or a dropped one both
- *  start from "no conductors known" rather than leaking a prior session's picks. */
+/** Clear the conductor catalog/active/status state AND the controller-lease view — a fresh connection
+ *  or a dropped one both start from "nothing known" rather than leaking a prior session's picks. The
+ *  lease view is re-seeded from the next `hello.controller`. */
 function resetConductorState(): void {
 	conductors.length = 0;
 	conductorState.active = null;
 	conductorStatus.text = null;
 	conductorStatus.metrics = undefined;
+	controllerState.info = null;
 }
 
 /** Send a remote-control command to the host (guarded on socket state). */
@@ -212,7 +277,13 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 	// its literal loopback hostname and forwards the bearer from its /accordion URL. The extension
 	// also recognizes exact-origin cookies and verified sibling Accordion Origins.
 	const host = opts.host ?? "127.0.0.1";
-	const tokenQs = opts.token ? `/?token=${encodeURIComponent(opts.token)}` : "";
+	// v16 (ADR 0024): always carry this surface's identity so the host knows who is connecting for the
+	// single-controller lease; the token (when present) rides the same query string.
+	const params = new URLSearchParams();
+	if (opts.token) params.set("token", opts.token);
+	params.set("surface", mySurfaceId());
+	params.set("label", mySurfaceLabel());
+	const tokenQs = `/?${params.toString()}`;
 	live.status = "connecting";
 	live.detail = `ws://${host}:${port}`;
 	live.sessionId = null;
@@ -265,6 +336,9 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// or malformed on a host with none attached/advertising ⇒ empty catalog, never a throw.
 			conductors.length = 0;
 			if (Array.isArray(msg.conductors)) conductors.push(...msg.conductors.filter(isConductorMeta));
+			// v16: adopt the current controller lease (guard the shape). The store/UI layer (Part 3)
+			// decides auto-claim vs. the takeover popup from this; here we only surface the state.
+			controllerState.info = isControllerInfo(msg.controller) ? msg.controller : null;
 			// The store is built when the snapshot arrives (it carries the blocks + rev).
 			awaitingSnapshot = false;
 		} else if (msg.type === "snapshot") {
@@ -302,6 +376,12 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			conductorStatus.text = typeof msg.text === "string" ? msg.text : null;
 			conductorStatus.metrics =
 				msg.metrics && typeof msg.metrics === "object" ? msg.metrics : undefined;
+		} else if (msg.type === "controller") {
+			// v16: the global lease changed hands. A broadcast holder is fresh by construction (a claim/
+			// heartbeat just wrote it). The UI layer (Part 3) reacts (re-render / demotion) from this.
+			if (typeof msg.surfaceId === "string" && typeof msg.label === "string") {
+				controllerState.info = { surfaceId: msg.surfaceId, label: msg.label, fresh: true };
+			}
 		} else if (msg.type === "recall") {
 			// The live agent read folded content (a pure host-side read, no state change). Surfaced
 			// for conductors (Phase C); the GUI has nothing to mutate, so this is observational only.
