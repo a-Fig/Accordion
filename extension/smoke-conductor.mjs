@@ -102,8 +102,14 @@ for (let i = 0; i < PAIRS; i++) {
 await Promise.resolve(handlers.context({ messages }, ctx));
 
 // ── GUI client ──────────────────────────────────────────────────────────────────
-const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
-const inbox = { hello: [], snapshot: [], event: [], conductorState: [], conductorStatus: [], telemetry: [] };
+// v16 (ADR 0024): dial with a surface identity and CLAIM control — selectConductor/setBudget/
+// setFolding/the freeze ops command are all mutating commands gated by the READ-ONLY controller
+// check, so an unclaimed surface would have every one of them refused. This is setup only; every
+// conductor-path assertion below (conductorState, strata, hold telemetry, freeze clamp, detach) is
+// unchanged. The conductor role itself is entirely unaffected by the controller gate.
+const GUI_SURFACE = "conductor-smoke-gui";
+const ws = new WebSocket(`ws://127.0.0.1:${PORT}/?surface=${GUI_SURFACE}&label=${encodeURIComponent("Desktop app")}`);
+const inbox = { hello: [], snapshot: [], event: [], conductorState: [], conductorStatus: [], telemetry: [], controller: [] };
 ws.on("message", (d) => {
 	let m;
 	try { m = JSON.parse(d.toString()); } catch { return; }
@@ -115,6 +121,12 @@ const resnapshot = () => ws.send(JSON.stringify({ type: "resnapshot" }));
 
 await waitFor(() => inbox.hello.length > 0, 3000, "gui hello").catch(() => fails.push("GUI never received hello"));
 await waitFor(() => inbox.snapshot.length > 0, 3000, "gui snapshot").catch(() => fails.push("GUI never received a snapshot"));
+
+// Claim the controller lease so this GUI may steer (attach conductors, set dials, arm folding).
+ws.send(JSON.stringify({ type: "claimController" }));
+await waitFor(() => inbox.controller.some((c) => c.surfaceId === GUI_SURFACE), 3000, "gui becomes controller").catch(
+	() => fails.push("the GUI's claimController did not make it the controller"),
+);
 
 // (2) hello advertises thermocline as a REMOTE (spawn) conductor.
 {

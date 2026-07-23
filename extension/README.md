@@ -35,10 +35,17 @@ That adds the package to `~/.pi/agent/settings.json`. Restart pi, then in any pr
 /accordion
 ```
 
-The extension HTTP-serves the Accordion UI on a local ephemeral port and prints the URL
-(also opens it). The page auto-connects to the running session. Folding is **off by
+The extension HTTP-serves the Accordion UI and prints the URL (also opens it) — a single
+stable link (`http://127.0.0.1:24317/...`) that one extension holds at a time and that
+survives any one pi session ending, so you don't need to re-copy a fresh URL out of pi's
+output every time. The page auto-connects to the running session. Folding is **off by
 default** — flip the **Folding** toggle in the header to start steering what the agent
 sees.
+
+Only one surface steers at a time. Opening Accordion from a second tab/window while
+another is already driving prompts you once to take control; every other surface is a
+live, strictly read-only mirror — a **READ-ONLY** chip with a **TAKE CONTROL** button,
+never two surfaces silently racing to steer the same session.
 
 > **Multi-session, browser-served — no desktop app required.** The extension serves the UI
 > in your browser and exposes every live pi session on the machine over a token-gated
@@ -93,7 +100,10 @@ hydrates from a full snapshot on connect, then stays in sync over a stream of sm
 replayable events — no polling, and no round trip on the model-call path. Steering actions
 (fold, pin, group, the budget/tail dials) are sent to the extension as commands; the
 extension applies them to its own state and echoes the result back to every connected
-client, so there's never more than one copy of the truth to disagree with.
+client, so there's never more than one copy of the truth to disagree with. Only the one
+surface currently holding control may send a command that actually changes anything —
+every other connected client is a live mirror, so multiple open tabs/windows can never
+silently race each other to steer the same session.
 
 Folding is **opt-in and off by default** — flip the **Folding** toggle in the header to
 start steering what the agent sees. When it's off, pi's `context` hook is a no-op and your
