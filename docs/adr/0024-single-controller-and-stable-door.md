@@ -117,19 +117,30 @@ lease.
   label ("Desktop app" / "Browser tab") and sends both as `?surface=`/`?label=` dial params, which
   the extension sanitizes at connect (`sanitizeSurfaceId`/`sanitizeSurfaceLabel`,
   `core/protocol.ts:673-697` — bounded charset/length; a socket with no valid surface id can never
-  hold the lease at all).
+  hold the lease at all). The `label` is **display-only** — it names the current controller in the
+  READ-ONLY chip and the takeover copy and is **never an authorization input**. A spoofed label is
+  therefore purely cosmetic: it cannot grant or deny control (only the `surfaceId` plus the
+  fresh-lease check gate anything), and it is sanitized (charset/length + control-char stripping,
+  re-validated again on the disk-read path per §S2) solely so a hostile or corrupt value cannot ride
+  into a broadcast, not because any trust decision depends on its contents.
 - **Heartbeat.** Whichever extension the controlling surface's socket is currently connected to
-  refreshes `heartbeatAt` every `CONTROLLER_HEARTBEAT_MS` (2s, `accordion.ts:125`) — but only while a
-  connected socket's `surfaceId` actually matches the lease (`heartbeatController`,
-  `accordion.ts:1440`). Since the lease is global but each extension is its own OS process, only the
+  refreshes `heartbeatAt` every `CONTROLLER_HEARTBEAT_MS` (2s) — but only while a connected socket's
+  `surfaceId` actually matches the lease (`heartbeatController`). It re-reads the lease **fresh from
+  disk** at the top of every tick and only ever writes back the surfaceId it just read (never its
+  cached one): at a coincident tick the heartbeat can fire *before* the poll, so writing from a stale
+  cache would let this extension re-assert an old holder and clobber another extension's just-written
+  fresh claim (**C1**). Since the lease is global but each extension is its own OS process, only the
   one process the controller is actually talking to *can* renew it; there is no other process that
   could meaningfully claim to know the controller socket is still alive.
 - **Propagation to sibling extensions.** No push channel exists between independent pi sessions'
   extension processes, so every *other* extension observes a lease change via a `~1s`
-  (`CONTROLLER_POLL_MS`, `accordion.ts:126`) mtime poll of `controller.json`
-  (`pollControllerFile`, `accordion.ts:1426`) rather than being told directly. Best-effort, bare
-  unref'd timer, never on the `context` hook — same posture as every other piece of discovery I/O in
-  this codebase.
+  (`CONTROLLER_POLL_MS`) poll of `controller.json` (`pollControllerFile`) rather than being told
+  directly. The poll compares **file content** (`surfaceId`/`label`/`claimedAt`/`heartbeatAt`), not
+  the file's mtime — an mtime-equality early-return could miss a same-mtime foreign rewrite (**C4**);
+  the file is tiny, so reading it every tick is cheap. Both timers are best-effort, bare unref'd,
+  never on the `context` hook — same posture as every other piece of discovery I/O in this codebase.
+  (The cadence for both is overridable via test-only env seams `ACCORDION_CONTROLLER_HEARTBEAT_MS` /
+  `ACCORDION_CONTROLLER_POLL_MS`; production never sets them.)
 - **Staleness window: 6s** (`CONTROLLER_STALE_AFTER_MS`, `registry.ts:68`) — comfortably above 3× the
   heartbeat interval (so a merely-idle-but-connected controller is never falsely treated as gone),
   tight enough that closing a tab frees control within a handful of seconds rather than requiring a
@@ -138,7 +149,14 @@ lease.
   only surfaces on a fresh connect's `hello.controller.fresh: false`
   (`ControllerMessage`'s doc comment, `core/protocol.ts:343-349`, is explicit that this is
   deliberate: "last write wins," not "last write wins until it's been quiet a while, in which case
-  broadcast a clear").
+  broadcast a clear"). A direct and **accepted** consequence, stated plainly: if the controlling
+  surface simply **vanishes** (its tab is closed, its process dies), every OTHER already-connected
+  surface stays **READ-ONLY** — still showing the now-gone controller as the steerer — until a human
+  clicks **TAKE CONTROL** on one of them. Auto-claim is a *connect-time* decision (§2); an
+  already-open surface does not silently re-claim a lease that goes stale under it, precisely because
+  no client is ever told the lease went stale (no clearing frame). The escape hatch — TAKE CONTROL is
+  always one unconditional click (§4) — is deemed sufficient, and a background "the controller went
+  quiet, promote myself" path is deliberately not built.
 
 ### 6. Enforcement lives at the WS command ingress, not inside `Truth`
 
@@ -175,21 +193,43 @@ to do with telemetry collection.
 
 One extension at a time binds the door as an **additional** listener serving the identical handlers
 (static UI, `/__accordion/*`, WS upgrade) its own per-session ephemeral server already serves
-(`tryBindDoor`, `accordion.ts:1318`) — a client dialing the door is, from the server's point of view,
-indistinguishable from one dialing that session's ephemeral port; the door is just also reachable at
-a fixed address. Claim protocol on `EADDRINUSE`: probe the incumbent's `/__accordion/meta` (reusing
-the existing bounded sibling-origin probe machinery, `DOOR_PROBE_MS` = 750ms) — a live Accordion door
-answering `served: true` → stand down and retry on a slow timer (`DOOR_RETRY_MS` = 4s, unref'd, never
-on the `context` hook, `scheduleDoorRetry`, `accordion.ts:1305`); anything else (timeout, a
-non-Accordion response) → foreign software holds the port, log once and stand down **permanently**
-for this run (`doorForeign`, `accordion.ts:1343`). When the door holder's process exits, the OS frees
-the port and a standing-by extension's retry timer rebinds it within a few seconds — automatic
-takeover with no coordination beyond "keep trying."
+(`tryBindDoor`) — a client dialing the door is, from the server's point of view, indistinguishable
+from one dialing that session's ephemeral port; the door is just also reachable at a fixed address.
+
+Claim protocol on `EADDRINUSE`: probe + **classify** the incumbent's `/__accordion/meta` (reusing the
+existing bounded sibling-origin probe machinery, `DOOR_PROBE_MS` = 750ms) into one of three outcomes
+(`probeDoor`), rather than the earlier binary served-true / everything-else split:
+
+- **ACCORDION** (trust — stand down this cycle, and `/accordion` may print the secret door URL): a
+  completed HTTP 200 from a loopback peer that is `served: true` **AND** `protocolVersion ===
+  PROTOCOL_VERSION` **AND** whose `sessionId` appears in the live session registry. Retry on a slow
+  timer (`DOOR_RETRY_MS` = 4s, unref'd, never on the `context` hook, `scheduleDoorRetry`).
+- **FOREIGN** (permanent stand-down for this run, `doorForeign`): a **completed** HTTP response that
+  fails the served/shape check — a non-200, an unparseable body, or `served !== true`. This is
+  definitive evidence of non-Accordion software, and only this earns the permanent stand-down.
+- **TRANSIENT / ambiguous** (schedule a retry, **never** permanent): a probe timeout, a connection
+  error/refused (a busy peer, or one that exited mid-probe), a `served: true` peer of a **different**
+  protocol version, or a matching peer whose `sessionId` we could not confirm in the registry (a
+  startup race). This is the correction to a real earlier defect: collapsing a timeout, a mid-probe
+  exit, or an other-version Accordion to "foreign" would **permanently disable the door for this
+  process** against a peer that was merely busy, momentarily gone, or a different build — a peer that
+  will often be back a second later.
+
+The trust bar is deliberately stricter than `served: true` alone (which was weaker than the
+sibling-origin probe): foreign software that answers `{"served":true}`, or an Accordion of a
+mismatched version, never gets the secret-bearing door URL aimed at it. When the door holder's process
+exits, the OS frees the port and a standing-by extension's retry timer rebinds it within a few seconds
+— automatic takeover with no coordination beyond "keep trying."
+
+The fixed-port `listen(DOOR_PORT, "127.0.0.1")` was empirically verified on Windows 11 (2026-07-23):
+two separate processes racing the identical bind do **not** both succeed — the loser cleanly receives
+`EADDRINUSE` (no `SO_REUSEADDR` socket-hijack), so the `EADDRINUSE` probe above is the sole arbitration
+and no additional lockfile is required.
 
 `/accordion`'s output prefers the door: if a live door is up (this extension holds it, or a probe
-confirms a sibling does), it prints `http://127.0.0.1:24317/?token=<door-secret>`; otherwise
-(foreign-occupied case) it falls back to this session's own ephemeral URL exactly as before
-(`accordion.ts:2209-2216`).
+returns the **ACCORDION** verdict for a sibling), it prints `http://127.0.0.1:24317/?token=<door-secret>`;
+otherwise (foreign-occupied, or a merely-ambiguous probe) it falls back to this session's own ephemeral
+URL exactly as before.
 
 ### 8. The door-secret: exclusive-create, a deliberate deviation from write-rename
 
@@ -212,22 +252,37 @@ the race gets `EEXIST`, falls through to reading the now-guaranteed-present file
 every extension in the process group converges on the one value that was ever actually created,
 regardless of who wrote it.
 
-### 9. Security posture: no new local exposure
+### 9. Security posture: no new local exposure, but new secret-lifecycle properties to own
 
 - The shared secret is accepted as a bearer everywhere the existing per-session `webToken` already
   is (static serving, token-gated endpoints, WS upgrade) — it adds no new endpoint and no new
   capability beyond what a token holder could already reach; it only makes "which token" independent
   of which specific session's URL you happen to have.
-- Same-user local processes on this machine can already read `~/.accordion` — including every live
-  session's own per-session `webToken`s — so a same-user process reading `door-secret` learns nothing
-  it could not already learn by reading the sessions directory directly. The shared secret collapses
-  N per-session trust boundaries that were never meant to stop a local, same-user process in the
-  first place; it is not a new boundary.
-- What still matters, and is unchanged: a **hostile web page** (as opposed to a local process) cannot
-  read files at all — its only paths in remain the Origin/token checks at the WS upgrade and the
-  HTTP static-serve gate, exactly as strict as before (ADR 0021 §7's "WS auth model is unchanged"
-  carries forward verbatim; the door listener reuses the identical `verifyWsUpgrade`/auth logic on
-  its second socket, not a relaxed copy of it).
+- **The correct honest framing** (an earlier draft of this ADR, and an earlier `isBearer` comment,
+  mis-stated it as "both secrets already live on disk"): the per-session `webToken` is **memory-only**
+  — minted with `crypto.randomBytes` per session and **never written to disk** (a `SessionEntry`
+  carries no token field; `buildEntry` writes none). Only the **door secret** is a file
+  (`~/.accordion/door-secret`). So the two secrets do NOT share an on-disk footprint, and the argument
+  for why sharing one is acceptable must not rest on the false "they were both on disk anyway."
+- What actually stops a **hostile web page** is unchanged, and is the boundary that matters: a web
+  page can read neither files nor this process's memory, so neither the door secret nor the webToken
+  is reachable to it. Its only paths in remain the Origin/token checks at the WS upgrade and the HTTP
+  static-serve gate, exactly as strict as before (ADR 0021 §7's "WS auth model is unchanged" carries
+  forward verbatim; the door listener reuses the identical `verifyWsUpgrade`/auth logic on its second
+  socket, not a relaxed copy of it).
+- A **same-user local process** is explicitly outside the threat model. It can already read pi's own
+  session data on disk directly (transcripts, tool output), so a same-user process reading
+  `door-secret` learns nothing it could not already obtain — the shared secret is not a new boundary
+  against it, and never claimed to be.
+- What the door secret DOES newly introduce, versus the ephemeral in-memory webToken, and which this
+  ADR owns rather than hand-waves: it is **persistent across reboots** (the file survives), **never
+  rotated** for the life of the file, **shared machine-wide** (every extension honors it), and **rides
+  a bookmarkable URL** — so it can leak via browser history / bookmark sync, or via a link the user
+  copies or forwards. The passive address-bar path is closed client-side: the served page captures the
+  token once and `history.replaceState`s it out of the visible URL (§S1b, `servedToken.ts`), so it
+  no longer accretes in history/bookmarks by merely being open. But a link the user *deliberately*
+  shares still carries a live, machine-wide, non-expiring credential. **Secret rotation (and/or a
+  shorter-lived door token) is a named follow-up, deliberately not shipped in this PR.**
 - A predictable, fixed port (24317, vs. a random ephemeral one) removes nothing that was actually
   load-bearing: the ephemeral port was never itself a secret (the existing sibling-origin probe
   already treats "some local Accordion server is listening" as discoverable) — only the token gated
