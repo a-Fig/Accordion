@@ -124,12 +124,19 @@ lease.
   (§6), defeating the whole arbitration. `sessionStorage` is per-tab, so two door tabs get distinct
   ids. It survives a tab's own reloads (so a controller that reloads reclaims its own lease); a
   tab that is closed and reopened is a **new** surface by design. Browsers copy `sessionStorage` on
-  tab-**duplicate**, which would recreate the shared-id hole, so on startup — before a surface dials
-  — it announces its id on a `BroadcastChannel` ("accordion-surface-id") and briefly listens: any
-  other live context that already owns the id answers "in-use", and the not-yet-dialed newcomer
-  re-mints a fresh id into its own `sessionStorage`. An established/dialed context never re-mints (it
-  defends its id); the whole guard is failure-open (no `BroadcastChannel` support / any error ⇒
-  proceed with the `sessionStorage` id). See `app/src/lib/live/surfaceId.ts`. The `label` is
+  tab-**duplicate**, which would recreate the shared-id hole, so at init the module announces its id
+  on a `BroadcastChannel` ("accordion-surface-id") and keeps listening: any other live context that
+  owns the id answers "in-use", and an **undialed** context that learns its id is taken re-mints a
+  fresh one into its own `sessionStorage` — no matter how late the reply lands. A **dialed** context
+  never re-mints (it defends its id instead). Ordering is load-bearing: a dial obtains its id
+  through `surfaceIdReady()`, which waits out the short (~150ms) dedupe window before freezing and
+  handing the id to the wire — freezing in the same synchronous frame as init (exactly what
+  browser-served auto-connect would otherwise do via onMount → `connectLive`) would put the copied
+  id on the wire before the owner's reply could land, making the whole guard inert. The app primes
+  the module at bootstrap (`+layout.svelte`) so the window has usually elapsed by the first dial and
+  the wait is zero; the worst case is one ≤150ms hold on the very first dial. The guard is
+  failure-open (no `BroadcastChannel` support / any error ⇒ proceed with the `sessionStorage` id,
+  no wait). See `app/src/lib/live/surfaceId.ts`. The `label` is
   **display-only** — it names the current controller in the
   READ-ONLY chip and the takeover copy and is **never an authorization input**. A spoofed label is
   therefore purely cosmetic: it cannot grant or deny control (only the `surfaceId` plus the

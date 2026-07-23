@@ -30,7 +30,7 @@ import {
 } from "$core/protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import { evaluateHelloController, noteControllerBroadcast, flashBlockedHintCenter, resetControllerUi, someoneElseControls } from "./controllerUi.svelte";
-import { mySurfaceId, markSurfaceDialed } from "./surfaceId";
+import { mySurfaceId, surfaceIdIfSettled, surfaceIdReady } from "./surfaceId";
 
 // Re-export so existing importers keep a stable path (`mySurfaceId` moved to surfaceId.ts to add the
 // sessionStorage + BroadcastChannel-dedupe machinery without bloating this module — ADR 0024 §5).
@@ -39,6 +39,9 @@ export { mySurfaceId };
 let socket: WebSocket | null = null;
 let manualClose = false;
 let commandSeq = 0;
+// Guards the surfaceIdReady()-deferred first dial (see connectLive): a deferred open aborts when a
+// newer connect/disconnect superseded it during the ≤150ms dedupe wait.
+let connectSeq = 0;
 // While true, incoming `event`s are dropped — a fresh `snapshot` is in flight (after a rev gap /
 // reset), so replaying stale events onto the about-to-be-replaced replica is pointless.
 let awaitingSnapshot = false;
@@ -264,6 +267,33 @@ function orphanReplica(): void {
 
 export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; token?: string } = {}): void {
 	if (typeof window === "undefined" || typeof WebSocket === "undefined") return;
+	// v16 (ADR 0024): the dial must carry an id the duplicate-tab dedupe has SETTLED on. Freezing the
+	// id in the same synchronous frame as the module's init (exactly what browser-served auto-connect
+	// does: onMount → connectLive) would render the whole BroadcastChannel guard inert — the same-id
+	// owner's in-use reply lands milliseconds later, after the copied id already rode the wire. So:
+	// fast path when the dedupe has already settled (bootstrap priming in +layout.svelte makes this
+	// the norm — the window has long elapsed); otherwise wait out the ≤150ms window ONCE via
+	// surfaceIdReady() (an in-use reply inside it re-mints us first), then re-enter — by then the id
+	// is frozen and the sync path runs. The seq guard drops a deferred dial that a newer
+	// connect/disconnect superseded during the wait.
+	const settledSurface = surfaceIdIfSettled();
+	if (settledSurface === null) {
+		cancelPendingLoad();
+		disconnectLive(); // drop any prior socket NOW, not after the wait
+		manualClose = false;
+		awaitingSnapshot = false;
+		live.status = "connecting";
+		live.detail = `ws://${opts.host ?? "127.0.0.1"}:${port}`;
+		live.sessionId = null;
+		live.port = port;
+		const seq = ++connectSeq;
+		void surfaceIdReady().then(() => {
+			if (seq !== connectSeq || manualClose) return; // superseded during the dedupe wait
+			connectLive(port, opts); // id now frozen — re-entry takes the synchronous path below
+		});
+		return;
+	}
+	++connectSeq; // supersede any still-pending deferred dial
 	cancelPendingLoad(); // invalidate any pending file/CC load that would otherwise clobber the live store
 	disconnectLive(); // drop any prior socket
 	manualClose = false;
@@ -272,14 +302,13 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 	// its literal loopback hostname and forwards the bearer from its /accordion URL. The extension
 	// also recognizes exact-origin cookies and verified sibling Accordion Origins.
 	const host = opts.host ?? "127.0.0.1";
-	// v16 (ADR 0024): always carry this surface's identity so the host knows who is connecting for the
-	// single-controller lease; the token (when present) rides the same query string. Marking the
-	// surface "dialed" here FREEZES its id — from this point the duplicate-tab dedupe never re-mints
-	// it out from under a live connection (surfaceId.ts).
-	markSurfaceDialed();
+	// Always carry this surface's identity so the host knows who is connecting for the single-
+	// controller lease; the token (when present) rides the same query string. `settledSurface` is
+	// the frozen id — surfaceIdIfSettled() marked the surface dialed on the way out, so from here
+	// the dedupe never re-mints it out from under this connection (surfaceId.ts).
 	const params = new URLSearchParams();
 	if (opts.token) params.set("token", opts.token);
-	params.set("surface", mySurfaceId());
+	params.set("surface", settledSurface);
 	params.set("label", mySurfaceLabel());
 	const tokenQs = `/?${params.toString()}`;
 	live.status = "connecting";
