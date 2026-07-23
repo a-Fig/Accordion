@@ -201,7 +201,7 @@
 		padding: var(--sp-4);
 		background: var(--panel);
 		border: 1px solid var(--line);
-		border-radius: var(--radius-md, 10px);
+		border-radius: var(--radius);
 		box-shadow: var(--shadow-2);
 	}
 
