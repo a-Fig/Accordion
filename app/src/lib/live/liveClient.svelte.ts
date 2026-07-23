@@ -29,6 +29,7 @@ import {
 	type ControllerInfo,
 } from "$core/protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
+import { evaluateHelloController, noteControllerBroadcast, flashBlockedHintCenter, resetControllerUi } from "./controllerUi.svelte";
 
 let socket: WebSocket | null = null;
 let manualClose = false;
@@ -185,6 +186,7 @@ function resetConductorState(): void {
 	conductorStatus.text = null;
 	conductorStatus.metrics = undefined;
 	controllerState.info = null;
+	resetControllerUi(); // drop any popup/toast/hint left over from a prior connection (Part 3)
 }
 
 /** Send a remote-control command to the host (guarded on socket state). */
@@ -336,9 +338,12 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// or malformed on a host with none attached/advertising ⇒ empty catalog, never a throw.
 			conductors.length = 0;
 			if (Array.isArray(msg.conductors)) conductors.push(...msg.conductors.filter(isConductorMeta));
-			// v16: adopt the current controller lease (guard the shape). The store/UI layer (Part 3)
-			// decides auto-claim vs. the takeover popup from this; here we only surface the state.
+			// v16: adopt the current controller lease (guard the shape), then decide what THIS
+			// surface should do about it (Part 3): silently claim an uncontested/stale lease, ask
+			// via the takeover popup for a fresh lease held elsewhere, or nothing when it's already
+			// ours (reconnect / sidebar session switch).
 			controllerState.info = isControllerInfo(msg.controller) ? msg.controller : null;
+			if (evaluateHelloController(controllerState.info, mySurfaceId()) === "claim") claimController();
 			// The store is built when the snapshot arrives (it carries the blocks + rev).
 			awaitingSnapshot = false;
 		} else if (msg.type === "snapshot") {
@@ -378,8 +383,10 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 				msg.metrics && typeof msg.metrics === "object" ? msg.metrics : undefined;
 		} else if (msg.type === "controller") {
 			// v16: the global lease changed hands. A broadcast holder is fresh by construction (a claim/
-			// heartbeat just wrote it). The UI layer (Part 3) reacts (re-render / demotion) from this.
+			// heartbeat just wrote it). Check for OUR OWN demotion (Part 3) against the PRIOR info
+			// before overwriting it — noteControllerBroadcast needs the "did we just lose it" comparison.
 			if (typeof msg.surfaceId === "string" && typeof msg.label === "string") {
+				noteControllerBroadcast(controllerState.info, { surfaceId: msg.surfaceId, label: msg.label }, mySurfaceId());
 				controllerState.info = { surfaceId: msg.surfaceId, label: msg.label, fresh: true };
 			}
 		} else if (msg.type === "recall") {
@@ -387,6 +394,12 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			// for conductors (Phase C); the GUI has nothing to mutate, so this is observational only.
 		} else if (msg.type === "commandResult") {
 			// No optimistic apply — state arrives via the event stream. Clamp UX could read `results`.
+			// v16: the server is the REAL boundary for READ-ONLY enforcement — the client-side gate
+			// (`attemptSteer`) is a mirror, not a guarantee (a race: we thought we were the controller
+			// when we sent this, the lease moved before the host processed it). No natural interaction
+			// coordinates for a server-driven refusal, so the hint centers near the top of the view; the
+			// imminent `controller` broadcast (a separate message) is what actually re-dims the controls.
+			if (msg.refused === "read-only") flashBlockedHintCenter("steer");
 		} else if (msg.type === "stream") {
 			// Ghost lifecycle — presentation only; ghosts NEVER enter session.store.blocks.
 			if (msg.phase === "start") {
