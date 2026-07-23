@@ -70,20 +70,38 @@
  *    (birth-fold-eligible / back in `freshIds`) while both revs advance in lockstep — the same
  *    invisible-divergence class v12's `birthFolded` closed. Bumped so a pre-v15 peer (which neither
  *    sends nor expects the field) cannot pair with a v15 host/client that assumes it.
+ *  - v16: single-controller + the stable door (ADR 0024, issue #66). `hello` gains `controller`
+ *    (the current global lease + a `fresh` flag); a NEW client→server `claimController {}` takes the
+ *    lease (allowed from any GUI socket — the human is the authority, takeover is never refused); a
+ *    NEW server→client `controller { surfaceId, label }` broadcasts a lease change of hands. A GUI
+ *    socket dials with `?surface`/`?label` identity params (sanitized like every other ingress), and
+ *    `CommandResultMessage` gains `refused:"read-only"` — a mutating command from a surface that is
+ *    not the fresh lease-holder is refused before it touches Truth. Bumped so a pre-v16 peer (which
+ *    has none of this vocabulary) cannot pair with a v16 host/client that assumes it.
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import { sanitizeOps, type Op, type OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 15;
+export const PROTOCOL_VERSION = 16;
 
 /**
- * Browser dev-loop fallback port only. In the desktop ("pull") model each pi session binds an
- * EPHEMERAL port and advertises it via the registry, which clients discover — so this constant
- * is NOT what a real session listens on. It is the default the browser manual-connect pre-fills.
+ * The DOOR: a fixed, well-known loopback port that exactly ONE extension binds at a time as an
+ * ADDITIONAL listener (its per-session ephemeral port is unchanged), with automatic takeover when
+ * the holder dies (ADR 0024). This is what makes `/accordion`'s URL stable across any single
+ * session's death. Deliberately NOT the standard OTLP/gRPC collector port 4317 — that has a real
+ * collision risk on dev machines.
  */
-export const DEFAULT_PORT = 4317;
+export const DOOR_PORT = 24317;
+
+/**
+ * Manual-connect pre-fill default. Points at the DOOR (a stable URL that survives any one session's
+ * death), NOT a real ephemeral session port — in the desktop ("pull") model each session binds an
+ * ephemeral port advertised via the registry, which clients discover. This constant is only the
+ * value the browser manual-connect field pre-fills / falls back to.
+ */
+export const DEFAULT_PORT = DOOR_PORT;
 
 /**
  * A serialisable block — the wire form of engine `Block`, minus the reactive overlay (which
@@ -156,6 +174,19 @@ export interface ActiveConductorMeta {
 	holdWireUpToMs: number;
 	/** True iff this conductor runs out-of-process over the wire (a remote SDK), not in-extension. */
 	remote: boolean;
+}
+
+/**
+ * The current global controller lease as the host knows it (ADR 0024, single-controller). Exactly
+ * one surface controls machine-wide, across ALL live pi sessions; every other surface is a live
+ * READ-ONLY mirror. Carried on `hello` so a connecting GUI can decide silent auto-claim (no lease,
+ * or `fresh:false`) vs. the takeover popup (`fresh` and a DIFFERENT surface). `fresh` = the lease's
+ * `heartbeatAt` is within the staleness window — a stale lease is treated as uncontrolled.
+ */
+export interface ControllerInfo {
+	surfaceId: string;
+	label: string;
+	fresh: boolean;
 }
 
 /** One block's overlay in a snapshot (only blocks whose overlay differs from the fresh default). */
@@ -239,6 +270,10 @@ export interface HelloMessage {
 	/** The available-conductor catalog (Phase C) — omitted/undefined on a host with none attached
 	 *  or not yet advertising one; the GUI picker renders from this, never from local knowledge. */
 	conductors?: ActiveConductorMeta[];
+	/** The current global controller lease (v16, ADR 0024), or `null` when no lease exists. Optional
+	 *  so a pre-v16-shaped literal still type-checks (the version bump is the real cross-version gate);
+	 *  a v16 host always emits it (possibly `null`). */
+	controller?: ControllerInfo | null;
 }
 
 /** Full state to (re)build a replica Truth. Sent right after hello and on any forced resnapshot. */
@@ -294,6 +329,28 @@ export interface CommandResultMessage {
 	seq: number;
 	results: OpResult[];
 	rev: number;
+	/**
+	 * v16 (ADR 0024): the whole command was refused BEFORE it touched the Truth because the sending
+	 * surface is not the current fresh controller (READ-ONLY enforcement). For an `ops` command
+	 * `results` additionally mirrors one `read-only` clamp per op (so per-tile clamp UX still works);
+	 * this top-level flag is the uniform signal for the dial commands (setBudget/setProtect/
+	 * setFolding/selectConductor) that carry no ops. `rev` is unchanged (nothing applied).
+	 */
+	refused?: "read-only";
+}
+
+/**
+ * Broadcast to EVERY client of this extension whenever the global controller lease changes hands
+ * (v16, ADR 0024): this extension's own `claimController` write, OR an external change observed via
+ * the ~1s `controller.json` mtime poll. Carries the NEW holder's identity; a GUI compares
+ * `surfaceId` to its own to decide "I gained control" vs. "someone took control from me" (demotion),
+ * never a locally tracked guess. Staleness (holder went away) is NOT signalled here — it surfaces on
+ * the next connect via `hello.controller.fresh:false`; a hard clear never happens (last write wins).
+ */
+export interface ControllerMessage {
+	type: "controller";
+	surfaceId: string;
+	label: string;
 }
 
 /**
@@ -391,7 +448,8 @@ export type ServerMessage =
 	| WireDepartingMessage
 	| TurnCommittedMessage
 	| ProposeResultMessage
-	| CompleteResultMessage;
+	| CompleteResultMessage
+	| ControllerMessage;
 
 // ── Client → server ──────────────────────────────────────────────────────────
 
@@ -483,6 +541,17 @@ export interface ResnapshotMessage {
 	type: "resnapshot";
 }
 
+/**
+ * A GUI client's request to become the global controller (v16, ADR 0024). Allowed from ANY gui
+ * socket — the human is the authority, so a takeover is never refused and last write wins on races.
+ * Carries no payload: the claiming surface's identity is the socket's own `?surface`/`?label` dial
+ * params, which the host already sanitized at connect. NOT a `command` (it is never gated by the
+ * READ-ONLY controller check — that would make claiming impossible for a non-controller).
+ */
+export interface ClaimControllerMessage {
+	type: "claimController";
+}
+
 export type ClientMessage =
 	| CommandMessage
 	| ResnapshotMessage
@@ -490,7 +559,8 @@ export type ClientMessage =
 	| CompleteRequestMessage
 	| SetConductorStatusMessage
 	| HoldReleaseMessage
-	| CancelCompleteMessage;
+	| CancelCompleteMessage
+	| ClaimControllerMessage;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -509,6 +579,7 @@ const SERVER_TYPES = new Set([
 	"turnCommitted",
 	"proposeResult",
 	"completeResult",
+	"controller",
 ]);
 
 export function isServerMessage(v: unknown): v is ServerMessage {
@@ -516,7 +587,7 @@ export function isServerMessage(v: unknown): v is ServerMessage {
 	return SERVER_TYPES.has((v as { type: unknown }).type as string);
 }
 
-const CLIENT_TYPES = new Set(["command", "resnapshot", "propose", "completeRequest", "setConductorStatus", "holdRelease", "cancelComplete"]);
+const CLIENT_TYPES = new Set(["command", "resnapshot", "propose", "completeRequest", "setConductorStatus", "holdRelease", "cancelComplete", "claimController"]);
 
 export function isClientMessage(v: unknown): v is ClientMessage {
 	if (!v || typeof v !== "object" || !("type" in v)) return false;
@@ -584,4 +655,43 @@ export function sanitizeCommand(cmd: unknown): WireCommand | null {
 		default:
 			return null;
 	}
+}
+
+/** Bound on a surface id (`?surface=`) — comfortably longer than a UUID (36 chars). */
+export const MAX_SURFACE_ID_LEN = 64;
+/** Bound on a surface label (`?label=`) — e.g. "Desktop app" / "Browser tab". */
+export const MAX_SURFACE_LABEL_LEN = 48;
+
+/**
+ * Validate + clamp a surface-id dial param (v16, ADR 0024). Each surface mints a persistent UUID in
+ * localStorage and sends it as `?surface=`; this is the SAME "authorized ≠ well-formed" ingress gate
+ * `sanitizeCommand` is — a malformed/hostile value must never reach the `controller.json` lease file
+ * or a `controller` broadcast. Accept only a bounded `[A-Za-z0-9._-]` token (covers a UUID and any
+ * reasonable persistent id); anything else → `null` (the socket is then treated as having no
+ * identity and can never hold the lease).
+ */
+export function sanitizeSurfaceId(v: unknown): string | null {
+	if (typeof v !== "string") return null;
+	const s = v.trim();
+	if (!s || s.length > MAX_SURFACE_ID_LEN) return null;
+	return /^[A-Za-z0-9._-]+$/.test(s) ? s : null;
+}
+
+/**
+ * Validate + clamp a surface-label dial param (v16). Human-facing only (rendered in the READ-ONLY
+ * chip / takeover popup), so it may contain spaces, but control characters are stripped and the
+ * length is bounded before it can ride a broadcast to every client. Returns a safe non-empty label,
+ * or `null` when nothing usable remains.
+ */
+export function sanitizeSurfaceLabel(v: unknown): string | null {
+	if (typeof v !== "string") return null;
+	// Keep printable chars only (drop C0 control chars + DEL by code point), then trim + cap
+	// length before the label can ride a broadcast to every client.
+	let s = "";
+	for (const ch of v) {
+		const code = ch.codePointAt(0);
+		if (code !== undefined && code >= 0x20 && code !== 0x7f) s += ch;
+	}
+	s = s.trim().slice(0, MAX_SURFACE_LABEL_LEN);
+	return s ? s : null;
 }
