@@ -385,8 +385,8 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	}
 
 	/**
-	 * Emit `text` as `group` command(s) (digest = text) covering the covered survivors in the aged
-	 * prefix that are also `includeInGroup`-eligible. Re-derived from the LIVE view on every call:
+	 * Emit `text` as `group` command(s) covering the covered survivors in the aged prefix that are
+	 * also `includeInGroup`-eligible. Re-derived from the LIVE view on every call:
 	 *   - A survivor is a block in `coveredIds` that is still in the aged prefix, not held, not
 	 *     inside a FOREIGN group, and `includeInGroup(b)`. A block this conductor has "covered"
 	 *     (fed to the model at least once) but which is NOT group-eligible (only possible if a
@@ -397,10 +397,25 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	 *     walking the FULL aged prefix (including held/foreign-grouped/excluded blocks) so any of
 	 *     those SPLIT the run rather than being spanned.
 	 *
+	 * ONLY THE FIRST EMITTED RUN CARRIES `text` (issue #90): a held/pinned block or a foreign group
+	 * can fragment the aged prefix into K > 1 survivor runs, and every run used to get the FULL
+	 * summary as its digest — the wire then carried K copies of the same text while `conduct()`'s
+	 * `savedTokens` (below) charges `textTokenCost()` exactly ONCE, so a fragmented aged region could
+	 * make "compaction" grow the wire and starve the trigger. Every run AFTER the first instead gets
+	 * digest `""` — the group-op vocabulary's explicit DROP sentinel (`Truth.isDropGroup`/
+	 * `core/ops.ts`'s `group.summary` doc: `null`/`""` → no wire message at all), not the
+	 * default-recap `undefined` would trigger. A dropped run costs zero wire tokens (barring the
+	 * unrelated, pre-existing role-validity-floor degradation `Truth` can still apply to ANY drop
+	 * group), which is exactly what the charge-once accounting already assumes — so `savedTokens`
+	 * needs no change at all: it was always "one full-text charge, the rest free," and this is what
+	 * now actually reaches the wire. K = 1 (the common case, no fragmentation) is unaffected: the
+	 * single run still gets the full `text` digest, byte-identical to before this fix.
+	 *
 	 * Returns:
 	 *   - null  → no result yet (used ONLY while a first-trip completion is in-flight).
 	 *   - []    → no surviving covered blocks to cover (clear to raw; lossless).
-	 *   - [...] → one `group` command per contiguous survivor run, digest = text.
+	 *   - [...] → one `group` command per contiguous survivor run — the first carries `text`,
+	 *             every subsequent one carries `""` (DROP).
 	 */
 	private emitCoverageGroup(view: ConductorView): Command[] | null {
 		if (this.text === null) return null;
@@ -410,9 +425,12 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		let runStart = -1;
 		let runEnd = -1;
 		let survivorCount = 0;
+		let carriedText = false; // true once the first run has claimed the full-text digest
 		const flush = (): void => {
 			if (runStart === -1) return;
-			cmds.push({ kind: "group", ids: [view.blocks[runStart].id, view.blocks[runEnd].id], digest: this.text! });
+			const digest = carriedText ? "" : this.text!;
+			carriedText = true;
+			cmds.push({ kind: "group", ids: [view.blocks[runStart].id, view.blocks[runEnd].id], digest });
 			runStart = -1;
 			runEnd = -1;
 		};
