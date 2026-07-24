@@ -7,7 +7,9 @@
 	 *
 	 * Copy verbatim from the approved mock (§05): "<Label> took control" / "This window is now a
 	 * live mirror." Neutral styling, light-grey left edge — never the reserved user-block blue.
+	 * Positioning/stacking is owned by `ToastRegion.svelte` — this component renders only the card.
 	 */
+	import { toastPop } from "./toastTransition";
 	let {
 		label,
 		onclose,
@@ -20,7 +22,7 @@
 	} = $props();
 </script>
 
-<div class="demotion-toast" role="status">
+<div class="demotion-toast" role="status" transition:toastPop|global>
 	<div class="demotion-body">
 		<div class="demotion-title">{label} took control</div>
 		<div class="demotion-detail">This window is now a live mirror.</div>
@@ -31,15 +33,9 @@
 
 <style>
 	.demotion-toast {
-		position: fixed;
-		top: 18px;
-		right: 18px;
-		z-index: 210;
 		display: flex;
 		align-items: flex-start;
 		gap: var(--sp-3);
-		width: 320px;
-		max-width: calc(100vw - 36px);
 		padding: var(--sp-3);
 		background: var(--panel);
 		border: 1px solid var(--line-strong);
