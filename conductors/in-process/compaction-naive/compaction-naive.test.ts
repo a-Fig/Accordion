@@ -132,6 +132,55 @@ describe("NaiveCompactionConductor — trigger + first pass", () => {
 	});
 });
 
+// Issue #11 stage 2 (ADR 0025): `AgedSummaryConductor`'s own trigger baseline (`sumTokens(view.blocks)`,
+// `agedSummaryConductor.ts`) sums `ViewBlock.tokens` — now a CALIBRATED number (`core/conductor/
+// hostAdapter.ts`'s `viewBlockOf`) — against `view.budget` (a literal, real-token dial value, never
+// multiplied). This is exactly the "trigger fires on real numbers" behavior stage 2 exists for: the
+// identical raw session content that stays under the mark at k=1 (see the sibling test above) now
+// crosses it once the session's real tokens run higher than the raw chars/4 estimate.
+describe("NaiveCompactionConductor — token calibration (issue #11 stage 2)", () => {
+	it("the SAME raw content that stays under the 90% mark at k=1 triggers once calibration is raised (k>1)", async () => {
+		const host = new TestHost();
+		host.setBudget(BUDGET); // 1000 — 90% high-water mark = 900
+		host.setProtect(0);
+		host.appendBlocks(Array.from({ length: 5 }, (_, i) => mkBlock(idOf(i), i, i % 2 === 0 ? "user" : "text", TOK, `LOW-${i}`)));
+		// Raw: 5 * 100 = 500 < 900 — the sibling "does not trigger" test above confirms this holds at
+		// k=1. Real tokens for this session run 2x the raw estimate:
+		host.truth.setCalibration(2);
+
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+
+		host.commitTurn();
+		await flush();
+
+		// Calibrated: 5 * calTokens(100) = 5 * 200 = 1000 >= 900 — triggers on the SAME session
+		// content that stayed silent at k=1.
+		expect(host.completeLog.length).toBe(1);
+		expect(host.truth.groups.length).toBe(1);
+	});
+
+	it("conversely: content that WOULD trigger at k=1 stays silent once calibration is lowered (k<1)", async () => {
+		const host = new TestHost();
+		host.setBudget(BUDGET); // 90% high-water mark = 900
+		host.setProtect(0);
+		// 10 blocks * 100 raw tokens = 1000 >= 900 — triggers at k=1.
+		host.appendBlocks(Array.from({ length: 10 }, (_, i) => mkBlock(idOf(i), i, "text", TOK, `MID-${i}`)));
+		// Real tokens for this session run HALF the raw estimate — calibrated total = 500 < 900.
+		host.truth.setCalibration(0.5);
+
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+
+		host.commitTurn();
+		await flush();
+
+		expect(host.completeLog.length).toBe(0);
+		expect(host.truth.groups.length).toBe(0);
+	});
+});
+
 describe("NaiveCompactionConductor — recursive pass", () => {
 	it("wraps <previous-summary> + only newly-aged blocks; the old compacted originals are never re-read", async () => {
 		const { host } = await runPass1();

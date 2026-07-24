@@ -69,8 +69,12 @@
 		{ f: 5, lbl: "up to 15k tok" },
 		{ f: 6, lbl: "past 15k tok" },
 	] as const;
-	// Use the canonical faceFor from tileDraw (single source of truth).
-	const faceFor = faceForLib;
+	// Use the canonical faceFor from tileDraw (single source of truth) — every call site below feeds
+	// it a CALIBRATED token count (issue #11 stage 2, ADR 0025) so a tile's die-face weight matches
+	// what the rest of the UI now reports as that block's real size, not the raw chars/4 estimate.
+	// Wrapped once here (rather than at each call site) so `faceFor(x)` stays a drop-in raw-tokens-in
+	// call everywhere it's already used; the canvas/sprite machinery `faceForLib` feeds is untouched.
+	const faceFor = (tokens: number) => faceForLib(store.calTokens(tokens));
 
 	// Color = kind legend (toolbar). Each block kind owns one spectrum hue (--k-*);
 	// this names them so the grid's colours are self-explaining. Order follows the

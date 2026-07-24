@@ -28,9 +28,14 @@ export interface ViewBlock {
 	kind: "user" | "text" | "thinking" | "tool_call" | "tool_result";
 	turn: number;
 	order: number;
-	/** Full token cost. */
+	/**
+	 * Full token cost, CALIBRATED (issue #11 stage 2, ADR 0025 — `Truth.calTokens`) — a real,
+	 * provider-anchored number, not the raw chars/4 estimate. See `TruthStats`'s doc comment
+	 * (`../truth`) for the "calibrate every conductor read surface" convention this is part of.
+	 */
 	tokens: number;
-	/** Token cost if folded — the digest/subst size for a foldable kind, else full tokens. */
+	/** Token cost if folded — the digest/subst size for a foldable kind, else full tokens. Same
+	 *  calibration convention as `tokens`. */
 	foldedTokens: number;
 	toolName?: string;
 	callId?: string;
@@ -145,9 +150,14 @@ export interface ConductorHost {
 	groups(): readonly GroupInfo[];
 	/** The full original text of a block (never the folded substitution), or null if unknown. */
 	textOf(id: string): string | null;
-	/** Aggregate readout of the current state. */
+	/** Aggregate readout of the current state. CALIBRATED — see `TruthStats`'s doc comment. */
 	stats(): TruthStats;
-	/** Synchronous token estimate using the host's tokenizer. */
+	/**
+	 * Synchronous token estimate using the host's tokenizer, CALIBRATED (issue #11 stage 2, ADR 0025)
+	 * against the session's current `Truth.calibration` — same convention as `ViewBlock.tokens` /
+	 * `stats()`, so a conductor mixing this with either in one comparison (e.g. reserving output room
+	 * against `contextWindow`) stays unit-consistent.
+	 */
 	countTokens(text: string): number;
 	/** The engine's per-kind folded digest for block `id`, or null if unknown. */
 	digestOf(id: string): string | null;

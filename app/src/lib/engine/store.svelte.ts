@@ -273,7 +273,11 @@ export class AccordionStore {
 	fullTokens = $derived.by(() => (void this.version, this.truth.fullTokens()));
 	savedTokens = $derived.by(() => this.fullTokens - this.liveTokens);
 	foldedCount = $derived.by(() => (void this.version, this.truth.foldedCount()));
-	overBudget = $derived.by(() => this.liveTokens > this.budget);
+	// Issue #11 stage 2 (ADR 0025): compares the CALIBRATED live total against `budget` — `budget` is
+	// itself a real-token target (the dial's literal value; stage 2 does not multiply it), so this
+	// stays unit-consistent with the hero readout's own `calTokens(liveTokens)` and can no longer
+	// visually disagree with it the way the stage-1-only raw comparison could.
+	overBudget = $derived.by(() => this.calTokens(this.liveTokens) > this.budget);
 	protectedFromIndex = $derived.by(() => (void this.version, this.truth.protectedFromIndex()));
 	protectedTokens = $derived.by(() => (void this.version, this.truth.protectedTokens()));
 

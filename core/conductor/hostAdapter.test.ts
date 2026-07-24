@@ -81,6 +81,25 @@ describe("viewBlockOf — per-block projection fidelity", () => {
 		t.markSent(2);
 		expect(viewBlockOf(t, t.get("a:b2:p0")!).sent).toBe(true);
 	});
+
+	// Issue #11 stage 2 (ADR 0025): `tokens`/`foldedTokens` are CALIBRATED — every conductor-facing
+	// read surface shares this convention (see `TruthStats`'s doc comment in `../truth`).
+	it("tokens/foldedTokens are calibrated against the Truth's current calibration multiplier", () => {
+		const t = bulk(seq(2, 1000));
+		t.setProtect(0);
+		t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "you");
+		const b0 = t.get("a:b0:p0")!;
+
+		const atDefault = viewBlockOf(t, b0);
+		expect(atDefault.tokens).toBe(1000); // k=1 is the identity
+		const rawFolded = atDefault.foldedTokens;
+
+		t.setCalibration(2.5);
+		const calibrated = viewBlockOf(t, b0);
+		expect(calibrated.tokens).toBe(t.calTokens(1000));
+		expect(calibrated.tokens).toBe(Math.round(1000 * 2.5));
+		expect(calibrated.foldedTokens).toBe(t.calTokens(rawFolded));
+	});
 });
 
 // ── stateChangeFromOp ─────────────────────────────────────────────────────────

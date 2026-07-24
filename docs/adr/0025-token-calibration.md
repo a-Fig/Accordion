@@ -1,7 +1,8 @@
 # ADR 0025 — Provider-anchored token calibration
 
-**Status:** accepted, stage 1 shipped (plumbing + display; see Deferred for stage 2)
-**Date:** 2026-07-24
+**Status:** accepted, stage 1 + stage 2 shipped (plumbing + display, then decision math; see the
+Stage 2 section below)
+**Date:** 2026-07-24 (stage 1) / 2026-07-24 (stage 2)
 **Builds on:** [ADR 0021](0021-truth-in-the-extension.md) (the Truth that owns every config dial in
 the pi extension process, and whose `context` hook is the one place the departing wire and pi's own
 `getContextUsage()` are both in scope), [ADR 0011](0011-conductor-involvement-locks.md) (the config-
@@ -61,16 +62,17 @@ on `SnapshotState` and the `config` event, plus `realTokens`/`estWireTokens` on 
 raw ingredients of the most recent observation, so the GUI/smoke tests can audit `k` independently of
 the derived multiplier).
 
-### Stage-1 invariant: decision math is untouched
+### Stage-1 invariant (historical): decision math was untouched
 
-`canFold`, `protectedFromIndex`, `stats()`, `serializeWire`/`computeFoldOps`/`computeGroupOps`, and
-every conductor-visible number (`ConductorHost.stats`/`countTokens`) read the raw chars/4 estimate,
-exactly as before this ADR. `calibration` is invisible to that whole surface — `core/conductor/
-hostAdapter.ts`'s `hostEventsFromTruthEvent` explicitly drops a calibration-only `config` event rather
-than let it fall through to the existing `budget !== undefined ? "budget" : "protect"` default and
-mislabel it a "protect" change, which would otherwise wake every subscribed conductor once per model
-reply for a dial it was never meant to see. Stage 1 is plumbing and display; stage 2 (below) is a
-separate, later decision about whether/how the fold boundary itself should read calibrated numbers.
+At stage 1, `canFold`, `protectedFromIndex`, `stats()`, `serializeWire`/`computeFoldOps`/
+`computeGroupOps`, and every conductor-visible number (`ConductorHost.stats`/`countTokens`) read the
+raw chars/4 estimate, exactly as before this ADR. `calibration` was invisible to that whole surface —
+`core/conductor/hostAdapter.ts`'s `hostEventsFromTruthEvent` explicitly drops a calibration-only
+`config` event rather than let it fall through to the existing `budget !== undefined ? "budget" :
+"protect"` default and mislabel it a "protect" change, which would otherwise wake every subscribed
+conductor once per model reply for a dial it was never meant to see (this guard is still in place —
+`calibration` never becomes a conductor `state-changed` notification, even after stage 2). Stage 2
+(below) is what flips the rest of that surface onto calibrated numbers.
 
 ### Pairing: real usage vs. the estimate of the wire that earned it
 
@@ -123,42 +125,106 @@ A calibrated number renders bare when it is provider-anchored; a component shows
 `store.calibration === 1` (covers both cold start and every read-only/demo/CC/file session in one
 check — the same failure mode either way) or, in `MapHeader` specifically, the existing `readOnly`
 prop. `MapHeader`'s hero line, composition-strip tooltips, and `ContextMap`/`Inspector`'s token
-readouts all route through `store.calTokens(n)`; tile canvas drawing (dice-face bins) is untouched —
-stage 2's call, not stage 1's (see below). No new colors — the marker is `var(--muted)`/`var(--faint)`,
-matching the existing monochrome UI-chrome rule.
+readouts all route through `store.calTokens(n)`; tile canvas drawing (dice-face bins) stayed on raw
+bins through stage 1 — stage 2 (below) is what routes `faceFor()`'s input through `calTokens` too. No
+new colors — the marker is `var(--muted)`/`var(--faint)`, matching the existing monochrome UI-chrome
+rule.
+
+## Stage 2 — decision math reads calibrated numbers too
+
+Stage 2 flips the surface stage 1 deliberately left alone: `protectedFromIndex()`, `Truth.stats()`,
+and every conductor-facing read (`ViewBlock.tokens`/`foldedTokens`, `ConductorHost.countTokens`) now
+report CALIBRATED numbers, so the protected-tail boundary, a conductor's own budget-trigger math
+(`compaction-naive`/`handoff`'s 90% high-water mark, thermocline's hard-budget ladder), and the app's
+over-budget/composition-bar chrome all agree with the hero readout stage 1 already calibrated.
+`canFold` itself needed no direct change — it carries no token-threshold comparison of its own
+(verified by audit; it only ever calls `isProtected`), so it inherits the calibrated boundary
+transitively through `protectedFromIndex`.
+
+### The chosen convention: calibrate every conductor-facing read surface
+
+Two conventions were on the table: (a) calibrate only the AGGREGATE (`stats()`), leaving every
+per-block read (`ViewBlock.tokens`/`foldedTokens`, `countTokens`) raw, with each conductor doing its
+own unit conversion where it mixes the two; or (b) calibrate at EVERY read surface a conductor
+touches, so nothing downstream ever needs to know calibration exists. (b) shipped. The deciding
+evidence: `AgedSummaryConductor` (`conductors/in-process/agedSummaryConductor.ts`, the shared base of
+`compaction-naive`/`handoff`) sums `ViewBlock.tokens` directly to build its own trigger baseline
+(`sumTokens(view.blocks)`) rather than reading `stats().liveTokens`, and thermocline's `project()`
+(`conductors/ws/thermocline/policy.ts`) subtracts per-block `tokens − foldedTokens` from a
+`stats()`-derived baseline in the SAME expression. Leaving one side of either calculation raw and the
+other calibrated would not just shift a trigger threshold — it would produce a wrong-order-of-magnitude
+number the instant `calibration` drifts from 1. Calibrating every read surface means no shipped
+conductor needed a single code change to become calibration-aware: they already treat whatever
+`ViewBlock.tokens`/`stats()`/`countTokens` report as ground truth. `budget`/`protectTokens`/
+`contextWindow` — the literal dial values a human sets (or a conductor declares via `tailTokens`) —
+are the one thing that stays UNCONVERTED: stage 2 treats the number already on the dial as meaning
+REAL tokens (that is the entire point of calibrating the numerator against it), never multiplying it.
+
+### `protectedFromIndex`: one division of the target, not a multiplication per block
+
+`computeProtectedFromIndex` (`core/truth.ts`) still walks the block log's RAW `Block.tokens` — it does
+not call `calTokens` inside the loop. Instead the REAL-token target (`protectTokens`, or a `tail-size`
+holder's `activeTailTokens`) is converted ONCE, before the walk, to the equivalent raw-estimate
+threshold: `target = targetReal / calibration`. `calibrated(rawSum) >= targetReal` iff `rawSum >=
+targetReal / calibration`, so the two forms decide identically — the division-first form was chosen
+purely for host/replica determinism: `calibration` is a rev-stamped scalar both sides carry
+byte-identical (JSON round-trips any finite double exactly), so one shared division from the same two
+operands is bit-identical on both sides (IEEE-754 basic ops are deterministic). Calibrating per block
+inside the walk instead would call `Math.round` (inside `calTokens`) once per iteration, whose
+cumulative rounding error is a function of iteration order/count — something a host and a replica have
+no contractual guarantee to reproduce identically walk-for-walk over a session's lifetime. A single
+division has no such accumulation to diverge on. `core/truth.test.ts` extends the stage-1 replica
+round-trip tests with a non-1-calibration case asserting the host and a JSON-round-tripped replica
+compute the IDENTICAL `protectedFromIndex()`.
+
+### `Truth.stats()`: the aggregate is calibrated once per call, not per block
+
+`stats().liveTokens`/`fullTokens` route the ALREADY-SUMMED raw total through one `calTokens` call
+each — never a per-block calibration inside `liveTokens()`/`fullTokens()` themselves, which stay the
+raw accessors every other internal caller (`effTokens`, group accounting, `serializeWire`) still needs
+untouched. `budget`/`protectTokens`/`contextWindow`/`protectedFromIndex`/`blockCount` are unconverted
+(the first three are literal dial values under the convention above; the last two are already
+calibration-aware or structural facts, not token sums).
+
+### The app: closing the hero/bar/flag disagreement stage 1 accepted
+
+`store.overBudget` now compares `calTokens(liveTokens)` against `budget` (previously a raw-vs-raw
+comparison sitting next to an already-calibrated hero readout — exactly the disagreement stage 1's
+Consequences called out). `MapHeader`'s composition-bar axis (`denom`) and everything scaled against
+it (segment widths, the budget marker, headroom, the protected-tail handle/underline) now run on
+`calTokens(fullTokens)` instead of the raw total, so the bar's proportions agree with the calibrated
+hero numbers and with `budget`/`protectTokens` (both already real-token dial values). `calBudget` —
+stage 1's `calTokens(budget)` — is now simply `budget` itself: under the new convention the dial is
+ALREADY real, so multiplying it again would double-calibrate it and reintroduce a hero/flag mismatch
+in the other direction. `ContextMap.svelte`'s `faceFor()` die-face binning now feeds on
+`store.calTokens(tokens)` (wrapped once at the call site, `tileDraw.ts`'s pure `faceFor` function
+itself untouched) so a tile's visual weight matches its calibrated readout.
 
 ## Consequences
 
-- **A calibrated number and the raw decision it sits next to can visibly disagree in stage 1.** The
-  hero line's live/budget text is calibrated for internal consistency (both numbers route through the
-  same `calTokens`, so their on-screen ratio still reads sensibly), but `store.overBudget`'s color and
-  every fold-boundary decision stay on the raw estimate — so, rarely, the calibrated numbers can read
-  as "under" while the tint says "over," or vice versa. Accepted as a stage-1-only cosmetic artifact;
-  stage 2 is exactly the decision about whether to close this gap by calibrating the decision math too.
-- **Smearing is real and visible per-block.** A single multiplier cannot separate "this block is
-  genuinely bigger than we estimated" from "the system prompt is bigger than we estimated" — both show
-  up as the same per-block nudge. Most visible on a session with an unusually large tool schema set.
-- **One-turn lag.** `k` reflects the LAST completed request, not the one about to be sent — a session
-  whose content shape just changed sharply (a burst of code after a burst of prose) sees the new `k`
-  only after that shift's own reply lands, not preemptively.
-- **Protected-boundary twitch, deferred.** Because `protectedFromIndex()` still walks raw estimates,
-  turning stage 2 on later (calibrating the fold/protect math itself) will make the protected-tail
-  boundary jump slightly on every calibration snap, as the walk-back's token sum changes underneath it
-  without any block actually changing size. Called out here so it is not a surprise when stage 2 lands
-  — stage 1 cannot exhibit this, since it never feeds `calTokens` back into `protectedFromIndex`.
+- **Protected-boundary twitch, as predicted.** Because `protectedFromIndex()` now reads the
+  calibration dial, the protected-tail boundary can shift by a block or two on a calibration snap
+  (once per model reply) even though no block actually changed size — this was called out as an
+  expected stage-2 consequence in the original version of this ADR, and stage 2 confirms it: it is the
+  direct, intended effect of sizing the tail in real tokens rather than raw estimate tokens.
+- **Smearing is still real and visible per-block.** Unchanged from stage 1 — a single multiplier
+  cannot separate "this block is genuinely bigger than we estimated" from "the system prompt is bigger
+  than we estimated." Stage 2 makes the smeared number load-bearing for MORE decisions (the protected
+  boundary, a conductor's trigger) than stage 1 did (display only), so this caveat now matters more,
+  not less.
+- **One-turn lag, still present.** `k` reflects the LAST completed request — a session whose content
+  shape just changed sharply sees the new `k`, and therefore the new protected-boundary/trigger
+  behavior, only after that shift's own reply lands.
+- **A conductor's trigger point moves with the session, not just with content volume.** Two sessions
+  with byte-identical raw content can now trigger `compaction-naive`'s 90% mark at different points if
+  their `calibration` differs (see `compaction-naive.test.ts`'s "token calibration" describe block) —
+  accepted as the whole point of the stage (a REAL 90%, not a raw-estimate 90%), but worth naming
+  explicitly since it means the trigger is no longer a pure function of block count/kind alone.
 
-## Deferred (stage 2)
+## Deferred
 
-- **The affine fit (`real = base + k·est`).** Needs ≥2 observations and a real regression (or at least
-  a two-parameter least-squares over a short rolling window) — out of scope here; stage 1 ships the
-  pure multiplier knowingly, not as a placeholder for "we'll get to it eventually" but as the
-  documented first step.
-- **Decision math using calibrated numbers.** Whether `canFold`/`protectedFromIndex`/the budget
-  comparison should read `calTokens` output is a separate, later decision — it changes what the model
-  actually receives (or when a human/strategy's fold gate fires), which this stage was explicitly
-  scoped to leave untouched.
+- **The affine fit (`real = base + k·est`).** Still needs ≥2 observations and a real regression (or a
+  two-parameter least-squares over a short rolling window) — out of scope for both stages shipped so
+  far; the pure multiplier remains a documented simplification, not a placeholder.
 - **Smoothing / outlier rejection.** Once there is an affine fit to smooth, raw-snap-per-observation
   stops being the obviously-simplest option; revisit together with the affine work, not before.
-- **Dice-face tile bins.** `ContextMap.svelte`'s `faceFor()` thresholds stay on raw bins in stage 1
-  (explicitly out of scope per the task that shipped this ADR) — a calibration-aware bin scheme is a
-  stage-2 visual call, not a plumbing one.
