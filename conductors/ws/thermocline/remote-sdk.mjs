@@ -403,6 +403,16 @@ var Truth = class _Truth {
   budgetTok = 7e4;
   contextWindowTok = null;
   protectTokensTarget = 2e4;
+  /**
+   * Provider-anchored calibration multiplier (issue #11 stage 1, ADR 0025): `k = realTokens /
+   * estimatedTokens` for the same request, snapped by the HOST ONLY (`setCalibration`, called from
+   * the extension after pairing an assistant reply's real usage against the wire estimate that
+   * produced it). Default 1 — a session that never observes a real pairing (cold start; read-only /
+   * demo / CC / file sessions, which have no live host to ever call the setter) stays at 1 forever.
+   * DISPLAY-ONLY: nothing in `canFold`/`protectedFromIndex`/`stats()`/wire serialization reads this
+   * — decision math stays on the raw chars/4 estimate (stage 1 invariant). See `calTokens`.
+   */
+  calibrationMul = 1;
   activeLocks = [];
   activeTailTok = 0;
   holderLabel = null;
@@ -475,6 +485,8 @@ var Truth = class _Truth {
    * otherwise invisible. `carriedSent` MUST round-trip (v15) for the same silent-divergence reason:
    * a replica that lost it reclassifies a block the host recorded as already-sent back to fresh
    * (birth-fold-eligible / re-listed in `freshIds`), again with both revs still advancing in step.
+   * `calibration` (v18) is DISPLAY-only (see the field's own doc comment) — a replica that lost it
+   * just falls back to the safe default (1), never a decision-affecting silent divergence.
    */
   adoptSnapshot(s) {
     this.blockLog = s.blocks.slice();
@@ -490,6 +502,7 @@ var Truth = class _Truth {
     this.sentThroughOrderValue = s.sentThroughOrder;
     this.birthFolded = new Set(s.birthFolded);
     this.carriedSent = new Set(s.carriedSent);
+    this.calibrationMul = Number.isFinite(s.calibration) && s.calibration > 0 ? s.calibration : 1;
     this.lastChangedRev.clear();
     this.revCounter = s.rev;
     this.pfiCache = { rev: -1, value: 0 };
@@ -522,6 +535,7 @@ var Truth = class _Truth {
     next.activeLocks = prev.activeLocks.slice();
     next.holderLabel = prev.holderLabel;
     next.activeTailTok = prev.activeTailTok;
+    next.calibrationMul = prev.calibrationMul;
     for (const b of next.blockLog) {
       const old = prev.get(b.id);
       if (!old) continue;
@@ -582,6 +596,23 @@ var Truth = class _Truth {
   }
   get contextWindow() {
     return this.contextWindowTok;
+  }
+  /** The current provider-anchored calibration multiplier (default 1). See `calibrationMul`'s doc. */
+  get calibration() {
+    return this.calibrationMul;
+  }
+  /**
+   * Calibrated DISPLAY value of a raw token estimate — `Math.round(n * calibration)`. A pure helper
+   * a display consumer routes a number it ALREADY computed (`liveTokens()`, `effTokens(b)`, a
+   * per-kind sum, …) through to opt into calibration; it never feeds back into `canFold` /
+   * `protectedFromIndex` / `stats()` / wire serialization, which stay on the raw estimate (stage 1
+   * invariant, issue #11). One multiplier necessarily SMEARS the fixed system-prompt/tool-schema
+   * overhead (which belongs to no block) proportionally across every block rather than carrying it
+   * as its own line item — `real = base + k·est` would be the honest affine model; this ships the
+   * pure multiplier knowingly (see ADR 0025 for the stage-2 plan).
+   */
+  calTokens(n) {
+    return Math.round(n * this.calibrationMul);
   }
   get locks() {
     return this.activeLocks;
@@ -1043,6 +1074,22 @@ var Truth = class _Truth {
     const rev = ++this.revCounter;
     for (const id of touched) this.lastChangedRev.set(id, rev);
     this.emit({ type: "config", protectTokens: this.protectTokensTarget, rev });
+  }
+  /**
+   * HOST-ONLY calibration snap (issue #11 stage 1, ADR 0025): `k = realTokens / estWireTokens` for
+   * the request that just completed. Raw snap, no clamp, no smoothing/EMA — owner-approved v1
+   * policy: the dial always reflects the MOST RECENT observation, not a running average. There is
+   * no `WireCommand` kind for this — a client can never call it; only the extension's own host code
+   * does, after pairing an assistant message's real usage against the estimate of the wire that
+   * produced it (see `extension/accordion.ts`'s `maybeObserveCalibration`). A non-finite or
+   * non-positive `k` is refused (poisons the dial / forks replicas via JSON `null`), the same guard
+   * shape as `setBudget`/`setProtect`.
+   */
+  setCalibration(k) {
+    if (!Number.isFinite(k) || k <= 0) return;
+    this.calibrationMul = k;
+    const rev = ++this.revCounter;
+    this.emit({ type: "config", calibration: this.calibrationMul, rev });
   }
   markSent(order) {
     if (order <= this.sentThroughOrderValue) return;
@@ -1567,6 +1614,9 @@ function hydrateSnapshot(meta, state) {
     // still type-checks — the version bump is the real cross-version gate; the host serializer
     // always emits it. Default `[]` (a session that never rebuilt has no carried sent-ness).
     carriedSent: state.carriedSent ?? [],
+    // Optional on the wire (v18, same treatment as v15's `carriedSent` above); default to the
+    // cold-start value `1` for a peer/test literal that omits it — the host serializer always emits it.
+    calibration: state.calibration ?? 1,
     rev: state.rev
   });
   return truth;
@@ -1583,6 +1633,7 @@ function applyWireEvent(truth, ev) {
       if (ev.budget !== void 0) truth.setBudget(ev.budget);
       if (ev.contextWindow !== void 0 && ev.contextWindow !== null) truth.setContextWindow(ev.contextWindow);
       if (ev.protectTokens !== void 0) truth.setProtect(ev.protectTokens);
+      if (ev.calibration !== void 0) truth.setCalibration(ev.calibration);
       return;
     case "locks":
       if (ev.locks.length) truth.setLocks(ev.locks, ev.holder ?? "", ev.tailTokens);
@@ -1660,6 +1711,7 @@ function hostEventsFromTruthEvent(truth, e) {
     return changes.length ? [{ type: "state-changed", changes, rev: e.rev }] : [];
   }
   if (e.type === "config") {
+    if (e.budget === void 0 && e.protectTokens === void 0 && e.contextWindow === void 0) return [];
     const what = e.budget !== void 0 ? "budget" : "protect";
     return [{ type: "state-changed", changes: [{ what, by: "you" }], rev: e.rev }];
   }
@@ -1673,7 +1725,7 @@ function recallHostEvent(ids, by, rev) {
 }
 
 // core/protocol.ts
-var PROTOCOL_VERSION = 17;
+var PROTOCOL_VERSION = 18;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
   "snapshot",

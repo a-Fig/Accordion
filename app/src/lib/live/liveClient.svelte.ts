@@ -51,7 +51,7 @@ let pendingMeta: SessionMeta = { format: "pi", title: "live pi session", cwd: ""
 
 /** Fresh, all-zero hook telemetry — one connection's worth. */
 function freshTelemetry() {
-	return { lastHookMs: 0, maxHookMs: 0, p95HookMs: 0, rebuilds: 0, hookCount: 0, lastHoldMs: 0, holdTimeouts: 0 };
+	return { lastHookMs: 0, maxHookMs: 0, p95HookMs: 0, rebuilds: 0, hookCount: 0, lastHoldMs: 0, holdTimeouts: 0, realTokens: null, estWireTokens: null };
 }
 
 /**
@@ -61,7 +61,10 @@ function freshTelemetry() {
  * NEW wire-departing hold the host grants an attached conductor's last-moment proposal — the
  * latency badge re-keys its amber/red thresholds off `lastHookMs - lastHoldMs` so a conductor
  * legitimately spending its declared hold budget never paints the badge as if the hook itself were
- * slow (see MapHeader.svelte). Reset on every new connection.
+ * slow (see MapHeader.svelte). `realTokens`/`estWireTokens` (v18, issue #11 stage 1) are the raw
+ * ingredients of the host's most recent token-calibration observation — `null` until the first one
+ * lands this connection; auditing-only, the calibrated multiplier itself lives on the replica Truth
+ * (`store.calibration`), not here. Reset on every new connection.
  */
 export const live = $state<{
 	status: "idle" | "connecting" | "connected" | "error";
@@ -76,6 +79,8 @@ export const live = $state<{
 		hookCount: number;
 		lastHoldMs: number;
 		holdTimeouts: number;
+		realTokens: number | null;
+		estWireTokens: number | null;
 	};
 }>({
 	status: "idle",
@@ -399,6 +404,8 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 				hookCount: msg.hookCount,
 				lastHoldMs: msg.lastHoldMs,
 				holdTimeouts: msg.holdTimeouts,
+				realTokens: msg.realTokens,
+				estWireTokens: msg.estWireTokens,
 			};
 		} else if (msg.type === "conductorState") {
 			// Broadcast to EVERY client — the honest, shared "who (if anyone) is driving" state.

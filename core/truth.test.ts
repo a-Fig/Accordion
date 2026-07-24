@@ -3,7 +3,7 @@ import { Truth } from "./truth";
 import type { Block, ParsedSession } from "./types";
 import { linearize, wireToBlock, type PiMessage } from "./wire";
 import { foldCode } from "./digest";
-import { wireEventFromTruthEvent, applyWireEvent } from "./replica";
+import { wireEventFromTruthEvent, applyWireEvent, serializeSnapshot, hydrateSnapshot } from "./replica";
 import type { WireEvent } from "./protocol";
 
 const META = { format: "pi" as const, title: "t", cwd: "", model: "" };
@@ -993,5 +993,126 @@ describe("Truth — config dials refuse non-finite input (fix #5)", () => {
 
 		t.setBudget(50_000); // a real value still applies
 		expect(t.budget).toBe(50_000);
+	});
+});
+
+// Issue #11 stage 1 (ADR 0025): the `calibration` dial — default, raw-snap (no clamp/smoothing),
+// non-finite/non-positive refusal (same guard shape as the other config dials), the display-only
+// `calTokens` helper, and survival across `rebuildFrom` + a snapshot/replica round trip.
+describe("Truth — calibration (issue #11 stage 1)", () => {
+	it("defaults to 1, and calTokens is the identity at the default", () => {
+		const t = bulk(seq(2, 1000));
+		expect(t.calibration).toBe(1);
+		expect(t.calTokens(1234)).toBe(1234);
+	});
+
+	it("setCalibration raw-snaps (no clamp, no smoothing) and emits a config event", () => {
+		const t = bulk(seq(2, 1000));
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+		const rev0 = t.rev;
+
+		t.setCalibration(1.5);
+		expect(t.calibration).toBe(1.5);
+		expect(t.calTokens(1000)).toBe(1500);
+		expect(t.rev).toBe(rev0 + 1);
+		expect(events.at(-1)).toMatchObject({ type: "config", calibration: 1.5 });
+
+		// A SECOND observation overwrites the first outright — no averaging/EMA toward it.
+		t.setCalibration(0.8);
+		expect(t.calibration).toBe(0.8);
+		expect(t.rev).toBe(rev0 + 2);
+	});
+
+	it("refuses non-finite / non-positive input — no poison, no rev bump, no event (same guard shape as setBudget/setProtect)", () => {
+		const t = bulk(seq(2, 1000));
+		const rev0 = t.rev;
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+
+		t.setCalibration(NaN);
+		t.setCalibration(Infinity);
+		t.setCalibration(0);
+		t.setCalibration(-1.2);
+		expect(t.calibration).toBe(1); // unchanged, not poisoned
+		expect(t.rev).toBe(rev0);
+		expect(events.length).toBe(0);
+	});
+
+	it("calTokens never affects canFold / protectedFromIndex / stats() — decision math is untouched by the dial", () => {
+		const t = bulk(seq(4, 1000));
+		t.setProtect(0);
+		// `rev` legitimately bumps (setCalibration is a state change like any other config dial) — every
+		// OTHER field of `stats()` must stay byte-identical, since none of them may read the dial.
+		const { rev: revBefore, ...statsBefore } = t.stats();
+		const pfiBefore = t.protectedFromIndex();
+		const canFoldBefore = t.canFold(t.get("a:b0:p0")!);
+
+		t.setCalibration(3.7);
+
+		const { rev: revAfter, ...statsAfter } = t.stats();
+		expect(statsAfter).toEqual(statsBefore);
+		expect(revAfter).toBe(revBefore + 1);
+		expect(t.protectedFromIndex()).toBe(pfiBefore);
+		expect(t.canFold(t.get("a:b0:p0")!)).toBe(canFoldBefore);
+		// The dial only affects the opt-in display helper.
+		expect(t.calTokens(1000)).toBe(3700);
+	});
+
+	it("survives rebuildFrom (carried like budget/protectTokens), and a fresh build (prev === null) stays at the default", () => {
+		const host = live();
+		host.append(seq(3, 1000));
+		host.setCalibration(1.42);
+
+		const fresh = seq(3, 1000);
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(next.calibration).toBe(1.42);
+
+		const firstBuild = Truth.rebuildFrom(null, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(firstBuild.calibration).toBe(1); // not polluted by ANY prior state
+	});
+
+	it("round-trips through serializeSnapshot → hydrateSnapshot (replica replay parity)", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		host.setCalibration(2.25);
+
+		const state = serializeSnapshot(host, false);
+		expect(state.calibration).toBe(2.25);
+
+		const replica = hydrateSnapshot(META, state);
+		expect(replica.calibration).toBe(2.25);
+		expect(replica.rev).toBe(host.rev);
+
+		// A stale-format peer that omits `calibration` (pre-v18) falls back to the safe cold-start
+		// default rather than forking on `undefined` — never a decision-affecting divergence.
+		const stale = hydrateSnapshot(META, { ...state, calibration: undefined });
+		expect(stale.calibration).toBe(1);
+	});
+
+	it("a config event carrying ONLY calibration replays via applyWireEvent without touching the other dials", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		const budget0 = host.budget;
+		const protect0 = host.protectTokens;
+
+		const events: WireEvent[] = [];
+		const off = host.onEvent((e) => {
+			const w = wireEventFromTruthEvent(e);
+			if (w) events.push(w);
+		});
+		host.setCalibration(1.1);
+		off();
+		const cfgEv = events.find((e) => e.kind === "config");
+		expect(cfgEv).toMatchObject({ kind: "config", calibration: 1.1 });
+		expect((cfgEv as any).budget).toBeUndefined();
+		expect((cfgEv as any).protectTokens).toBeUndefined();
+
+		const replica = live();
+		replica.append(seq(2, 1000));
+		applyWireEvent(replica, cfgEv!);
+		expect(replica.calibration).toBe(1.1);
+		expect(replica.budget).toBe(budget0);
+		expect(replica.protectTokens).toBe(protect0);
 	});
 });

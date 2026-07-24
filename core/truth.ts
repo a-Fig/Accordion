@@ -122,6 +122,16 @@ export class Truth {
 	private budgetTok = 70_000;
 	private contextWindowTok: number | null = null;
 	private protectTokensTarget = 20_000;
+	/**
+	 * Provider-anchored calibration multiplier (issue #11 stage 1, ADR 0025): `k = realTokens /
+	 * estimatedTokens` for the same request, snapped by the HOST ONLY (`setCalibration`, called from
+	 * the extension after pairing an assistant reply's real usage against the wire estimate that
+	 * produced it). Default 1 — a session that never observes a real pairing (cold start; read-only /
+	 * demo / CC / file sessions, which have no live host to ever call the setter) stays at 1 forever.
+	 * DISPLAY-ONLY: nothing in `canFold`/`protectedFromIndex`/`stats()`/wire serialization reads this
+	 * — decision math stays on the raw chars/4 estimate (stage 1 invariant). See `calTokens`.
+	 */
+	private calibrationMul = 1;
 
 	private activeLocks: readonly LockName[] = [];
 	private activeTailTok = 0;
@@ -206,6 +216,8 @@ export class Truth {
 	 * otherwise invisible. `carriedSent` MUST round-trip (v15) for the same silent-divergence reason:
 	 * a replica that lost it reclassifies a block the host recorded as already-sent back to fresh
 	 * (birth-fold-eligible / re-listed in `freshIds`), again with both revs still advancing in step.
+	 * `calibration` (v18) is DISPLAY-only (see the field's own doc comment) — a replica that lost it
+	 * just falls back to the safe default (1), never a decision-affecting silent divergence.
 	 */
 	adoptSnapshot(s: {
 		blocks: Block[];
@@ -220,6 +232,7 @@ export class Truth {
 		wireAttached: boolean;
 		birthFolded: readonly string[];
 		carriedSent: readonly string[];
+		calibration: number;
 		rev: number;
 	}): void {
 		this.blockLog = s.blocks.slice();
@@ -235,6 +248,7 @@ export class Truth {
 		this.sentThroughOrderValue = s.sentThroughOrder;
 		this.birthFolded = new Set(s.birthFolded);
 		this.carriedSent = new Set(s.carriedSent);
+		this.calibrationMul = Number.isFinite(s.calibration) && s.calibration > 0 ? s.calibration : 1;
 		this.lastChangedRev.clear();
 		this.revCounter = s.rev;
 		// Rev-keyed read caches are stamped stale so they recompute against the adopted rev.
@@ -269,6 +283,7 @@ export class Truth {
 		next.activeLocks = prev.activeLocks.slice();
 		next.holderLabel = prev.holderLabel;
 		next.activeTailTok = prev.activeTailTok;
+		next.calibrationMul = prev.calibrationMul;
 		for (const b of next.blockLog) {
 			const old = prev.get(b.id);
 			if (!old) continue;
@@ -361,6 +376,23 @@ export class Truth {
 	}
 	get contextWindow(): number | null {
 		return this.contextWindowTok;
+	}
+	/** The current provider-anchored calibration multiplier (default 1). See `calibrationMul`'s doc. */
+	get calibration(): number {
+		return this.calibrationMul;
+	}
+	/**
+	 * Calibrated DISPLAY value of a raw token estimate — `Math.round(n * calibration)`. A pure helper
+	 * a display consumer routes a number it ALREADY computed (`liveTokens()`, `effTokens(b)`, a
+	 * per-kind sum, …) through to opt into calibration; it never feeds back into `canFold` /
+	 * `protectedFromIndex` / `stats()` / wire serialization, which stay on the raw estimate (stage 1
+	 * invariant, issue #11). One multiplier necessarily SMEARS the fixed system-prompt/tool-schema
+	 * overhead (which belongs to no block) proportionally across every block rather than carrying it
+	 * as its own line item — `real = base + k·est` would be the honest affine model; this ships the
+	 * pure multiplier knowingly (see ADR 0025 for the stage-2 plan).
+	 */
+	calTokens(n: number): number {
+		return Math.round(n * this.calibrationMul);
 	}
 	get locks(): readonly LockName[] {
 		return this.activeLocks;
@@ -844,6 +876,22 @@ export class Truth {
 		const rev = ++this.revCounter;
 		for (const id of touched) this.lastChangedRev.set(id, rev);
 		this.emit({ type: "config", protectTokens: this.protectTokensTarget, rev });
+	}
+	/**
+	 * HOST-ONLY calibration snap (issue #11 stage 1, ADR 0025): `k = realTokens / estWireTokens` for
+	 * the request that just completed. Raw snap, no clamp, no smoothing/EMA — owner-approved v1
+	 * policy: the dial always reflects the MOST RECENT observation, not a running average. There is
+	 * no `WireCommand` kind for this — a client can never call it; only the extension's own host code
+	 * does, after pairing an assistant message's real usage against the estimate of the wire that
+	 * produced it (see `extension/accordion.ts`'s `maybeObserveCalibration`). A non-finite or
+	 * non-positive `k` is refused (poisons the dial / forks replicas via JSON `null`), the same guard
+	 * shape as `setBudget`/`setProtect`.
+	 */
+	setCalibration(k: number): void {
+		if (!Number.isFinite(k) || k <= 0) return;
+		this.calibrationMul = k;
+		const rev = ++this.revCounter;
+		this.emit({ type: "config", calibration: this.calibrationMul, rev });
 	}
 	markSent(order: number): void {
 		if (order <= this.sentThroughOrderValue) return;

@@ -310,6 +310,52 @@ await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2
 	// telemetry's hold fields stay pinned at 0 and the hook stays sync-fast (identical to pre-Phase-C).
 	if (tel && (tel.lastHoldMs !== 0 || tel.holdTimeouts !== 0))
 		fails.push(`default path paid a hold with no conductor (lastHoldMs=${tel.lastHoldMs}, holdTimeouts=${tel.holdTimeouts})`);
+	// Issue #11 stage 1 (protocol v18): cold start — no calibration observation has landed yet, so
+	// both ingredients stay null.
+	if (tel && tel.realTokens !== null) fails.push(`telemetry.realTokens should be null before any calibration observation lands (got ${tel.realTokens})`);
+	if (tel && tel.estWireTokens !== null) fails.push(`telemetry.estWireTokens should be null before any calibration observation lands (got ${tel.estWireTokens})`);
+}
+
+// ── issue #11 stage 1: provider-anchored token calibration (protocol v18) ────
+// Fire a context hook (records the departing wire's own estimate as `pendingWireEst`), then finish
+// it with a fabricated assistant message carrying REAL provider usage — the pairing
+// `maybeObserveCalibration` snaps `truth.calibration` from. `usage.output` is deliberately huge and
+// DIFFERENT from input/cacheRead/cacheWrite so an implementation that mistakenly summed it in
+// (matching pi's own forward-looking `calculateContextTokens`, which is NOT the pairing this project
+// chose) would fail the realTokens assertion below.
+{
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx)); // records pendingWireEst
+	const calibAssistant = {
+		role: "assistant",
+		content: [{ type: "text", text: "calibration probe reply" }],
+		responseId: "resp-calib-probe",
+		timestamp: T0 + 10,
+		stopReason: "stop",
+		usage: { input: 5000, output: 999_999, cacheRead: 100, cacheWrite: 50 },
+	};
+	handlers.message_end({ message: calibAssistant }, ctx); // pairs + raw-snaps truth.calibration
+
+	// `message_end` does not itself broadcast telemetry (only the `context` hook does) — fire one more
+	// hook so `telemetryMsg()` streams the just-observed realTokens/estWireTokens.
+	a.inbox.telemetry.length = 0;
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
+	await waitFor(() => a.inbox.telemetry.length > 0, 2000, "telemetry after calibration probe").catch(
+		() => fails.push("context hook did not stream telemetry after the calibration probe"),
+	);
+	const tel = a.inbox.telemetry.at(-1);
+	if (tel.realTokens !== 5150) fails.push(`telemetry.realTokens expected 5150 (5000 input + 100 cacheRead + 50 cacheWrite, output excluded), got ${tel.realTokens}`);
+	if (typeof tel.estWireTokens !== "number" || tel.estWireTokens <= 0) fails.push(`telemetry.estWireTokens expected a positive number, got ${tel.estWireTokens}`);
+
+	a.inbox.snapshot.length = 0;
+	a.ws.send(JSON.stringify({ type: "resnapshot" }));
+	await waitFor(() => a.inbox.snapshot.length > 0, 2000, "snapshot after calibration probe").catch(
+		() => fails.push("resnapshot after the calibration probe produced no snapshot"),
+	);
+	const snap = a.inbox.snapshot.at(-1);
+	const expectedK = tel.realTokens / tel.estWireTokens;
+	if (typeof snap.state.calibration !== "number" || Math.abs(snap.state.calibration - expectedK) > 1e-9)
+		fails.push(`snapshot.calibration expected ${expectedK} (realTokens/estWireTokens), got ${snap.state.calibration}`);
+	if (snap.state.calibration === 1) fails.push("calibration probe did not move the dial away from the cold-start default");
 }
 
 // ── agent_end is a RUN-LOCAL delta, never a full-history snapshot ─────────────

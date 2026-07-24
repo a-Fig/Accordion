@@ -86,13 +86,24 @@
  *    client→server counterpart. Bumped so a pre-v17 peer (which doesn't know this type) still can't
  *    silently pair with a v17 host/client — same policy as every prior bump, even though an unknown
  *    message type alone is harmless (`isServerMessage`/a conductor's `default:` case both ignore it).
+ *  - v18: provider-anchored token calibration, stage 1 — plumbing + display only, no decision-math
+ *    change (issue #11, ADR 0025). `SnapshotState` gains optional `calibration` (the current
+ *    multiplier, default 1 when absent — same "optional so an old literal still type-checks"
+ *    treatment as v15's `carriedSent`); the `config` `WireEvent` gains an optional `calibration`
+ *    field alongside `budget`/`contextWindow`/`protectTokens`; `TelemetryMessage` gains `realTokens`
+ *    and `estWireTokens` (the raw ingredients of the most recent calibration observation, `null`
+ *    until the first one lands) so the GUI/smoke tests can audit calibration independently of the
+ *    derived multiplier. `calibration` is HOST-SET ONLY — there is no new `WireCommand` kind, so a
+ *    client can never set it (only `extension/accordion.ts`'s own hook code calls
+ *    `Truth.setCalibration`). Bumped so a pre-v18 peer (which has none of this vocabulary) cannot
+ *    pair with a v18 host/client that assumes it.
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import { sanitizeOps, type Op, type OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 17;
+export const PROTOCOL_VERSION = 18;
 
 /**
  * The DOOR: a fixed, well-known loopback port that exactly ONE extension binds at a time as an
@@ -241,6 +252,15 @@ export interface SnapshotState {
 	 * from the host while both revs still advance in lockstep (the same class as v12's `birthFolded`).
 	 */
 	carriedSent?: string[];
+	/**
+	 * The current provider-anchored calibration multiplier (`Truth.calibration`, v18) — see the
+	 * protocol History note above and ADR 0025. Optional so a peer/test constructing a `SnapshotState`
+	 * literal without it still type-checks (the v18 version bump is the real cross-version gate, same
+	 * treatment as v15's `carriedSent`); a hydrating replica defaults it to `1` (the cold-start value),
+	 * and the host serializer always emits it. DISPLAY-only — losing it on a stale peer just falls
+	 * back to the safe default, never a decision-affecting silent divergence.
+	 */
+	calibration?: number;
 	rev: number;
 }
 
@@ -261,7 +281,7 @@ export interface SnapshotState {
 export type WireEvent =
 	| { kind: "appended"; blocks: WireBlock[]; rev: number }
 	| { kind: "ops"; by: Actor; ops: Op[]; rev: number }
-	| { kind: "config"; budget?: number; contextWindow?: number | null; protectTokens?: number; rev: number }
+	| { kind: "config"; budget?: number; contextWindow?: number | null; protectTokens?: number; calibration?: number; rev: number }
 	| { kind: "locks"; locks: LockName[]; holder: string | null; tailTokens: number; rev: number }
 	| { kind: "sent"; throughOrder: number; rev: number }
 	| { kind: "reset"; by: Actor; rev: number };
@@ -329,6 +349,17 @@ export interface TelemetryMessage {
 	hookCount: number;
 	lastHoldMs: number;
 	holdTimeouts: number;
+	/**
+	 * The raw ingredients of the MOST RECENT provider-anchored calibration observation (issue #11
+	 * stage 1, v18, ADR 0025) — `realTokens` the provider's own usage for that request (input +
+	 * cacheRead + cacheWrite; the request's own output is deliberately excluded, see
+	 * `maybeObserveCalibration`'s doc comment in extension/accordion.ts), `estWireTokens` Truth's
+	 * estimate of the same departing wire. Both `null` until the first observation lands this
+	 * connection (cold start). Exists so the GUI/smoke tests can audit `k = realTokens/estWireTokens`
+	 * independently of `Truth.calibration`, which only ever carries the DERIVED multiplier.
+	 */
+	realTokens: number | null;
+	estWireTokens: number | null;
 }
 
 /** The host's reply to a `command`. The client uses it for clamp UX only; state arrives via events. */

@@ -72,11 +72,14 @@
 	// Block mode: is this block part of a group? Used to render the "part of group" link.
 	const inGroup = $derived(block ? store.groupOf(block) : null);
 
-	// Group mode derived values
+	// Group mode derived values. Token readouts calibrated (issue #11 stage 1) — display only.
 	const gMembers = $derived(group ? store.groupMembers(group) : []);
-	const gFullTok = $derived(group ? store.groupFullTokens(group) : 0);
-	const gLiveTok = $derived(group ? store.groupLiveTokens(group) : 0);
-	const gSavedTok = $derived(group ? store.groupSavedTokens(group) : 0);
+	const gFullTok = $derived(group ? store.calTokens(store.groupFullTokens(group)) : 0);
+	const gLiveTok = $derived(group ? store.calTokens(store.groupLiveTokens(group)) : 0);
+	const gSavedTok = $derived(group ? store.calTokens(store.groupSavedTokens(group)) : 0);
+	// "≈" marker gate — `calibration === 1` covers both cold start and every read-only/demo/CC/file
+	// session (no live host ever calibrates those), so no separate `readOnly` prop is needed here.
+	const notAnchored = $derived(store.calibration === 1);
 	const gStrag = $derived(group ? store.groupStragglerCount(group) : 0);
 	const gIsDropGroup = $derived(group ? store.isDropGroup(group) : false);
 	// The EXACT summary the agent receives for this group: a custom digest literal when the
@@ -131,8 +134,9 @@
 						</span>
 					{/if}
 				</div>
-				<!-- Token data row: tabular mono -->
+				<!-- Token data row: tabular mono. Calibrated (issue #11 stage 1) — display only. -->
 				<div class="tok-table mono">
+					{#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}
 					<span class="tok-row">
 						<span class="tok-key">full</span>
 						<span class="tok-val">{fmt(gFullTok)}</span>
@@ -266,22 +270,23 @@
 						</span>
 					{/if}
 				</div>
-				<!-- Token data: tabular mono -->
+				<!-- Token data: tabular mono. Calibrated (issue #11 stage 1) — display only. -->
 				<div class="tok-table mono">
+					{#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}
 					{#if folded}
 						<span class="tok-row">
 							<span class="tok-key">full</span>
-							<span class="tok-val tok-struck">{fmt(block.tokens)}</span>
+							<span class="tok-val tok-struck">{fmt(store.calTokens(block.tokens))}</span>
 						</span>
 						<span class="tok-sep-char">→</span>
 						<span class="tok-row">
 							<span class="tok-key">live</span>
-							<span class="tok-val tok-live">{fmt(store.effTokens(block))}</span>
+							<span class="tok-val tok-live">{fmt(store.calTokens(store.effTokens(block)))}</span>
 						</span>
 					{:else}
 						<span class="tok-row">
 							<span class="tok-key">tokens</span>
-							<span class="tok-val tok-live">{fmt(block.tokens)}</span>
+							<span class="tok-val tok-live">{fmt(store.calTokens(block.tokens))}</span>
 						</span>
 					{/if}
 				</div>
@@ -362,7 +367,7 @@
 						{partner.kind === "tool_result" ? "Result produced" : "Call that produced this"}
 					</span>
 					<span class="partner-meta mono">
-						{partnerFolded ? "folded" : "live"} · {fmt(store.effTokens(partner))} tok
+						{partnerFolded ? "folded" : "live"} · {#if notAnchored}≈{/if}{fmt(store.calTokens(store.effTokens(partner)))} tok
 					</span>
 				</div>
 
@@ -606,6 +611,10 @@
 	.tok-saved {
 		color: var(--ok);
 		font-size: var(--fs-xs);
+	}
+	/* "≈" marker — a bare (not provider-anchored) estimate, issue #11 stage 1. Monochrome, no new color. */
+	.approx {
+		color: var(--faint);
 	}
 
 	/* Action row: buttons laid out in a flex row */

@@ -65,6 +65,11 @@ export class AccordionStore {
 	budget = $state(70_000);
 	contextWindow = $state<number | null>(null);
 	protectTokens = $state(20_000);
+	/** Provider-anchored calibration multiplier (issue #11 stage 1) — mirrors `truth.calibration`.
+	 *  Default 1; a demo/CC/file (local-mode) session never calls `setCalibration`, so it stays 1
+	 *  forever (no offline calibration in v1). In live mode this arrives ONLY via the wire's `config`
+	 *  event (host-set, see `commandSink`'s doc comment) — never a local action a UI can trigger. */
+	calibration = $state(1);
 	/** Bumped on every truth event — the reactive redraw signal the forwarded reads depend on. */
 	version = $state(0);
 
@@ -99,6 +104,7 @@ export class AccordionStore {
 		this.budget = this.truth.budget;
 		this.contextWindow = this.truth.contextWindow;
 		this.protectTokens = this.truth.protectTokens;
+		this.calibration = this.truth.calibration;
 		this._locks = this.truth.locks;
 		this._holder = this.truth.lockHolder;
 		this._activeTail = this.truth.activeTailTokens;
@@ -133,6 +139,7 @@ export class AccordionStore {
 				if (e.budget !== undefined) this.budget = e.budget;
 				if (e.contextWindow !== undefined) this.contextWindow = e.contextWindow;
 				if (e.protectTokens !== undefined) this.protectTokens = e.protectTokens;
+				if (e.calibration !== undefined) this.calibration = e.calibration;
 				break;
 			case "locks":
 				this.syncOverlay();
@@ -252,6 +259,14 @@ export class AccordionStore {
 	canFold(b: Block): boolean {
 		void this.version;
 		return this.truth.canFold(b, "you");
+	}
+	/** Calibrated DISPLAY value of a raw token number (issue #11 stage 1) — routes through
+	 *  `Truth.calTokens`. Never used by decision math (fold gating, budget comparisons, …); a display
+	 *  component opts in by passing a number it already computed. See `Truth.calTokens`'s doc comment
+	 *  for the smearing caveat. */
+	calTokens(n: number): number {
+		void this.version;
+		return this.truth.calTokens(n);
 	}
 
 	liveTokens = $derived.by(() => (void this.version, this.truth.liveTokens()));

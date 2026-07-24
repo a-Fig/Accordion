@@ -59,6 +59,7 @@ export function serializeSnapshot(truth: Truth, foldingEnabled: boolean): Snapsh
 		foldingEnabled,
 		birthFolded: [...truth.birthFoldedIds],
 		carriedSent: [...truth.carriedSentIds],
+		calibration: truth.calibration,
 		rev: truth.rev,
 	};
 }
@@ -96,6 +97,9 @@ export function hydrateSnapshot(meta: SessionMeta, state: SnapshotState): Truth 
 		// still type-checks — the version bump is the real cross-version gate; the host serializer
 		// always emits it. Default `[]` (a session that never rebuilt has no carried sent-ness).
 		carriedSent: state.carriedSent ?? [],
+		// Optional on the wire (v18, same treatment as v15's `carriedSent` above); default to the
+		// cold-start value `1` for a peer/test literal that omits it — the host serializer always emits it.
+		calibration: state.calibration ?? 1,
 		rev: state.rev,
 	});
 	return truth;
@@ -138,7 +142,7 @@ export function wireEventFromTruthEvent(e: TruthEvent): WireEvent | null {
 			return { kind: "ops", by: e.by, ops, rev: e.rev };
 		}
 		case "config":
-			return { kind: "config", budget: e.budget, contextWindow: e.contextWindow, protectTokens: e.protectTokens, rev: e.rev };
+			return { kind: "config", budget: e.budget, contextWindow: e.contextWindow, protectTokens: e.protectTokens, calibration: e.calibration, rev: e.rev };
 		case "locks":
 			return { kind: "locks", locks: e.locks.slice(), holder: e.holder, tailTokens: e.tailTokens, rev: e.rev };
 		case "sent":
@@ -162,6 +166,7 @@ export function applyWireEvent(truth: Truth, ev: WireEvent): void {
 			// A config event carries at most one dial; contextWindow is only ever emitted as a number.
 			if (ev.contextWindow !== undefined && ev.contextWindow !== null) truth.setContextWindow(ev.contextWindow);
 			if (ev.protectTokens !== undefined) truth.setProtect(ev.protectTokens);
+			if (ev.calibration !== undefined) truth.setCalibration(ev.calibration);
 			return;
 		case "locks":
 			if (ev.locks.length) truth.setLocks(ev.locks, ev.holder ?? "", ev.tailTokens);
