@@ -1,5 +1,5 @@
 /*
- * core/conductors/agedSummaryConductor.ts — shared base for the "aged region → one LLM-written
+ * conductors/in-process/agedSummaryConductor.ts — shared base for the "aged region → one LLM-written
  * summary group" conductor shape, factored out of `compaction-naive/compaction-naive.ts` and
  * `handoff/handoff.ts` (PR #82 adversarial review: the two were ~90% duplicated — same
  * agedRegion/foreignGroupedIds/emit-group/launch-completion machinery and the same output-token
@@ -23,8 +23,8 @@
  * No Svelte, no `$state`, no engine imports. Types only from `../conductor/contract` and
  * `../conductor/view`.
  */
-import { ViewConductor, type Command, type ConductorView } from "../conductor/view";
-import type { ConductorHost, LockName, ViewBlock } from "../conductor/contract";
+import { ViewConductor, type Command, type ConductorView } from "../../core/conductor/view";
+import type { ConductorHost, LockName, ViewBlock } from "../../core/conductor/contract";
 
 /** Fraction of budget at which a run triggers (high-water mark). Shared by both conductors. */
 const TRIGGER = 0.9;

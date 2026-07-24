@@ -22,7 +22,7 @@ import {
 	type ConductorView,
 	type ViewBlock,
 } from "./policy";
-import { foldTag } from "../../core/digest";
+import { foldTag } from "../../../core/digest";
 
 // ── factories ───────────────────────────────────────────────────────────────────────────────
 let _order = 0;

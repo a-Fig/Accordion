@@ -3,7 +3,7 @@
  * conductor-v2 contract, `./contract`) from a `Truth` and its `TruthEvent`s (`../events`).
  *
  * `TestHost` (`./testhost.ts`) was, until Phase C, the ONLY place this derivation existed — every
- * shipped conductor (`core/conductors/**`, `conductors/thermocline/**`) is golden-tested against
+ * shipped conductor (`conductors/in-process/**`, `conductors/ws/thermocline/**`) is golden-tested against
  * exactly what TestHost derives. Phase C needs the SAME derivation in two more places (the
  * in-extension live host, the out-of-process remote SDK), so it is extracted here rather than
  * re-derived — a second hand-rolled copy would risk drifting from what those conductors were

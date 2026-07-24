@@ -1,5 +1,5 @@
 /*
- * core/conductors/handoff/handoff.ts — the "Handoff (fresh start)" conductor.
+ * conductors/in-process/handoff/handoff.ts — the "Handoff (fresh start)" conductor.
  *
  * PORTED from the deleted `conductors/handoff/handoff.ts` (ADR 0017, git rev dc037bc) onto the
  * conductor-v2 contract, via the `ViewConductor` adapter (`core/conductor/view.ts`). Since that
@@ -76,7 +76,7 @@
  * `../agedSummaryConductor`.
  */
 import { AgedSummaryConductor, neutralizeClosingTags, sumTokens, blockLabel, truncateForStatus } from "../agedSummaryConductor";
-import type { LockName } from "../../conductor/contract";
+import type { LockName } from "../../../core/conductor/contract";
 
 /**
  * The inherited old-session tail this conductor OWNS via the `tail-size` lock. A literal fresh

@@ -561,7 +561,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	function resolveRunnerPath(entryFile: string): string | null {
 		try {
 			const here = path.dirname(fileURLToPath(import.meta.url));
-			const p = path.resolve(here, "..", "conductors", "thermocline", entryFile);
+			const p = path.resolve(here, "..", "conductors", "ws", "thermocline", entryFile);
 			return fs.existsSync(p) ? p : null;
 		} catch {
 			return null;

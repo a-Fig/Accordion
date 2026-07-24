@@ -8,7 +8,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { classifyCodeRead } from "./classify";
-import type { ViewBlock } from "../../conductor/contract";
+import type { ViewBlock } from "../../../core/conductor/contract";
 
 // ───────────────────────── builders (ported from the reference test file) ─────────────────
 

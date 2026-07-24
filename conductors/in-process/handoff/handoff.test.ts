@@ -1,5 +1,5 @@
 /*
- * core/conductors/handoff/handoff.test.ts — golden tests for the ported "Handoff (fresh start)"
+ * conductors/in-process/handoff/handoff.test.ts — golden tests for the ported "Handoff (fresh start)"
  * conductor, driven against `TestHost` (a real `Truth` instance) per `core/conductor/testhost.ts`'s
  * own doc comment ("Phase-D agents golden-test conductors against this").
  *
@@ -11,8 +11,8 @@
  * replace).
  */
 import { describe, it, expect } from "vitest";
-import { TestHost } from "../../conductor/testhost";
-import type { Block, ParsedSession } from "../../types";
+import { TestHost } from "../../../core/conductor/testhost";
+import type { Block, ParsedSession } from "../../../core/types";
 import { HandoffConductor, neutralizeSentinels, truncateForStatus, sumTokens, blockLabel } from "./handoff";
 
 const META = { format: "pi" as const, title: "t", cwd: "", model: "test-model" };

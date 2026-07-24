@@ -1,5 +1,5 @@
 /*
- * core/conductors/doorman/skeletonize.ts
+ * conductors/in-process/doorman/skeletonize.ts
  *
  * Ported VERBATIM (structural logic byte-identical, only this banner comment rewritten)
  * from the deleted `conductors/code-skeleton/skeletonize.ts` (ADR 0016, git rev dc037bc)
