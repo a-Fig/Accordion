@@ -27,6 +27,8 @@
  */
 import { describe, expect, it } from "vitest";
 import { TestHost } from "../../../core/conductor/testhost";
+import { estTokens, BLOCK_OVERHEAD } from "../../../core/tokens";
+import { roleFloorRecap } from "../../../core/wire";
 import type { Block, BlockKind } from "../../../core/types";
 import { COMPACTION_SYSTEM, NaiveCompactionConductor } from "./compaction-naive";
 
@@ -415,10 +417,13 @@ describe("NaiveCompactionConductor — fragmentation does not grow the wire (iss
 	// prefixed `a:`) makes EVERY block "assistant" for this floor's purposes regardless of `kind`.
 	// Dropping a whole run between two other `a:`-prefixed survivors therefore welds two "assistant"
 	// messages together — a real, pre-existing mechanism wholly unrelated to issue #90, but one that
-	// would leak a non-zero recap cost into a same-role-neighbors fixture and contaminate this
-	// specific comparison. This test uses a genuine `u:`-prefixed id for the held block (4) so it is
-	// unambiguously "user"-role on both sides of the drop, isolating exactly the invariant issue #90
-	// is about (a dropped run costing what the conductor's accounting already assumes: zero).
+	// turns the drop into a PAID recap stub and makes the trigger's accounting under-count the true
+	// wire by that recap's cost. So "accounting equals wire" is NOT exact in general: it holds
+	// precisely when no dropped run degrades (this test's fixture — a genuine `u:`-prefixed held
+	// block keeps the drop's surviving neighbors on different roles, so the drop is truly free), and
+	// otherwise under-counts by ~one recap (~25 tokens including its BLOCK_OVERHEAD) per degraded
+	// run — a bounded, small residual (vs. the unbounded K× full-summary error issue #90 removed),
+	// pinned exactly by the "degraded-recap residual" test below so it can never grow silently.
 	it("accounting matches the wire: the trigger's computed visible-window size equals the true post-fold wire size (within BLOCK_OVERHEAD's fixed per-run framing, already unaccounted by the K=1 formula today)", async () => {
 		const host = new TestHost();
 		host.setBudget(BUDGET);
@@ -454,8 +459,44 @@ describe("NaiveCompactionConductor — fragmentation does not grow the wire (iss
 		// K=1 must stay byte-identical). With exactly one surviving full-text carrier (the fix's
 		// entire point) and the dropped run genuinely free (no role-floor degradation — see the
 		// banner comment above), that is the ONLY discrepancy between the two numbers.
-		const BLOCK_OVERHEAD = 4;
 		expect(host.truth.liveTokens()).toBe(conductorVisible + BLOCK_OVERHEAD);
+	});
+
+	// The bounded residual named in the banner above, pinned exactly. `buildPass1Blocks()`'s
+	// all-`a:`-prefixed ids make every block "assistant" to the role-validity floor, so dropping run
+	// [5-8] welds the pinned block 4 against tail block 9 — same-role adjacency — and
+	// `computeDegradedDropRuns` degrades the drop into a paid `roleFloorRecap` stub. The trigger's
+	// charge-once accounting knows nothing of that stub, so it under-counts the true wire by exactly
+	// the stub's cost. This test asserts (a) non-growth STILL holds with the stub paid, and (b) the
+	// under-count is EXACTLY one recap + BLOCK_OVERHEAD for the one degraded run — pinning the
+	// residual so any future change that silently grows it (more degraded runs, a costlier stub, a
+	// second unmodeled term) fails here instead of shipping.
+	it("degraded-recap residual: when the role floor degrades the dropped run, non-growth holds and the accounting under-count is exactly one recap + BLOCK_OVERHEAD", async () => {
+		const { host } = setupHost();
+		const rawTotal = host.truth.fullTokens(); // 1200
+
+		host.queueCompletion({ text: SUMMARY_A });
+		host.humanPin(idOf(4)); // splits aged 0-8 into [0-3] (text carrier) and [5-8] (drop)
+		host.commitTurn();
+		await flush();
+
+		expect(host.truth.groups.length).toBe(2);
+		const gDrop = host.truth.groups.find((g) => g.memberIds[0] === idOf(5))!;
+		expect(host.truth.groupSummary(gDrop)).toBe(""); // still a DROP by intent — degradation is Truth's, not the conductor's
+
+		// (a) Non-growth: even with the degraded run paying for a recap stub, folding never
+		// increases live wire tokens versus the raw baseline.
+		expect(host.truth.liveTokens()).toBeLessThan(rawTotal);
+
+		// (b) The residual, pinned. The conductor's `visible` (rawTotal − savedTokens, per
+		// `conduct()`): survivors are the 8 covered blocks; textTokenCost is the summary's estimate.
+		const summaryText = `[Compacted summary of 8 earlier messages]\n\n${SUMMARY_A}`;
+		const conductorVisible = rawTotal - (8 * TOK - estTokens(summaryText));
+		// The true wire adds the carrier's framing (one BLOCK_OVERHEAD, same as the exact-match test
+		// above) PLUS the degraded run's recap stub at the exact text `applyPlan` synthesizes —
+		// `roleFloorRecap(groupId, messageCount)`; run [5-8] is 4 single-block messages.
+		const recapCost = estTokens(roleFloorRecap(gDrop.id, 4)) + BLOCK_OVERHEAD;
+		expect(host.truth.liveTokens()).toBe(conductorVisible + BLOCK_OVERHEAD + recapCost);
 	});
 
 	it("K=3 runs (two held blocks): only the FIRST (earliest) run carries the summary — every later run is dropped, not just the second", async () => {
