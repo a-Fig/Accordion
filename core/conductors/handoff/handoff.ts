@@ -13,6 +13,11 @@
  * real error text — see `rejectMessage`), and the `tail-size` lock / `HANDOFF_TAIL_TOKENS = 0`
  * declaration that makes a handoff cover the WHOLE session rather than only the aged prefix.
  *
+ * Both this conductor and `compaction-naive` swallow every kind — including `user` — into their
+ * respective groups; neither overrides `includeInGroup` (see `../agedSummaryConductor.ts`'s default
+ * — every kind — and `compaction-naive.ts`'s banner PARITY NOTE for why an earlier, since-reverted
+ * `user`-exclusion override briefly made them differ). There is no remaining behavioral fork there.
+ *
  * PURPOSE (unchanged): automatically simulate the user's manual handoff workflow:
  *   1. Ask the current agent to write a handoff document.
  *   2. Kill / clear the current session.
@@ -34,16 +39,14 @@
  * handoff. Subsequent handoffs are written from the prior handoff plus new work only, just like a
  * real chain of handoff documents.
  *
- * UNLIKE `compaction-naive`, THIS CONDUCTOR DOES SWALLOW `user` BLOCKS INTO THE GROUP (PR #82 task
- * 3 — see `../agedSummaryConductor.ts`'s `includeInGroup` doc). That is a DELIBERATE difference,
- * not the same bug: a handoff's whole product is "collapse the ENTIRE prior session, including
- * what the human asked for, into one prose document a fresh agent reads instead" — gated behind an
- * explicit ALL-THREE-LOCKS consent (`human-steering` + `agent-unfold` + `tail-size`), unlike
+ * Like `compaction-naive`, this conductor swallows `user` blocks into the group along with every
+ * other kind (`includeInGroup` is not overridden — see `../agedSummaryConductor.ts`'s default). For
+ * a handoff that is the whole product: "collapse the ENTIRE prior session, including what the
+ * human asked for, into one prose document a fresh agent reads instead" — gated behind an explicit
+ * ALL-THREE-LOCKS consent (`human-steering` + `agent-unfold` + `tail-size`), unlike
  * `compaction-naive`'s two-lock, budget-driven, otherwise-invisible foil. A user ask surviving only
- * in paraphrased form inside the handoff document is the intended mechanism here, not an
- * unintended side effect of a "verbatim" promise nothing enforced (which is what made it a bug in
- * `compaction-naive`). See `handoff.test.ts`'s zero-tail test and this file's `locks`/`tailTokens`
- * for the consent shape.
+ * in paraphrased form inside the handoff document is the intended mechanism here. See
+ * `handoff.test.ts`'s zero-tail test and this file's `locks`/`tailTokens` for the consent shape.
  *
  * PORT FIDELITY — real adaptations, not cosmetic renames:
  *
@@ -139,8 +142,9 @@ export class HandoffConductor extends AgedSummaryConductor {
 	 *     this lock the host drives `protectedFromIndex` from `tailTokens` below, so the conductor
 	 *     folds the whole current conversation into the handoff.
 	 *
-	 * Being exclusive over all three would trigger the (removed, pending redesign) consent gate;
-	 * the human's recourse is always DETACH.
+	 * Being exclusive over all three triggers the client-side one-time consent gate (ADR 0011,
+	 * `ConsentDialog.svelte` / `ConductorMenu.svelte` — see the Conductors section of CLAUDE.md);
+	 * the human's recourse after consenting is always DETACH.
 	 */
 	readonly locks: readonly LockName[] = ["human-steering", "agent-unfold", "tail-size"];
 
@@ -155,8 +159,8 @@ export class HandoffConductor extends AgedSummaryConductor {
 	protected readonly priorTag = "previous-handoff";
 
 	// `includeInGroup` is NOT overridden — every kind, including `user`, may be folded into the
-	// handoff group. See this file's banner for why that is the right call here and not the same
-	// bug `compaction-naive` had.
+	// handoff group (the shared base's default). See this file's banner for why that is the right
+	// call here.
 
 	protected firstPassInstruction(): string {
 		return "Write the handoff document for the session history above.";
@@ -187,6 +191,16 @@ export class HandoffConductor extends AgedSummaryConductor {
 	protected rejectMessage(err: unknown): string {
 		const detail = truncateForStatus(err instanceof Error ? err.message : String(err));
 		return `Handoff failed — ${detail || "model completion error"}`;
+	}
+
+	/**
+	 * Sticky status when the completion rejected because the session has no live model link (see
+	 * `isUnavailableError` in the base class). Mirrors main's `host.can("complete")` pre-check
+	 * message verbatim — the base class also clears `lastAttemptKey` for this case, so the very next
+	 * pass retries automatically once the link returns, exactly like the old pre-flight did.
+	 */
+	protected unavailableMessage(): string {
+		return "Handoff unavailable — waiting for live model link";
 	}
 }
 

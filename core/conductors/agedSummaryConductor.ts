@@ -9,14 +9,16 @@
  *
  * `AgedSummaryConductor` owns everything that was byte-identical (or identical modulo a field
  * name) between the two: the aged-region derivation, foreign-grouped-id exclusion, the per-run
- * group-emission walk, the completion launch/inflight/attempt-key/sticky-failure-status lifecycle,
- * the output-token reservation math (MAX/MIN/MARGIN), and the `<conversation>`/`<prior-tag>` prompt
+ * group-emission walk, the completion launch/inflight/attempt-key/sticky-failure-status lifecycle
+ * (now including link-unavailability classification, see `isUnavailableError` below), the
+ * output-token reservation math (MAX/MIN/MARGIN), and the `<conversation>`/`<prior-tag>` prompt
  * template with its prompt-injection neutralizer. A subclass supplies only what is genuinely
  * different: its system prompt, its two prompt instructions (first-pass / recursive), its
- * count-preamble format, its three status messages, and — the one behavioral fork —
- * `includeInGroup`, which decides whether a given aged block may actually be swallowed into the
- * non-recoverable summary group or must stay live on the wire (see `compaction-naive.ts` for why
- * `user` blocks answer "no" there and `handoff.ts` for why they answer "yes" there).
+ * count-preamble format, and its four status messages (empty-output / window-too-tight / reject /
+ * unavailable). `includeInGroup` (below) is an optional per-kind fold-eligibility hook a subclass
+ * MAY override — neither shipped subclass does today (both `compaction-naive` and `handoff`
+ * swallow every kind, including `user`, matching main's original behavior byte-for-byte), but the
+ * hook stays available for a future conductor that genuinely needs to exclude a kind.
  *
  * No Svelte, no `$state`, no engine imports. Types only from `../conductor/contract` and
  * `../conductor/view`.
@@ -85,6 +87,36 @@ export function truncateForStatus(s: string, max: number = ERROR_STATUS_MAX_LEN)
 	return s.length > max ? `${s.slice(0, max)}…` : s;
 }
 
+/**
+ * Classify a `complete()` rejection as "no live model link" — the same condition main's contract
+ * reported ahead-of-time via `host.can("complete")` returning false. The v2 contract has no such
+ * pre-check; a rejected `complete()` IS the only signal, so this classifies the rejection itself
+ * rather than pre-flighting a capability query.
+ *
+ * Deliberately conservative, keyed on the EXACT message the two hosts this conductor ever runs
+ * under actually produce for that condition:
+ *   - `LiveConductorHost.complete()` (`core/conductor/liveHost.ts`) calls straight through to the
+ *     extension's `runCompletion` (`extension/accordion.ts`), which throws `new Error("no model
+ *     available")` when the session has no live model context yet (or after `session_shutdown`
+ *     clears it) — the in-process path both conductors always use.
+ *   - The one out-of-process path either conductor could in principle run under (a remote
+ *     `ConductorHost`, `core/conductor/remote.ts`) rejects with `new Error(msg.error ?? "remote
+ *     conductor: completion failed")`, where `msg.error` is that exact same `err.message` relayed
+ *     verbatim over the wire from `handleCompleteRequest` — so the message text is unchanged
+ *     end-to-end regardless of which host is in play.
+ *
+ * Matched case-insensitively as a substring (not an exact-string test) so a host that wraps the
+ * message with a prefix still classifies correctly. No other pattern is included: this is the ONE
+ * message either host actually produces for "no live model," and inventing broader patterns (e.g.
+ * a bare `/unavailable/i`) would risk swallowing a genuine, transient provider error (a real 503,
+ * a rate limit, a timeout) into the calm "waiting for link" status instead of the sticky failure
+ * path — exactly the loose-matching mistake this function is deliberately built to avoid.
+ */
+export function isUnavailableError(err: unknown): boolean {
+	const msg = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+	return /no model available/i.test(msg);
+}
+
 /** Sum the full token cost of a set of blocks. `ViewBlock.tokens` is always the FULL cost. */
 export function sumTokens(blocks: readonly ViewBlock[]): number {
 	let n = 0;
@@ -126,16 +158,15 @@ export function blockLabel(b: ViewBlock): string {
  *   - `firstPassInstruction()` / `recursiveInstruction()` — the one-line mode preamble appended
  *     after the `<conversation>` (and, on a recursive round, `<${priorTag}>`) wrapper.
  *   - `formatText(count, body)` — the count-preamble wrapper for a freshly-completed result.
- *   - `emptyOutputMessage` / `windowTooTightMessage` / `rejectMessage` — the three sticky-status
- *     messages a failed attempt can surface (their wording genuinely differs — e.g. only
- *     `handoff`'s reject message includes the provider's real error text — so these stay
- *     subclass-owned rather than templated).
+ *   - `emptyOutputMessage` / `windowTooTightMessage` / `rejectMessage` / `unavailableMessage` — the
+ *     four sticky-status messages a failed attempt can surface (their wording genuinely differs —
+ *     e.g. only `handoff`'s reject message includes the provider's real error text — so these stay
+ *     subclass-owned rather than templated). `unavailableMessage` is the calm "no live model link"
+ *     case (`isUnavailableError`, below); `rejectMessage` is every OTHER rejection.
  *   - `includeInGroup(b)` (optional, defaults to "every kind") — whether a given aged block may be
  *     swallowed into the non-recoverable group, or must be excluded (stays live on the wire,
- *     splitting the run around it). `compaction-naive` overrides this to exclude `user` blocks
- *     (Task 3 fix); `handoff` does not (see `handoff.ts`'s PORT FIDELITY note on why the "fold the
- *     entire prior session, including user asks" behavior is a deliberate, consented product
- *     choice there, not the same bug).
+ *     splitting the run around it). Neither shipped subclass overrides this today — both swallow
+ *     every kind, matching main's original behavior.
  */
 export abstract class AgedSummaryConductor extends ViewConductor {
 	abstract readonly id: string;
@@ -164,9 +195,16 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	protected abstract emptyOutputMessage(count: number): string;
 	/** Sticky status when the context window leaves no room to reserve useful output. */
 	protected abstract windowTooTightMessage(inputTokens: number, contextWindow: number): string;
-	/** Sticky status when the completion promise rejected (network error, provider error, no live
-	 *  model link, abort, …). */
+	/** Sticky status when the completion promise rejected for a GENUINE reason (network error,
+	 *  provider error, abort, …) — i.e. `isUnavailableError(err)` was false. Never called for a
+	 *  no-live-model-link rejection; see `unavailableMessage` for that case. */
 	protected abstract rejectMessage(err: unknown): string;
+	/** Sticky status when the completion promise rejected specifically because the session has no
+	 *  live model link (`isUnavailableError(err)` was true) — mirrors main's `host.can("complete")`
+	 *  pre-check message. Unlike `rejectMessage`, this case also clears `lastAttemptKey` (see
+	 *  `launchCompletion`'s reject handler) so the very next pass retries automatically once the
+	 *  link returns, without waiting for genuinely new content to age in. */
+	protected abstract unavailableMessage(): string;
 	/** May `b` be swallowed into the non-recoverable summary group? Default: every kind. Excluded
 	 *  blocks still feed the prompt as CONTEXT (via `newlyAged`) — they are only ever excluded from
 	 *  actually being folded away, splitting the group run around them. */
@@ -254,9 +292,9 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// The blocks already represented by `text` that are still in the aged region AND actually
 		// eligible to be folded away (see `includeInGroup`). These are what the group covers, and
 		// their tokens are the saving that shrinks the VISIBLE window below the raw baseline. A
-		// covered-but-excluded block (e.g. a `user` block for compaction-naive) contributes NOTHING
-		// here — it was never actually removed from the wire, so crediting it as "saved" would
-		// understate the real visible window and starve the trigger.
+		// covered-but-excluded block (were a subclass to override `includeInGroup` to exclude a
+		// kind) contributes NOTHING here — it was never actually removed from the wire, so crediting
+		// it as "saved" would understate the real visible window and starve the trigger.
 		const survivors = aged.filter((b) => this.coveredIds.has(b.id) && this.includeInGroup(b));
 		const savedTokens = this.text !== null ? Math.max(0, sumTokens(survivors) - this.textTokenCost()) : 0;
 
@@ -346,8 +384,9 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	 * prefix that are also `includeInGroup`-eligible. Re-derived from the LIVE view on every call:
 	 *   - A survivor is a block in `coveredIds` that is still in the aged prefix, not held, not
 	 *     inside a FOREIGN group, and `includeInGroup(b)`. A block this conductor has "covered"
-	 *     (fed to the model at least once) but which is NOT group-eligible (e.g. a `user` block for
-	 *     compaction-naive) is never a survivor here — it stays live and forces the run to split.
+	 *     (fed to the model at least once) but which is NOT group-eligible (only possible if a
+	 *     subclass overrides `includeInGroup` to exclude a kind) is never a survivor here — it
+	 *     stays live and forces the run to split.
 	 *   - If no survivors → `[]` (clear to raw; lossless).
 	 *   - Otherwise emit one `group(first, last, digest)` per MAXIMAL CONTIGUOUS run of survivors,
 	 *     walking the FULL aged prefix (including held/foreign-grouped/excluded blocks) so any of
@@ -429,9 +468,9 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// commits the result against exactly the blocks it summarized, regardless of what the view
 		// looks like when it resolves.
 		const launchedAgedIds = new Set(agedBlocks.map((b) => b.id));
-		// The count preamble claims "N earlier messages" FOLDED — count only blocks eligible for
-		// the group (compaction excludes `user` blocks, which stay live on the wire; counting them
-		// here overstated what the summary replaced).
+		// The count preamble claims "N earlier messages" FOLDED — count only blocks eligible for the
+		// group. With the default `includeInGroup` (every kind) this is just `agedBlocks.length`; a
+		// subclass that excludes a kind gets the count right without any extra bookkeeping here.
 		const count = agedBlocks.filter((b) => this.includeInGroup(b)).length;
 
 		const prompt = this.buildPrompt(newlyAged);
@@ -510,8 +549,22 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 					// failure status (the human chose to stop it).
 					if (this.inflight !== controller) return;
 					this.inflight = null;
-					this.failureStatus = this.rejectMessage(err);
-					this.host.setStatus(this.failureStatus, { aged: count });
+					if (isUnavailableError(err)) {
+						// No live model link — the v2-contract analog of main's `host.can("complete")`
+						// pre-check reporting unavailability BEFORE ever launching. Mirror its semantics
+						// exactly: a calm, sticky "waiting for live model link" status, and — unlike a
+						// genuine reject — clear `lastAttemptKey` rather than leaving it set. Main's
+						// pre-check never recorded an attempt at all for this case, so the very next
+						// conduct() pass (the next turn, or the extension's own next `context` hook
+						// re-establishing a model) retries the SAME newly-aged set automatically, with
+						// no need for genuinely new content to age in first.
+						this.failureStatus = this.unavailableMessage();
+						this.host.setStatus(this.failureStatus, { aged: count });
+						this.lastAttemptKey = "";
+					} else {
+						this.failureStatus = this.rejectMessage(err);
+						this.host.setStatus(this.failureStatus, { aged: count });
+					}
 				},
 			);
 	}
