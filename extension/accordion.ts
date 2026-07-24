@@ -1,66 +1,43 @@
 /*
- * accordion.ts — the pi extension half of the Accordion live link.
+ * accordion.ts — the pi extension, now the AUTHORITY for a live session's context (Phase B).
  *
- * "GUI drives, extension is thin": this extension makes NO folding decisions. On
- * every `context` hook it linearizes pi's outgoing messages into blocks, streams
- * the new ones to the Accordion GUI over a WebSocket, awaits a fold plan, and
- * applies it to the messages pi is about to send. The GUI runs the engine.
+ * The truth moved into the extension: it hosts an in-process `Truth` per session (core/truth.ts —
+ * the same class the app once ran). pi's `context` hook is a LOCAL operation against that Truth —
+ * NO 250ms GUI plan round trip. A client (the GUI) is a REPLICA + remote control over protocol v12.
  *
- * Connection model: "pull" (see docs/adr/0001-pi-live-integration.md). Each pi
- * session binds an EPHEMERAL loopback port and advertises itself by writing a
- * descriptor to ~/.accordion/sessions/<id>.json (see ../app/src/lib/live/registry).
- * The app watches that directory, lists every live session, and connects to the
- * one the user picks. `/accordion` writes a one-shot focus request so the app
- * foregrounds itself on this session; as a convenience, the command can also
- * best-effort launch/reinvoke the desktop app (single-instance keeps that from
- * becoming duplicate windows).
+ * Per-hook loop (all local, no disk I/O, no await on any client):
+ *   1. reconcile pi's `event.messages` against the Truth by a cheap durable-id walk. If it is our
+ *      last-processed array plus a new suffix, linearize ONLY the suffix and append (O(Δ) text
+ *      work). If it diverges structurally (compaction / fork / tree-nav / another extension rewrote
+ *      it), REBUILD the Truth from scratch, re-mark all sent, and force clients to resnapshot —
+ *      counted in telemetry.
+ *   2. // PHASE C: wire-departing hold — a no-op seam where the conductor's last-moment fold plugs in.
+ *   3. if folding is enabled (default OFF; a GUI command toggles it) → `truth.serializeWire` and
+ *      return the replacement; else return undefined (passthrough). Either way the view stays live.
+ *   4. markSent through the last serialized block.
+ *   5. measure the whole hook duration and stream it as `telemetry`.
  *
- * Browser-served multi-session discovery: a browser tab has no filesystem access, but
- * THIS process does (it's Node, not sandboxed) — so any one session's HTTP server can
- * read every OTHER session's registry file and serve the list over `/__accordion/sessions`
- * (token-gated). The browser UI polls that endpoint and dials whichever session's port the
- * user picks, giving a single browser tab the same multi-session sidebar the desktop app
- * gets from its Tauri `list_sessions` command — no desktop app required.
+ * `message_end` / `agent_end` append the finished message(s) to the Truth immediately — this kills
+ * the one-turn lag. `model_select` → truth.setContextWindow. The agent's `unfold`/`recall` tools
+ * resolve LOCALLY against the Truth (no client needed).
+ *
+ * Every Truth mutation emits a TruthEvent; a single subscription forwards each as a REPLAYABLE
+ * `event` to all connected clients (append / ops / config / locks / sent / reset), rev-stamped.
+ * A client replays inputs through its own replica Truth and resnapshots on a rev mismatch. Human
+ * actions arrive as `command` messages; the host applies them and the resulting events echo back
+ * (no optimistic apply on the client — loopback echo is sub-ms).
+ *
+ * Connection model: "pull" (docs/adr/0001-pi-live-integration.md). Each pi session binds an
+ * ephemeral loopback port and advertises ~/.accordion/sessions/<id>.json for discovery; the
+ * browser-served static UI + `/__accordion/sessions` + all WS auth (origin/token/loopback) are
+ * UNCHANGED from before. `/__accordion/meta` now reports hook telemetry instead of plan outcomes.
  *
  * Safety:
- *   • No GUI connected → pass messages through UNMODIFIED. We never corrupt context.
- *   • The plan reply times out → apply the LAST KNOWN plan instead of silently
- *     passing through unfolded (issue #58: a stale one-turn plan is strictly better
- *     than shipping the whole conversation past budget). If there is no cached plan
- *     yet, pass through as before — but always log the timeout (never silent). Note:
- *     on a timeout-with-stale-fallback turn, what the GUI is showing can diverge for
- *     that one turn from what the extension actually sent the model (the stale plan
- *     may be missing folds/unfolds the GUI has since queued) — the next plan the GUI
- *     delivers resyncs both sides. Unlike before #60, this divergence is no longer
- *     invisible: every `context` hook outcome (including this one) is counted and, when
- *     a client is reachable, acked back as a `passthrough` message (issue #60, ADR 0020)
- *     — see `recordPlanOutcome` below — so the GUI and the bellows bench rig can observe
- *     it instead of assuming the fresh plan rode.
- *   • pi's native /compact is suppressed ONLY while the GUI is attached.
- *   • The shared mapping (linearize/applyPlan) carries the provider-safety rules
- *     (durable-id + kind checks); the engine is the single foldability gate and
- *     never folds a protected block, so no wire-side position backstop is needed.
- *
- * Env configuration (read once at module init):
- *   • ACCORDION_PLAN_TIMEOUT_MS  — how long a `context` hook waits on the GUI's plan
- *     before falling back when the attached client is DISARMED (positive int, default 250).
- *   • ACCORDION_PLAN_DEADLINE_MS — the plan wait used when the attached client declares
- *     itself ARMED (over the wire — see the `armed` message): a hard DEADLINE instead of
- *     the short timeout, so a blocking session (interactive steering, or a benchmark that
- *     must hold its cap) actually waits for the plan. A missed deadline is logged loudly and
- *     still falls back to the last known plan (or passthrough). It never blocks when no GUI
- *     is attached, and a mid-wait disconnect resolves at once. (positive int, default 10000).
- *   Parsed with `Number()`, then required to be a positive integer. Invalid values
- *   (missing / NaN / ≤0 / non-integer, e.g. "250.5") fall back to the default. Note
- *   `Number()` accepts more than plain decimal — scientific notation ("1e3") and hex
- *   ("0x10") are both valid positive integers and will be honored, not rejected.
- *
- * Plan round-trip time (RTT): each `context` hook measures how long it waited on the
- * plan and stamps it onto the assistant message it produced as `usage.rttMs` (integer
- * ms), so downstream tooling can see per-request wait cost. See the `message_end` hook.
- *
- * Milestone 1: the GUI replies with an empty plan, so this never alters a model
- * call — it only proves the loop and powers the live view.
+ *   • No disk I/O on the `context` hook path.
+ *   • Folding the live agent is OPT-IN and OFF by default; disabled ⇒ the model call is untouched.
+ *   • pi's native /compact is suppressed ONLY while a client is attached.
+ *   • The shared serialization (Truth.serializeWire → applyPlan) carries the provider-safety rules
+ *     (durable-id + kind checks); the engine never folds a protected block.
  *
  * Register it in ~/.pi/agent/settings.json:
  *   { "extensions": ["<repo>/extension/accordion.ts"] }
@@ -77,61 +54,46 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
-import { linearize, applyPlan, type PiMessage, type AppliedCounts } from "../app/src/lib/live/mapping";
-import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
-
-/** The GUI's reply to a sync: in-place fold ops + group-collapse ops (ADR 0006). */
-type Plan = { ops: FoldOp[]; groups: GroupOp[] };
-/**
- * Outcome of awaiting a plan (issue #58). The old code collapsed all three cases into
- * a single `{ops:[],groups:[]}`/`null`, so a genuine empty plan (conductor wants no
- * folds) was indistinguishable from a timeout (GUI too slow) — the timeout then passed
- * through UNFOLDED and silently. This discriminates them:
- *   • "plan"    — the GUI delivered a plan (possibly genuinely empty).
- *   • "timeout" — the wait elapsed with no reply → fall back to the last known plan.
- *                 `waitedMs` is the GOVERNING wait for this request (the armed deadline or
- *                 the disarmed timeout), carried out so the caller logs the duration it was
- *                 supposed to honor without re-deriving which knob applied.
- *   • "unsent"  — nothing was delivered (no GUI at call time, or the socket dropped /
- *                 was superseded mid-wait via flushPending) → passthrough, don't advance.
- */
-type PlanResult = { kind: "plan"; plan: Plan } | { kind: "timeout"; waitedMs: number } | { kind: "unsent" };
+import { Truth } from "../core/truth";
+import { linearize, messageInfo, contentFingerprint, wireToBlock, type PiMessage } from "../core/wire";
+import { serializeSnapshot, wireEventFromTruthEvent } from "../core/replica";
+import { resolveUnfold, resolveRecall } from "../core/agentView";
+import { applyGuardingHostOnly, sanitizeOps, type OpResult } from "../core/ops";
+import type { TruthEvent } from "../core/events";
+import {
+	PROTOCOL_VERSION,
+	DOOR_PORT,
+	sanitizeCommand,
+	sanitizeSurfaceId,
+	sanitizeSurfaceLabel,
+	type Role,
+	type ServerMessage,
+	type StreamMessage,
+	type WireCommand,
+	type ControllerInfo,
+} from "../core/protocol";
+import { LiveConductorHost, type SpawnedRunner } from "../core/conductor/liveHost";
+import { catalogMeta } from "../core/conductor/registry";
+import type { CompletionRequest, CompletionResult } from "../core/conductor/contract";
 import {
 	REGISTRY_PROTOCOL,
 	REGISTRY_DIR,
 	SESSIONS_SUBDIR,
 	FOCUS_FILE,
+	CONTROLLER_FILE,
+	DOOR_SECRET_FILE,
 	HEARTBEAT_INTERVAL_MS,
 	isLiveEntry,
+	isFreshLease,
+	isControllerLease,
 	type SessionEntry,
 	type FocusRequest,
+	type ControllerLease,
 } from "../app/src/lib/live/registry";
 
-// Env-config helpers. Parse defensively: a positive integer only, anything else
-// (missing / non-numeric / NaN / ≤0 / non-integer) falls back to the default.
-function envPositiveInt(name: string, fallback: number): number {
-	const raw = process.env[name];
-	if (typeof raw !== "string") return fallback;
-	const n = Number(raw.trim());
-	return Number.isInteger(n) && n > 0 ? n : fallback;
-}
-
-// How long a `context` hook waits on the GUI before falling back when the attached client
-// is DISARMED (issue #58). This used to be a silent 250ms passthrough; it is now configurable
-// and the fallback is no longer silent (stale plan + log — see the `context` hook).
-const PLAN_TIMEOUT_MS = envPositiveInt("ACCORDION_PLAN_TIMEOUT_MS", 250);
-// The plan wait used when the attached client declares itself ARMED over the wire (the
-// `armed` message): a hard DEADLINE instead of the short timeout, so a blocking session
-// (interactive steering, or a benchmark whose cap must hold) actually waits for the plan.
-// Either way a missed wait falls back (stale plan / passthrough). Which of the two applies
-// is decided PER REQUEST from the armed flag snapshotted in the `context` hook, not here.
-const PLAN_DEADLINE_MS = envPositiveInt("ACCORDION_PLAN_DEADLINE_MS", 10_000);
-// Unfold replies arrive during the agent's OWN turn (not on the model-call critical
-// path), so a generous wait is fine — the user's next message isn't blocked.
-const UNFOLD_TIMEOUT_MS = 2000;
-// Recall (ADR 0011) likewise runs during the agent's own turn — a read that echoes the
-// folded block's full content back THIS turn — so the same generous wait applies.
-const RECALL_TIMEOUT_MS = 2000;
+// Phase B: pi's `context` hook is a LOCAL operation against the in-process Truth — there is no
+// GUI plan round trip, so the old ACCORDION_PLAN_TIMEOUT_MS / ACCORDION_PLAN_DEADLINE_MS knobs and
+// the unfold/recall reply timeouts are gone. unfold/recall resolve synchronously against Truth.
 
 // WebSocket frames otherwise inherit ws's 100 MiB default. Plans and control messages are
 // normally kilobytes; 8 MiB leaves ample headroom while bounding allocation + JSON.parse work.
@@ -142,12 +104,64 @@ const MAX_WS_PAYLOAD_BYTES = 8 * 1024 * 1024;
 const SIBLING_ORIGIN_PROBE_MS = 750;
 const SIBLING_ORIGIN_META_MAX_BYTES = 16 * 1024;
 const MAX_PENDING_SIBLING_ORIGIN_PROBES = 8;
-// completeRequest launches real provider work. Keep the spend bound process-wide across socket
-// replacement: superseding a GUI suppresses its reply, but does not itself stop the provider.
+// Phase C: an attached conductor's out-of-band `complete()` launches real provider work. Keep the
+// spend bound process-wide (across in-process + spawned conductors) and finish before the wire's own
+// safety timeout.
 const MAX_CONCURRENT_COMPLETIONS = 4;
-// Finish before the GUI's 120 s completion backstop and pass the abort signal through to pi-ai.
-// The override keeps smoke tests fast; invalid values retain the production default.
-const COMPLETION_TIMEOUT_MS = envPositiveInt("ACCORDION_COMPLETION_TIMEOUT_MS", 110_000);
+const COMPLETION_TIMEOUT_MS = 110_000;
+// ── the door (ADR 0024) ──────────────────────────────────────────────────────
+// Slow, best-effort cadence at which a standing-by extension re-attempts to bind the door port
+// after it found it held by ANOTHER live Accordion door — so when that holder dies, this extension
+// claims the door within a few seconds. NEVER on the context hook (a bare unref'd timer).
+const DOOR_RETRY_MS = 4_000;
+// Bounded probe of the door port's /__accordion/meta (reuses the sibling-origin probe bound), used
+// both to classify an EADDRINUSE occupant (live Accordion vs. foreign software) and to decide the
+// /accordion URL. Never blocks a model call.
+const DOOR_PROBE_MS = 750;
+// Door-secret recovery (ADR 0024 §8/§9). When the secret file is absent or INVALID (empty/partial —
+// a crashed or mid-write creator), re-attempt the atomic ensure on a bare unref'd timer instead of
+// giving up with an empty (unusable) secret. Bounded so a permanently-broken file can't spin forever.
+const DOOR_SECRET_RETRY_MS = 400;
+const DOOR_SECRET_MAX_TRIES = 10;
+// An INVALID secret file older than this is treated as an abandoned crash artifact and unlinked so
+// the atomic create can re-run — no legitimate writer holds the file invalid for anywhere near this
+// long (a tmp+link create is sub-millisecond). Bounded convergence: two extensions both recovering
+// race the link/EEXIST primitive rather than fighting.
+const DOOR_SECRET_STALE_MS = 10_000;
+/**
+ * Three-way classification of whatever holds the door port (C2/S3):
+ *   • "accordion"  — a completed 200 from a loopback peer that is a MATCHING-version live Accordion
+ *                    (served:true AND protocolVersion===PROTOCOL_VERSION AND its sessionId is in the
+ *                    registry). Trust it: stand down this cycle, and /accordion may print the door URL.
+ *   • "foreign"    — a COMPLETED HTTP response that fails the served/shape check (definitive evidence
+ *                    of non-Accordion software). Permanent stand-down for this run.
+ *   • "transient"  — probe timeout, connection error/refused, or an Accordion of a DIFFERENT protocol
+ *                    version (served:true but protocolVersion mismatched), or a matching Accordion whose
+ *                    sessionId we could not confirm in the registry (likely a startup race). Ambiguous:
+ *                    keep retrying, NEVER permanent, and NEVER trust it with the secret door URL.
+ */
+type DoorProbe = "accordion" | "foreign" | "transient";
+// ── the controller lease (ADR 0024) ──────────────────────────────────────────
+// The lease-holder's extension refreshes controller.json's heartbeat this often while a matching
+// socket is connected; other extensions observe changes by polling + content-comparing the file
+// this often (no mtime gating — see pollControllerFile).
+// Both are bare unref'd timers, best-effort, NEVER on the context hook.
+const CONTROLLER_HEARTBEAT_MS = 2_000;
+const CONTROLLER_POLL_MS = 1_000;
+// Fixed cookie name for the shared door secret. Unlike the per-session webToken cookie (port-
+// qualified so two sessions on the same host don't clobber each other), the door secret is shared
+// across every extension, so a single stable name survives a door takeover (the value stays valid).
+const DOOR_COOKIE = "accordion_door";
+
+/** Test seam mirroring dc037bc: production resolves pi-ai lazily through pi's package alias. */
+type CompletionFunction = (
+	model: any,
+	context: { systemPrompt?: string; messages: Array<{ role: "user"; content: string; timestamp: number }> },
+	options: { apiKey: string; headers?: Record<string, string>; signal?: AbortSignal; maxTokens?: number },
+) => Promise<any>;
+interface RuntimeDependencies {
+	complete?: CompletionFunction;
+}
 // Vite's fixed localhost:1420 Origin is browser-obtainable, unlike Tauri's production custom
 // origins. Trust it only for an explicit local development session; shipped installs stay closed.
 const ALLOW_TAURI_DEV_ORIGIN = process.env.ACCORDION_ALLOW_TAURI_DEV_ORIGIN === "1";
@@ -174,6 +188,59 @@ const HOME = process.env.ACCORDION_HOME || os.homedir();
 const REGISTRY_ROOT = path.join(HOME, REGISTRY_DIR);
 const SESSIONS_DIR = path.join(REGISTRY_ROOT, SESSIONS_SUBDIR);
 const FOCUS_PATH = path.join(REGISTRY_ROOT, FOCUS_FILE);
+const CONTROLLER_PATH = path.join(REGISTRY_ROOT, CONTROLLER_FILE);
+const DOOR_SECRET_PATH = path.join(REGISTRY_ROOT, DOOR_SECRET_FILE);
+
+/**
+ * The door's loopback port. Fixed at DOOR_PORT (ADR 0024), but overridable via ACCORDION_DOOR_PORT
+ * for TEST ISOLATION (mirrors ACCORDION_HOME) — a smoke run points it at a free port so it never
+ * collides with a real running door, and `0`/invalid DISABLES the door entirely (bind nothing).
+ * Read dynamically (not cached) so a test can flip it between extension instances. Production never
+ * sets the env, so it is always DOOR_PORT.
+ */
+function currentDoorPort(): number | null {
+	const raw = process.env.ACCORDION_DOOR_PORT;
+	if (raw === undefined) return DOOR_PORT;
+	const n = Number(raw);
+	if (!Number.isInteger(n) || n <= 0 || n > 65535) return null; // 0 / invalid ⇒ door disabled
+	return n;
+}
+
+/** The door retry cadence, overridable via ACCORDION_DOOR_RETRY_MS for fast tests (default DOOR_RETRY_MS). */
+function currentDoorRetryMs(): number {
+	const raw = process.env.ACCORDION_DOOR_RETRY_MS;
+	if (raw === undefined) return DOOR_RETRY_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : DOOR_RETRY_MS;
+}
+
+/** Door-secret recovery retry cadence, overridable via ACCORDION_DOOR_SECRET_RETRY_MS for fast tests
+ *  (default DOOR_SECRET_RETRY_MS). Test-only seam; production always uses DOOR_SECRET_RETRY_MS. */
+function currentDoorSecretRetryMs(): number {
+	const raw = process.env.ACCORDION_DOOR_SECRET_RETRY_MS;
+	if (raw === undefined) return DOOR_SECRET_RETRY_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : DOOR_SECRET_RETRY_MS;
+}
+
+/** Controller heartbeat cadence, overridable via ACCORDION_CONTROLLER_HEARTBEAT_MS for fast tests
+ *  (default CONTROLLER_HEARTBEAT_MS). Test-only seam mirroring ACCORDION_DOOR_RETRY_MS; production
+ *  never sets the env, so it is always CONTROLLER_HEARTBEAT_MS. */
+function currentControllerHeartbeatMs(): number {
+	const raw = process.env.ACCORDION_CONTROLLER_HEARTBEAT_MS;
+	if (raw === undefined) return CONTROLLER_HEARTBEAT_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : CONTROLLER_HEARTBEAT_MS;
+}
+
+/** Controller poll cadence, overridable via ACCORDION_CONTROLLER_POLL_MS for fast tests
+ *  (default CONTROLLER_POLL_MS). Test-only seam; production always uses CONTROLLER_POLL_MS. */
+function currentControllerPollMs(): number {
+	const raw = process.env.ACCORDION_CONTROLLER_POLL_MS;
+	if (raw === undefined) return CONTROLLER_POLL_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : CONTROLLER_POLL_MS;
+}
 
 const ACCORDION_APP_FLAG = "accordion-app";
 const ACCORDION_APP_ENV = "ACCORDION_APP_PATH";
@@ -197,17 +264,6 @@ type LaunchResult =
 	| { ok: false; reason: "explicit-invalid"; path: string; source: Extract<LaunchSource, "cli" | "env"> }
 	| { ok: false; reason: "not-found" }
 	| { ok: false; reason: "spawn-failed"; path: string; source: LaunchSource; error: unknown };
-
-type CompletionFunction = (
-	model: any,
-	context: { systemPrompt?: string; messages: Array<{ role: "user"; content: string; timestamp: number }> },
-	options: { apiKey: string; headers?: Record<string, string>; signal?: AbortSignal; maxTokens?: number },
-) => Promise<any>;
-
-interface RuntimeDependencies {
-	/** Test seam; production resolves pi-ai lazily through pi's package alias. */
-	complete?: CompletionFunction;
-}
 
 function cleanExplicitPath(value: unknown): string | null {
 	if (typeof value !== "string") return null;
@@ -344,149 +400,91 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// without an Origin and the Tauri webview remain tokenless. Browser clients authenticate
 	// explicitly, by an exact-origin cookie, or as a verified live sibling Accordion origin.
 	let webToken = "";
-	let client: WebSocket | null = null; // the GUI (one driver at a time in M1)
+	// Connected clients (Phase B: broadcast Truth events to ALL). Each carries its declared role;
+	// `conductor` is carried through auth + tagged for Phase C. A client is a REPLICA + remote
+	// control — it never mutates optimistically, only via the echoed event stream.
+	// v16 (ADR 0024): a gui socket also carries the connecting surface's sanitized identity —
+	// surfaceId/label decide who may steer (the READ-ONLY controller gate) and who claimed the lease.
+	const clients = new Map<WebSocket, { role: Role; surfaceId: string | null; label: string | null }>();
 	let sessionId = "";
 	let meta = { title: "pi session", cwd: "", model: "", contextWindow: null as number | null, format: "pi" as const };
-
-	let sentCount = 0; // blocks already streamed to the current client
-	let reqSeq = 0;
-	let epoch = 0; // bumped on every new GUI connection; invalidates in-flight requests
-	const pending = new Map<number, (r: PlanResult) => void>();
-	// Unique tokens, rather than request ids, make cleanup exact when a later connection reuses
-	// an id. This set is deliberately not reset on reconnect while old provider work is running.
-	const activeCompletionCalls = new Set<symbol>();
 	let pendingSiblingOriginProbes = 0;
-	// Last plan the GUI DELIVERED (issue #58). Cached — including a genuinely empty plan
-	// (empty = "conductor wants no folds", so caching it prevents wrongly re-applying an
-	// older non-empty plan) — so a timed-out `context` can apply it instead of shipping the
-	// whole conversation unfolded. Reset wherever the cursor/epoch resets (session_start +
-	// GUI (re)connect): a plan from a superseded view must never apply to a fresh sync.
-	let lastPlan: Plan | null = null;
-	// Whether the attached client has declared itself ARMED over the wire (the `armed`
-	// message — the single source of truth for "is this client steering?", replacing the old
-	// ACCORDION_STEERING env flag). Armed, each `context` hook waits the hard PLAN_DEADLINE_MS
-	// for the plan instead of the short PLAN_TIMEOUT_MS. Reset to false wherever the client
-	// context resets — new connection, session_start, and the drop closure — so a stale armed
-	// state can never carry into a fresh attach and silently block (or a benchmark can never
-	// inherit a prior session's arming). Snapshotted per request in the `context` hook.
-	let armed = false;
-	// Most recent plan round-trip time (ms), stashed by `context` and consumed by
-	// `message_end` to stamp `usage.rttMs` on the assistant message this request produced.
-	// null = no context RTT to attribute (e.g. no GUI attached this turn) → no field stamped.
-	let lastPlanRttMs: number | null = null;
+	// Phase C: the socket of the currently-attached spawn conductor (null for none / in-process).
+	// `sendToConductor` routes to it; the connection handler sets it on accept, clears it on close.
+	let conductorWs: WebSocket | null = null;
+	// Most recent full model object (dc037bc's `latestModel`) — a completion needs the whole object
+	// (apiKey resolution + maxTokens ceiling), not just the id string kept in `model`.
+	let latestModelObj: any = null;
+	// Process-wide in-flight completion count, bounded by MAX_CONCURRENT_COMPLETIONS.
+	let activeCompletions = 0;
 
-	// ── plan-outcome observability (issue #60, ADR 0020) ────────────────────────────
-	// Every `context` hook resolves to EXACTLY one of these causes — the full taxonomy of
-	// what happened to a model call's context, including the two that used to be totally
-	// silent (`no-gui`, `epoch-mismatch`) and the pre-existing-but-unobservable timeout
-	// fallbacks. `no-gui`/`unsent` have no reachable client to ack (see `recordPlanOutcome`),
-	// so they are counter-only; the other five are also acked to the GUI as a `passthrough`
-	// message (`PassthroughCause` in protocol.ts is this type minus those two).
-	type PlanOutcomeCause = "applied" | "empty-plan" | "timeout-stale" | "timeout-raw" | "no-gui" | "epoch-mismatch" | "unsent";
-	// Per-extension-lifetime counters (plain in-memory state, mirrors `sentCount`'s pattern).
-	// Deliberately NOT reset on `session_start` — a session swap doesn't invalidate the
-	// observability value of a running total, unlike `sentCount`/`epoch`/`lastPlan`, which
-	// genuinely describe THIS session's cursor and must not leak across a swap. Never
-	// persisted (the context hook must stay disk-I/O-free — see the header Safety note).
-	const planOutcomeCounts: Record<PlanOutcomeCause, number> = {
-		applied: 0,
-		"empty-plan": 0,
-		"timeout-stale": 0,
-		"timeout-raw": 0,
-		"no-gui": 0,
-		"epoch-mismatch": 0,
-		unsent: 0,
-	};
-	let contextHookCount = 0; // total `context` hook invocations this extension lifetime
-	// Previous outcome cause — used ONLY to log a TRANSITION into a silent-passthrough state
-	// (not every call: every session legitimately starts unattached, so per-turn no-gui
-	// logging would be pure noise). null until the first `context` hook ever resolves.
-	let lastOutcomeCause: PlanOutcomeCause | null = null;
-	const SILENT_CAUSES: ReadonlySet<PlanOutcomeCause> = new Set(["no-gui", "unsent", "epoch-mismatch"]);
+	// -- the door (ADR 0024) --
+	// The shared browser bearer secret (32 hex bytes), read/created at startServer from
+	// ~/.accordion/door-secret. EVERY extension accepts it wherever the per-session webToken is
+	// accepted, which makes the door URL session-independent. Empty until loaded.
+	let doorSecret = "";
+	// The additional fixed-port listeners this extension binds IFF it currently holds the door.
+	let doorServer: http.Server | null = null;
+	let doorWss: WebSocketServer | null = null;
+	let doorHeld = false;      // we successfully bound and hold the door port
+	let doorBinding = false;   // a bind attempt is in flight (guards concurrent tryBindDoor)
+	let doorForeign = false;   // the door port is held by NON-Accordion software -> stood down permanently
+	let doorRetryTimer: ReturnType<typeof setTimeout> | null = null; // slow re-attempt while an Accordion door holds it
+	let doorSecretRetryTimer: ReturnType<typeof setTimeout> | null = null; // re-attempt the secret ensure (absent/invalid file)
+	let doorSecretTries = 0;   // bounded retry counter for the secret ensure (DOOR_SECRET_MAX_TRIES)
+	let doorSecretGaveUp = false; // exhaustion warned once (parity with the foreign-occupant warn)
 
-	/**
-	 * Record the outcome of ONE `context` hook resolution (issue #60). Called exactly once
-	 * per hook invocation, on every exit path — including the success path — so every
-	 * `context` call increments exactly one counter.
-	 *
-	 * Side effects, in order:
-	 *   1. Bump `planOutcomeCounts[cause]` and `contextHookCount`.
-	 *   2. `console.warn` iff this call is entering a SILENT state (no-gui/unsent/
-	 *      epoch-mismatch) from a non-silent ("healthy") one — e.g. the first no-gui call
-	 *      after having been attached, or the first unsent/epoch-mismatch after a healthy
-	 *      run. Never warns on the very first call ever (nothing to transition FROM), and
-	 *      never warns silent→silent (already noisy enough at the transition). The
-	 *      already-logged timeout branches (`timeout-stale`/`timeout-raw`) are untouched —
-	 *      they log every call via `console.warn`/`console.error` at their call sites.
-	 *   3. Fire-and-forget a `passthrough` ack to `ackTarget` iff it is non-null and OPEN.
-	 *      `ackTarget` is null for `no-gui`/`unsent` (no reachable client — counter-only per
-	 *      spec) and the CURRENT client for every other cause, including `epoch-mismatch`
-	 *      (whose `reqId` belongs to the superseded view — the current client can still
-	 *      count it, it just can't correlate the id to anything it itself sent).
-	 *
-	 * NEVER awaited by the caller — `send()` is itself fire-and-forget (try/catch, no
-	 * return value), so this can never delay or block the `context` hook's own return.
-	 */
-	function recordPlanOutcome(
-		cause: PlanOutcomeCause,
-		reqId: number | null,
-		applied: { ops: number; groups: number },
-		ackTarget: WebSocket | null,
-	): void {
-		planOutcomeCounts[cause]++;
-		contextHookCount++;
-		if (SILENT_CAUSES.has(cause) && lastOutcomeCause !== null && !SILENT_CAUSES.has(lastOutcomeCause)) {
-			console.warn(
-				`[accordion] context hook: silent passthrough (${cause})${reqId != null ? ` reqId=${reqId}` : ""} — previous outcome was '${lastOutcomeCause}'`,
-			);
-		}
-		lastOutcomeCause = cause;
-		if (ackTarget && ackTarget.readyState === 1 /* OPEN */) {
-			// Cast: `no-gui`/`unsent` never reach here with a non-null ackTarget (every call
-			// site below passes `null` for those two causes), so `cause` is always one of
-			// protocol.ts's narrower `PassthroughCause` at runtime despite the wider static type.
-			send(ackTarget, {
-				type: "passthrough",
-				reqId: reqId ?? -1,
-				cause: cause as Exclude<PlanOutcomeCause, "no-gui" | "unsent">,
-				ops: applied.ops,
-				groups: applied.groups,
-			});
-		}
+	// -- the controller lease (ADR 0024) --
+	// In-memory view of the GLOBAL controller.json lease, kept current by our own claim writes and a
+	// ~1s poll. null => no lease exists. Enforcement reads this; the poll, the heartbeat, and a claim
+	// all re-read the file fresh (content-level, not mtime-gated — see reloadControllerLease / C4).
+	let controllerLease: ControllerLease | null = null;
+	let lastBroadcastHolder: string | null = null; // last surfaceId we broadcast (dedupe `controller` frames)
+	let controllerPollTimer: ReturnType<typeof setInterval> | null = null;
+	let controllerHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+	// ── the authoritative Truth (Phase B) ──────────────────────────────────────
+	// The single source of context state for this live session. Built at session_start, rebuilt on
+	// structural divergence (compaction / fork / tree-nav / another extension rewriting messages).
+	// pi's `context` hook operates against it LOCALLY. `unsubTruth` detaches the event forwarder.
+	let truth: Truth | null = null;
+	let unsubTruth: (() => void) | null = null;
+	// Folding the live agent is OPT-IN and OFF by default (today's armed semantics). Toggled by a
+	// GUI `setFolding` command; disabled ⇒ the model call is untouched. Broadcast on change and
+	// carried in every snapshot so a reconnecting client sees the current arm.
+	let foldingEnabled = false;
+
+	// The last full messages array the Truth was reconciled against (an authoritative `context`
+	// snapshot, extended by message_end / agent_end deltas). pi's next `event.messages` is compared
+	// against it by a cheap durable-id walk to decide append-a-suffix vs. rebuild.
+	let lastMessages: PiMessage[] = [];
+	// Index-aligned content fingerprints for `lastMessages` (E1 hardening, sol P1). Computed once at
+	// INGEST time so the per-hook identity walk hashes only the fresh INCOMING copy and reads the prev
+	// side straight from this cache — never re-hashing already-ingested history on every `context` hook
+	// (see `contentFingerprint`'s doc comment for the cost analysis). INVARIANT: `lastFps` is written
+	// ONLY through `setLastMessages`, in the SAME statement as `lastMessages`, so the two can never
+	// drift out of alignment — a stale/misaligned fingerprint here would silently defeat E1 (a false
+	// "same identity" on a real rewrite), the exact failure this cache must never introduce.
+	let lastFps: number[] = [];
+	function setLastMessages(messages: PiMessage[], fps?: number[]): void {
+		lastMessages = messages;
+		lastFps = fps ?? messages.map((m) => contentFingerprint(m));
 	}
 
-	// Unfold requests: keyed by reqId, resolved when the GUI replies (or null on flush).
-	// Deliberately NOT reset on reconnect (unlike reqSeq): a late reply from a superseded
-	// GUI can never alias a fresh request's reqId, and flushPending() drains the map anyway.
-	let unfoldSeq = 0;
-	const pendingUnfold = new Map<number, (res: { restored: Array<{ code: string; kind: string; label: string }>; missing: string[] } | null) => void>();
-	// Recall requests (ADR 0011): keyed by reqId, resolved when the GUI replies (or null on
-	// flush). Same lifecycle as pendingUnfold; recall is a pure READ (the GUI never mutates
-	// fold state) and the result carries the folded block's ORIGINAL full content, echoed to
-	// the agent THIS turn.
-	let recallSeq = 0;
-	const pendingRecall = new Map<number, (res: { restored: RecallContent[]; missing: string[] } | null) => void>();
-	// Last messages snapshot seen at `context` or `agent_end`. Used by the
-	// `message_end` committed-streaming path to build a full array for linearize
-	// without losing global turn/order numbering (see Phase 3 in ADR 0003).
-	let lastMessages: PiMessage[] = [];
-	// Messages that have FINISHED since the last `context`/`agent_end` snapshot, in
-	// finish order. In a tool loop the assistant message and its tool result both end
-	// before the next `context` fires; we must accumulate ALL of them (not just the
-	// latest) so `linearize([...lastMessages, ...pendingSince])` carries correct global
-	// turn/order and never drops or mis-numbers the earlier message. Reset whenever an
-	// authoritative snapshot (`context`/`agent_end`) supersedes it.
-	let pendingSince: PiMessage[] = [];
-	// Most recent ExtensionContext seen on any hook. Captured so the WS connection
-	// handler (which gets no ctx of its own) can read pi's CURRENT session history
-	// directly at attach time — the authoritative way to populate the view for a
-	// session that already has turns (especially a RESUMED session, where no
-	// `context`/`agent_end` has fired yet so `lastMessages` would still be empty).
+	// ── hook telemetry (replaces the plan-outcome ack) ──────────────────────────
+	let hookCount = 0; // total `context` hook invocations this extension lifetime
+	let lastHookMs = 0; // most recent hook duration (ms)
+	let maxHookMs = 0; // worst hook duration
+	let rebuilds = 0; // structural-divergence Truth rebuilds
+	let hookErrors = 0; // `context` hook throws caught by the passthrough guard (should stay 0)
+	let ingressErrors = 0; // unexpected throws caught at the WS message boundary (should stay 0 — a buggy peer must not crash us)
+	const hookDurations: number[] = []; // bounded ring for the p95 readout
+	const HOOK_RING = 256;
+
+	// Most recent ExtensionContext seen on any hook. Captured so the WS connection handler
+	// (which gets no ctx of its own) can read pi's CURRENT session history at attach time — the
+	// authoritative way to populate a session that already has turns (especially a RESUMED one).
 	let latestCtx: ExtensionContext | null = null;
-	// Most recent model object, updated both from full hook contexts and the immediate
-	// `/model` event. Completion requests use this so `model: "current"` really follows a
-	// just-selected model instead of waiting for the next `context` hook to refresh latestCtx.
-	let latestModel: any = null;
 
 	// ── discovery (registry) state ──────────────────────────────────────────────
 	let port = 0; // actual ephemeral port, filled once the server is listening
@@ -501,24 +499,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// still-booting server. Surfaced verbatim in the /accordion status line instead.
 	let bindError: string | null = null;
 
-	const attached = (): boolean => !!client && client.readyState === 1; /* OPEN */
-
-	/** Resolve every outstanding request as passthrough (used on connect-swap / disconnect / shutdown). */
-	function flushPending(): void {
-		// "unsent": the GUI is gone (superseded / dropped / shutting down), so the in-flight
-		// `context` awaits pass through WITHOUT advancing the cursor — same meaning as before
-		// (an undeliverable request never alters or claims-as-sent a model call). Distinct from
-		// a timeout, which DID deliver blocks and falls back to the last known plan.
-		for (const resolve of pending.values()) resolve({ kind: "unsent" });
-		pending.clear();
-		// In-flight unfold requests (if any) must also be resolved. null signals "not
-		// attached" — the tool returns a safe "did not respond" message to the agent.
-		for (const resolve of pendingUnfold.values()) resolve(null);
-		pendingUnfold.clear();
-		// Same for in-flight recall reads — resolve as null so the tool reports cleanly.
-		for (const resolve of pendingRecall.values()) resolve(null);
-		pendingRecall.clear();
-	}
+	const attached = (): boolean => clients.size > 0;
 
 	function send(ws: WebSocket, m: ServerMessage): void {
 		try {
@@ -528,11 +509,200 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		}
 	}
 
-	/** Send a stream lifecycle frame if and only if a GUI is currently attached. */
+	/** Send a message to every connected client (Phase B fan-out). */
+	function broadcast(m: ServerMessage): void {
+		for (const ws of clients.keys()) if (ws.readyState === 1 /* OPEN */) send(ws, m);
+	}
+
+	/** Forward a host Truth event to every replica as a replayable `event` (null ⇒ nothing to replay). */
+	function forwardTruthEvent(e: TruthEvent): void {
+		const ev = wireEventFromTruthEvent(e);
+		if (ev) broadcast({ type: "event", event: ev });
+	}
+
+	/**
+	 * Send the current Truth snapshot to one client, or — with `ws` omitted — broadcast it to every
+	 * client (the forced resnapshot after a divergence rebuild). A no-op until the Truth exists.
+	 */
+	function sendSnapshot(ws?: WebSocket): void {
+		if (!truth) return;
+		const m: ServerMessage = { type: "snapshot", state: serializeSnapshot(truth, foldingEnabled) };
+		if (ws) send(ws, m);
+		else broadcast(m);
+	}
+
+	/** Broadcast a stream lifecycle frame to every attached client (presentation-only ghosts). */
 	function sendStream(frame: StreamMessage): void {
-		const ws = client;
-		if (!ws || ws.readyState !== 1) return;
-		send(ws, frame);
+		broadcast(frame);
+	}
+
+	// ── Phase C: the live conductor host (registry, locks, wire-departing hold, completion relay) ─
+	// Fully dependency-injected; every capability it needs — the live Truth, client fan-out, the
+	// conductor socket, token minting, the spawn bridge, the completion executor — is a closure over
+	// this session's state. It makes NO folding decisions of its own on the hook path.
+	const liveHost = new LiveConductorHost({
+		truth: () => truth,
+		broadcast,
+		sendToConductor: (m) => {
+			if (conductorWs && conductorWs.readyState === 1) send(conductorWs, m);
+		},
+		sendToSocket: (socket, m) => {
+			const ws = socket as WebSocket | null;
+			if (ws && ws.readyState === 1) send(ws, m);
+		},
+		mintToken: () => crypto.randomBytes(16).toString("hex"),
+		spawnRunner,
+		runCompletion,
+		spawnEnv: () => ({ port, sessionKey: sessionId, home: HOME }),
+		now: () => Date.now(),
+	});
+
+	/** Resolve a thermocline-style runner file on disk (repo checkout only this phase), or null. */
+	function resolveRunnerPath(entryFile: string): string | null {
+		try {
+			const here = path.dirname(fileURLToPath(import.meta.url));
+			const p = path.resolve(here, "..", "conductors", "ws", "thermocline", entryFile);
+			return fs.existsSync(p) ? p : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Launch a spawn conductor's runner in its own Node process (NOT detached, so it dies with pi),
+	 * piping stderr into a bounded buffer surfaced via `conductorStatus` on an unexpected exit. The
+	 * returned handle's `kill()` sends SIGTERM first, SIGKILL on a second call — the grace loop lives
+	 * in `LiveConductorHost`. Returns null when the runner file is absent (thermocline then simply
+	 * doesn't appear in the catalog, and a defensive `select` of it undoes cleanly).
+	 */
+	function spawnRunner(entryFile: string, env: Record<string, string>): SpawnedRunner | null {
+		const runnerPath = resolveRunnerPath(entryFile);
+		if (!runnerPath) return null;
+		let child: ReturnType<typeof spawn>;
+		try {
+			child = spawn(process.execPath, [runnerPath], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+		} catch {
+			return null;
+		}
+		let stderrBuf = "";
+		const STDERR_CAP = 8 * 1024;
+		child.stderr?.on("data", (d: Buffer) => {
+			stderrBuf = (stderrBuf + d.toString()).slice(-STDERR_CAP);
+		});
+		let sigterm = false;
+		return {
+			kill(): void {
+				try {
+					child.kill(sigterm ? "SIGKILL" : "SIGTERM");
+					sigterm = true;
+				} catch {
+					/* already dead */
+				}
+			},
+			onExit(cb): void {
+				child.on("exit", (code) => cb({ code, stderr: stderrBuf }));
+				child.on("error", () => cb({ code: null, stderr: stderrBuf }));
+			},
+		};
+	}
+
+	/**
+	 * The out-of-band completion executor (ported from dc037bc's completeRequest handler): resolve
+	 * the live model's API key, lazily import pi-ai, clamp `maxOutputTokens` to the model's ceiling,
+	 * and race the provider call against an abortable timeout. NEVER on the `context` hook path — the
+	 * conductor awaits it off to the side. A process-wide semaphore bounds concurrent spend.
+	 */
+	async function runCompletion(req: CompletionRequest, signal: AbortSignal): Promise<CompletionResult> {
+		if (typeof req.prompt !== "string" || req.prompt.length === 0) throw new Error("missing or empty prompt");
+		if (req.maxOutputTokens !== undefined && (!Number.isSafeInteger(req.maxOutputTokens) || req.maxOutputTokens <= 0))
+			throw new Error("maxOutputTokens must be a positive safe integer");
+		if (activeCompletions >= MAX_CONCURRENT_COMPLETIONS) throw new Error(`too many concurrent completions in flight (max ${MAX_CONCURRENT_COMPLETIONS})`);
+		activeCompletions++;
+		const abort = new AbortController();
+		const onAbort = () => abort.abort();
+		if (signal.aborted) abort.abort();
+		else signal.addEventListener("abort", onAbort, { once: true });
+		const timeoutError = new Error(`completion timed out after ${COMPLETION_TIMEOUT_MS}ms`);
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		const deadline = new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(() => {
+				abort.abort(timeoutError);
+				reject(timeoutError);
+			}, COMPLETION_TIMEOUT_MS);
+			(timer as { unref?: () => void }).unref?.();
+		});
+		// Non-null only AFTER complete() has actually launched provider work. A client-facing timeout
+		// aborts that work and settles this call, but the concurrency slot stays occupied until the
+		// underlying provider promise confirms settlement — an adapter that ignores AbortSignal must
+		// not let spend accounting reopen a slot while its call is still burning tokens (issue: the
+		// `finally` fires when Promise.race settles, i.e. on timeout BEFORE providerCall settles).
+		let providerSettlement: Promise<void> | null = null;
+		try {
+			const ctx = latestCtx;
+			const m = latestModelObj ?? (ctx?.model as any);
+			if (!ctx || !m) throw new Error("no model available");
+			const auth = await Promise.race([(ctx as any).modelRegistry.getApiKeyAndHeaders(m), deadline]);
+			if (!auth?.ok) throw new Error(`could not resolve API key: ${auth?.error ?? "unknown"}`);
+			const complete: CompletionFunction = dependencies.complete ?? (await Promise.race([import("@earendil-works/pi-ai" as any), deadline])).complete;
+			const context = {
+				...(typeof req.system === "string" ? { systemPrompt: req.system } : {}),
+				messages: [{ role: "user" as const, content: req.prompt, timestamp: Date.now() }],
+			};
+			let maxTokens: number | undefined;
+			if (typeof req.maxOutputTokens === "number") {
+				const ceiling = Number.isSafeInteger(m.maxTokens) && m.maxTokens > 0 ? m.maxTokens : undefined;
+				maxTokens = ceiling !== undefined ? Math.min(req.maxOutputTokens, ceiling) : req.maxOutputTokens;
+			}
+			const providerCall = complete(m, context, { apiKey: auth.apiKey, headers: auth.headers, signal: abort.signal, ...(maxTokens !== undefined ? { maxTokens } : {}) });
+			// Consume either outcome for cleanup without changing the result used below.
+			providerSettlement = providerCall.then(() => {}, () => {});
+			const result = await Promise.race([providerCall, deadline]);
+			let text = "";
+			if (Array.isArray(result.content))
+				text = result.content.filter((p: any) => p?.type === "text").map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("");
+			return {
+				text,
+				model: result.model,
+				inputTokens: typeof result.usage?.input === "number" ? result.usage.input : undefined,
+				outputTokens: typeof result.usage?.output === "number" ? result.usage.output : undefined,
+			};
+		} finally {
+			if (timer) clearTimeout(timer);
+			signal.removeEventListener("abort", onAbort);
+			// Release the concurrency slot only when the provider call itself settles; if we timed out
+			// or failed before provider work ever launched, release immediately (there is nothing in
+			// flight to keep the slot for).
+			const release = (): void => {
+				activeCompletions--;
+			};
+			if (providerSettlement) void providerSettlement.then(release);
+			else release();
+		}
+	}
+
+	// ── hook telemetry ──────────────────────────────────────────────────────────
+	function recordHook(ms: number): void {
+		hookCount++;
+		lastHookMs = ms;
+		if (ms > maxHookMs) maxHookMs = ms;
+		hookDurations.push(ms);
+		if (hookDurations.length > HOOK_RING) hookDurations.shift();
+	}
+	function p95HookMs(): number {
+		if (!hookDurations.length) return 0;
+		const sorted = [...hookDurations].sort((a, b) => a - b);
+		return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+	}
+	/** The current telemetry frame — one builder for the per-connection seed + the per-hook broadcast. */
+	function telemetryMsg(): ServerMessage {
+		// lastHoldMs/holdTimeouts (protocol v13) are the REAL wire-departing hold telemetry now: how
+		// long the host held the departing wire for the attached conductor's last-moment proposal on
+		// the most recent hook, and how many holds have timed out over the session. Both stay 0 while
+		// no conductor is attached (no hold is ever fired), so a no-conductor session is unchanged.
+		return { type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: liveHost.lastHoldMs, holdTimeouts: liveHost.holdTimeouts };
+	}
+	function broadcastTelemetry(): void {
+		broadcast(telemetryMsg());
 	}
 
 	// ── registry file: advertise this session for the app to discover ───────────
@@ -584,10 +754,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	 * any one session's HTTP server can list every session on the machine. Best-effort:
 	 * an unreadable directory or a partially-written/corrupt file is skipped, never thrown.
 	 *
-	 * ASYNC (fs.promises), not fs.*Sync: this runs on the same event loop as the `context`
-	 * hook's `requestPlan`, which only allows REQUEST_TIMEOUT_MS (250ms) before falling back
-	 * to passthrough. A browser tab polls this every second — synchronous directory/file I/O
-	 * here would add avoidable jitter to that budget; the async form yields between files.
+	 * ASYNC (fs.promises), not fs.*Sync: this runs on the same event loop as the `context` hook,
+	 * which is now a LOCAL, synchronous reconcile against the in-process Truth (no plan round
+	 * trip) that must stay fast — disk I/O on that path is a documented invariant violation. A
+	 * browser tab polls this endpoint every second; synchronous directory/file I/O here would
+	 * still share that event loop and add avoidable jitter ahead of the next model call. The
+	 * async form yields between files instead.
 	 *
 	 * Opportunistically REAPS dead entries it encounters (unlike a bare read): a browser-only
 	 * user has no desktop app ever running to clean up `~/.accordion/sessions/` after a
@@ -703,10 +875,32 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		}
 	}
 
+	/**
+	 * Shared model-window budget-clamp policy. A mid-session swap to a smaller-window model must
+	 * shrink an oversized budget, or the aged-summary conductors' 90%-of-budget trigger only fires
+	 * after the REAL window is already exhausted (the output-reservation path then declines with
+	 * "window too tight"). Clamps DOWN only — never raises budget, so a human's smaller custom
+	 * budget (or a swap to a LARGER window) survives untouched. Applied at every call site that
+	 * learns/changes the window (`buildTruth`'s rebuild path, `model_select`, and the late-learned
+	 * path in `refreshFromCtx`) rather than inside `Truth.setContextWindow` itself — doing it there
+	 * would need the emitted `config` event to carry both fields in one rev-bump, but
+	 * `core/replica.ts`'s `applyWireEvent` replays `budget`/`contextWindow` fields independently via
+	 * the ordinary public setters, so a replica replaying one combined event would double-apply the
+	 * clamp and end up one rev ahead of the host. Calling `setBudget` as a separate, ordinary
+	 * follow-up call (as done here) emits its own single-field `config` event exactly like any other
+	 * human/host budget change, which a replica already replays 1:1 — no protocol change needed.
+	 */
+	function clampBudgetToWindow(t: Truth, window: number): void {
+		if (t.budget > window) t.setBudget(window);
+	}
+
 	/** Adopt a model's id + context window into the live + meta state (best-effort). */
 	function applyModel(m: { id?: string; contextWindow?: number } | undefined): void {
 		if (!m) return;
-		latestModel = m;
+		// Keep the FULL model object — an out-of-band completion needs it (apiKey resolution, the
+		// maxTokens ceiling), not just the id string. `model: "current"` then follows a just-selected
+		// model immediately instead of waiting for the next `context` hook to refresh `latestCtx`.
+		latestModelObj = m;
 		if (m.id) {
 			model = m.id;
 			meta.model = m.id;
@@ -730,6 +924,18 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 					contextWindow = u.contextWindow;
 					meta.contextWindow = u.contextWindow;
 				}
+			}
+			// Late-learned window: `buildTruth` may have run with `contextWindow` still null (left the
+			// 70_000 default budget in place), or the window only becomes known/changes here rather
+			// than via `model_select`. Adopt it into the live Truth now, clamping budget DOWN only.
+			// Guarded on an actual change so a steady-state hook tick (this runs before every model
+			// call) doesn't spam a rev bump/broadcast when nothing moved. On a genuine change the
+			// two setters emit config events that reach an attached ViewConductor as `state-changed`,
+			// so a swap tick pays for the conductor's synchronous re-conduct on the hook path —
+			// CPU-only (no disk I/O), one-time per swap, and only with folding + a conductor active.
+			if (truth && contextWindow != null && truth.contextWindow !== contextWindow) {
+				truth.setContextWindow(contextWindow);
+				clampBudgetToWindow(truth, contextWindow);
 			}
 		} catch {
 			/* optional APIs */
@@ -787,12 +993,40 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		return `accordion_token_p${port}`;
 	}
 
-	/** Is this request authenticated for static-file serving? (token query OR cookie.) */
+	/**
+	 * True iff `token` is one this extension accepts as a bearer: the per-session `webToken` OR the
+	 * shared door secret (v16, ADR 0024). EVERY extension accepts the door secret wherever the
+	 * webToken is accepted — that is what makes the door URL session-independent and lets a
+	 * door-served page dial any sibling session's ephemeral port.
+	 *
+	 * Security posture (honest version — an earlier comment wrongly said "both live on disk"): the
+	 * per-session `webToken` is MEMORY-ONLY — minted with `crypto.randomBytes` per session, never
+	 * written to disk (a `SessionEntry`/`buildEntry` carries no token). Only the door secret is a file
+	 * (`~/.accordion/door-secret`). What stops a hostile WEB PAGE is unchanged and is the boundary that
+	 * matters: it can read neither files nor this process's memory, so neither secret is reachable to
+	 * it. A same-user LOCAL process is explicitly OUTSIDE the threat model — it can already read pi's
+	 * own session data on disk directly, so reading `door-secret` grants it nothing new. What the door
+	 * secret DOES newly introduce, versus the ephemeral in-memory webToken, and which is owned rather
+	 * than hand-waved: it is persisted (survives reboots), never rotated for the life of the file,
+	 * shared machine-wide, and rides a bookmarkable URL (history/bookmark-sync exposure — the address
+	 * bar is scrubbed client-side after capture, S1b, but a link the user copies/shares still carries a
+	 * live, non-expiring, machine-wide credential). Secret rotation is a NAMED FOLLOW-UP, not shipped.
+	 */
+	function isBearer(token: string | null | undefined): boolean {
+		if (typeof token !== "string" || !token) return false;
+		if (webToken && token === webToken) return true;
+		if (doorSecret && token === doorSecret) return true;
+		return false;
+	}
+
+	/** Is this request authenticated for static-file serving? (bearer token query OR a matching cookie.) */
 	function isWebAuthed(req: http.IncomingMessage, u: URL): boolean {
-		if (!webToken) return false;
-		if (u.searchParams.get("token") === webToken) return true;
+		if (isBearer(u.searchParams.get("token"))) return true;
 		const cookie = req.headers["cookie"];
-		if (typeof cookie === "string" && cookie.split(";").some((c) => c.trim() === `${accordionCookieName()}=${webToken}`)) return true;
+		if (typeof cookie !== "string") return false;
+		const parts = cookie.split(";").map((c) => c.trim());
+		if (webToken && parts.includes(`${accordionCookieName()}=${webToken}`)) return true;
+		if (doorSecret && parts.includes(`${DOOR_COOKIE}=${doorSecret}`)) return true;
 		return false;
 	}
 
@@ -811,11 +1045,18 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			// fetch all depend on reading it without a token.
 			if (u.pathname === "/__accordion/meta") {
 				res.writeHead(200, { "Content-Type": "application/json" });
-				// `planOutcomes` (issue #60, ADR 0020): per-cause counts of every `context` hook
-				// resolution this extension has ever resolved, plus `total` (= `contextHookCount`,
-				// the total invocation count) — what the bellows bench rig polls to see how much
-				// of a session actually rode the GUI's plan vs. a silent/fallback passthrough.
-				res.end(JSON.stringify({ served: true, sessionId, protocolVersion: PROTOCOL_VERSION, planOutcomes: { ...planOutcomeCounts, total: contextHookCount } }));
+				// Phase B telemetry: the `context` hook is a local operation, so instead of plan
+				// outcomes we report the hook-duration stream (proving the local path is fast) plus
+				// the structural-rebuild count and the current folding-enabled arm. `served`/
+				// `sessionId`/`protocolVersion` are unchanged (the sibling-origin probe depends on them).
+				res.end(
+					JSON.stringify({
+						served: true,
+						sessionId,
+						protocolVersion: PROTOCOL_VERSION,
+						telemetry: { hookCount, lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookErrors, ingressErrors, foldingEnabled },
+					}),
+				);
 				return;
 			}
 
@@ -850,10 +1091,15 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				return;
 			}
 			// A valid ?token mints a cookie so subsequent same-origin requests (the SvelteKit
-			// asset fetches, which don't carry the query string) stay authenticated.
+			// asset fetches, which don't carry the query string) stay authenticated. The webToken and
+			// the shared door secret each mint their OWN cookie: the webToken's is port-qualified (per
+			// session), the door secret's is the fixed DOOR_COOKIE (shared, survives a door takeover).
 			const headers: Record<string, string> = {};
-			if (u.searchParams.get("token") === webToken) {
+			const qtoken = u.searchParams.get("token");
+			if (webToken && qtoken === webToken) {
 				headers["Set-Cookie"] = `${accordionCookieName()}=${webToken}; HttpOnly; SameSite=Strict; Path=/`;
+			} else if (doorSecret && qtoken === doorSecret) {
+				headers["Set-Cookie"] = `${DOOR_COOKIE}=${doorSecret}; HttpOnly; SameSite=Strict; Path=/`;
 			}
 
 			const root = resolveClientRoot();
@@ -922,6 +1168,14 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		const cookie = req.headers.cookie;
 		return !!webToken && typeof cookie === "string"
 			&& cookie.split(";").some((part) => part.trim() === `${accordionCookieName()}=${webToken}`);
+	}
+
+	/** v16: does this request carry the shared door-secret cookie? (The door-served page's ambient
+	 *  auth for its no-query asset fetches; still gated by an exact-served-Origin check at upgrade.) */
+	function hasDoorCookie(req: http.IncomingMessage): boolean {
+		const cookie = req.headers.cookie;
+		return !!doorSecret && typeof cookie === "string"
+			&& cookie.split(";").some((part) => part.trim() === `${DOOR_COOKIE}=${doorSecret}`);
 	}
 
 	/**
@@ -1028,7 +1282,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	/**
 	 * Loopback binding blocks network peers, but not cross-site WebSocket hijacking: browsers do
 	 * not apply CORS to WebSocket handshakes. A hostile page that finds the ephemeral port could
-	 * otherwise replace the GUI, read the backlog, steer plans, and launch paid completions.
+	 * otherwise replace the GUI, read the backlog, and steer plans.
 	 */
 	function verifyWsUpgrade(info: { req: http.IncomingMessage }, cb: (res: boolean, code?: number, message?: string) => void): void {
 		const req = info.req;
@@ -1046,11 +1300,26 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			return;
 		}
 
+		// PHASE C: a conductor-role socket is authorized SOLELY by the single-use pending attach token
+		// the host minted when it spawned this runner — role confers NO privilege on its own. It skips
+		// EVERY GUI trust branch (native no-Origin, Tauri origin, cookie, sibling probe): a hostile
+		// page (or a stray native client) that guesses `?role=conductor` still needs the unguessable
+		// token, and the token is valid only for the exact spawn currently awaiting its runner. The
+		// GUI path below is byte-identical to before (PR #72 hardening must not regress).
+		if (roleFromUrl(req.url) === "conductor") {
+			const pending = liveHost.pendingAttachToken;
+			const ok = !!pending && token === pending;
+			cb(ok, ok ? undefined : 403, ok ? undefined : "conductor attach token required");
+			return;
+		}
+
 		const origin = req.headers.origin;
 		if (typeof origin !== "string" || origin === "") { cb(true); return; } // native client
 		if (isTrustedTauriOrigin(origin)) { cb(true); return; }
-		if (!!webToken && token === webToken) { cb(true); return; } // explicit bearer
-		if (hasAccordionCookie(req) && isExactServedOrigin(req, origin)) { cb(true); return; }
+		if (isBearer(token)) { cb(true); return; } // explicit bearer (webToken OR the shared door secret)
+		// A page served by us (webToken cookie) OR by the door (door-secret cookie) — both still gated
+		// by an exact-served-Origin check so an ambient host-scoped cookie can't authorize cross-port.
+		if ((hasAccordionCookie(req) || hasDoorCookie(req)) && isExactServedOrigin(req, origin)) { cb(true); return; }
 
 		// A browser page served by another live Accordion session is the one intentional
 		// cross-origin path. verifyClient supports an asynchronous callback.
@@ -1060,12 +1329,640 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		);
 	}
 
+	// -- door secret: the shared browser bearer (ADR 0024 §8) --
+	// One value, written EXACTLY once, stable for as long as any extension has it cached. Creation is
+	// atomic-WITH-CONTENT: write the full secret to a same-dir tmp file (0600), then
+	// fs.linkSync(tmp, DOOR_SECRET_PATH) -- the destination appears with COMPLETE bytes or not at all,
+	// and EEXIST means a racer won (adopt theirs). This replaces the earlier "wx" open-then-write,
+	// whose open->write gap let a racer read empty/partial bytes and cache "" with NO retry, and whose
+	// crash window (creator dies between open and write) left a permanently invalid file on disk.
+	// (Still deliberately NOT write-rename like controller.json: a rename would clobber an in-use
+	// secret out from under every extension that already cached + handed it out. link/EEXIST keeps
+	// first-writer-wins; the tmp step just guarantees the winner's bytes are complete.)
+	// Reader side: an absent/invalid read schedules a BOUNDED re-attempt on an unref'd timer (never a
+	// one-shot give-up), and an invalid file whose mtime is older than DOOR_SECRET_STALE_MS is a
+	// crashed creator's artifact -- unlinked and re-created (two extensions both recovering converge
+	// via the link/EEXIST primitive rather than fighting). The retry budget (~22s of linear backoff)
+	// deliberately exceeds the staleness threshold (10s), so a young invalid file always ages into
+	// reapability within the budget. The door itself is GATED on a valid secret: tryBindDoor refuses
+	// to bind while doorSecret is "", and the retry timer re-kicks it the moment the secret resolves,
+	// so the door is never up (nor its URL printable) while the bearer it would serve is empty.
+	// Retries exhausted => doorSecret stays "" (no door; the per-session webToken path is unaffected,
+	// and every bearer/cookie comparison pre-checks doorSecret so "" can never match).
+	const DOOR_SECRET_RE = /^[0-9a-f]{64}$/i;
+
+	/** The on-disk secret iff present AND well-formed (64 hex chars), else null. */
+	function readValidDoorSecret(): string | null {
+		try {
+			const existing = fs.readFileSync(DOOR_SECRET_PATH, "utf8").trim();
+			return DOOR_SECRET_RE.test(existing) ? existing : null;
+		} catch {
+			return null; // absent / unreadable
+		}
+	}
+
+	/** Attempt the atomic create (tmp + linkSync). Sets doorSecret iff WE created the file. On a
+	 *  filesystem without hard links (EPERM/ENOSYS/EXDEV/ENOTSUP -- non-NTFS edge) falls back to the
+	 *  old exclusive "wx" create-then-write; its open->write window is exactly what the reader-side
+	 *  retry exists to cover. EEXIST (either path) = a racer won -- the caller re-reads. The tmp file
+	 *  is always unlinked, success or failure. */
+	function tryCreateDoorSecret(): void {
+		const secret = crypto.randomBytes(32).toString("hex");
+		const tmp = `${DOOR_SECRET_PATH}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+		try {
+			fs.mkdirSync(REGISTRY_ROOT, { recursive: true });
+			fs.writeFileSync(tmp, secret, { mode: 0o600 });
+			try {
+				fs.linkSync(tmp, DOOR_SECRET_PATH); // appears with COMPLETE bytes or not at all
+				doorSecret = secret;
+			} catch (e) {
+				const code = (e as NodeJS.ErrnoException)?.code;
+				if (code === "EPERM" || code === "ENOSYS" || code === "EXDEV" || code === "ENOTSUP") {
+					const fd = fs.openSync(DOOR_SECRET_PATH, "wx", 0o600); // fallback; EEXIST if a racer won
+					try { fs.writeSync(fd, secret); } finally { fs.closeSync(fd); }
+					doorSecret = secret;
+				}
+				// EEXIST or anything else: a racer won / creation failed -- caller re-reads + retries.
+			}
+		} catch {
+			/* best-effort: mkdir / tmp write / wx fallback failed -- the bounded retry re-attempts */
+		} finally {
+			try { fs.unlinkSync(tmp); } catch { /* never created / already gone */ }
+		}
+	}
+
+	/** Crash recovery: an INVALID secret file whose mtime is older than DOOR_SECRET_STALE_MS has no
+	 *  live writer (a tmp+link create is sub-millisecond; even the wx fallback's window is micro-
+	 *  seconds) -- unlink it so the atomic create can re-run. Never touches a VALID file, and leaves
+	 *  a YOUNG invalid file alone (possibly a legacy-path writer mid-write; it either completes or
+	 *  ages into reapability within the retry budget). */
+	function reapStaleInvalidDoorSecret(): void {
+		try {
+			const st = fs.statSync(DOOR_SECRET_PATH);
+			if (Date.now() - st.mtimeMs <= DOOR_SECRET_STALE_MS) return;
+			if (readValidDoorSecret() !== null) return; // valid -- never reap a good secret
+			// Decision made: stale + invalid. Re-stat + re-validate IMMEDIATELY before the unlink to
+			// shrink the TOCTOU against a racer that reaped + re-created a VALID file inside our gap --
+			// a fresh mtime or now-valid content means a racer just acted, so stand down. The residual
+			// window is now just validate->unlink (microseconds) and remains accepted (ADR 0024 par. 8).
+			const again = fs.statSync(DOOR_SECRET_PATH);
+			if (Date.now() - again.mtimeMs <= DOOR_SECRET_STALE_MS) return;
+			if (readValidDoorSecret() !== null) return;
+			fs.unlinkSync(DOOR_SECRET_PATH);
+		} catch {
+			/* absent or unreadable -- nothing to reap */
+		}
+	}
+
+	/**
+	 * Ensure the shared door secret exists on disk, is valid, and is cached in `doorSecret` -- with
+	 * bounded retry instead of the old one-shot. Synchronous happy path (valid file, or we win the
+	 * create). Otherwise: reap a stale-invalid file, attempt the atomic create, re-read (a racer may
+	 * have won), and if STILL unresolved schedule a bounded, linearly backed-off, unref'd re-attempt
+	 * that re-kicks the (secret-gated) door bind when the secret finally resolves. Idempotent; a
+	 * session swap re-arms it via startServer. Never on the context hook path.
+	 */
+	function ensureDoorSecret(): void {
+		if (doorSecret) return;
+		const existing = readValidDoorSecret();
+		if (existing !== null) { doorSecret = existing; doorSecretTries = 0; return; }
+		reapStaleInvalidDoorSecret();
+		tryCreateDoorSecret();
+		if (!doorSecret) {
+			const again = readValidDoorSecret(); // a racer may have completed while we tried
+			if (again !== null) doorSecret = again;
+		}
+		if (doorSecret) { doorSecretTries = 0; return; }
+		if (doorSecretRetryTimer) return;
+		if (doorSecretTries >= DOOR_SECRET_MAX_TRIES) {
+			// P3: exhaustion must not be silent (parity with the foreign-occupant warn). One line, once:
+			// e.g. a persistently-invalid file we may not unlink, or EACCES on every create attempt.
+			if (!doorSecretGaveUp) {
+				doorSecretGaveUp = true;
+				console.warn(`[accordion] door secret could not be created or read after ${DOOR_SECRET_MAX_TRIES} attempts (${DOOR_SECRET_PATH}); the stable door URL is unavailable this run`);
+			}
+			return;
+		}
+		doorSecretTries++;
+		doorSecretRetryTimer = setTimeout(() => {
+			doorSecretRetryTimer = null;
+			ensureDoorSecret();
+			if (doorSecret) tryBindDoor(); // the secret just resolved -- the gated door bind may proceed
+		}, currentDoorSecretRetryMs() * doorSecretTries); // linear backoff: n * base
+		doorSecretRetryTimer.unref?.();
+	}
+
+	// -- the door: an ADDITIONAL fixed-port listener, one extension at a time (ADR 0024) --
+	/**
+	 * Probe the door port's /__accordion/meta and CLASSIFY the occupant (C2/S3, DoorProbe above). This
+	 * is deliberately STRICTER than the old served:true-only trust: a completed response that only sets
+	 * served:true is not enough to print the secret door URL at it — it must also match this protocol
+	 * version and name a session in the registry. And, critically, a timeout / connection error / a
+	 * mismatched-version Accordion is "transient", NOT foreign: a busy or momentarily-unavailable peer
+	 * must never trigger a PERMANENT door stand-down. Bounded (DOOR_PROBE_MS); never on the hook path.
+	 */
+	function probeDoor(): Promise<DoorProbe> {
+		const dp = currentDoorPort();
+		if (dp === null) return Promise.resolve("transient");
+		return new Promise((resolve) => {
+			let settled = false;
+			let request: http.ClientRequest | null = null;
+			const finish = (result: DoorProbe): void => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(deadline);
+				resolve(result);
+			};
+			// A timeout means we never got a completed response — AMBIGUOUS (a busy/slow peer), not foreign.
+			const deadline = setTimeout(() => { request?.destroy(); finish("transient"); }, DOOR_PROBE_MS);
+			request = http.get({ hostname: "127.0.0.1", port: dp, path: "/__accordion/meta" }, (response) => {
+				if (!isLoopbackPeer(response.socket.remoteAddress)) { response.destroy(); finish("transient"); return; }
+				// A COMPLETED non-200 HTTP response is a live server that isn't our (ungated, always-200)
+				// /meta contract — definitive foreign software.
+				if (response.statusCode !== 200) { response.destroy(); finish("foreign"); return; }
+				const chunks: Buffer[] = [];
+				let bodyBytes = 0;
+				response.on("data", (chunk: Buffer) => {
+					bodyBytes += chunk.length;
+					if (bodyBytes > SIBLING_ORIGIN_META_MAX_BYTES) { response.destroy(); finish("foreign"); return; }
+					chunks.push(chunk);
+				});
+				response.on("end", () => {
+					if (settled) return;
+					let meta: { served?: unknown; sessionId?: unknown; protocolVersion?: unknown };
+					try {
+						meta = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+					} catch { finish("foreign"); return; } // completed response, unparseable body → foreign
+					// Fails the served/shape check → foreign (a completed response from non-Accordion software).
+					if (meta.served !== true || typeof meta.sessionId !== "string") { finish("foreign"); return; }
+					// An Accordion of a DIFFERENT protocol version — do NOT trust it with the secret URL, but
+					// do NOT permanently stand down either (it's still Accordion). Keep retrying.
+					if (meta.protocolVersion !== PROTOCOL_VERSION) { finish("transient"); return; }
+					// Best-effort registry confirmation: a matching sessionId in the live registry proves this
+					// really is our peer. If we can't confirm it (registry read fails, or the session isn't
+					// listed yet — a startup race), treat it as ambiguous rather than trusting the secret URL.
+					const sid = meta.sessionId;
+					void listLiveSessions().then(
+						(sessions) => finish(sessions.some((s) => s.sessionId === sid) ? "accordion" : "transient"),
+						() => finish("transient"),
+					);
+				});
+				response.on("aborted", () => finish("transient"));
+				response.on("error", () => finish("transient"));
+			});
+			// A connection error (ECONNREFUSED, ECONNRESET from a peer that exited mid-probe, …) is
+			// AMBIGUOUS — never a permanent foreign stand-down.
+			request.on("error", () => finish("transient"));
+		});
+	}
+
+	/** Schedule a slow re-attempt to bind the door (only while a LIVE Accordion door holds it). */
+	function scheduleDoorRetry(): void {
+		if (doorHeld || doorForeign || doorRetryTimer) return;
+		doorRetryTimer = setTimeout(() => { doorRetryTimer = null; tryBindDoor(); }, currentDoorRetryMs());
+		doorRetryTimer.unref?.();
+	}
+
+	/**
+	 * Try to become the door holder: bind the fixed door port as an ADDITIONAL listener serving the
+	 * SAME handlers (static UI, /__accordion/*, WS upgrade) as this session's ephemeral server. On
+	 * EADDRINUSE, probe + classify the occupant (probeDoor): a matching live Accordion door -> stand by
+	 * and re-check on a slow timer; definitive foreign software -> log once and stand down PERMANENTLY;
+	 * anything ambiguous (timeout / connection error / other-version Accordion) -> keep retrying, never
+	 * permanent. Idempotent (no-op once held / stood down / a bind is already in flight). NEVER on the
+	 * context hook.
+	 */
+	function tryBindDoor(): void {
+		if (doorHeld || doorForeign || doorBinding) return;
+		const dp = currentDoorPort();
+		if (dp === null) return; // door disabled (test isolation)
+		// GATED on a valid shared secret (ADR 0024 §8): never bind/advertise the door while doorSecret
+		// is "" -- a door with no bearer to serve is a door nobody can be authorized through, and the
+		// /accordion print path must never see doorHeld=true with an empty secret. ensureDoorSecret's
+		// bounded retry re-invokes this the moment the secret resolves.
+		if (!doorSecret) { ensureDoorSecret(); if (!doorSecret) return; }
+		doorBinding = true;
+		let server: http.Server;
+		let dwss: WebSocketServer;
+		try {
+			server = http.createServer(handleHttp);
+			dwss = new WebSocketServer({ server, verifyClient: verifyWsUpgrade, maxPayload: MAX_WS_PAYLOAD_BYTES });
+		} catch {
+			doorBinding = false;
+			scheduleDoorRetry();
+			return;
+		}
+		dwss.on("connection", onWsConnection);
+		dwss.on("error", () => { /* best-effort: a door WS error runs headless, like the ephemeral one */ });
+		server.once("error", (err: NodeJS.ErrnoException) => {
+			doorBinding = false;
+			try { dwss.close(); } catch { /* ignore */ }
+			try { server.close(); } catch { /* ignore */ }
+			if (err?.code === "EADDRINUSE") {
+				void probeDoor().then((result) => {
+					if (result === "accordion") {
+						scheduleDoorRetry(); // a matching live Accordion door holds it -> stand by, re-check
+					} else if (result === "foreign") {
+						if (!doorForeign) {
+							doorForeign = true; // definitive non-Accordion software -> permanent stand-down (log once)
+							console.warn(`[accordion] door port ${dp} is held by non-Accordion software; the stable door URL is unavailable this run`);
+						}
+					} else {
+						// transient/ambiguous (timeout / connection error / other-version Accordion / unconfirmed
+						// session) -> NEVER a permanent stand-down; keep retrying so a busy or momentarily-gone
+						// Accordion peer, or one still mid-startup, doesn't disable the door for this whole run.
+						scheduleDoorRetry();
+					}
+				});
+			} else {
+				scheduleDoorRetry(); // transient -> try again later
+			}
+		});
+		// C3: verified on Windows 11 (2026-07-23) that two SEPARATE node processes racing this exact
+		// listen(PORT, "127.0.0.1") do NOT both bind — the loser cleanly gets EADDRINUSE (no SO_REUSEADDR
+		// hijack). So the EADDRINUSE probe path above is the sole arbitration; no lockfile is needed.
+		server.listen(dp, "127.0.0.1", () => {
+			doorBinding = false;
+			doorServer = server;
+			doorWss = dwss;
+			doorHeld = true;
+			// A post-listen server error (rare) drops the door -> reset + let the retry timer reclaim it.
+			server.on("error", () => {
+				try { dwss.close(); } catch { /* ignore */ }
+				try { server.close(); } catch { /* ignore */ }
+				doorServer = null; doorWss = null; doorHeld = false;
+				scheduleDoorRetry();
+			});
+		});
+	}
+
+	/** Close the door listener if we hold it (releases the port for a standing-by extension). Also
+	 *  stops any pending secret-ensure retry and resets its budget (a session swap re-arms both via
+	 *  startServer). The cached doorSecret itself is kept -- it is stable for the process lifetime. */
+	function closeDoor(): void {
+		if (doorRetryTimer) { clearTimeout(doorRetryTimer); doorRetryTimer = null; }
+		if (doorSecretRetryTimer) { clearTimeout(doorSecretRetryTimer); doorSecretRetryTimer = null; }
+		doorSecretTries = 0;
+		doorSecretGaveUp = false;
+		try { doorWss?.close(); } catch { /* ignore */ }
+		try { doorServer?.close(); } catch { /* ignore */ }
+		doorServer = null; doorWss = null; doorHeld = false; doorBinding = false;
+	}
+
+	// -- the controller lease: the GLOBAL single-controller blackboard (ADR 0024) --
+	/** Read + parse controller.json (best-effort). Returns the lease or null (absent/corrupt/old-proto).
+	 *  S2: controller.json is a shared, ANY-extension-writable (or hand-editable) blackboard, so the
+	 *  fields read off it are re-validated through the SAME ingress sanitizers a live `?surface`/`?label`
+	 *  dial goes through — a corrupt/hostile file must not ride a malformed id or an unbounded label into
+	 *  the lease cache or a `controller` broadcast. A field that fails sanitization ⇒ treat as no lease. */
+	function readControllerLease(): ControllerLease | null {
+		try {
+			const raw = JSON.parse(fs.readFileSync(CONTROLLER_PATH, "utf8"));
+			if (!isControllerLease(raw)) return null;
+			const surfaceId = sanitizeSurfaceId(raw.surfaceId);
+			const label = sanitizeSurfaceLabel(raw.label);
+			if (!surfaceId || !label) return null; // reject: same charset/length gate as the dial ingress
+			return { ...raw, surfaceId, label };
+		} catch {
+			return null;
+		}
+	}
+
+	/** Structural equality on the fields that decide "did the lease change" — content-level so a
+	 *  same-mtime foreign rewrite is caught (C4). Compares holder + timestamps, not the file's mtime. */
+	function leaseEq(a: ControllerLease | null, b: ControllerLease | null): boolean {
+		if (a === b) return true;               // both null (or the same object)
+		if (!a || !b) return false;
+		return a.surfaceId === b.surfaceId
+			&& a.label === b.label
+			&& a.claimedAt === b.claimedAt
+			&& a.heartbeatAt === b.heartbeatAt;
+	}
+
+	/** Read controller.json FRESH into the in-memory cache (content-level, NOT mtime-gated — C4/C1) and
+	 *  report whether the lease changed since our cached copy. Never broadcasts (each caller decides). */
+	function reloadControllerLease(): { lease: ControllerLease | null; changed: boolean } {
+		const next = readControllerLease();
+		const changed = !leaseEq(controllerLease, next);
+		controllerLease = next;
+		return { lease: next, changed };
+	}
+
+	/** Atomic write-rename of controller.json (same pattern as a registry entry). Updates the in-memory
+	 *  cache so a following poll does not re-read our own write as an external change (the content compare
+	 *  in reloadControllerLease sees it as unchanged). */
+	function writeControllerLease(lease: ControllerLease): void {
+		try {
+			fs.mkdirSync(REGISTRY_ROOT, { recursive: true });
+			const tmp = `${CONTROLLER_PATH}.${process.pid}.tmp`;
+			fs.writeFileSync(tmp, JSON.stringify(lease));
+			fs.renameSync(tmp, CONTROLLER_PATH);
+			controllerLease = lease;
+		} catch {
+			/* best-effort: a lease write never breaks a session */
+		}
+	}
+
+	/** The controller field for a `hello`: the current lease + whether its heartbeat is fresh. */
+	function controllerInfo(): ControllerInfo | null {
+		const l = controllerLease;
+		if (!l) return null;
+		return { surfaceId: l.surfaceId, label: l.label, fresh: isFreshLease(l, Date.now()) };
+	}
+
+	/** Broadcast a `controller` frame IFF the lease-holder changed since our last broadcast (dedupe). */
+	function maybeBroadcastController(): void {
+		const holder = controllerLease ? controllerLease.surfaceId : null;
+		if (holder === lastBroadcastHolder) return;
+		lastBroadcastHolder = holder;
+		// No wire "cleared" frame exists (a stale lease surfaces via hello.fresh:false); only a real
+		// holder is broadcast.
+		if (controllerLease) broadcast({ type: "controller", surfaceId: controllerLease.surfaceId, label: controllerLease.label });
+	}
+
+	/** Read controller.json fresh into the cache + broadcast any change (used at connect time). */
+	function refreshControllerNow(): void {
+		reloadControllerLease();
+		maybeBroadcastController();
+	}
+
+	/** ~1s poll: adopt an EXTERNAL controller.json change (another extension's claim) + broadcast it.
+	 *  C4: a CONTENT compare (not the old mtime early-return) so a same-mtime foreign rewrite is never
+	 *  missed. The file read is tiny, so reading it every tick is cheap. */
+	function pollControllerFile(): void {
+		const { changed } = reloadControllerLease();
+		// maybeBroadcastController dedupes on holder, so a pure heartbeat bump (holder unchanged) is a
+		// no-op; an absent file resolves to null and is never broadcast as a "cleared" frame.
+		if (changed) maybeBroadcastController();
+	}
+
+	/** ~2s heartbeat: refresh the lease's heartbeatAt IFF a connected socket IS the current holder.
+	 *  C1: re-read the lease FRESH FROM DISK first (not the possibly-stale in-memory cache). At a
+	 *  coincident tick the heartbeat can fire before the poll, so writing from the cache would let this
+	 *  extension re-assert an OLD holder and clobber another extension's just-written fresh claim. By
+	 *  reading fresh and only ever writing back the SAME surfaceId that is on disk, we can never write a
+	 *  surfaceId that differs from the current file, and we adopt+broadcast a foreign change as the poll
+	 *  would. */
+	function heartbeatController(): void {
+		const { lease, changed } = reloadControllerLease();
+		if (changed) maybeBroadcastController(); // a foreign claim we observed this tick — adopt + broadcast it
+		if (!lease) return;
+		// Only refresh the heartbeat if the FRESH on-disk holder is a surface connected to THIS
+		// extension; we write back that exact holder (never a different surfaceId than the file's).
+		let holderConnected = false;
+		for (const info of clients.values()) if (info.surfaceId && info.surfaceId === lease.surfaceId) { holderConnected = true; break; }
+		if (!holderConnected) return;
+		writeControllerLease({ ...lease, heartbeatAt: Date.now() });
+	}
+
+	/** Start the controller poll + heartbeat timers once (idempotent). Both are unref'd, best-effort. */
+	function startControllerTimers(): void {
+		if (!controllerPollTimer) {
+			controllerPollTimer = setInterval(pollControllerFile, currentControllerPollMs());
+			controllerPollTimer.unref?.();
+		}
+		if (!controllerHeartbeatTimer) {
+			controllerHeartbeatTimer = setInterval(heartbeatController, currentControllerHeartbeatMs());
+			controllerHeartbeatTimer.unref?.();
+		}
+	}
+
+	/** Stop the controller timers (session teardown). The lease itself is global and left on disk. */
+	function stopControllerTimers(): void {
+		if (controllerPollTimer) { clearInterval(controllerPollTimer); controllerPollTimer = null; }
+		if (controllerHeartbeatTimer) { clearInterval(controllerHeartbeatTimer); controllerHeartbeatTimer = null; }
+	}
+
+	/** Parse + sanitize a gui socket's surface identity (`?surface`/`?label`) from its connect URL. */
+	function surfaceFromUrl(url: string | undefined): { surfaceId: string | null; label: string | null } {
+		try {
+			const p = new URL(url || "/", "http://accordion.local").searchParams;
+			return { surfaceId: sanitizeSurfaceId(p.get("surface")), label: sanitizeSurfaceLabel(p.get("label")) };
+		} catch {
+			return { surfaceId: null, label: null };
+		}
+	}
+
+	/** True iff this socket's surface is the CURRENT FRESH controller (the READ-ONLY steer gate). A
+	 *  stale/absent lease is treated as uncontrolled -> not the controller -> commands are refused
+	 *  (the client claims first; auto-claim makes this invisible in practice). */
+	function isControllerSocket(ws: WebSocket): boolean {
+		const info = clients.get(ws);
+		const lease = controllerLease;
+		if (!lease || !info || !info.surfaceId) return false;
+		if (!isFreshLease(lease, Date.now())) return false;
+		return lease.surfaceId === info.surfaceId;
+	}
+
+	/** Build the READ-ONLY refusal reply for a mutating command from a non-controller surface. For an
+	 *  `ops` command, mirror one `read-only` clamp per op so per-tile clamp UX still works; the
+	 *  top-level `refused` is the uniform signal for the dial commands that carry no ops. Truth is
+	 *  never touched (rev unchanged). */
+	function refusedCommandResult(seq: number, cmd: unknown): ServerMessage {
+		const parsed = sanitizeCommand(cmd);
+		const results: OpResult[] = parsed && parsed.kind === "ops"
+			? parsed.ops.map((op) => ({ op, applied: false, clamped: "read-only" as const }))
+			: [];
+		return { type: "commandResult", seq, results, rev: truth ? truth.rev : 0, refused: "read-only" };
+	}
+
+	/** A gui socket claims the global controller lease. Never refused (the human is the authority);
+	 *  last write wins on races. Writes controller.json + broadcasts the change of hands. */
+	function handleClaimController(ws: WebSocket): void {
+		const info = clients.get(ws);
+		if (!info || !info.surfaceId) return; // a surface with no identity can never hold the lease
+		const now = Date.now();
+		// S4: read the current lease fresh, then skip the write-rename entirely when this surface ALREADY
+		// holds a fresh lease — the heartbeat timer keeps heartbeatAt current, so a redundant claim (claim
+		// spam) shouldn't amplify disk churn. A stale-but-ours or someone-else's lease still rewrites.
+		const { lease: current } = reloadControllerLease();
+		if (current && current.surfaceId === info.surfaceId && isFreshLease(current, now)) {
+			// The reload above may have just adopted a holder change this extension had not yet
+			// broadcast (cache updated ⇒ later polls see no change), so emit before skipping —
+			// otherwise TAKE CONTROL is a silent no-op in the same-surfaceId dual-tab corner.
+			// Holder-dedupe in maybeBroadcastController keeps plain claim spam emitting nothing.
+			maybeBroadcastController();
+			return; // already the fresh holder — nothing to write
+		}
+		const prior = current && current.surfaceId === info.surfaceId ? current : null;
+		writeControllerLease({
+			registryProtocol: REGISTRY_PROTOCOL,
+			surfaceId: info.surfaceId,
+			label: info.label || "Surface",
+			claimedAt: prior ? prior.claimedAt : now,
+			heartbeatAt: now,
+		});
+		maybeBroadcastController();
+	}
+
+	/**
+	 * Shared WebSocket connection handler, attached to BOTH this session's ephemeral WS server AND
+	 * (whenever we hold it) the fixed DOOR WS server (ADR 0024) — identical auth/replica behavior on
+	 * either listener. A gui socket additionally carries its sanitized surface identity and is subject
+	 * to the v16 READ-ONLY controller gate; conductor sockets are entirely unaffected.
+	 */
+	function onWsConnection(ws: WebSocket, req: http.IncomingMessage): void {
+		const role = roleFromUrl(req?.url);
+		const surface = surfaceFromUrl(req?.url); // v16: the connecting surface's sanitized identity (gui only)
+		// PHASE C: a conductor-role socket must consume its single-use attach token before it is
+		// treated as the active conductor (the token was already verified at upgrade time; consume
+		// it here so a re-dial with the same token is rejected). It STILL joins `clients` and gets
+		// the same hello/snapshot/event stream as a GUI — a remote conductor is a replica.
+		if (role === "conductor") {
+			let token: string | null = null;
+			try {
+				token = new URL(req?.url || "/", "http://accordion.local").searchParams.get("token");
+			} catch {
+				/* verifyWsUpgrade already rejected a malformed target */
+			}
+			if (!liveHost.acceptConductorSocket(ws, token)) {
+				try { ws.close(); } catch { /* ignore */ }
+				return;
+			}
+			conductorWs = ws;
+		}
+		// Bring the Truth up to date with the session's current history BEFORE snapshotting.
+		// On a resumed/loaded session no hook has fired yet, so read straight from the session
+		// manager. This runs before `ws` joins `clients`, so any resulting append events reach
+		// only the ALREADY-connected clients — the new client gets the up-to-date snapshot next.
+		//
+		// This intentionally still runs even when `truth` already exists (not gated behind
+		// `!truth`, i.e. NOT bootstrap-only): `readSessionMessages` reads pi's CURRENT
+		// `sessionManager` state, which reflects tree-nav (`session_before_tree`/`session_tree`,
+		// which this extension does not hook) the instant it happens — the only other way a
+		// tree-nav jump surfaces is the next `context` hook. Gating this to
+		// bootstrap-only would leave a client that attaches right after a tree-nav (before the
+		// next model call) looking at the stale pre-nav branch. A second client attaching mid-
+		// session can still spuriously trip `ingestMessages`' divergence check against
+		// `lastMessages` here, forcing a rebuild — but `buildTruth`/`Truth.rebuildFrom` now
+		// preserves every surviving block's overlay and the host's dials across that rebuild, so
+		// the rebuild this triggers no longer wipes the first client's folds/pins/groups/dials
+		// (review finding).
+		const history = readSessionMessages(latestCtx);
+		if (history.length) ingestMessages(history);
+
+		// v16: re-read the controller lease from disk so this client's hello carries the current lease
+		// (and any external change it reveals is broadcast to already-connected clients).
+		refreshControllerNow();
+		// hello advertises the conductor catalog (thermocline only if its runner resolves on disk) plus
+		// the current controller lease (v16).
+		send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta, conductors: catalogMeta((entryFile) => resolveRunnerPath(entryFile) !== null), controller: controllerInfo() });
+		sendSnapshot(ws);
+		// P1-6: a freshly attached REMOTE conductor gets an initial turn-committed right AFTER its
+		// snapshot — by now the spawned SDK has hydrated its replica and run `conductor.attach`, so its
+		// listener is live and this drives an immediate pass over existing state instead of idling
+		// until the next real turn. (The in-process seam fires its own initial pass inside `select`.)
+		if (role === "conductor" && truth) liveHost.fireInitialTurnCommitted();
+		// After the snapshot, a (re)connecting client learns who — if anyone — is driving, plus any
+		// cached conductor status line, so it never renders from a locally tracked guess.
+		const activeMeta = liveHost.activeMeta();
+		if (activeMeta) send(ws, { type: "conductorState", active: activeMeta });
+		const cachedStatus = liveHost.cachedStatus();
+		if (cachedStatus) send(ws, cachedStatus);
+		// Seed the client's latency badge with current telemetry (blank until the first hook otherwise).
+		send(ws, telemetryMsg());
+		// Register only AFTER the snapshot so no event can precede the replica it must replay onto.
+		clients.set(ws, { role, surfaceId: surface.surfaceId, label: surface.label });
+
+		ws.on("message", (data: Buffer) => {
+			if (!clients.has(ws)) return; // ignore stray messages from a dropped socket
+			let msg: any;
+			try {
+				msg = JSON.parse(data.toString());
+			} catch {
+				return;
+			}
+			// ── ingress boundary: authorized ≠ well-formed ─────────────────────────────
+			// Clearing WS authorization proves a peer may REACH us, never that its frames are
+			// well-formed. An authorized-but-buggy client can send `setBudget:"hello"` (→ NaN budget
+			// → JSON-null on the wire → forked replicas) or `ops:[null]` (a raw `op.kind` deref that
+			// would throw). Sanitize every inbound command/ops HERE, before it can touch the
+			// authoritative Truth, and wrap the whole dispatch so an unexpected throw is caught +
+			// counted at this seam — never allowed to escape the WS callback, where an uncaught throw
+			// would tear down the live session for every other connected client.
+			try {
+				if (role === "conductor") {
+					// A conductor replica: propose / completeRequest / setConductorStatus route to the
+					// live host (which verifies this is the ACTIVE conductor socket), plus resnapshot.
+					if (msg?.type === "resnapshot") {
+						sendSnapshot(ws);
+					} else {
+						// Defense-in-depth mirror of the GUI `ops` guard: a `propose`'s ops reach
+						// `Truth.apply` inside handleConductorMessage, so scrub structurally-invalid
+						// elements (`[null]`, bad kinds) at the boundary before they get there. `null`
+						// (not an array) collapses to an empty batch — an honest no-op proposal.
+						if (msg?.type === "propose") msg.ops = sanitizeOps(msg.ops) ?? [];
+						liveHost.handleConductorMessage(ws, msg);
+					}
+					return;
+				}
+				// v16 (ADR 0024): claiming control is allowed from ANY gui socket — the human is the
+				// authority, takeover is never refused, last write wins on races. NOT gated by the
+				// READ-ONLY controller check (that would make claiming impossible for a non-controller).
+				if (msg?.type === "claimController") {
+					handleClaimController(ws);
+					return;
+				}
+				// The GUI client→server message: a remote-control command. The host applies it to the
+				// authoritative Truth (emitting events to ALL clients) and replies with the per-op
+				// results + resulting rev. There is NO optimistic apply on the client — the replica
+				// mutates only via the echoed event stream, so a command and its events can't race.
+				if (msg?.type === "command" && typeof msg.seq === "number") {
+					// v16 READ-ONLY enforcement: a mutating command from a surface that is not the current
+					// fresh controller is refused BEFORE it touches the Truth (typed "read-only" clamp). A
+					// stale/absent lease counts as uncontrolled -> still refused (the client claims first;
+					// auto-claim makes this invisible in practice). resnapshot/claimController are unaffected.
+					if (!isControllerSocket(ws)) {
+						send(ws, refusedCommandResult(msg.seq, msg.cmd));
+						return;
+					}
+					// `sanitizeCommand` returns a safe, applyable WireCommand or null (a NaN/negative
+					// dial coerced finite, malformed `ops` dropped). A null result is unusable: refuse
+					// it with an empty-results `commandResult` (the clamp-UX shape the GUI already
+					// reads) that acks the client's `seq` WITHOUT mutating the Truth (rev unchanged).
+					const cmd = sanitizeCommand(msg.cmd);
+					if (!cmd) {
+						send(ws, { type: "commandResult", seq: msg.seq, results: [], rev: truth ? truth.rev : 0 });
+					} else {
+						const { results, rev } = applyCommand(cmd);
+						send(ws, { type: "commandResult", seq: msg.seq, results, rev });
+					}
+				} else if (msg?.type === "resnapshot") {
+					// The replica diverged (rev mismatch) or saw a `reset` — hand it a fresh snapshot.
+					sendSnapshot(ws);
+				}
+			} catch {
+				// A malformed peer must never crash the process (an uncaught throw in a `ws` message
+				// listener surfaces as an uncaughtException). Count it (surfaced in /meta telemetry)
+				// and drop the frame; the session and every other client stay live.
+				ingressErrors++;
+			}
+		});
+		const drop = () => {
+			clients.delete(ws);
+			if (role === "conductor") {
+				if (conductorWs === ws) conductorWs = null;
+				liveHost.handleSocketClose(ws); // a clean detach if this was the active conductor
+			}
+		};
+		ws.on("close", drop);
+		ws.on("error", drop);
+	}
+
 	function startServer(): void {
 		if (wss || httpServer) return;
 		bindError = null; // fresh attempt — clear any failure a prior call recorded
 		// Per-session token for the HTTP surface and browser WebSocket upgrades. Native/Tauri
 		// clients and verified sibling Accordion origins are the only tokenless paths.
 		webToken = crypto.randomBytes(16).toString("hex");
+		// v16 (ADR 0024): ensure the shared door secret (accepted as a bearer everywhere the webToken
+		// is; bounded-retry, never a one-shot -- see ensureDoorSecret), start the controller lease
+		// timers, and attempt to become the door holder. tryBindDoor is gated on a valid secret; when
+		// the secret only resolves on a later retry tick, that tick re-kicks the bind. All idempotent +
+		// best-effort; re-run on a session swap after `closeDoor`/`stopControllerTimers`.
+		ensureDoorSecret();
+		startControllerTimers();
+		tryBindDoor();
 		try {
 			// One HTTP server hosts BOTH halves on the SAME ephemeral loopback port:
 			//   • HTTP GETs → handleHttp (the browser build, token-gated)
@@ -1103,220 +2000,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			wss = null;
 			return;
 		}
-		wss.on("connection", (ws: WebSocket) => {
-			// Request-id deduplication is per connection; paid-call accounting above is global.
-			const connectionCompletionIds = new Set<number>();
-			flushPending(); // supersede any prior GUI: its in-flight requests pass through
-			client = ws;
-			epoch++;
-			sentCount = 0; // re-sync the whole context to the freshly-connected GUI
-			reqSeq = 0;
-			lastPlan = null; // a new view starts with no known plan; never apply the old one to it
-			armed = false; // a fresh client is DISARMED until it declares otherwise over the wire
-			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, meta });
-
-			// Flush existing history IMMEDIATELY on attach. Without this, a session that
-			// already has turns stays empty in the app until the next hook fires — and the
-			// only hook that streams the backlog is `context`, which fires before the next
-			// model call (i.e. when the user sends their next message). So `/accordion` in a
-			// session with history would show nothing until the first message.
-			//
-			// Read the history STRAIGHT FROM THE SESSION at attach time (not from the cached
-			// `lastMessages`): on a resumed/loaded session no hook has fired yet, so the cache
-			// is empty — but the session manager already holds the full conversation. We adopt
-			// that read as the new baseline so the flush, the message_end dedup, and the cursor
-			// all agree. If the live read is empty (e.g. a brand-new session, or no session
-			// manager in tests) we fall back to whatever the hooks have cached.
-			const live = readSessionMessages(latestCtx);
-			if (live.length) lastMessages = live;
-			// VIEW-ONLY full sync: folding may legally happen only at `context`, so (like the
-			// agent_end/message_end paths) we do NOT await or apply a plan here.
-			const backlog = linearize(lastMessages);
-			if (backlog.length) {
-				send(ws, { type: "sync", reqId: ++reqSeq, full: true, blocks: backlog, contextWindow });
-				sentCount = backlog.length; // cursor now matches what the GUI holds
-			}
-			ws.on("message", (data: Buffer) => {
-				if (ws !== client) return; // ignore stray messages from a superseded GUI
-				let msg: any;
-				try {
-					msg = JSON.parse(data.toString());
-				} catch {
-					return;
-				}
-				if (msg?.type === "plan" && typeof msg.reqId === "number") {
-					const resolve = pending.get(msg.reqId);
-					if (resolve) {
-						pending.delete(msg.reqId);
-						// A delivered plan — possibly genuinely empty. "plan" (not the "timeout"/"unsent"
-						// sentinels) tells the context hook the GUI actually replied, so an empty reply
-						// is honored as "no folds" and cached, not mistaken for a slow/absent GUI.
-						resolve({ kind: "plan", plan: { ops: Array.isArray(msg.ops) ? msg.ops : [], groups: Array.isArray(msg.groups) ? msg.groups : [] } });
-					}
-				}
-				if (msg?.type === "armed" && typeof msg.armed === "boolean") {
-					// The attached client declared its ARMED state (the single steering switch —
-					// interactive arm toggle or a headless benchmark host). Adopt it for subsequent
-					// `context` waits, and ACK so a headless client can confirm this extension
-					// understood the message (an old extension would silently drop the unknown type,
-					// leaving a "blocking" benchmark actually non-blocking). The snapshot semantics
-					// live in the `context` hook: an in-flight wait keeps its value; the next request
-					// picks up this one.
-					armed = msg.armed;
-					send(ws, { type: "armedAck", armed });
-				}
-				if (msg?.type === "unfoldResult" && typeof msg.reqId === "number") {
-					const resolve = pendingUnfold.get(msg.reqId);
-					if (resolve) {
-						pendingUnfold.delete(msg.reqId);
-						resolve({
-							restored: Array.isArray(msg.restored) ? msg.restored : [],
-							missing: Array.isArray(msg.missing) ? msg.missing : [],
-						});
-					}
-				}
-				if (msg?.type === "recallResult" && typeof msg.reqId === "number") {
-					const resolve = pendingRecall.get(msg.reqId);
-					if (resolve) {
-						pendingRecall.delete(msg.reqId);
-						resolve({
-							restored: Array.isArray(msg.restored) ? msg.restored : [],
-							missing: Array.isArray(msg.missing) ? msg.missing : [],
-						});
-					}
-				}
-				if (msg?.type === "completeRequest" && Number.isSafeInteger(msg.reqId) && msg.reqId >= 0) {
-					// Out-of-band: fire async and NEVER block the message handler or any hook.
-					// Dynamic import so the module is resolved lazily — at pi load time pi's jiti
-					// alias table maps "@earendil-works/pi-ai" to its bundled copy; the smoke test
-					// never triggers a real model call so it never reaches this import.
-					const req = msg as CompleteRequestMessage;
-					const capturedWs = ws;
-					void (async () => {
-						const reply = (r: CompleteResultMessage): void => {
-							// Only send if this GUI is still the active client (reconnect guard).
-							if (capturedWs === client && capturedWs.readyState === 1) send(capturedWs, r);
-						};
-						// A duplicate is a replay of the one GUI promise keyed by reqId. Coalesce it onto
-						// the original; replying with an error under the same id would reject that promise
-						// while its already-paid provider call continued unseen.
-						if (connectionCompletionIds.has(req.reqId)) return;
-						// Validate prompt before doing any async work.
-						if (typeof req.prompt !== "string" || req.prompt.length === 0) {
-							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "missing or empty prompt" });
-							return;
-						}
-						if (req.maxOutputTokens !== undefined && (!Number.isSafeInteger(req.maxOutputTokens) || req.maxOutputTokens <= 0)) {
-							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "maxOutputTokens must be a positive safe integer" });
-							return;
-						}
-						// Admission is synchronous before the first await, so back-to-back frames cannot
-						// race past the cap. A unique token makes cleanup safe across reconnect/id reuse.
-						if (activeCompletionCalls.size >= MAX_CONCURRENT_COMPLETIONS) {
-							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: `too many concurrent completions in flight (max ${MAX_CONCURRENT_COMPLETIONS})` });
-							return;
-						}
-						const callToken = Symbol(`completion:${req.reqId}`);
-						activeCompletionCalls.add(callToken);
-						connectionCompletionIds.add(req.reqId);
-						const completionAbort = new AbortController();
-						const timeoutError = new Error(`completion timed out after ${COMPLETION_TIMEOUT_MS}ms`);
-						let completionTimer: ReturnType<typeof setTimeout> | null = null;
-						// Non-null only after complete() has actually launched provider work. A client-facing
-						// timeout aborts that work, but the global slot remains occupied until the underlying
-						// promise confirms settlement; an adapter that ignores AbortSignal must not let spend
-						// accounting reopen early.
-						let providerSettlement: Promise<void> | null = null;
-						const deadline = new Promise<never>((_resolve, reject) => {
-							completionTimer = setTimeout(() => {
-								completionAbort.abort(timeoutError);
-								reject(timeoutError);
-							}, COMPLETION_TIMEOUT_MS);
-						});
-						try {
-							const ctx = latestCtx;
-							const m = latestModel ?? ctx?.model;
-							if (!ctx || !m) {
-								reply({ type: "completeResult", reqId: req.reqId, ok: false, error: "no model available" });
-								return;
-							}
-							const auth = await Promise.race([ctx.modelRegistry.getApiKeyAndHeaders(m), deadline]);
-							if (!auth.ok) {
-								reply({ type: "completeResult", reqId: req.reqId, ok: false, error: `could not resolve API key: ${(auth as any).error ?? "unknown"}` });
-								return;
-							}
-							const complete: CompletionFunction = dependencies.complete
-								?? (await Promise.race([import("@earendil-works/pi-ai"), deadline])).complete;
-							// Pass system only if it's a string; treat as optional.
-							const context = {
-								...(typeof req.system === "string" ? { systemPrompt: req.system } : {}),
-								messages: [{ role: "user" as const, content: req.prompt, timestamp: Date.now() }],
-							};
-							// Clamp requested maxOutputTokens to the model's own output ceiling
-							// so a conductor requesting more than the model allows can't trigger a provider
-							// rejection; the model still hard-caps generation (truncates at the limit).
-							let maxTokens: number | undefined;
-							if (typeof req.maxOutputTokens === "number") {
-								const modelCeiling = Number.isSafeInteger(m.maxTokens) && m.maxTokens > 0 ? m.maxTokens : undefined;
-								maxTokens = modelCeiling !== undefined ? Math.min(req.maxOutputTokens, modelCeiling) : req.maxOutputTokens;
-							}
-							const providerCall = complete(m, context, {
-								apiKey: auth.apiKey,
-								headers: auth.headers,
-								signal: completionAbort.signal,
-								...(maxTokens !== undefined ? { maxTokens } : {}),
-							});
-							// Consume either outcome for cleanup without changing providerCall's result used below.
-							providerSettlement = providerCall.then(() => {}, () => {});
-							const result = await Promise.race([providerCall, deadline]);
-							// Concatenate ALL text parts in order (a multi-part response must not be
-							// truncated to the first part only). Defensively guard non-array content
-							// and missing/non-string part text.
-							let text = "";
-							if (Array.isArray(result.content)) {
-								text = result.content
-									.filter((p: any) => p?.type === "text")
-									.map((p: any) => (typeof p?.text === "string" ? p.text : ""))
-									.join("");
-							}
-							reply({
-								type: "completeResult",
-								reqId: req.reqId,
-								ok: true,
-								text,
-								model: result.model,
-								inputTokens: typeof result.usage?.input === "number" ? result.usage.input : undefined,
-								outputTokens: typeof result.usage?.output === "number" ? result.usage.output : undefined,
-							});
-						} catch (err: unknown) {
-							const errMsg = err instanceof Error ? err.message : String(err);
-							reply({ type: "completeResult", reqId: req.reqId, ok: false, error: errMsg });
-						} finally {
-							if (completionTimer) clearTimeout(completionTimer);
-							const release = (): void => {
-								activeCompletionCalls.delete(callToken);
-								connectionCompletionIds.delete(req.reqId);
-							};
-							if (providerSettlement) void providerSettlement.then(release);
-							else release(); // timed out/failed before provider work launched
-						}
-					})();
-				}
-			});
-			const drop = () => {
-				if (client === ws) {
-					client = null;
-					armed = false; // defense-in-depth: a dropped client is no longer steering anything
-					// The active GUI dropped mid-flight: resolve any in-flight plan/unfold/recall
-					// waits at once instead of letting them run out their timers. This matters most
-					// when armed, where the plan wait is a multi-second deadline — without this a
-					// disconnect would stall the model call until that deadline elapsed.
-					flushPending();
-				}
-			};
-			ws.on("close", drop);
-			ws.on("error", drop);
-		});
+		wss.on("connection", onWsConnection);
 		wss.on("error", () => {
 			/* e.g. unexpected WS error — run headless (passthrough). Tear down the shared
 			   HTTP server too so we don't leave an orphaned listener serving files. */
@@ -1326,104 +2010,237 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		});
 	}
 
+	// ── Phase B host helpers (the truth lives here now) ─────────────────────────
+
+	/** Parse the client role from the connect URL (`?role=conductor`); default "gui". */
+	function roleFromUrl(url: string | undefined): Role {
+		try {
+			const r = new URL(url || "/", "http://accordion.local").searchParams.get("role");
+			return r === "conductor" ? "conductor" : "gui";
+		} catch {
+			return "gui";
+		}
+	}
+
+	/** The current folding arm, echoed in snapshots + on toggle. Only broadcasts on a real change. */
+	function setFolding(on: boolean): void {
+		if (foldingEnabled === on) return;
+		foldingEnabled = on;
+		broadcast({ type: "folding", enabled: foldingEnabled });
+	}
+
 	/**
-	 * Send a sync and await the GUI's plan. Resolves a discriminated PlanResult:
-	 *   • "unsent"  — no GUI attached at call time (nothing sent).
-	 *   • "timeout" — sent, but no reply within the governing wait (the caller falls back to
-	 *                 the last known plan). `waitedMs` is that wait: PLAN_DEADLINE_MS when the
-	 *                 caller passes `armedNow`, PLAN_TIMEOUT_MS otherwise. Snapshotted by the
-	 *                 caller (the `context` hook) so an in-flight wait keeps its value.
-	 *   • "plan"    — the GUI replied (delivered via the pending resolver / flushPending).
-	 * The pending resolver is also driven by flushPending() (→ "unsent") on a superseded /
-	 * dropped / shutting-down GUI, so a mid-wait disconnect never runs out the full timer.
-	 *
-	 * This is the ONE sync site whose reply is actually APPLIED to a model call (the `context`
-	 * hook below). Every other sync site in this file is VIEW-ONLY.
+	 * (Re)build the authoritative Truth from a full messages array. Subscribes the event forwarder
+	 * so every subsequent Truth mutation streams to clients as a replayable `event`. Uses
+	 * `Truth.rebuildFrom` so a structural-divergence rebuild (the CURRENT `truth`, captured as
+	 * `prev` below, is non-null) carries over every surviving block's overlay, `birthFolded`
+	 * membership, scalar dials, and fully-surviving groups from the truth being replaced — a
+	 * rebuild must reconcile pi's messages, not silently wipe every human/host fold, pin, group,
+	 * and dial (review finding). `prev === null` (session_start already nulled `truth`) skips
+	 * carryover: a brand-new session has nothing to preserve. Sets `wireAttached` + the known
+	 * context window BEFORE subscribing so those internal bumps ride the snapshot, not a stray event.
 	 */
-	function requestPlan(reqId: number, full: boolean, blocks: ReturnType<typeof linearize>, armedNow: boolean): Promise<PlanResult> {
-		const waitMs = armedNow ? PLAN_DEADLINE_MS : PLAN_TIMEOUT_MS;
-		return new Promise((resolve) => {
-			const ws = client;
-			if (!ws || ws.readyState !== 1) return resolve({ kind: "unsent" });
-			const timer = setTimeout(() => {
-				if (pending.has(reqId)) {
-					pending.delete(reqId);
-					resolve({ kind: "timeout", waitedMs: waitMs }); // delivered but no reply in time → caller applies last known plan
+	function buildTruth(messages: PiMessage[]): void {
+		if (unsubTruth) {
+			unsubTruth();
+			unsubTruth = null;
+		}
+		const prev = truth;
+		const blocks = linearize(messages).map(wireToBlock);
+		const t = Truth.rebuildFrom(prev, { meta: { format: "pi", title: meta.title, cwd: meta.cwd, model: meta.model }, blocks, lineCount: 0, skipped: 0 });
+		t.wireAttached = true; // a live pi session is always a live wire (durability-aware accounting)
+		if (contextWindow != null) {
+			t.setContextWindow(contextWindow);
+			// Snap the budget to the model window only on the FIRST build (no prior human dial to
+			// respect). A rebuild already carried `prev`'s budget via `rebuildFrom` — re-snapping it
+			// here on every divergence would silently undo a human's custom budget (part of the same
+			// finding: a rebuild must preserve the human's dials, not just per-block overlay). But a
+			// rebuild that coincides with (or trails) a swap to a smaller-window model must still
+			// clamp an oversized carried-over budget DOWN — never raise it — same policy as every
+			// other window-change call site (model-window budget clamp fix).
+			if (!prev) t.setBudget(contextWindow);
+			else clampBudgetToWindow(t, contextWindow);
+		}
+		// One subscription drives BOTH the client fan-out (replayable events) and the in-process
+		// conductor's HostEvent stream — the same TruthEvent, projected two ways.
+		unsubTruth = t.onEvent((e) => {
+			forwardTruthEvent(e);
+			liveHost.dispatchTruthEvent(e);
+		});
+		truth = t;
+		setLastMessages(messages); // fingerprints the full array once (rare rebuild path) — see lastFps
+	}
+
+	/**
+	 * Rebuild on structural DIVERGENCE (compaction / fork / tree-nav / another extension rewriting
+	 * messages). Counts the rebuild in telemetry and forces every connected client to resnapshot.
+	 * The first build (session_start, `truth === null`) is NOT a divergence rebuild.
+	 */
+	function rebuildTruth(messages: PiMessage[]): void {
+		const isDivergence = truth !== null;
+		buildTruth(messages);
+		if (isDivergence) {
+			rebuilds++;
+			sendSnapshot();
+			// The Truth object was replaced — an in-process conductor rebuilds its tracked desired
+			// state from resync; a remote replica gets the forced resnapshot broadcast above.
+			liveHost.dispatchResync();
+		}
+	}
+
+	/**
+	 * Two messages share identity iff they emit the same durable block ids (cheap; no token work) AND
+	 * the same content fingerprint (E1: catches a same-id in-place rewrite — see `contentFingerprint`).
+	 * The two fingerprints are passed in, not recomputed: `fpA` is the cached `lastFps[i]` for the
+	 * prev side, `fpB` the incoming hash the caller computed once this hook — so the prev side is never
+	 * re-hashed on the hot path. The int compare goes FIRST as the cheapest short-circuit for the
+	 * common content-changed case; the id walk still runs to catch an anchor-only change (same text,
+	 * new responseId/timestamp) that leaves the fingerprint untouched.
+	 */
+	function sameMessageIdentity(a: PiMessage, b: PiMessage, i: number, fpA: number, fpB: number): boolean {
+		if (a.role !== b.role) return false;
+		if (fpA !== fpB) return false;
+		const ia = messageInfo(a, i).ids;
+		const ib = messageInfo(b, i).ids;
+		if (ia.length !== ib.length) return false;
+		for (let k = 0; k < ia.length; k++) if (ia[k] !== ib[k]) return false;
+		return true;
+	}
+
+	/** Linearize `messages.slice(from)` with globally-correct numbering and append it to the Truth. */
+	function appendSuffix(messages: PiMessage[], from: number): void {
+		if (!truth) return;
+		const lastB = truth.blocks[truth.blocks.length - 1];
+		const orderStart = truth.blocks.length; // orders are contiguous from 0 → next order = count
+		const turnStart = lastB ? lastB.turn : 0;
+		const fresh = linearize(messages.slice(from), orderStart, turnStart).map(wireToBlock);
+		truth.append(fresh); // idempotent by id; emits `appended` → forwarded to clients
+	}
+
+	/**
+	 * Reconcile pi's messages against the Truth by a cheap durable-id walk: if `messages` is our
+	 * last array plus a new suffix, linearize ONLY the suffix and append (O(Δ) text work); if it
+	 * diverges structurally, REBUILD. Mutations broadcast automatically via the Truth subscription.
+	 */
+	function ingestMessages(messages: PiMessage[]): void {
+		if (!truth) {
+			rebuildTruth(messages);
+			return;
+		}
+		const prev = lastMessages;
+		let diverged = messages.length < prev.length;
+		// Incoming content fingerprints, hashed once (prev side comes from the `lastFps` cache). Only the
+		// prefix is needed to decide divergence; the suffix is filled below so an append can hand the
+		// whole array to `setLastMessages` without a second hashing pass. Left null when we already know
+		// we diverge (shorter array) — the rebuild path re-hashes from scratch anyway.
+		const incomingFps = diverged ? null : new Array<number>(messages.length);
+		if (!diverged) {
+			for (let i = 0; i < prev.length; i++) {
+				const fp = contentFingerprint(messages[i]);
+				incomingFps![i] = fp;
+				if (!sameMessageIdentity(prev[i], messages[i], i, lastFps[i], fp)) {
+					diverged = true;
+					break;
 				}
-			}, waitMs);
-			pending.set(reqId, (r) => {
-				clearTimeout(timer);
-				resolve(r);
-			});
-			send(ws, { type: "sync", reqId, full, blocks, contextWindow });
-		});
-	}
-
-	/** Ask the GUI to restore folded blocks by their codes; mirrors requestPlan in structure. */
-	function requestUnfold(codes: string[]): Promise<{ restored: Array<{ code: string; kind: string; label: string }>; missing: string[] } | null> {
-		return new Promise((resolve) => {
-			const ws = client;
-			if (!ws || ws.readyState !== 1) return resolve(null);
-			const reqId = ++unfoldSeq;
-			// Generous timeout: this runs during the agent's own turn, not on the critical
-			// model-call path, so 2 s gives the GUI time to process and reply.
-			const timer = setTimeout(() => {
-				if (pendingUnfold.has(reqId)) { pendingUnfold.delete(reqId); resolve(null); }
-			}, UNFOLD_TIMEOUT_MS);
-			pendingUnfold.set(reqId, (res) => { clearTimeout(timer); resolve(res); });
-			send(ws, { type: "unfoldRequest", reqId, codes } as UnfoldRequestMessage);
-		});
+			}
+		}
+		if (diverged) {
+			rebuildTruth(messages);
+			return;
+		}
+		for (let i = prev.length; i < messages.length; i++) incomingFps![i] = contentFingerprint(messages[i]);
+		if (messages.length > prev.length) appendSuffix(messages, prev.length);
+		setLastMessages(messages, incomingFps!);
 	}
 
 	/**
-	 * Ask the GUI for the ORIGINAL full content of folded blocks by their codes (ADR 0011).
-	 * Mirrors requestUnfold in structure, but the GUI replies with the blocks' full content
-	 * (a pure READ — fold state is never changed). The tool echoes that content to the agent
-	 * THIS turn. Resolves null if unsent (no GUI) or on timeout.
+	 * Append ONE just-finished message (message_end) to the Truth immediately — this is what kills
+	 * the one-turn lag. Deduped on the message's durable ids so a re-fire or an already-appended
+	 * message is skipped (and `lastMessages` is extended so the next context prefix still matches).
 	 */
-	function requestRecall(codes: string[]): Promise<{ restored: RecallContent[]; missing: string[] } | null> {
-		return new Promise((resolve) => {
-			const ws = client;
-			if (!ws || ws.readyState !== 1) return resolve(null);
-			const reqId = ++recallSeq;
-			const timer = setTimeout(() => {
-				if (pendingRecall.has(reqId)) { pendingRecall.delete(reqId); resolve(null); }
-			}, RECALL_TIMEOUT_MS);
-			pendingRecall.set(reqId, (res) => { clearTimeout(timer); resolve(res); });
-			send(ws, { type: "recallRequest", reqId, codes } as RecallRequestMessage);
-		});
+	function ingestFinishedMessage(msg: PiMessage): void {
+		if (!truth) return;
+		const ids = messageInfo(msg, 0).ids;
+		if (!ids.length) return;
+		if (ids.every((id) => truth!.get(id))) return; // already represented → nothing to do
+		appendSuffix([...lastMessages, msg], lastMessages.length);
+		setLastMessages([...lastMessages, msg], [...lastFps, contentFingerprint(msg)]);
 	}
 
+	/** Apply a client command to the authoritative Truth; returns the per-op results + resulting rev. */
+	function applyCommand(cmd: WireCommand): { results: OpResult[]; rev: number } {
+		if (!truth) return { results: [], rev: 0 };
+		switch (cmd.kind) {
+			case "ops": {
+				// Guard host-only ops (`freeze`) at the GUI wire entry: an authenticated client must not
+				// be able to seize a conductor's strategy folds through the ungated kill switch. A smuggled
+				// freeze is stripped and reported back as a `locked` clamp in the commandResult.
+				const t = truth;
+				const r = applyGuardingHostOnly(Array.isArray(cmd.ops) ? cmd.ops : [], (allowed) => t.apply(allowed, "you"));
+				return { results: r.results, rev: r.rev };
+			}
+			case "setBudget":
+				truth.setBudget(cmd.value);
+				return { results: [], rev: truth.rev };
+			case "setProtect":
+				truth.setProtect(cmd.value);
+				return { results: [], rev: truth.rev };
+			case "setFolding":
+				setFolding(!!cmd.value);
+				return { results: [], rev: truth.rev };
+			case "selectConductor":
+				// GUI-only (a conductor socket never reaches applyCommand — its messages route to
+				// handleConductorMessage). Drives the host's attach/detach; state arrives via events +
+				// the conductorState broadcast, so nothing to return here beyond the current rev.
+				liveHost.select(cmd.id);
+				return { results: [], rev: truth.rev };
+			default:
+				return { results: [], rev: truth.rev };
+		}
+	}
 	// ── lifecycle ──────────────────────────────────────────────────────────────
 	pi.on("session_start", (_event, ctx: ExtensionContext) => {
-		// Invalidate any `context` await still in flight from the OLD session BEFORE resetting
-		// the cursor below — mirrors the GUI-reconnect path (flushPending() then epoch++).
-		// Without this, a plan for the old session that lands after this switch still passes
-		// the epoch guard (`epoch !== myEpoch`) and applies against the NEW session: it
-		// re-inflates `sentCount` with the old session's block count (delta-cursor corruption)
-		// and overwrites `lastPlan` with the old session's plan.
-		flushPending();
-		epoch++;
+		// Tear down the OLD session's Truth + event forwarder before building the new one; a
+		// session swap invalidates the whole context state (a fresh Truth is authoritative). Detach
+		// any attached conductor first (kills a spawned runner, clears its locks off the old Truth,
+		// aborts in-flight completions) — a conductor is per-session and never carries across a swap.
+		liveHost.shutdown();
+		conductorWs = null;
+		if (unsubTruth) {
+			unsubTruth();
+			unsubTruth = null;
+		}
+		truth = null;
+		setLastMessages([]); // clears lastMessages + lastFps together (invariant: never one without the other)
+		// E2 (external review round): folding is OPT-IN and OFF by default PER SESSION — reset the
+		// arm on every `session_start`, regardless of `_event.reason` ("startup"/"reload"/"new"/
+		// "resume"/"fork"). Everything else this handler touches (Truth, `lastMessages`, `meta`, the
+		// conductor, and — a few lines below — `sessionId` itself) is ALREADY unconditionally reset
+		// here for every reason, including a mere "reload": pi's own types note `previousSessionFile`
+		// is present only for "new"/"resume"/"fork", implying "reload" re-enters the SAME session, yet
+		// this handler has never special-cased it — it still tears down and rebuilds the authoritative
+		// Truth from scratch and mints a brand-new `sessionId`. Leaving `foldingEnabled` as the one
+		// piece of state that survives a reload would be an inconsistent, easy-to-miss exception to
+		// that existing behavior, and would violate the per-session opt-in invariant on the case this
+		// finding named explicitly. `setFolding` only broadcasts when the value actually changes, so an
+		// already-attached client whose GUI toggle shows "on" gets an explicit `folding:false` to
+		// resync it — connected clients are NOT dropped across a session_start, so without this a
+		// client's toggle could silently drift from the true (now-reset) internal state.
+		setFolding(false);
 		latestCtx = ctx;
 		sessionId = `s-${process.pid}-${Date.now()}`;
-		sentCount = 0;
-		lastPlan = null; // fresh session → no known plan yet (cursor also resets here)
-		armed = false; // fresh session → disarmed until the (re)attached client declares otherwise
-		lastPlanRttMs = null;
-		pendingSince = [];
-		// Seed the cache from the session itself. For a fresh session this is []; for a
-		// RESUMED/loaded session (reason "resume"/"startup"/"fork") it is the full prior
-		// conversation, which would otherwise stay invisible until the first `context` hook
-		// (i.e. the user's next message) — the bug. Reading here means an attach that lands
-		// before any turn still has a correct baseline to flush.
-		lastMessages = readSessionMessages(ctx);
 		startedAt = Date.now();
 		try {
 			meta = { title: "pi session", cwd: process?.cwd?.() ?? "", model: "", contextWindow: null, format: "pi" };
 		} catch {
 			/* keep defaults */
 		}
-		refreshFromCtx(ctx); // model may be known already
+		refreshFromCtx(ctx); // model / context window may be known already
+		// Build the authoritative Truth from the session's current history. For a fresh session
+		// this is []; for a RESUMED/loaded session it is the full prior conversation, born SENT
+		// (the Truth constructor marks all loaded blocks sent). A client that attaches before any
+		// turn still gets a correct snapshot.
+		buildTruth(readSessionMessages(ctx));
 		startServer();
 		try {
 			ctx.ui.setStatus("accordion", ctx.ui.theme.fg("accent", "\u{1FA97} accordion"));
@@ -1444,8 +2261,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// Kind mapping: text_start/end → "text", thinking_start/end → "thinking",
 	//               toolcall_start/end → "tool_call". error → abort sweep.
 	pi.on("message_update", (event: any) => {
-		const ws = client;
-		if (!ws || ws.readyState !== 1) return;
+		if (!attached()) return;
 
 		const ev = event?.assistantMessageEvent;
 		if (!ev || typeof ev.type !== "string") return;
@@ -1482,303 +2298,218 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// firehose) are silently dropped — we never forward token deltas over the wire.
 	});
 
-	// ── the loop: stream context, await a plan, apply it ────────────────────────
-	// Returning `undefined` keeps pi's original messages (documented passthrough);
-	// only an explicit `{ messages }` replaces them. Every passthrough path below
-	// returns undefined, so we never alter a model call without a plan.
+	// ── the loop: LOCAL reconcile + optional serialize + telemetry ──────────────
+	// Phase B: pi's `context` hook is a LOCAL operation against the in-process Truth. No client
+	// round trip, no await, no disk I/O. Returning `undefined` passes pi's messages through
+	// unchanged (the default when folding is disabled); an explicit `{ messages }` replaces them.
 	pi.on("context", async (event, ctx: ExtensionContext) => {
-		// Clear any stash from a previous request FIRST, before the no-GUI early return below.
-		// Otherwise an aborted turn (no assistant message_end to consume it) followed by a GUI
-		// detach leaves the old RTT sitting in the stash, and the next message_end — for an
-		// unrelated message — stamps it on the wrong reply.
-		lastPlanRttMs = null;
-		latestCtx = ctx;
-		const myEpoch = epoch;
-		// Snapshot the armed flag SYNCHRONOUSLY with myEpoch, BEFORE the await below. Mid-toggle
-		// semantics: an in-flight `context` wait keeps the value it started with; the NEXT request
-		// picks up a value the client changed meanwhile. This governs whether requestPlan waits the
-		// hard deadline (armed) or the short timeout (disarmed), and which log fires on a miss.
-		const myArmed = armed;
-		// Refresh model/usage in memory only — NO disk I/O on the model-call critical
-		// path. The 5s heartbeat persists these to the registry for the sidebar.
-		refreshFromCtx(ctx);
-		// Cache the snapshot so `message_end` can build a globally-correct full array.
-		// Note: pi passes a structuredClone here (runner.js emitContext), so this is
-		// always a safe point-in-time snapshot of messages going INTO the model call.
-		// This snapshot is authoritative, so any messages we accumulated since the last
-		// one are now subsumed by it — drop them.
-		lastMessages = event.messages as unknown as PiMessage[];
-		pendingSince = [];
-		const all = linearize(lastMessages);
-		if (!attached()) {
-			recordPlanOutcome("no-gui", null, { ops: 0, groups: 0 }, null);
-			return; // no GUI → pass through untouched
-		}
-
-		const fresh = all.slice(sentCount);
-		const reqId = ++reqSeq;
-		const full = sentCount === 0;
-		// Measure the plan round-trip (Feature C). Stashed for `message_end` regardless of
-		// outcome — the assistant message this request produces waited this long, whatever
-		// the result (applied / stale-fallback / timeout).
 		const t0 = Date.now();
-		const result = await requestPlan(reqId, full, fresh, myArmed);
-		lastPlanRttMs = Date.now() - t0;
-
-		if (epoch !== myEpoch) {
-			// A new client attached mid-wait, superseding the view this request was sent to.
-			// Ack the CURRENT client anyway (it can still count the outcome) — its `reqId`
-			// belongs to the superseded view, not to anything the current client itself sent.
-			recordPlanOutcome("epoch-mismatch", reqId, { ops: 0, groups: 0 }, client);
-			return; // GUI reconnected mid-flight → don't apply/advance
-		}
-		if (result.kind === "unsent") {
-			recordPlanOutcome("unsent", reqId, { ops: 0, groups: 0 }, null);
-			return; // couldn't deliver (no GUI / dropped) → pass through, don't advance
-		}
-
-		if (result.kind === "timeout") {
-			// Issue #58: the plan missed the wait. Blocks WERE delivered, so advance the cursor
-			// as before — but instead of shipping unfolded, re-apply the LAST KNOWN plan (a
-			// one-turn-stale, id-addressed plan is strictly better than none; applyPlan passes
-			// through ops for ids no longer present). Never silent: log cause + reqId + elapsed.
-			sentCount = Math.max(sentCount, all.length);
-			const elapsed = lastPlanRttMs;
-			const hasStale = !!lastPlan && (lastPlan.ops.length > 0 || lastPlan.groups.length > 0);
-			// Three distinct outcomes, not two: a cached EMPTY plan (lastPlan set, 0 ops/groups
-			// — the conductor explicitly asked for no folds) still passes through unfolded,
-			// same as genuinely having no cached plan at all — but the two causes are worth telling
-			// apart in the log rather than both reading as "no cached plan".
-			const detail = hasStale
-				? `applying last known plan (${lastPlan!.ops.length} ops, ${lastPlan!.groups.length} groups)`
-				: lastPlan
-					? "cached plan is empty (no folds) — passing through unfolded"
-					: "no cached plan — passing through unfolded";
-			if (myArmed) {
-				// Armed promised to hold the budget and didn't: shout, don't whisper. `result.waitedMs`
-				// is the deadline this request was supposed to honor (carried out of requestPlan).
-				console.error(`[accordion] armed deadline missed: plan reqId=${reqId} did not arrive within ${result.waitedMs}ms (waited ${elapsed}ms) — ${detail}`);
-			} else {
-				console.warn(`[accordion] plan timeout: reqId=${reqId} after ${elapsed}ms — ${detail}`);
+		// Invariant: this hook must NEVER break a model call. Everything that can throw (a bad
+		// parse, an unexpected message shape, a Truth bug) is guarded — on any throw we fall back to
+		// passthrough (`ret` stays undefined) so pi proceeds with its own original messages,
+		// unmodified. Timing (below) still covers the whole guarded body, error or not.
+		let ret: { messages: AgentMessage[] } | undefined;
+		try {
+			latestCtx = ctx;
+			// Refresh model/usage in memory only — NO disk I/O on the model-call critical path.
+			refreshFromCtx(ctx);
+			const messages = event.messages as unknown as PiMessage[];
+			// (a) Reconcile pi's messages against the Truth: append a new suffix, or rebuild on
+			//     structural divergence (both broadcast to clients via the Truth subscription).
+			ingestMessages(messages);
+			if (truth) {
+				// (b) PHASE C: the wire-departing hold. ONLY paid when folding is armed AND the attached
+				//     conductor declares a hold window — the sync fast path (no conductor / no hold /
+				//     folding off) never awaits anything, keeping a no-conductor session byte-identical
+				//     to pre-Phase-C. This is where a conductor's last-moment (birth-)fold lands before
+				//     the wire is serialized. No disk I/O; the spawn/kill bridge is never on this path.
+				const holdMeta = liveHost.activeMeta();
+				if (foldingEnabled && holdMeta && holdMeta.holdWireUpToMs > 0) {
+					await liveHost.fireWireDepartingAndAwaitHold();
+				}
+				// (c) If folding is armed, serialize the wire from the Truth and replace; else passthrough.
+				if (foldingEnabled) {
+					ret = { messages: truth.serializeWire(messages) as unknown as AgentMessage[] };
+				}
 			}
-			// `recordPlanOutcome` below acks `timeout-stale`/`timeout-raw` to the GUI for its
-			// wire-outcome tally (ADR 0020).
-			if (hasStale) {
-				// Apply FIRST, ack AFTER — with the counts applyPlan actually substituted, not the
-				// stale plan's submitted lengths. A stale plan re-applied against messages that have
-				// moved on can easily have ids that no longer match anything live; the old code acked
-				// `lastPlan!.ops.length` etc. regardless, over-reporting what really rode the wire
-				// (ADR 0020 promises counts ACTUALLY applied).
-				const appliedCounts: AppliedCounts = { ops: 0, groups: 0 };
-				const newMessages = applyPlan(
-					event.messages as unknown as PiMessage[],
-					lastPlan!.ops,
-					lastPlan!.groups,
-					appliedCounts,
-				);
-				recordPlanOutcome("timeout-stale", reqId, appliedCounts, client);
-				return { messages: newMessages as unknown as AgentMessage[] };
+		} catch (err) {
+			hookErrors++;
+			console.error("[accordion] context hook failed; passing messages through unmodified:", err);
+			ret = undefined;
+		} finally {
+			// (d) markSent through the last block — GUARANTEED on both the success AND the error path
+			// (E3, external review round). Invariant: whatever this hook actually let through to the
+			// model counts as sent. On the happy path `ret` may hold the serialized replacement, but
+			// either way (folding on or off) pi ends up delivering every block up to the Truth's current
+			// tail — the range markSent covers is correct regardless of which branch built `ret`. On the
+			// error path `ret` stays `undefined`, so pi sends `event.messages` RAW AND UNMODIFIED — every
+			// block in the Truth mirroring that array still departed to the model whole. Previously
+			// markSent lived only inside the try, AFTER the risky work (ingestMessages / the wire-
+			// departing hold / serializeWire) — a throw anywhere in there returned raw passthrough
+			// (those messages DO reach the model) but skipped markSent, so already-departed blocks were
+			// later misclassified as never-sent and wrongly treated as still birth-foldable (`canFold`'s
+			// `!sent(b)` exemption). Moving it to `finally` makes it run on every exit path. Guarded in
+			// its own try/catch so a throw HERE (Truth in a genuinely broken state) still can't escape
+			// and break the model call — the hook's return value is already decided either way.
+			try {
+				if (truth) {
+					const last = truth.blocks[truth.blocks.length - 1];
+					if (last) truth.markSent(last.order);
+				}
+			} catch (err) {
+				console.error("[accordion] context hook markSent (finally) failed:", err);
 			}
-			recordPlanOutcome("timeout-raw", reqId, { ops: 0, groups: 0 }, client);
-			return;
 		}
-
-		// result.kind === "plan": the GUI replied. Cache it (even when empty — that is the
-		// conductor explicitly asking for NO folds, and caching it stops a later timeout from
-		// wrongly resurrecting an older non-empty plan).
-		const plan = result.plan;
-		lastPlan = plan;
-		sentCount = Math.max(sentCount, all.length); // advance cursor; never rewind (a message_end during the await may have advanced it further)
-		if (plan.ops.length === 0 && plan.groups.length === 0) {
-			recordPlanOutcome("empty-plan", reqId, { ops: 0, groups: 0 }, client);
-			return; // empty plan → pass through
-		}
-
-		// Apply FIRST, ack AFTER (same reasoning as the timeout-stale branch above): a shape-valid
-		// op/group whose id matches nothing live in `messages` is silently skipped by applyPlan, so
-		// the SUBMITTED plan length (`plan.ops.length` etc.) can overstate what actually rode the
-		// wire. `appliedCounts` reflects the real substitutions.
-		const appliedCounts: AppliedCounts = { ops: 0, groups: 0 };
-		const newMessages = applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups, appliedCounts);
-		recordPlanOutcome("applied", reqId, appliedCounts, client);
-		return { messages: newMessages as unknown as AgentMessage[] };
+		// (e) Measure the whole hook (guarded body included, hold window and all) and stream it as
+		// telemetry — lastHoldMs/holdTimeouts (from the live host) ride alongside the hook duration.
+		recordHook(Date.now() - t0);
+		broadcastTelemetry();
+		return ret;
 	});
 
-	// ── model swap: keep the GUI's context window (and budget) in lockstep ───────
-	// `/model` fires `model_select` immediately, carrying the NEW model. Adopt its
-	// context window and push it to the GUI right away (a view-only sync with no
-	// blocks) so the budget tracks the swap without waiting for the next model call.
-	// No plan is awaited — this never touches a model call.
+	// ── model swap: keep the context window in lockstep ─────────────────────────
+	// `/model` fires `model_select` immediately, carrying the NEW model. Adopt its context window
+	// into the Truth right away (emits a `config` event to every client) so the budget tracks the
+	// swap without waiting for the next model call.
 	pi.on("model_select", (event) => {
 		applyModel(event?.model as { id?: string; contextWindow?: number } | undefined);
-		const ws = client;
-		if (ws && ws.readyState === 1) {
-			send(ws, { type: "sync", reqId: ++reqSeq, full: false, blocks: [], contextWindow });
+		if (truth && contextWindow != null) {
+			truth.setContextWindow(contextWindow);
+			// A swap to a smaller-window model must shrink an oversized budget too, or the
+			// aged-summary conductors' 90%-of-budget trigger only fires after the REAL window is
+			// already exhausted (model-window budget clamp fix). Never raises budget.
+			clampBudgetToWindow(truth, contextWindow);
 		}
 	});
 
-	// ── committed streaming: push blocks the instant pi finishes a message ──────
-	// `context` only fires BEFORE a model call (messages going IN); `agent_end` fires
-	// only once at loop end. `message_end` fires the moment each message is finalized
-	// — including assistant replies mid-tool-loop — so the GUI sees new blocks
-	// immediately rather than waiting for the next turn.
-	//
-	// Implementation path: SAFE FALLBACK (not the simple array-cache path).
-	// Evidence: pi's runner.js emitContext() calls structuredClone() before passing
-	// the array to the `context` extension hook, so `lastMessages` cached there is a
-	// snapshot of messages BEFORE the model call — it does NOT include the reply that
-	// `message_end` is delivering. We therefore build a synthetic full array,
-	// `[...lastMessages, ...pendingSince]`, where `pendingSince` accumulates EVERY
-	// message finished since that snapshot (in finish order). Linearizing the whole
-	// thing gives correct global turn/order numbering.
-	//
-	// Why accumulate, not just append the latest: in a tool loop the assistant message
-	// AND its tool result both finish before the next `context` fires. Appending only
-	// the latest to a stale `lastMessages` would drop the earlier message — the later
-	// one would then be mis-numbered or (because the cursor already counted the dropped
-	// one) skipped entirely until the next `context` caught up. Accumulating preserves
-	// both with correct numbering and keeps the cursor aligned.
-	//
-	// Hazard guarded: a message already represented in `lastMessages` (e.g. a user
-	// message that went through the context snapshot) or already in `pendingSince` is
-	// NOT added again — double-counting would over-advance `sentCount` and open a gap
-	// at the next `context` that the GUI's dedup cannot fix.
-	//
-	// View-only: no reqId registered in `pending`; folding may only happen at `context`.
-	// The `agent_end` handler below remains the loop-end backstop — with dedup it is
-	// harmless; it catches anything missed (e.g. if message_end fired with no GUI).
-	//
-	// This handler ALSO carries the Feature C RTT injection. That is deliberately merged
-	// here rather than split into a second `pi.on("message_end", …)`:
-	//   • The vendored pi SDK composes multiple handlers on one event reliably (loader.js
-	//     pushes each into a per-event array; runner.js emitMessageEnd chains their returned
-	//     messages, so a second handler WOULD work in production) — but smoke.mjs's mock
-	//     `pi.on` overwrites per event (last-wins), so a second handler would silently drop
-	//     one of the two in tests.
-	//   • Injection must run even when no GUI is attached, otherwise a value stashed while a
-	//     GUI was briefly attached could leak onto a later assistant message. Keeping it in
-	//     ONE handler, above the no-GUI guard, guarantees the stash is always consumed+cleared.
-	// So the RTT stamp is computed first (and returned at every exit), then the view-only
-	// sync push runs only when a GUI is attached.
+	// ── turn settled: the canonical re-plan trigger for a turn-based conductor ───
+	// `turn_end` fires after each LLM turn. It is the host-lifecycle equivalent of
+	// `TestHost.commitTurn` — an attached conductor (in-process) or the remote replica (over the
+	// wire) treats it as the moment to re-run its pass. Purely a notification; folding still happens
+	// only at `context`, and there is no conductor attached ⇒ this is a no-op.
+	pi.on("turn_end", () => {
+		if (!truth) return;
+		const last = truth.blocks[truth.blocks.length - 1];
+		liveHost.fireTurnCommitted(last ? last.turn : 0, truth.rev);
+	});
+
+	// ── committed streaming: append finished messages to the Truth immediately ──
+	// `context` only fires BEFORE a model call (messages going IN); `agent_end` fires once at loop
+	// end. `message_end` fires the moment each message is finalized — including assistant replies
+	// mid-tool-loop — so appending here (idempotent by id) is what KILLS the one-turn lag: the
+	// reply's blocks enter the Truth (and stream to every client) the instant they exist, not at
+	// the next model call. View-only: folding still happens only at `context`.
 	pi.on("message_end", (event) => {
-		// ── Feature C: stamp usage.rttMs onto the assistant message this request produced ──
-		// Persisted verbatim: pi applies this replacement in place (agent-session._replace-
-		// MessageInPlace) and SessionManager.appendMessage JSON-serializes the whole message,
-		// so arbitrary `usage` keys survive to the session file. Consume+clear the stash so a
-		// message with no preceding context RTT (null) gets no field.
-		let replacement: AgentMessage | undefined;
-		const finished = event.message as unknown as PiMessage & { role?: string; usage?: Record<string, unknown> };
-		if (finished && finished.role === "assistant" && lastPlanRttMs !== null) {
-			const rttMs = lastPlanRttMs;
-			lastPlanRttMs = null;
-			replacement = { ...(event.message as object), usage: { ...(finished.usage ?? {}), rttMs } } as unknown as AgentMessage;
-		}
-
-		// pi's MessageEndEventResult requires `{ message }` — emitMessageEnd does
-		// `if (!handlerResult?.message) continue;`, so a bare message is silently
-		// dropped and the RTT stamp never reaches the session file. Wrap every exit.
-		const finish = () => (replacement ? { message: replacement } : undefined);
-
-		const ws = client;
-		if (!ws || ws.readyState !== 1) return finish(); // no GUI → nothing to push (still stamp RTT)
-
-		// Guaranteed teardown (invariant #2, ADR 0003): sweep all active ghosts as a
-		// backstop. Any ghost not already resolved by its own *_end frame is cleared
-		// here so no ghost can outlive the message. Sent BEFORE the sync so the GUI
-		// clears ghost placeholders exactly when it receives the real committed blocks.
+		// Sweep all active ghosts (invariant #2, ADR 0003) BEFORE the committed blocks stream, so a
+		// client swaps its ghost placeholders for the real blocks in the same tick.
 		sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
-
 		const msg = event.message as unknown as PiMessage;
-
-		// Add to `pendingSince` only if NONE of the durable ids this message emits are
-		// already represented — in the authoritative snapshot or already accumulated
-		// this turn. We dedup on the message's FULL id set, not a single probe id:
-		//   • a probe of only part 0 misses a message whose leading part is empty
-		//     (linearize drops empty non-result parts, so `:p0` is never emitted), and
-		//   • a reference check (`pendingSince.includes(msg)`) misses a re-fired message
-		//     delivered as a different object with the same durable id.
-		// Either escape would double-count and over-advance `sentCount`. Durable ids are
-		// position-independent, so linearizing each set in isolation is sound (we read
-		// only `.id`, never the locally-numbered turn/order).
-		const msgIds = new Set(linearize([msg]).map((b) => b.id));
-		const baseIds = new Set(linearize(lastMessages).map((b) => b.id));
-		const pendIds = new Set(linearize(pendingSince).map((b) => b.id));
-		const alreadySeen = [...msgIds].some((id) => baseIds.has(id) || pendIds.has(id));
-		if (msgIds.size > 0 && !alreadySeen) pendingSince.push(msg);
-
-		const all = linearize([...lastMessages, ...pendingSince]);
-		if (all.length <= sentCount) return finish(); // nothing new to push (RTT stamp still returned)
-		const reqId = ++reqSeq;
-		const full = sentCount === 0;
-		send(ws, { type: "sync", reqId, full, blocks: all.slice(sentCount) });
-		sentCount = all.length; // advance cursor; agent_end and next context will dedup
-		return finish(); // hand the RTT-stamped assistant message back to pi, wrapped per MessageEndEventResult (undefined = unchanged)
+		if (msg) ingestFinishedMessage(msg);
 	});
 
-	// ── live view: push the assistant's reply the moment the loop ends ──────────
-	// `context` only fires BEFORE a model call, so it sees messages going IN, never
-	// the reply coming OUT — the GUI would otherwise lag one turn (the assistant's
-	// response only appears at the next user message). `agent_end` fires when the
-	// agent loop finishes and carries the FULL message array, so we stream the new
-	// blocks as a VIEW-ONLY sync: we do NOT await or apply a fold plan here (folding
-	// may legally happen only at `context`, the one place we can alter the outgoing
-	// call). It shares the `sentCount` cursor with `context`, so the deltas never
-	// overlap; any plan the GUI replies with carries an unknown reqId and is ignored.
+	// ── loop-end backstop: append this run's finished messages ──────────────────
+	// pi's `agent_end.messages` contains ONLY messages generated by this prompt, not the full
+	// session history. Treating it as an authoritative snapshot makes `ingestMessages` see a
+	// shorter array and rebuild Truth from just the latest run; the app then appears to lose all
+	// prior context until the next `context` hook restores the full history. Replay these run-local
+	// messages through the same idempotent delta path as `message_end` instead. Usually every id is
+	// already present; this remains a backstop for any finalized message that hook missed.
 	pi.on("agent_end", (event, ctx: ExtensionContext) => {
 		latestCtx = ctx;
-		// Cache for next message_end (backstop path); also keeps lastMessages current
-		// after the loop ends so any late message_end fires against the right context.
-		// This snapshot is authoritative, so drop anything accumulated since the last.
-		//
-		// Done BEFORE the no-GUI guard ON PURPOSE: even when no app is attached, this
-		// keeps the cached history COMPLETE (including this turn's final reply) so that a
-		// later `/accordion` attach can flush the whole conversation immediately. `context`
-		// alone keeps the cache only up to the last model call — one reply short.
-		lastMessages = event.messages as unknown as PiMessage[];
-		pendingSince = [];
-
-		const ws = client;
-		if (!ws || ws.readyState !== 1) return; // no GUI → cache refreshed, nothing to push
-
-		// Guaranteed teardown (invariant #2, ADR 0003): sweep all active ghosts as a
-		// backstop at loop end. Any ghost that survived the message_end sweep (e.g. if
-		// the loop ended without a message_end, or a ghost spawned in the last turn) is
-		// cleared here so no ghost can survive the agent loop.
 		sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
-
-		const all = linearize(lastMessages);
-		if (all.length <= sentCount) return; // nothing new since the last sync
-		const reqId = ++reqSeq;
-		const full = sentCount === 0;
-		send(ws, { type: "sync", reqId, full, blocks: all.slice(sentCount) });
-		sentCount = all.length; // advance so the next `context` doesn't resend these
+		for (const msg of event.messages as unknown as PiMessage[]) ingestFinishedMessage(msg);
 	});
 
-	// ── suppress pi's native compaction ONLY while the GUI is driving ───────────
+	// ── suppress pi's native compaction ONLY while folding is actually armed ────
+	// Owner-approved policy: suppression is gated on `foldingEnabled`, NOT on `attached()`. A
+	// connected client with folding OFF (a read-only mirror, or a preview with an attached conductor
+	// but folding disarmed) leaves pi's own overflow safety net fully intact — whoever is actually
+	// rewriting the wire owns overflow, not whoever merely has a socket open. While folding IS armed,
+	// suppression stays unconditional (no hard-overflow escape valve) — Accordion's own budget/fold
+	// state is the only thing standing between the session and overflow at that point, so pi's native
+	// compaction must not race it. When a native compaction DOES run because folding was off, the
+	// paired `session_compact` handler below immediately reconciles the Truth against the compacted
+	// history (the same `ingestMessages` → `rebuildTruth` structural-divergence path the hooks use —
+	// including conductor resync via `liveHost.dispatchResync()`) and then notifies.
 	pi.on("session_before_compact", (_event, ctx: ExtensionContext) => {
-		if (attached()) {
+		if (foldingEnabled) {
 			try {
-				ctx.ui.notify("Accordion attached — native compaction suppressed.", "info");
+				ctx.ui.notify("Accordion folding armed — native compaction suppressed.", "info");
 			} catch {
 				/* ignore */
 			}
 			return { cancel: true };
 		}
-		// detached → let pi protect itself
+		// folding off (whether or not a client is attached) → let pi protect itself natively
+	});
+
+	// ── native compaction ran while folding was off: rebuild NOW + notify ──────
+	// Fires AFTER pi has actually saved a compaction (the one above did not cancel it, since folding
+	// was off). Reconcile the Truth HERE rather than waiting for the next `agent_end`/`message_end`/
+	// `context` pass: pi's MANUAL `/compact` path saves the compaction, emits this event, and returns
+	// with NO follow-up model call, so an attached map would otherwise show pre-compaction history
+	// until the human's next prompt — while the toast below claims it was rebuilt. `readSessionMessages`
+	// resolves the post-compaction history via pi's own `buildSessionContext()` (collapses the
+	// compaction to exactly what the next model call will see); `ingestMessages` detects the
+	// structural divergence and rebuilds (forced client resnapshot + conductor resync). For the
+	// AUTOMATIC (threshold/overflow) trigger a retry's `context` hook follows immediately and would
+	// reconcile anyway — this same-path ingest just lands moments earlier and the retry's ingest
+	// becomes a cheap no-divergence walk. Best-effort like all discovery I/O: an EMPTY read means the
+	// session state could not be resolved — keep the current Truth and let the normal reconciliation
+	// catch up, rather than rebuilding an empty map (a real post-compaction branch is never empty:
+	// it always contains at least the compaction summary entry). Not the `context` hook path, so the
+	// no-disk-I/O-on-hook invariant is untouched.
+	//
+	// The human-facing note then goes out two ways: `ctx.ui.notify` for whoever is watching pi's own
+	// CLI/log, and — v17 — a `notice` broadcast (`core/protocol.ts`) to every connected GUI client,
+	// so a browser-served tab or a desktop window that isn't looking at pi's terminal still sees why
+	// the map just changed shape. The map itself already visibly changed on the forced resnapshot;
+	// the notice is the accompanying explanation of why.
+	pi.on("session_compact", (_event, ctx: ExtensionContext) => {
+		latestCtx = ctx;
+		const msgs = readSessionMessages(ctx);
+		if (msgs.length > 0) ingestMessages(msgs);
+		if (!attached()) return;
+		const text = "pi compacted the session natively — Accordion's map has been rebuilt to match.";
+		try {
+			ctx.ui.notify(text, "info");
+		} catch {
+			/* ignore */
+		}
+		broadcast({ type: "notice", text });
 	});
 
 	pi.on("session_shutdown", () => {
+		// Tear the attached conductor down FIRST (while the Truth still exists): SIGTERM→grace→SIGKILL
+		// any spawned runner, abort in-flight completions, release any pending hold. The freeze kill
+		// switch runs against the live Truth before we null it below.
+		liveHost.shutdown();
+		conductorWs = null;
 		if (heartbeat) {
 			clearInterval(heartbeat);
 			heartbeat = null;
 		}
+		// v16 (ADR 0024): stop the controller timers and RELEASE the door (close its listener) so a
+		// standing-by extension's retry claims it — this also models release-on-exit explicitly rather
+		// than relying on the OS to free the fixed port. The global controller.json lease is left on
+		// disk; the holder's heartbeat simply stops, so it goes stale and any surface may re-claim.
+		stopControllerTimers();
+		closeDoor();
 		deleteEntry(); // stop advertising — the app drops our row immediately
-		flushPending(); // resolve any awaiting context hook as passthrough
-		try {
-			client?.close();
-		} catch {
-			/* ignore */
+		// Tear down the Truth + its event forwarder, and close every client.
+		if (unsubTruth) {
+			unsubTruth();
+			unsubTruth = null;
 		}
+		truth = null;
+		for (const ws of clients.keys()) {
+			try {
+				ws.close();
+			} catch {
+				/* ignore */
+			}
+		}
+		clients.clear();
 		try {
 			wss?.close();
 		} catch {
@@ -1793,7 +2524,6 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		}
 		httpServer = null;
 		wss = null;
-		client = null;
 		latestCtx = null;
 	});
 
@@ -1813,14 +2543,24 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			// "starting…" on an EADDRINUSE-type error — see startServer's httpServer "error"
 			// handler), or "starting" while the async listen() is still pending.
 			const portStatus = port ? String(port) : bindError ? `failed (${bindError})` : "starting";
+			const blockCount = truth ? truth.blocks.length : 0;
 			const lines = [
 				action.text,
-				`Live link: ${wasAttached ? "attached" : "detached"} · port ${portStatus} · streamed ${sentCount} blocks`,
+				`Live link: ${clients.size} client(s) · port ${portStatus} · ${blockCount} blocks · folding ${foldingEnabled ? "on" : "off"}`,
 			];
-			// Browser entry point: the extension also serves the web build of Accordion on
-			// the same ephemeral loopback port, gated by a per-session token. Surface the
-			// tokenized URL so the user can open the UI in a browser instead of the desktop app.
-			if (port && webToken) {
+			// Browser entry point (v16, ADR 0024): prefer the STABLE door URL. If a live Accordion door
+			// is up — us or any other extension — print `http://127.0.0.1:<door>/?token=<door-secret>`
+			// (a single well-known link that survives any one session's death). Otherwise fall back to
+			// this session's own ephemeral token URL as before (the door-occupied-by-foreign case).
+			const dp = currentDoorPort();
+			// Only print the secret-bearing door URL when WE hold the door, or a probe confirms a MATCHING
+			// live Accordion door holds it ("accordion"). A "transient" (busy/other-version peer) or
+			// "foreign" occupant falls back to this session's own ephemeral URL — never leak the secret
+			// URL at software we could not positively identify as a compatible Accordion (C2/S3).
+			const doorUp = dp !== null && doorSecret !== "" && (doorHeld || (await probeDoor()) === "accordion");
+			if (doorUp) {
+				lines.push(`Browser: http://127.0.0.1:${dp}/?token=${doorSecret}`);
+			} else if (port && webToken) {
 				lines.push(`Browser: http://127.0.0.1:${port}/?token=${webToken}`);
 			} else if (bindError) {
 				lines.push(`Browser: unavailable — ${bindError}`);
@@ -1832,12 +2572,9 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	});
 
 	// ── unfold tool: let the live agent restore its own folded context ─────────
-	// "GUI drives, extension is thin": the extension makes no unfold decisions. It
-	// relays the agent's request to the GUI and reports back what the GUI scheduled.
-	// The actual content restoration happens at the NEXT `context` hook — the unfolded
-	// block simply doesn't appear in the fold plan — so the agent's past context changes
-	// on its next turn. We don't echo the full content back: the past-context change
-	// is the primary mechanism; echoing is a documented fallback if needed.
+	// Phase B: resolved LOCALLY against the in-process Truth (no client needed). The unfolded
+	// block becomes standing-open (sticky, provenance "agent") and its content returns to the
+	// model on the NEXT `context` hook — it simply no longer appears in the fold serialization.
 	pi.registerTool({
 		name: "unfold",
 		label: "Unfold Context",
@@ -1859,13 +2596,11 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			if (!codes.length) {
 				return { content: [{ type: "text", text: 'No fold codes given. Pass the code(s) from a {#<code> FOLDED} tag, e.g. unfold({codes:["3f9a2c"]}).' }] };
 			}
-			if (!attached()) {
-				return { content: [{ type: "text", text: "Accordion isn't attached, so nothing in your context is folded right now — it is already full." }] };
+			// Nothing rides the wire folded unless folding is armed, so there is nothing to unfold.
+			if (!truth || !foldingEnabled) {
+				return { content: [{ type: "text", text: "Accordion isn't folding your context right now, so nothing is folded to restore — it is already full." }] };
 			}
-			const res = await requestUnfold(codes);
-			if (res === null) {
-				return { content: [{ type: "text", text: "Accordion did not respond. Folded content restores automatically if it detaches; otherwise try again." }], isError: true };
-			}
+			const res = resolveUnfold(truth, codes); // LOCAL: mutates the Truth (broadcasts to clients)
 			const lines: string[] = [];
 			if (res.restored.length) {
 				lines.push(`Unfolded ${res.restored.length} block(s); full content returns on your next turn:`);
@@ -1882,10 +2617,10 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// ── recall tool: an UNBLOCKABLE READ of folded content (ADR 0011) ───────────
 	// recall is the agent's counterpart to the human's "peek": it returns a folded block's
 	// ORIGINAL full content AS a tool result THIS turn (like read_file) and does NOT change
-	// what is standing in the agent's context — no override is created, the block stays
-	// folded. That makes it safe-by-construction and therefore never lockable: it is the net
-	// that keeps a locked `unfold` from blinding the agent. "GUI drives, extension is thin":
-	// the extension only relays the request and echoes back the content the GUI returns.
+	// what is standing in the agent's context — no override is created, the block stays folded.
+	// Phase B: resolved LOCALLY against the Truth (a pure read, never a mutation). Because it
+	// changes no state it is never lockable — the net that keeps a locked `unfold` from blinding
+	// the agent. A `recall` observation is broadcast so clients/conductors can see the read.
 	pi.registerTool({
 		name: "recall",
 		label: "Recall Folded Content",
@@ -1907,12 +2642,17 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			if (!codes.length) {
 				return { content: [{ type: "text", text: 'No fold codes given. Pass the code(s) from a {#<code> FOLDED} tag, e.g. recall({codes:["3f9a2c"]}).' }] };
 			}
-			if (!attached()) {
+			if (!truth) {
 				return { content: [{ type: "text", text: "Accordion isn't attached, so nothing in your context is folded right now — it is already full." }] };
 			}
-			const res = await requestRecall(codes);
-			if (res === null) {
-				return { content: [{ type: "text", text: "Accordion did not respond. If it has detached, your context is already full; otherwise try again." }], isError: true };
+			const res = resolveRecall(truth, codes); // LOCAL, pure read — never mutates fold state
+			// Surface the read so clients/conductors can observe it (no Truth state changed). The
+			// broadcast reaches conductor-role sockets too (a remote conductor derives its recall
+			// observation from it); an in-process conductor gets the derived HostEvent via dispatchRecall.
+			if (res.restored.length) {
+				const ids = res.restored.flatMap((r) => r.ids);
+				broadcast({ type: "recall", ids, by: "agent" });
+				liveHost.dispatchRecall(ids, "agent");
 			}
 			// The defining difference from `unfold`: echo the FULL original content back THIS turn,
 			// one text block per recalled item, each prefixed with its label + code so the agent
@@ -1950,8 +2690,3 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		return {};
 	});
 }
-
-// DEFAULT_PORT is retained in protocol.ts only as the browser dev-loop fallback
-// (the desktop app discovers ephemeral ports via the registry); reference it so
-// the import graph and the constant's purpose stay explicit.
-export const BROWSER_FALLBACK_PORT = DEFAULT_PORT;

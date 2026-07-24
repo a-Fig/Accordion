@@ -37,13 +37,13 @@
 	const protect = $derived(block ? store.isProtected(block) : false);
 
 	// Involvement locks (ADR 0011): under `human-steering` the human's fold / unfold / pin /
-	// group / reset controls are the conductor's, so they show disabled — the honest mirror of
+	// group / reset controls are the holder's, so they show disabled — the honest mirror of
 	// the engine's no-op. Observation (this whole panel's content, the digest, the partner
 	// preview) is NEVER gated; only the mutating buttons are. Drive purely off `store.isLocked`
 	// so it's correct in preview/demo/read-only too.
 	const steerLocked = $derived(store.isLocked("human-steering"));
 	const lockTip = $derived(
-		`Locked by ${store.lockingConductorLabel ?? "the active conductor"} — detach to take back control`,
+		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
 	);
 
 	// the call/result partner — they're separate blocks sharing a callId
@@ -79,11 +79,11 @@
 	const gSavedTok = $derived(group ? store.groupSavedTokens(group) : 0);
 	const gStrag = $derived(group ? store.groupStragglerCount(group) : 0);
 	const gIsDropGroup = $derived(group ? store.isDropGroup(group) : false);
-	// The EXACT summary the agent receives for this group: the conductor's custom digest
-	// (e.g. naive compaction's LLM summary) when present, else the deterministic structural
-	// recap. Mirrors the wire (`plan.ts` → `store.groupSummary`) so this "shown to agent"
-	// panel never diverges from what the agent actually sees. (Drop groups return ""; this
-	// derived is only rendered in the non-drop branch.)
+	// The EXACT summary the agent receives for this group: a custom digest literal when the
+	// group carries one, else the deterministic structural recap. Mirrors the wire
+	// (`plan.ts` → `store.groupSummary`) so this "shown to agent" panel never diverges from
+	// what the agent actually sees. (Drop groups return ""; this derived is only rendered in
+	// the non-drop branch.)
 	const gDigest = $derived(group ? store.groupSummary(group) : "");
 	const gTurnFirst = $derived(gMembers.length > 0 ? gMembers[0].turn : 0);
 	const gTurnLast = $derived(gMembers.length > 0 ? gMembers[gMembers.length - 1].turn : 0);

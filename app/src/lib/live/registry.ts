@@ -30,15 +30,42 @@
  * bundle can import the types without pulling in Node built-ins.
  */
 
-/** Bump on any breaking change to SessionEntry / FocusRequest below. */
+/** Bump on any breaking change to SessionEntry / FocusRequest / ControllerLease below. */
 export const REGISTRY_PROTOCOL = 1;
 
-/** Layout under the user's home directory. Rust mirrors these (lib.rs). */
+/** Layout under the user's home directory. Rust mirrors the SESSIONS_SUBDIR / FOCUS_FILE reads
+ *  (lib.rs). CONTROLLER_FILE / DOOR_SECRET_FILE are NOT read by Rust — the controller lease reaches
+ *  every client over the WS (ADR 0024), and the door secret is used only by the Node extension —
+ *  so they need no Rust mirror. */
 export const REGISTRY_DIR = ".accordion";
 export const SESSIONS_SUBDIR = "sessions";
-/** Subdir under ~/.accordion where conductors advertise themselves (ADR 0007). */
-export const CONDUCTORS_SUBDIR = "conductors";
 export const FOCUS_FILE = "focus.json";
+
+/**
+ * The global single-controller lease (ADR 0024), written at `~/.accordion/controller.json`. Exactly
+ * one surface controls machine-wide across ALL live sessions; every other surface is a live
+ * READ-ONLY mirror. Any extension may read/write it (atomic write-rename, same as SessionEntry); the
+ * lease-holder's extension refreshes `heartbeatAt` while a matching socket is connected, and other
+ * extensions observe changes via a ~1s mtime poll.
+ */
+export const CONTROLLER_FILE = "controller.json";
+
+/**
+ * The shared browser bearer secret (32 hex bytes), written at `~/.accordion/door-secret` by the first
+ * extension that needs it (ADR 0024). EVERY extension accepts it as a bearer wherever the per-session
+ * `webToken` is accepted (static serving, token-gated endpoints, WS upgrade), which makes the door URL
+ * session-independent. Posture is unchanged: local same-user processes can already read pi's session
+ * data; a hostile web page cannot read files.
+ */
+export const DOOR_SECRET_FILE = "door-secret";
+
+/**
+ * No controller heartbeat for this long ⇒ the lease is STALE and the session is treated as
+ * uncontrolled (any surface may silently auto-claim). Deliberately tight (6s) so a surface that
+ * closed its tab frees control quickly. Must be comfortably larger than the extension's controller
+ * heartbeat interval so a merely-idle controller surface is never treated as gone.
+ */
+export const CONTROLLER_STALE_AFTER_MS = 6_000;
 
 /**
  * No heartbeat for this long ⇒ the app treats the session as dead and reaps its
@@ -79,6 +106,51 @@ export interface FocusRequest {
 	ts: number;
 }
 
+/**
+ * The global controller lease (ADR 0024), written to `~/.accordion/controller.json`. One surface
+ * steers all live sessions; the rest are live READ-ONLY mirrors.
+ */
+export interface ControllerLease {
+	/** REGISTRY_PROTOCOL at write time — the reader rejects mismatches. */
+	registryProtocol: number;
+	/** The controlling surface's per-tab id (a UUID minted in sessionStorage; see surfaceId.ts). */
+	surfaceId: string;
+	/** Human label for the controlling surface, e.g. "Desktop app" / "Browser tab". */
+	label: string;
+	/** Epoch ms when this surface first took the lease. */
+	claimedAt: number;
+	/** Epoch ms of the last heartbeat refresh — the freshness/liveness signal. */
+	heartbeatAt: number;
+}
+
+/** True when a value parses as a current-protocol controller lease whose heartbeat is fresh. */
+export function isFreshLease(l: unknown, now: number): l is ControllerLease {
+	if (!l || typeof l !== "object") return false;
+	const v = l as Record<string, unknown>;
+	return (
+		v.registryProtocol === REGISTRY_PROTOCOL &&
+		typeof v.surfaceId === "string" &&
+		v.surfaceId.length > 0 &&
+		typeof v.label === "string" &&
+		typeof v.heartbeatAt === "number" &&
+		now - (v.heartbeatAt as number) <= CONTROLLER_STALE_AFTER_MS
+	);
+}
+
+/** True when a value parses as a well-formed controller lease, regardless of heartbeat freshness. */
+export function isControllerLease(l: unknown): l is ControllerLease {
+	if (!l || typeof l !== "object") return false;
+	const v = l as Record<string, unknown>;
+	return (
+		v.registryProtocol === REGISTRY_PROTOCOL &&
+		typeof v.surfaceId === "string" &&
+		v.surfaceId.length > 0 &&
+		typeof v.label === "string" &&
+		typeof v.claimedAt === "number" &&
+		typeof v.heartbeatAt === "number"
+	);
+}
+
 /** True when an entry parses as a current-protocol, non-stale, dialable session. */
 export function isLiveEntry(e: unknown, now: number): e is SessionEntry {
 	if (!e || typeof e !== "object") return false;
@@ -88,36 +160,6 @@ export function isLiveEntry(e: unknown, now: number): e is SessionEntry {
 		typeof v.sessionId === "string" &&
 		typeof v.port === "number" &&
 		v.port > 0 &&
-		typeof v.heartbeatAt === "number" &&
-		now - (v.heartbeatAt as number) <= STALE_AFTER_MS
-	);
-}
-
-/**
- * A conductor advertising itself for discovery. Mirrors SessionEntry, but a conductor
- * exposes a full ws:// URL (it may be remote, not just an ephemeral local port) and its
- * own protocol version (the conductor wire, distinct from the pi wire PROTOCOL_VERSION).
- */
-export interface ConductorEntry {
-	registryProtocol: number;   // must === REGISTRY_PROTOCOL
-	conductorProtocol: number;  // the conductor wire version it speaks
-	id: string;                 // stable conductor id
-	label: string;              // human-facing name for the switcher
-	url: string;                // ws:// endpoint the app connects to (as a client)
-	pid: number;
-	startedAt: number;
-	heartbeatAt: number;        // liveness signal — stale after STALE_AFTER_MS
-}
-
-/** True if `e` is a well-formed, non-stale conductor advertisement. */
-export function isLiveConductor(e: unknown, now: number): e is ConductorEntry {
-	if (!e || typeof e !== "object") return false;
-	const v = e as Record<string, unknown>;
-	return (
-		v.registryProtocol === REGISTRY_PROTOCOL &&
-		typeof v.id === "string" &&
-		typeof v.url === "string" &&
-		v.url.length > 0 &&
 		typeof v.heartbeatAt === "number" &&
 		now - (v.heartbeatAt as number) <= STALE_AFTER_MS
 	);

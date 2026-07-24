@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { applyPlan, linearize, wireToBlock, type PiMessage } from "./mapping";
-import { computeFoldOps, computeGroupOps } from "./plan";
+import { applyPlan, linearize, wireToBlock, type PiMessage } from "$core/wire";
 import { AccordionStore } from "../engine/store.svelte";
 import type { ParsedSession } from "../engine/types";
 
@@ -38,8 +37,9 @@ function storeFrom(messages: PiMessage[]): AccordionStore {
 	const blocks = linearize(messages).map(wireToBlock);
 	const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks, lineCount: 0, skipped: 0 };
 	const s = new AccordionStore(parsed);
-	s.detach(); // no conductor — isolate pure group behavior (no auto-folds to confound the delta)
-	s.setBudget(1_000_000); // never auto-fold under budget pressure
+	// No conductor / auto-folder exists on this branch, so nothing folds under budget pressure —
+	// isolate pure group behavior with no auto-folds to confound the delta.
+	s.setBudget(1_000_000);
 	s.setProtect(0); // disable the protected tail — every block is groupable
 	return s;
 }
@@ -47,7 +47,7 @@ function storeFrom(messages: PiMessage[]): AccordionStore {
 /** Apply the engine's CURRENT plan (folds + groups) to the messages and measure the wire delta. */
 function wireDelta(store: AccordionStore, messages: PiMessage[]): number {
 	const before = wireTokens(messages);
-	const after = wireTokens(applyPlan(messages, computeFoldOps(store), computeGroupOps(store)));
+	const after = wireTokens(applyPlan(messages, store.computeFoldOps(), store.computeGroupOps()));
 	return before - after;
 }
 
@@ -176,8 +176,8 @@ describe("group accounting cross-validates against the wire (applyPlan)", () => 
 		expect(store.groupSavedTokens(g)).toBe(delta);
 		expect(store.savedTokens).toBe(delta);
 		// And confirm the wire actually inserted two summary messages (sanity on the test fixture).
-		const out = applyPlan(messages, computeFoldOps(store), computeGroupOps(store));
-		const summary = computeGroupOps(store)[0].summaryText!;
+		const out = applyPlan(messages, store.computeFoldOps(), store.computeGroupOps());
+		const summary = store.computeGroupOps()[0].summaryText!;
 		const summaryCount = out.filter((m) => Array.isArray(m.content) && (m.content as any[])[0]?.text === summary).length;
 		expect(summaryCount).toBe(2);
 	});
@@ -222,7 +222,7 @@ describe("group accounting cross-validates against the wire (applyPlan)", () => 
 		expect(store.savedTokens).toBe(0);
 		expect(wireDelta(store, messages)).toBe(0);
 		// applyPlan returns the messages structurally unchanged (identity).
-		expect(wireTokens(applyPlan(messages, [], computeGroupOps(store)))).toBe(wireTokens(messages));
+		expect(wireTokens(applyPlan(messages, [], store.computeGroupOps()))).toBe(wireTokens(messages));
 	});
 
 	// A DROP group (summaryText null / digest null) with an INTERIOR straggler: both summaries
@@ -293,8 +293,8 @@ describe("group accounting cross-validates against the wire (applyPlan)", () => 
 		expect(store.groupSavedTokens(g)).toBe(delta);
 		expect(store.savedTokens).toBe(delta);
 		// And the wire really did insert TWO summary messages (the run is split around m2:u).
-		const out = applyPlan(messages, computeFoldOps(store), computeGroupOps(store));
-		const summary = computeGroupOps(store)[0].summaryText!;
+		const out = applyPlan(messages, store.computeFoldOps(), store.computeGroupOps());
+		const summary = store.computeGroupOps()[0].summaryText!;
 		const summaryCount = out.filter((m) => Array.isArray(m.content) && (m.content as any[])[0]?.text === summary).length;
 		expect(summaryCount).toBe(2);
 	});
@@ -314,7 +314,7 @@ describe("group accounting cross-validates against the wire (applyPlan)", () => 
 		expect(store.savedTokens).toBe(0);
 		expect(wireDelta(store, messages)).toBe(0);
 		// The wire emits no group op at all (all memberIds stripped) → messages unchanged.
-		expect(wireTokens(applyPlan(messages, [], computeGroupOps(store)))).toBe(wireTokens(messages));
+		expect(wireTokens(applyPlan(messages, [], store.computeGroupOps()))).toBe(wireTokens(messages));
 	});
 
 	it("#13 DEMO: same non-durable interior member stays AGNOSTIC (NOT live) — previews logical collapse", () => {

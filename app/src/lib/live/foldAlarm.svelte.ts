@@ -49,8 +49,7 @@
  */
 import type { AccordionStore } from "../engine/store.svelte";
 import type { Block } from "../engine/types";
-import { wireFoldable } from "../engine/digest";
-import { computeFoldOps } from "./plan";
+import { wireFoldable } from "$core/digest";
 
 /** Indicator-only alarm state. `active` drives the header dot; `detail` names the first divergence. */
 export const foldAlarm = $state<{ active: boolean; detail: string }>({ active: false, detail: "" });
@@ -93,7 +92,7 @@ export function runFoldCheck(store: AccordionStore, isLive: boolean): void {
 		// wireSet — the would-be ARMED wire plan (what computeFoldOps emits if steering is on).
 		// Comparing against this, not the possibly-empty disarmed wire, is intentional: preview
 		// must match what steering WOULD send (CLAUDE.md). See the Layer 2 note in the file doc.
-		const wireSet = new Set<string>(computeFoldOps(store).map((op) => op.id));
+		const wireSet = new Set<string>(store.computeFoldOps().map((op) => op.id));
 
 		// In view but NOT on the wire — the screen shows a fold the agent never receives
 		// (e.g. a foldable-kind block dropped by computeFoldOps for a non-durable id).

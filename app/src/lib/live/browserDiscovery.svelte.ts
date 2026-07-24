@@ -15,17 +15,21 @@
  * in listLiveSessions — see accordion.ts, which also does the isLiveEntry staleness/shape
  * filtering, so the response here is trusted as-is rather than re-validated).
  *
- * Known limitation: `fetch("/__accordion/sessions")` is a RELATIVE url, so it always targets
- * the origin that served this page — not whichever session the user has since switched to via
- * the sidebar (connectLive(B.port) dials a different port over the WebSocket, but there is no
- * cross-port equivalent for this HTTP poll without either a CORS change to accordion.ts,
- * currently deliberately absent everywhere, or routing discovery over the WS itself). If the
- * serving session's pi process exits, this tab's polling goes permanently silent — new sibling
- * sessions started afterward will not appear here; only a page reload from a still-live
- * session's own `/accordion` URL restores full discovery. localFallback() below at least keeps
- * the CURRENTLY connected (or actively-being-dialed) session visible/reconnectable regardless,
- * so the sidebar never lies about "no live sessions" while one is plainly connected, and a
- * session switch can never be torn down by a poll that just hasn't caught up yet.
+ * Known limitation (narrowed by the door, ADR 0024): `fetch("/__accordion/sessions")` is a
+ * RELATIVE url, so it always targets the origin that served this page — not whichever session
+ * the user has since switched to via the sidebar (connectLive(B.port) dials a different port
+ * over the WebSocket, but there is no cross-port equivalent for this HTTP poll without either a
+ * CORS change to accordion.ts, currently deliberately absent everywhere, or routing discovery
+ * over the WS itself). Since the door (`/accordion`'s printed URL, fixed DOOR_PORT), pages are
+ * normally served from a port that OUTLIVES any single session: when the door-holding extension
+ * exits, another live extension re-binds the port within seconds and this poll self-heals after
+ * a brief outage (the poll-failure handling below rides it out). The old permanent-silence
+ * failure mode still applies to a page loaded from a session's OWN ephemeral URL (the
+ * foreign-port-occupied fallback path): if that serving process exits, only a reload from the
+ * door or a still-live session's `/accordion` URL restores discovery. localFallback() below at
+ * least keeps the CURRENTLY connected (or actively-being-dialed) session visible/reconnectable
+ * regardless, so the sidebar never lies about "no live sessions" while one is plainly connected,
+ * and a session switch can never be torn down by a poll that just hasn't caught up yet.
  *
  * Poll-failure handling (PR #52 review findings #4/#5): a poll that fails outright — network
  * error, non-ok status (403/500 — the deterministic cookie-collision case fixed on another
@@ -52,8 +56,9 @@
 import { discovery, publishSessions, DEMO_ID } from "./discovery.svelte";
 import { REGISTRY_PROTOCOL, type SessionEntry } from "./registry";
 import { live as liveConn } from "./liveClient.svelte";
-import { PROTOCOL_VERSION } from "./protocol";
+import { PROTOCOL_VERSION } from "$core/protocol";
 import { session } from "../session.svelte";
+import { servedToken } from "./servedToken";
 
 const POLL_MS = 1000;
 
@@ -61,21 +66,28 @@ const POLL_MS = 1000;
 // and treat the server as gone — see "Threshold death" in the banner comment above.
 const MAX_CONSECUTIVE_FAILURES = 10;
 
+// A hung `fetch` (half-open connection, dead extension process that never resets the socket)
+// would otherwise leave `_polling` true forever — freezing the session list without ever
+// tripping MAX_CONSECUTIVE_FAILURES, since a promise that never settles never counts as a
+// failure. Derived from POLL_MS (4x it) rather than a bare literal so the two can't drift out
+// of proportion to each other; an abort here counts as an ordinary failed poll (see `poll()`).
+const FETCH_TIMEOUT_MS = POLL_MS * 4;
+
 let _timer: ReturnType<typeof setInterval> | null = null;
 let _polling = false;
 let _consecutiveFailures = 0;
 
 /**
- * Read the per-session token the page was opened with (`/?token=...` — see +page.svelte's
- * `readServedToken()`, which does the same lookup for the WS dial). The poll fetch relies on
- * the ambient `accordion_token` cookie by default, but that cookie is shared per-origin: if a
- * sibling session's tab (or a reload) mints a DIFFERENT session's cookie on the same origin,
- * this tab's cookie gets clobbered and the poll starts 403ing. Forwarding the URL token as a
- * query param survives that — the server accepts either (see accordion.ts's isWebAuthed).
+ * The per-session token the page was opened with (`/?token=...`). The poll fetch relies on the
+ * ambient `accordion_token` cookie by default, but that cookie is shared per-origin: if a sibling
+ * session's tab (or a reload) mints a DIFFERENT session's cookie on the same origin, this tab's cookie
+ * gets clobbered and the poll starts 403ing. Forwarding the token as a query param survives that — the
+ * server accepts either (see accordion.ts's isWebAuthed). Read via the shared `servedToken()` (which
+ * captures it ONCE and scrubs it from the address bar — S1b) so forwarding keeps working AFTER the
+ * strip; the WS dial (+page.svelte's `readServedToken()`) reads the same memoized value.
  */
 function urlToken(): string | null {
-	if (typeof window === "undefined") return null;
-	return new URLSearchParams(window.location.search).get("token");
+	return servedToken();
 }
 
 /**
@@ -143,7 +155,14 @@ export async function poll(): Promise<void> {
 		try {
 			const token = urlToken();
 			const url = token ? `/__accordion/sessions?token=${encodeURIComponent(token)}` : "/__accordion/sessions";
-			const res = await fetch(url);
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+			let res: Response;
+			try {
+				res = await fetch(url, { signal: controller.signal });
+			} finally {
+				clearTimeout(timer);
+			}
 			if (res.ok) {
 				const ct = res.headers.get("content-type") ?? "";
 				if (ct.includes("application/json")) {

@@ -56,7 +56,7 @@ go. Today's answers are dumb and dumber:
 ## The proof — early, but pointed
 
 Accordion ships with a catalog of interchangeable **Conductors**. The strongest so far,
-**[Thermocline](conductors/thermocline/)**, scores each block relevance to the most recent context using the attention from a 500M parameter model as a proxy.
+**[Thermocline](conductors/ws/thermocline/)**, scores each block relevance to the most recent context using the attention from a 500M parameter model as a proxy.
 
 In a test run on **SlopCodeBench** (a long-horizon coding benchmark), Thermocline at a
 100k-token budget outperformed naive compaction with the same constrained context budget. Both used deepseekV4Pro.
@@ -226,6 +226,12 @@ Accordion's **Sessions** sidebar within ~1s. Click it (or run `/accordion` in th
 terminal) and its context populates live. Folding is preview-only by default; use the
 header's **Folding** toggle to opt in to steering the live agent's context.
 
+Only one surface steers at a time, machine-wide across every session — the rest are live
+mirrors. If you open Accordion from a second tab or window while another is already
+driving, you'll see a one-time prompt to take control; everywhere else stays
+**READ-ONLY** with a **TAKE CONTROL** button, never a silent write race between two open
+surfaces.
+
 To refresh the binary after `main` moves (close any open Accordion window first so the
 file isn't locked, then `git pull`, `npm install`, and rebuild): see
 **[CONTRIBUTING.md](CONTRIBUTING.md)**.
@@ -238,11 +244,17 @@ Setup, the quality gate, and platform gotchas are in **[CONTRIBUTING.md](CONTRIB
 Our main frontier right now is **better conductors**: researching which context actually
 matters, developing stronger strategies, and testing them against real sessions. We're not
 chasing a long tail of mediocre ones — the goal is one to three conductors that genuinely
-hold up. A conductor is a single class with one method — `conduct(view) → Command[]` — and
-one registration line to appear in the app. Strategies can range from simple oldest-first
-folding to scoring each block's relevance with a small model. If you have a theory about
-what an agent should keep and what it can let go, that's the surface to prove it — and the
-place where outside help is most valuable right now.
+hold up. Four ship today (`compaction-naive`, `handoff`, `doorman`, and the attention-gated
+`thermocline`) against a small, frozen contract (`core/conductor/contract.ts`): a conductor
+attaches to a host, reacts to context-change events, and proposes fold/group edits between
+turns — clamped by the exact same rules a human fold goes through, never a privileged write
+path. If you don't need that finer-grained event stream, `core/conductor/view.ts`'s
+`ViewConductor` adapter lets you write the simpler `conduct(view) → Command[]` shape instead
+(what `compaction-naive` and `handoff` do); one line in `core/conductor/registry.ts` registers
+it. Strategies can range from simple oldest-first folding to scoring each block's relevance
+with a small model. If you have a theory about what an agent should keep and what it can let
+go, that's the surface to prove it — and the place where outside help is most valuable right
+now.
 
 ---
 

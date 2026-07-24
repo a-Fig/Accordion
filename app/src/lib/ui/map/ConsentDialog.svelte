@@ -2,31 +2,39 @@
 	/*
 	 * ConsentDialog.svelte — the one-time handover gate for an EXCLUSIVE conductor (ADR 0011 §6).
 	 *
-	 * Attaching a conductor that declares a non-empty lock-set is a deliberate handover, not a
-	 * silent switch: "trust moves from override to revocability." So before the attach happens
-	 * we show the LOCK TABLE — for each of the three lockable steering controls, whether this
-	 * conductor takes it over (✗ "taken over") or leaves it to the human (✓ "stays yours") —
-	 * plus the sacred tier that is ALWAYS the human's (observation/peek, the budget, the agent's
-	 * recall, and detach itself). Confirm → proceed with the normal attach path. Cancel → the
-	 * caller reverts the selection (nothing attaches).
+	 * Restored (Phase C) from the pre-excision version (`git show dc037bc:app/src/lib/ui/map/
+	 * ConsentDialog.svelte`) almost verbatim — the presentation, the lock table, the focus trap,
+	 * and the sacred tier are unchanged. What changed is the DATA SOURCE: the old contract-era
+	 * dialog took a bare `label` + `locks` pair from `$conductors/contract` (now deleted); this one
+	 * takes the whole `ActiveConductorMeta` the v13 wire hands the picker (`hello.conductors` /
+	 * `conductorState`) — the host, not a local conductor object, is the source of truth for what a
+	 * conductor claims. `LOCK_NAMES`/`hasLock` now come from `$core/locks` (the framework-free
+	 * package both the app and the extension gate on), replacing the old `$conductors/contract`
+	 * import — the only import that needed fixing.
 	 *
-	 * Pure presentation: it reads the candidate conductor's label + locks (passed in, so we
-	 * never instantiate the conductor to show its table) and emits onconfirm / oncancel. The
-	 * caller (ConductorMenu) owns the selection flow.
+	 * Attaching a conductor that declares a non-empty lock-set is a deliberate handover, not a
+	 * silent switch: "trust moves from override to revocability." So before the attach happens we
+	 * show the LOCK TABLE — for each of the three lockable steering controls, whether this
+	 * conductor takes it over (✗ "taken over") or leaves it to the human (✓ "stays yours") — plus
+	 * the sacred tier that is ALWAYS the human's (observation/peek, the budget, the agent's recall,
+	 * and detach itself). Confirm → the caller sends `selectConductor(conductor.id)`. Cancel → the
+	 * caller sends nothing (this dialog itself never sends a command).
+	 *
+	 * Pure presentation: it reads the candidate conductor's declared shape and emits
+	 * onconfirm / oncancel. The caller (ConductorMenu) owns the selection flow and the wire send.
 	 */
-	import { LOCK_NAMES, hasLock, type LockName } from "$conductors/contract";
+	import { LOCK_NAMES, LOCK_LABELS, hasLock, type LockName } from "$core/locks";
+	import type { ActiveConductorMeta } from "$core/protocol";
 	import Icon from "$lib/ui/Icon.svelte";
 
 	let {
-		label,
-		locks,
+		conductor,
 		onconfirm,
 		oncancel,
 	}: {
-		/** Human-facing name of the conductor about to be attached. */
-		label: string;
-		/** The lock-set it declares (non-empty — this dialog only shows for exclusive conductors). */
-		locks: readonly LockName[];
+		/** The candidate conductor about to be attached (non-empty lock-set — this dialog only
+		 *  shows for exclusive conductors; the caller gates that). */
+		conductor: ActiveConductorMeta;
 		onconfirm: () => void;
 		oncancel: () => void;
 	} = $props();
@@ -37,23 +45,27 @@
 		"agent-unfold": "The agent's unfold",
 		"tail-size": "The tail size",
 	};
-	const LOCK_DETAIL: Record<LockName, string> = {
-		"human-steering": "hand fold / unfold / pin / group / reset",
-		"agent-unfold": "the agent forcing a block to stand open",
-		"tail-size": "the protected-tail dial and its no-fold floor",
-	};
 
 	// One row per lockable control, in canonical order — taken vs stays-yours.
 	const rows = $derived(
-		LOCK_NAMES.map((name) => ({ name, taken: hasLock(locks, name) })),
+		LOCK_NAMES.map((name) => ({ name, taken: hasLock(conductor.locks, name) })),
+	);
+
+	// Under `tail-size`, `tailTokens` is what the conductor DECLARES it will enforce — 0 means it
+	// claims the whole context (no protected tail); >0 protects the newest ~N tokens (core/locks.ts).
+	const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : `${n}`);
+	const tailNote = $derived(
+		conductor.tailTokens > 0
+			? `protects the newest ~${k(conductor.tailTokens)} tokens`
+			: "claims the whole context — no protected tail",
 	);
 
 	// The sacred tier — never lockable, always the human's (or the agent's, for recall).
 	const SACRED: { label: string; note: string }[] = [
-		{ label: "Watch", note: "peek, the live map, the activity log" },
+		{ label: "Watch", note: "the live map, peek, the inspector, the STATUS readout" },
 		{ label: "Recall", note: "the agent can always read folded content" },
 		{ label: "Budget", note: "the context budget stays yours" },
-		{ label: "Detach", note: "the kill switch — take back control anytime" },
+		{ label: "Detach", note: "pick None anytime — take back control" },
 	];
 
 	// Focus the safe default (Cancel) when the dialog mounts; trap Escape → cancel.
@@ -108,14 +120,18 @@
 	>
 		<header class="consent-head">
 			<span class="consent-icon"><Icon name="lock" size={15} /></span>
-			<h2 id="consent-title" class="consent-title"><strong>{label}</strong> wants to take over</h2>
+			<h2 id="consent-title" class="consent-title"><strong>{conductor.label}</strong> wants to take over</h2>
 		</header>
 
 		<p class="consent-lede">
 			This conductor is <b>exclusive</b> — it asks for uncontested control of some steering
 			controls. Your safety net is no longer reaching in to overrule it; it is being able to
-			<b>detach</b> at any time.
+			<b>detach</b> (pick None) at any time.
 		</p>
+
+		{#if conductor.description}
+			<p class="consent-desc">{conductor.description}</p>
+		{/if}
 
 		<!-- Lock table: which steering controls this conductor takes over. -->
 		<ul class="lock-table" aria-label="Controls this conductor takes over">
@@ -126,7 +142,12 @@
 					</span>
 					<span class="lock-text">
 						<span class="lock-name">{LOCK_LABEL[row.name]}</span>
-						<span class="lock-detail">{LOCK_DETAIL[row.name]}</span>
+						<span class="lock-detail">
+							{LOCK_LABELS[row.name]}
+							{#if row.name === "tail-size" && row.taken}
+								— {tailNote}
+							{/if}
+						</span>
 					</span>
 					<span class="lock-state" class:taken={row.taken}>
 						{row.taken ? "taken over" : "stays yours"}
@@ -180,7 +201,7 @@
 		padding: var(--sp-4);
 		background: var(--panel);
 		border: 1px solid var(--line);
-		border-radius: var(--radius-md, 10px);
+		border-radius: var(--radius);
 		box-shadow: var(--shadow-2);
 	}
 
@@ -219,6 +240,13 @@
 	.consent-lede b {
 		color: var(--text);
 		font-weight: 600;
+	}
+
+	.consent-desc {
+		margin: 0;
+		font-size: var(--fs-xs);
+		line-height: 1.5;
+		color: var(--faint);
 	}
 
 	/* ── Lock table ── */
