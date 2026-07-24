@@ -875,6 +875,25 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		}
 	}
 
+	/**
+	 * Shared model-window budget-clamp policy. A mid-session swap to a smaller-window model must
+	 * shrink an oversized budget, or the aged-summary conductors' 90%-of-budget trigger only fires
+	 * after the REAL window is already exhausted (the output-reservation path then declines with
+	 * "window too tight"). Clamps DOWN only — never raises budget, so a human's smaller custom
+	 * budget (or a swap to a LARGER window) survives untouched. Applied at every call site that
+	 * learns/changes the window (`buildTruth`'s rebuild path, `model_select`, and the late-learned
+	 * path in `refreshFromCtx`) rather than inside `Truth.setContextWindow` itself — doing it there
+	 * would need the emitted `config` event to carry both fields in one rev-bump, but
+	 * `core/replica.ts`'s `applyWireEvent` replays `budget`/`contextWindow` fields independently via
+	 * the ordinary public setters, so a replica replaying one combined event would double-apply the
+	 * clamp and end up one rev ahead of the host. Calling `setBudget` as a separate, ordinary
+	 * follow-up call (as done here) emits its own single-field `config` event exactly like any other
+	 * human/host budget change, which a replica already replays 1:1 — no protocol change needed.
+	 */
+	function clampBudgetToWindow(t: Truth, window: number): void {
+		if (t.budget > window) t.setBudget(window);
+	}
+
 	/** Adopt a model's id + context window into the live + meta state (best-effort). */
 	function applyModel(m: { id?: string; contextWindow?: number } | undefined): void {
 		if (!m) return;
@@ -905,6 +924,15 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 					contextWindow = u.contextWindow;
 					meta.contextWindow = u.contextWindow;
 				}
+			}
+			// Late-learned window: `buildTruth` may have run with `contextWindow` still null (left the
+			// 70_000 default budget in place), or the window only becomes known/changes here rather
+			// than via `model_select`. Adopt it into the live Truth now, clamping budget DOWN only.
+			// Guarded on an actual change so a steady-state hook tick (this runs before every model
+			// call) doesn't spam a rev bump/broadcast when nothing moved.
+			if (truth && contextWindow != null && truth.contextWindow !== contextWindow) {
+				truth.setContextWindow(contextWindow);
+				clampBudgetToWindow(truth, contextWindow);
 			}
 		} catch {
 			/* optional APIs */
@@ -2023,8 +2051,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			// Snap the budget to the model window only on the FIRST build (no prior human dial to
 			// respect). A rebuild already carried `prev`'s budget via `rebuildFrom` — re-snapping it
 			// here on every divergence would silently undo a human's custom budget (part of the same
-			// finding: a rebuild must preserve the human's dials, not just per-block overlay).
+			// finding: a rebuild must preserve the human's dials, not just per-block overlay). But a
+			// rebuild that coincides with (or trails) a swap to a smaller-window model must still
+			// clamp an oversized carried-over budget DOWN — never raise it — same policy as every
+			// other window-change call site (model-window budget clamp fix).
 			if (!prev) t.setBudget(contextWindow);
+			else clampBudgetToWindow(t, contextWindow);
 		}
 		// One subscription drives BOTH the client fan-out (replayable events) and the in-process
 		// conductor's HostEvent stream — the same TruthEvent, projected two ways.
@@ -2338,7 +2370,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// swap without waiting for the next model call.
 	pi.on("model_select", (event) => {
 		applyModel(event?.model as { id?: string; contextWindow?: number } | undefined);
-		if (truth && contextWindow != null) truth.setContextWindow(contextWindow);
+		if (truth && contextWindow != null) {
+			truth.setContextWindow(contextWindow);
+			// A swap to a smaller-window model must shrink an oversized budget too, or the
+			// aged-summary conductors' 90%-of-budget trigger only fires after the REAL window is
+			// already exhausted (model-window budget clamp fix). Never raises budget.
+			clampBudgetToWindow(truth, contextWindow);
+		}
 	});
 
 	// ── turn settled: the canonical re-plan trigger for a turn-based conductor ───
