@@ -2244,10 +2244,15 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	 */
 	function ingestFinishedMessage(msg: PiMessage): void {
 		if (!truth) return;
-		maybeObserveCalibration(msg);
 		const ids = messageInfo(msg, 0).ids;
 		if (!ids.length) return;
 		if (ids.every((id) => truth!.get(id))) return; // already represented → nothing to do
+		// Calibration pairing runs only for a message actually being NEWLY appended (review round,
+		// issue #11): the `agent_end` backstop replays the whole run in order, and an already-appended
+		// earlier assistant message must be deduped out ABOVE before it can consume `pendingWireEst` —
+		// otherwise it would mispair its own (older, smaller) usage against the estimate of the LATER
+		// departing wire the backstop is actually recovering, snapping k visibly low for one turn.
+		maybeObserveCalibration(msg);
 		appendSuffix([...lastMessages, msg], lastMessages.length);
 		setLastMessages([...lastMessages, msg], [...lastFps, contentFingerprint(msg)]);
 	}

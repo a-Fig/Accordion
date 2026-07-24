@@ -1066,7 +1066,7 @@
 					class:inrange={rangeSet.has(b.id)}
 					style:height="{cell}px"
 					data-id={interactive ? b.id : undefined}
-					title={interactive ? foldTip(b) : `folded · ${k(b.tokens)} tok · grouped`}
+					title={interactive ? foldTip(b) : `folded · ${k(store.calTokens(b.tokens))} tok · grouped`}
 				>
 					{#each { length: face } as _, n}
 						<div class="bar" style:top="{barStart + n * gap}px"></div>
