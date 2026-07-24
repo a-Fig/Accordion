@@ -1110,11 +1110,23 @@ var Truth = class _Truth {
    * produced it (see `extension/accordion.ts`'s `maybeObserveCalibration`). A non-finite or
    * non-positive `k` is refused (poisons the dial / forks replicas via JSON `null`), the same guard
    * shape as `setBudget`/`setProtect`.
+   *
+   * HOUSEKEEP (issue #11 stage 2 F2, ADR 0025): `protectedFromIndex()` sizes the protected tail
+   * against a calibration-converted threshold (`targetReal / calibration` — see
+   * `computeProtectedFromIndex`'s doc), so `calibration` is a THIRD boundary-moving dial alongside
+   * `budget`/`protectTokens` — a `k` decrease grows the raw-estimate threshold and can leave folds/
+   * groups standing inside the now-larger protected tail. Run `housekeep()` + stamp
+   * `lastChangedRev` exactly like `setBudget`/`setProtect` do, so a k-decrease heals any fold/group
+   * the tail just grew over in the SAME rev it moved, instead of leaving it stale until the next
+   * unrelated mutation happens to call `housekeep()`.
    */
   setCalibration(k) {
     if (!Number.isFinite(k) || k <= 0) return;
     this.calibrationMul = k;
+    const touched = /* @__PURE__ */ new Set();
+    this.housekeep(touched);
     const rev = ++this.revCounter;
+    for (const id of touched) this.lastChangedRev.set(id, rev);
     this.emit({ type: "config", calibration: this.calibrationMul, rev });
   }
   markSent(order) {
@@ -2959,8 +2971,17 @@ var ThermoclineConductor = class {
       // baseline where none of our folds/strata are applied. In the new engine our folds PERSIST,
       // so stats.liveTokens ALREADY reflects them — feeding that in would double-count our own
       // folding (fill/projection would read far too low). Because we hold `human-steering`, the
-      // ONLY foldable overlay is ours, so the raw "none-of-mine-folded" baseline is exactly
-      // stats.fullTokens; `project(view, appliedForProject())` then reproduces stats.liveTokens.
+      // ONLY foldable overlay is ours, so the "none-of-mine-folded" baseline is exactly
+      // stats.fullTokens (both calibrated aggregates, ADR 0025). CORRECTED (issue #11 F1):
+      // `project(view, appliedForProject())` only APPROXIMATES stats.liveTokens with our folds
+      // applied, not reproduces it exactly — every per-fold/per-stratum term it subtracts
+      // (`ViewBlock.tokens`/`foldedTokens`, and `summaryTokens`, which MUST come from the host's
+      // calibrated `countTokens` — see `planWithRealStratumTokens`) is itself calibrated, but
+      // `project()` sums PER-BLOCK calibrated terms while `stats.liveTokens` calibrates the raw
+      // sum ONCE, so the two can drift by a few tokens of rounding smear once `calibration !== 1`
+      // (the same per-block-vs-aggregate smearing ADR 0025's Consequences section already names),
+      // never by an order of magnitude — an uncalibrated `summaryTokens` was the order-of-
+      // magnitude bug (F1), not this rounding smear.
       liveTokens: stats.fullTokens,
       protectedFromIndex: stats.protectedFromIndex,
       protectTokens: stats.protectTokens
@@ -3159,7 +3180,7 @@ var ThermoclineConductor = class {
   async commit(view, plan, digests) {
     const touched = unionSet(this.agentTouched, this.recalledThisEpoch);
     let working = reconcilePlan(plan, touched);
-    working = planWithRealStratumTokens(working, digests);
+    working = planWithRealStratumTokens(working, digests, (t) => this.host.countTokens(t));
     working = this.topUpToCap(working, view, working.cap || capOf(view));
     const finalProjected = project(view, appliedShapeOf(working));
     const finalCap = working.cap || capOf(view);
@@ -3386,8 +3407,14 @@ var ThermoclineConductor = class {
     const savedStrata = Array.isArray(saved.strata) ? saved.strata.filter((s) => Array.isArray(s.unitIds) && s.unitIds.length > 0) : [];
     if (savedStrata.length) {
       this.appliedStrata = savedStrata.map((s) => ({ ...s, unitIds: s.unitIds.slice(), memberIds: s.memberIds.slice() }));
-      for (const s of savedStrata) {
-        if (s.summary != null) this.digestCache.set(`stratum:${s.firstId}`, stripTag(s.summary));
+      for (const s of this.appliedStrata) {
+        if (s.summary == null) {
+          s.summaryTokens = 0;
+          continue;
+        }
+        const bare = stripTag(s.summary);
+        this.digestCache.set(`stratum:${s.firstId}`, bare);
+        s.summaryTokens = this.host.countTokens(bare);
       }
       this.appliedPlan = {
         folds: [],
@@ -3529,13 +3556,13 @@ function reconcilePlan(plan, touched) {
   if (folds.length === plan.folds.length && strata.length === plan.strata.length) return plan;
   return { ...plan, folds, strata };
 }
-function planWithRealStratumTokens(plan, digests) {
+function planWithRealStratumTokens(plan, digests, countTokens) {
   const d = digests ?? /* @__PURE__ */ new Map();
   const strata = plan.strata.map((s) => {
     if (s.digestKind === "drop") return s;
     const summary = d.get(`stratum:${s.ids[0]}`);
     if (summary == null) return s;
-    return { ...s, summaryTokens: Math.ceil(summary.length / 4) };
+    return { ...s, summaryTokens: countTokens(summary) };
   });
   return { ...plan, strata };
 }

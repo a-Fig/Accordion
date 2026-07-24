@@ -2183,13 +2183,19 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	 * Real provider usage fields (issue #11 stage 1) — NOT part of `core/wire.ts`'s `PiMessage` (a
 	 * lowest-common-denominator projection used across both the extension and `core/`), so read them
 	 * off the raw pi message object instead of the narrowed type.
+	 *
+	 * Deliberately no `totalTokens` field (F6, review round): the pairing this project chose is
+	 * `input + cacheRead + cacheWrite`, never `usage.totalTokens` (see `maybeObserveCalibration`'s
+	 * doc for why `output` is excluded). Accepted gap: a provider that reports ONLY `totalTokens` and
+	 * leaves `input`/`cacheRead`/`cacheWrite` all undefined never calibrates — `real` computes to 0
+	 * and the `real <= 0` guard below refuses the observation — rather than silently falling back to
+	 * a quantity (`totalTokens`, which INCLUDES output) this pairing exists specifically to exclude.
 	 */
 	interface RealUsage {
 		input?: number;
 		output?: number;
 		cacheRead?: number;
 		cacheWrite?: number;
-		totalTokens?: number;
 	}
 
 	/**
@@ -2241,8 +2247,15 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	 * Append ONE just-finished message (message_end) to the Truth immediately — this is what kills
 	 * the one-turn lag. Deduped on the message's durable ids so a re-fire or an already-appended
 	 * message is skipped (and `lastMessages` is extended so the next context prefix still matches).
+	 *
+	 * `allowCalibration` (issue #11 F3, ADR 0025) defaults true for the normal `message_end` path,
+	 * where it is always correct: `message_end` fires once per message, immediately after that
+	 * message's own generating `context` hook and strictly before the NEXT one, so `pendingWireEst`
+	 * always describes the wire that produced THIS message. The `agent_end` backstop below passes
+	 * `false` for every message except the run's FINAL assistant reply — see that handler's comment
+	 * for why an EARLIER newly-appended message must never be allowed to consume `pendingWireEst`.
 	 */
-	function ingestFinishedMessage(msg: PiMessage): void {
+	function ingestFinishedMessage(msg: PiMessage, allowCalibration = true): void {
 		if (!truth) return;
 		const ids = messageInfo(msg, 0).ids;
 		if (!ids.length) return;
@@ -2252,7 +2265,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// earlier assistant message must be deduped out ABOVE before it can consume `pendingWireEst` —
 		// otherwise it would mispair its own (older, smaller) usage against the estimate of the LATER
 		// departing wire the backstop is actually recovering, snapping k visibly low for one turn.
-		maybeObserveCalibration(msg);
+		if (allowCalibration) maybeObserveCalibration(msg);
 		appendSuffix([...lastMessages, msg], lastMessages.length);
 		setLastMessages([...lastMessages, msg], [...lastFps, contentFingerprint(msg)]);
 	}
@@ -2520,10 +2533,33 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// prior context until the next `context` hook restores the full history. Replay these run-local
 	// messages through the same idempotent delta path as `message_end` instead. Usually every id is
 	// already present; this remains a backstop for any finalized message that hook missed.
+	//
+	// CALIBRATION PAIRING (issue #11 F3, ADR 0025): a multi-call run (a tool loop) fires the
+	// `context` hook once per LLM call, each overwriting `pendingWireEst` with the estimate of ITS
+	// OWN departing wire — by the time this backstop runs, `pendingWireEst` (if still set at all)
+	// describes only the LAST of those calls. If `message_end` missed an EARLIER assistant message
+	// in this run (the actual gap this backstop exists to cover), that message reaches
+	// `ingestFinishedMessage` here as genuinely new, and — pre-fix — would consume whatever
+	// `pendingWireEst` happened to be sitting there and pair its own (earlier, smaller) usage against
+	// the estimate of a wire it never departed on, corrupting `calibration` for that observation and
+	// starving the run's actual FINAL reply (the very next `ingestFinishedMessage` call) of the
+	// pairing it should have gotten. Only the run's FINAL assistant message may pair: it is the one
+	// message in this array `message_end` had a chance to pair correctly too, so replaying it here is
+	// exactly like `message_end`'s own normal case (usually a no-op — this id is already in Truth —
+	// and otherwise correct). Every earlier message replays with calibration suppressed, never
+	// touching `pendingWireEst`, which stays reserved for the final message's own pairing attempt.
 	pi.on("agent_end", (event, ctx: ExtensionContext) => {
 		latestCtx = ctx;
 		sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
-		for (const msg of event.messages as unknown as PiMessage[]) ingestFinishedMessage(msg);
+		const messages = event.messages as unknown as PiMessage[];
+		let lastAssistantIdx = -1;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i]?.role === "assistant") {
+				lastAssistantIdx = i;
+				break;
+			}
+		}
+		messages.forEach((msg, i) => ingestFinishedMessage(msg, i === lastAssistantIdx));
 	});
 
 	// ── suppress pi's native compaction ONLY while folding is actually armed ────

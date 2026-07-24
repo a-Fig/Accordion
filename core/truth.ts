@@ -957,11 +957,23 @@ export class Truth {
 	 * produced it (see `extension/accordion.ts`'s `maybeObserveCalibration`). A non-finite or
 	 * non-positive `k` is refused (poisons the dial / forks replicas via JSON `null`), the same guard
 	 * shape as `setBudget`/`setProtect`.
+	 *
+	 * HOUSEKEEP (issue #11 stage 2 F2, ADR 0025): `protectedFromIndex()` sizes the protected tail
+	 * against a calibration-converted threshold (`targetReal / calibration` — see
+	 * `computeProtectedFromIndex`'s doc), so `calibration` is a THIRD boundary-moving dial alongside
+	 * `budget`/`protectTokens` — a `k` decrease grows the raw-estimate threshold and can leave folds/
+	 * groups standing inside the now-larger protected tail. Run `housekeep()` + stamp
+	 * `lastChangedRev` exactly like `setBudget`/`setProtect` do, so a k-decrease heals any fold/group
+	 * the tail just grew over in the SAME rev it moved, instead of leaving it stale until the next
+	 * unrelated mutation happens to call `housekeep()`.
 	 */
 	setCalibration(k: number): void {
 		if (!Number.isFinite(k) || k <= 0) return;
 		this.calibrationMul = k;
+		const touched = new Set<string>();
+		this.housekeep(touched);
 		const rev = ++this.revCounter;
+		for (const id of touched) this.lastChangedRev.set(id, rev);
 		this.emit({ type: "config", calibration: this.calibrationMul, rev });
 	}
 	markSent(order: number): void {
