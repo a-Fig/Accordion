@@ -641,6 +641,47 @@ if (unfoldTool && foldCodeStr) {
 	}
 }
 
+// ── native-compaction suppression is gated on foldingEnabled, NOT attached() ────
+// Folding is ARMED (true) here (Phase C step (0) restored it). A connected client (`a`) is attached
+// throughout this block — the whole point of the policy is that attachment alone must NOT suppress.
+{
+	// (1) folding ON + client attached → suppressed, with the "armed" notify.
+	notifications.length = 0;
+	const armedRet = await Promise.resolve(handlers.session_before_compact({ reason: "threshold" }, ctx));
+	if (!armedRet || armedRet.cancel !== true) fails.push("folding ON did not suppress native compaction (expected {cancel:true})");
+	if (!notifications.some((n) => n.message.includes("suppressed"))) fails.push("folding-ON suppression did not notify");
+
+	// (2) folding OFF + client attached → NOT suppressed (owner policy: a viewer with folding off
+	//     leaves pi's own safety net intact) — pi runs its native compaction unhindered.
+	a.inbox.folding.length = 0;
+	a.sendCmd({ kind: "setFolding", value: false });
+	await waitFor(() => a.inbox.folding.some((f) => f.enabled === false), 1500, "folding off (compaction section)").catch(
+		() => fails.push("setFolding(false) was not echoed (compaction section)"),
+	);
+	notifications.length = 0;
+	const offRet = await Promise.resolve(handlers.session_before_compact({ reason: "overflow" }, ctx));
+	if (offRet !== undefined) fails.push("folding OFF still suppressed native compaction (attached() regression)");
+	if (notifications.some((n) => n.message.includes("suppressed"))) fails.push("folding-OFF path unexpectedly emitted the suppression notify");
+
+	// (3) session_compact (post-compaction) fires while a client IS attached → a quiet status notify,
+	//     no cancellation possible (there's nothing to cancel — pi already saved the compaction).
+	// (`session_compact` gating on `attached()` reuses the same primitive already exercised
+	// extensively elsewhere in this file — e.g. the /accordion command's wasAttached branch above and
+	// the READ-ONLY/controller sections below all depend on `attached()` being accurate — so a
+	// dedicated "zero clients" rerun here is not repeated; it would require tearing down both `a` and
+	// `b`, which every later section in this file depends on staying open.)
+	notifications.length = 0;
+	await Promise.resolve(handlers.session_compact({ reason: "overflow", fromExtension: false, willRetry: false }, ctx));
+	if (!notifications.some((n) => n.message.includes("compacted"))) fails.push("session_compact (attached) did not notify about the native compaction");
+
+	// Restore folding ON for the sections that follow, which assume it.
+	a.inbox.folding.length = 0;
+	a.sendCmd({ kind: "setFolding", value: true });
+	await waitFor(() => a.inbox.folding.some((f) => f.enabled === true), 1500, "folding on (compaction section restore)").catch(
+		() => fails.push("setFolding(true) restore (compaction section) was not echoed"),
+	);
+}
+
 // ── E2 (external review round): folding must reset to OFF on every session_start ──
 // Folding is ARMED (true) at this point — Phase C step (0) above restored it after the folding-off
 // hold check. `foldingEnabled` is a process-level closure var, separate from the Truth this handler
