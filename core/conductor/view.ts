@@ -12,7 +12,7 @@
  * (including `auto`/`ungroup` for blocks it no longer wants folded). `null` = keep current state.
  */
 import type { Conductor, ConductorHost, HostEvent, ViewBlock, GroupInfo, LockName } from "./contract";
-import type { Op } from "../ops";
+import type { Op, TxnResult } from "../ops";
 import { foldTag } from "../digest";
 
 // ─── OLD read surface + command vocabulary (ported verbatim) ─────────────────
@@ -98,6 +98,29 @@ export abstract class ViewConductor implements Conductor {
 	private applied = new Map<string, string>();
 	/** Strategy groups successfully applied, keyed by the named-ids run. */
 	private appliedGroups = new Map<string, TrackedGroup>();
+	/**
+	 * True for the full synchronous duration of this conductor's OWN `host.propose(...)` call (set
+	 * right before, cleared in a `finally` right after). Guards a real reentrancy hazard: `Truth.emit`
+	 * (`core/truth.ts`) notifies every subscriber SYNCHRONOUSLY, inside the same call stack as the
+	 * `apply()` that produced the change — so this conductor's own successful propose fires a
+	 * `state-changed` HostEvent back into `onHostEvent` BEFORE that propose's own promise has even
+	 * resolved, let alone before `applyDesired` has reconciled `applied`/`appliedGroups` with the
+	 * result. Reacting to `state-changed` (below) is exactly what main's UX did on ANY context
+	 * change, so it must stay — but without this guard, that reentrant `state-changed` would trigger
+	 * an immediate second `rerun()` that computes the SAME desired ops against STALE tracked state
+	 * (the reconciliation from the first call hasn't run yet) and re-proposes them, recursing into
+	 * `host.propose` a second time from inside the first one's own synchronous call chain. Skipping
+	 * `state-changed` while `busy` is true is safe: `applyDesired`'s reconciliation always runs
+	 * immediately after the (now-settled) propose call returns, at which point the tracked state is
+	 * already caught up — no rerun is lost, only deduplicated.
+	 *
+	 * Caveat: the "nothing else can run in the window" reasoning holds for IN-PROCESS hosts, whose
+	 * `propose` applies synchronously and resolves on a microtask. Over an out-of-process host the
+	 * awaited propose is a full wire round trip, and a genuinely external `state-changed` arriving
+	 * mid-flight would be skipped until the next host event. No shipped `ViewConductor` runs out of
+	 * process today (thermocline is a raw `Conductor`), so this stays a documented limitation.
+	 */
+	private busy = false;
 
 	/** The strategy's complete desired state for `view`, or `null` to hold the current state. */
 	abstract conduct(view: ConductorView): Command[] | null;
@@ -120,7 +143,17 @@ export abstract class ViewConductor implements Conductor {
 		if (!this.attached) return;
 		if (e.type === "turn-committed") return this.rerun();
 		else if (e.type === "wire-departing" && (this.holdWireUpToMs ?? 0) > 0) return this.rerun();
-		else if (e.type === "resync") this.rebuildFromTruth();
+		else if (e.type === "state-changed") {
+			// React to ANY context change (a human budget/protect/lock edit, a fold/pin/group, another
+			// conductor's own group elsewhere, …) so a strategy acts immediately rather than waiting for
+			// the next turn to commit — main's original per-pass UX (ADR 0014/0017: "the human lowers
+			// the budget and compaction/handoff reacts right away"), not just on turn boundaries.
+			// `busy` skips the reentrant self-triggered case (see the field doc) — never a genuinely
+			// external event, since nothing else can run between this conductor's own synchronous
+			// `Truth.apply` and the return of `host.propose` in a single-threaded runtime.
+			if (this.busy) return;
+			return this.rerun();
+		} else if (e.type === "resync") this.rebuildFromTruth();
 	}
 
 	/**
@@ -212,7 +245,13 @@ export abstract class ViewConductor implements Conductor {
 		}
 		if (!ops.length) return;
 
-		const res = await this.host.propose({ baseRev, ops });
+		this.busy = true;
+		let res: TxnResult;
+		try {
+			res = await this.host.propose({ baseRev, ops });
+		} finally {
+			this.busy = false;
+		}
 		// Reconcile tracked desired-state with what ACTUALLY applied. A clamped op must NOT enter
 		// the tracked state (or it would never be retried / would be wrongly diffed next pass).
 		for (const r of res.results) {

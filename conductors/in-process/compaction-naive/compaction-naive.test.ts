@@ -18,19 +18,16 @@
  * the "only aged blocks in the prompt" / "only newly-aged blocks on the recursive pass" assertions
  * below can check precise marker membership rather than vague existence.
  *
- * PR #82 note: these shared fixtures are uniform `"text"` kind (previously alternating
- * `user`/`text`). Task 3 of that PR makes `user`-kind blocks structurally ineligible for group
- * membership (they stay live, splitting the run around them — see `includeInGroup` in
- * `compaction-naive.ts`), so a fixture that alternates kind every block would fragment EVERY test
- * below into many single-block groups, none of which is what these tests are actually about (token
- * math, retry gating, held-block splitting). The dedicated "user-block exclusion" describe block
- * near the bottom of this file exercises that behavior with its own small, purpose-built fixture;
- * the "all block kinds" describe block below was updated in place since it already deliberately
- * mixes kinds.
+ * These shared fixtures are uniform `"text"` kind on purpose — a fixture that alternated kind every
+ * block would exercise `blockLabel`/prompt-formatting concerns that are orthogonal to what these
+ * tests actually check (token math, retry gating, held-block splitting), without changing the
+ * group SHAPE (every kind is swallowed into the same group — see `includeInGroup`'s default in
+ * `../agedSummaryConductor.ts`; `compaction-naive` does not override it). The "all block kinds"
+ * and "a user block in the middle" describe blocks below exercise mixed-kind fixtures directly.
  */
 import { describe, expect, it } from "vitest";
-import { TestHost } from "../../conductor/testhost";
-import type { Block, BlockKind } from "../../types";
+import { TestHost } from "../../../core/conductor/testhost";
+import type { Block, BlockKind } from "../../../core/types";
 import { COMPACTION_SYSTEM, NaiveCompactionConductor } from "./compaction-naive";
 
 const BUDGET = 1000; // TRIGGER (0.9) high-water mark = 900 tokens
@@ -283,6 +280,54 @@ describe("NaiveCompactionConductor — reject path", () => {
 	});
 });
 
+describe("NaiveCompactionConductor — link-unavailable path (Fix 3, main parity)", () => {
+	// Main's contract pre-checked `host.can("complete")` and reported unavailability WITHOUT ever
+	// recording an attempt, so the very next pass retried automatically once the live model link
+	// returned. The v2 contract has no pre-check; a rejected `complete()` IS the only signal, so
+	// `isUnavailableError` (agedSummaryConductor.ts) classifies the rejection itself by the exact
+	// message `runCompletion` (extension/accordion.ts) throws when there is no live model.
+	it("shows the calm 'unavailable — waiting for live model link' status and retries on the very next pass, without new content aging in", async () => {
+		const { host } = setupHost();
+
+		host.queueCompletionError(new Error("no model available"));
+		host.commitTurn();
+		await flush();
+
+		expect(host.completeLog.length).toBe(1);
+		expect(host.truth.groups.length).toBe(0); // still raw — nothing to fold yet
+		const afterFirst = host.statusLog[host.statusLog.length - 1];
+		expect(afterFirst.text).toBe("Naive compaction unavailable — waiting for live model link");
+
+		// SAME aged set as the failed attempt, no new content — yet this retries, unlike a genuine
+		// rejection (see "reject path" above), because the unavailable branch clears lastAttemptKey.
+		host.queueCompletion({ text: SUMMARY_A });
+		host.commitTurn();
+		await flush();
+
+		expect(host.completeLog.length).toBe(2); // retried automatically
+		expect(host.truth.groups.length).toBe(1);
+		const afterRecover = host.statusLog[host.statusLog.length - 1];
+		expect(afterRecover.text).toBeNull();
+	});
+
+	it("classification is conservative: a generic rejection (even one mentioning \"unavailable\") is NOT treated as link-down", async () => {
+		const { host } = setupHost();
+
+		host.queueCompletionError(new Error("The model provider returned 503 Service Unavailable"));
+		host.commitTurn();
+		await flush();
+
+		expect(host.completeLog.length).toBe(1);
+		const afterFirst = host.statusLog[host.statusLog.length - 1];
+		expect(afterFirst.text).toMatch(/waiting for new context to age in/i); // the generic rejectMessage, not the calm one
+
+		// Same aged set, no new content — a genuine rejection must NOT auto-retry.
+		host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+	});
+});
+
 describe("NaiveCompactionConductor — stale-completion guard", () => {
 	it("a resolve after detach mutates nothing and proposes nothing", async () => {
 		const { host, conductor } = setupHost();
@@ -302,9 +347,13 @@ describe("NaiveCompactionConductor — stale-completion guard", () => {
 describe("NaiveCompactionConductor — a held block splits the aged region", () => {
 	it("emits two groups (one per side), both carrying the same summary; the held block stays untouched", async () => {
 		const { host } = setupHost();
-		host.humanPin(idOf(4)); // split point, inside the aged region (0-8)
-
+		// Queue the completion BEFORE pinning: with Fix 4 (ViewConductor reacts to ANY state-changed
+		// event, not just turn-committed — see core/conductor/view.ts), the pin itself immediately
+		// reacts and launches a completion, since the session is already at the 90% high-water mark.
+		// A real live session already has its model link established before any human action, so the
+		// completion must already be queued at that point, exactly as it would be live.
 		host.queueCompletion({ text: SUMMARY_A });
+		host.humanPin(idOf(4)); // split point, inside the aged region (0-8) — triggers immediately
 		host.commitTurn();
 		await flush();
 
@@ -323,13 +372,11 @@ describe("NaiveCompactionConductor — a held block splits the aged region", () 
 	});
 });
 
-describe("NaiveCompactionConductor — all block kinds", () => {
-	// Task 3 (sol P1/P2 #5): the leading `user` block is fed to the prompt as context (still "aged")
-	// but is NEVER a group member — it stays live, full-fidelity, on the wire. The remaining
-	// text/thinking/tool_call/tool_result run IS contiguous (no user block interrupts it), so it
-	// still collapses into exactly one group, same as before this fix — only the leading user block
-	// is now excluded from it.
-	it("the aged region includes every kind; a user block is excluded from the group and stays live; a tool_call/tool_result pair inside the group is swallowed together", async () => {
+describe("NaiveCompactionConductor — all block kinds are swallowed (main parity, restored)", () => {
+	// Main behavior (git show origin/main:conductors/compaction-naive/compaction-naive.ts, "all block
+	// kinds are swallowed" describe block): EVERY kind — including `user` — is a group member. The
+	// single summary group spans the FULL 6-block run; nothing splits it.
+	it("the aged region includes every kind; the user block is swallowed into the group along with everything else; a tool_call/tool_result pair inside the group is swallowed together", async () => {
 		const host = new TestHost();
 		host.setBudget(BUDGET);
 		host.setProtect(0); // no protected tail — the whole 6-block conversation is aged
@@ -347,24 +394,21 @@ describe("NaiveCompactionConductor — all block kinds", () => {
 		host.commitTurn();
 		await flush();
 
-		expect(host.truth.groups.length).toBe(1);
+		expect(host.truth.groups.length).toBe(1); // ONE group, no split around the user block
 		const g = host.truth.groups[0];
-		expect(g.memberIds).toEqual(["a:t1:p0", "a:k2:p0", "a:c3:p0", "a:r4:p0", "a:t5:p0"]); // user excluded
-		expect(g.memberIds).not.toContain("a:u0:p0");
+		expect(g.memberIds).toEqual(["a:u0:p0", "a:t1:p0", "a:k2:p0", "a:c3:p0", "a:r4:p0", "a:t5:p0"]); // user included
 
-		// The user block is still fed to the prompt as context...
+		// The user block is fed to the prompt as context...
 		expect(host.completeLog[0].prompt).toContain("USER-0");
-		// ...but stays fully live: not folded, not swept into any group.
+		// ...and, like every other kind, is swallowed into the group: no longer live/ungrouped.
 		const userBlock = host.get("a:u0:p0")!;
-		expect(userBlock.folded).toBe(false);
-		expect(userBlock.grouped).toBe(false);
-		expect(userBlock.text).toBe("USER-0");
+		expect(userBlock.grouped).toBe(true);
 	});
 });
 
 describe("NaiveCompactionConductor — output-token reservation (external review round, P1-7)", () => {
 	// PORT FIDELITY §6 (see compaction-naive.ts banner): `launchCompletion` now reserves output room
-	// against `view.contextWindow`, mirroring `core/conductors/handoff/handoff.ts`'s identical fix
+	// against `view.contextWindow`, mirroring `conductors/in-process/handoff/handoff.ts`'s identical fix
 	// (and its `handoff.test.ts` "middle branch"/"decline path" tests below, adapted to this
 	// conductor's own system prompt/prompt shape and constants — MAX_SUMMARY_TOKENS(8000),
 	// MIN_SUMMARY_TOKENS(1000), OUTPUT_SAFETY_MARGIN(512)).
@@ -412,19 +456,17 @@ describe("NaiveCompactionConductor — output-token reservation (external review
 	// Derivation (all via the same chars/4 `estTokens` TestHost.countTokens uses):
 	//   - `paddedSession(5, 200)` gives a first-pass prompt (`<conversation>` wrapping 5
 	//     "[assistant]\n<800 x's>" blocks + the trailing instruction line) of 4205 chars → 1052 tokens.
-	//   - `COMPACTION_SYSTEM` is 2012 chars → 503 tokens (PR #82 task 3 reworded the user-messages
-	//     clause — shorter than the pre-#82 wording — so this differs from the number the reference
-	//     conductor's own test derived; re-measured against the CURRENT `COMPACTION_SYSTEM`, not
-	//     copied from `handoff.test.ts`'s unrelated derivation).
-	//   - inputTokens = 503 + 1052 = 1555.
-	//   - Choosing contextWindow = 6067 makes
-	//     reserve = contextWindow - inputTokens - OUTPUT_SAFETY_MARGIN(512) = 6067 - 1555 - 512 = 4000,
+	//   - `COMPACTION_SYSTEM` (restored to main's verbatim wording, including the "## User messages"
+	//     section — see compaction-naive.ts) is 2249 chars → 563 tokens.
+	//   - inputTokens = 563 + 1052 = 1615.
+	//   - Choosing contextWindow = 6127 makes
+	//     reserve = contextWindow - inputTokens - OUTPUT_SAFETY_MARGIN(512) = 6127 - 1615 - 512 = 4000,
 	//     which sits strictly between MIN_SUMMARY_TOKENS(1000) and MAX_SUMMARY_TOKENS(8000) — the
 	//     untested middle branch — so `maxOutputTokens` must land EXACTLY on 4000, not clamped to
 	//     8000 (a min/max swap) and not shrunk further by a doubled margin.
 	it("reserves the exact contextWindow − input − 512 token count when it lands strictly between the 1000 floor and the 8000 cap", () => {
 		const host = setupReservationHost();
-		host.truth.setContextWindow(6067);
+		host.truth.setContextWindow(6127);
 		host.queueCompletion({ text: "middle-branch summary" });
 		const conductor = new NaiveCompactionConductor();
 		conductor.attach(host);
@@ -445,6 +487,42 @@ describe("NaiveCompactionConductor — output-token reservation (external review
 
 		expect(host.completeLog.length).toBe(1);
 		expect(host.completeLog[0].maxOutputTokens).toBe(8000); // MAX_SUMMARY_TOKENS, flat behavior unchanged
+	});
+});
+
+// Model-window budget clamp fix (defense in depth): the 90%-high-water trigger must key off
+// `cap = min(budget, contextWindow)`, not `budget` alone — a mid-session swap to a smaller-window
+// model can otherwise leave `budget` oversized for a hook tick (the extension's own clamp is the
+// primary fix; this is the conductor keying off the real ceiling regardless).
+describe("NaiveCompactionConductor — trigger keys off min(budget, contextWindow) (model-window budget clamp fix, defense in depth)", () => {
+	/** Text padded to `tokens * 4` chars so `estTokens(text) ≈ tokens` — mirrors `paddedBlock` in the
+	 *  output-token-reservation describe block above (scoped there, so redefined here). */
+	function paddedBlock(id: string, order: number, tokens: number): Block {
+		return mkBlock(id, order, "text", tokens, `${id} ` + "x".repeat(tokens * 4));
+	}
+
+	it("fires at ~30k visible tokens under budget 200_000 / contextWindow 32_000 — only true because the cap is min(budget, contextWindow), not budget alone", () => {
+		const host = new TestHost();
+		host.setBudget(200_000);
+		host.setProtect(0); // whole session ages in immediately
+		host.appendBlocks(Array.from({ length: 30 }, (_, i) => paddedBlock(idOf(i), i, 1000))); // 30 * 1000 = 30_000 raw tokens
+		host.truth.setContextWindow(32_000); // cap = min(200_000, 32_000) = 32_000 → 90% high-water = 28_800 ≤ 30_000 visible
+
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+
+		host.commitTurn();
+
+		// Pre-fix, the cap was `budget` alone (200_000); 90% = 180_000 ≫ 30_000 visible, so this would
+		// never trigger at all — `completeLog` stays empty AND no status is ever set (the "not yet
+		// triggered" path calls `setStatus(null)`, not a message). Post-fix, the 90% mark against the
+		// REAL ceiling (32_000) is crossed, so the conductor DOES attempt a run — but a ~32k window is
+		// too tight to reserve useful output for a ~30k-token input, so it declines with a visible,
+		// sticky status rather than silence. That decline is the proof the trigger actually fired.
+		expect(host.completeLog.length).toBe(0); // triggered, then declined — never actually sent
+		const last = host.statusLog[host.statusLog.length - 1];
+		expect(last?.text).toMatch(/needs a bigger window/i); // windowTooTightMessage — only reachable once triggered
+		expect(host.truth.groups.length).toBe(0); // no ops emitted either way
 	});
 });
 
@@ -484,8 +562,12 @@ describe("NaiveCompactionConductor — prompt injection defense (PR #82 task 2, 
 	});
 });
 
-describe("NaiveCompactionConductor — user-block exclusion splits the group run (PR #82 task 3, sol P1/P2 #5)", () => {
-	it("a user block in the middle of the aged region forces two groups; the user block stays live between them", async () => {
+describe("NaiveCompactionConductor — a user block in the middle of the aged region no longer splits the group (main parity, restored)", () => {
+	// Regression coverage for the reverted `includeInGroup` override: a `user` block sitting between
+	// two other kinds used to force TWO groups (splitting the run around it). Restored main behavior:
+	// ONE group spans the whole contiguous aged run, the user block included — only a HELD
+	// (human-pinned) block still splits a run (see "a held block splits the aged region" above).
+	it("a user block in the middle of the aged region is swallowed into a single group, not left live between two", async () => {
 		const host = new TestHost();
 		host.setBudget(1000);
 		host.setProtect(0); // whole session ages in
@@ -503,52 +585,15 @@ describe("NaiveCompactionConductor — user-block exclusion splits the group run
 		host.commitTurn();
 		await flush();
 
-		expect(host.truth.groups.length).toBe(2); // the user block splits one run into two
-		const g1 = host.truth.groups.find((g) => g.memberIds[0] === idOf(0))!;
-		const g2 = host.truth.groups.find((g) => g.memberIds[0] === idOf(3))!;
-		expect(g1).toBeDefined();
-		expect(g2).toBeDefined();
-		expect(g1.memberIds).toEqual([idOf(0), idOf(1)]);
-		expect(g2.memberIds).toEqual([idOf(3), idOf(4)]);
-		expect(host.truth.groupSummary(g1)).toBe(host.truth.groupSummary(g2)); // same summary digest
-		expect(host.truth.groups.some((g) => g.memberIds.includes(idOf(2)))).toBe(false); // user never a member
+		expect(host.truth.groups.length).toBe(1); // ONE group — no split around the user block
+		const g = host.truth.groups[0];
+		expect(g.memberIds).toEqual([idOf(0), idOf(1), idOf(2), idOf(3), idOf(4)]); // user included, mid-run
 
 		const userBlock = host.get(idOf(2))!;
-		expect(userBlock.folded).toBe(false);
-		expect(userBlock.grouped).toBe(false);
-		expect(userBlock.text).toBe("USER-2"); // untouched, full content, live on the wire
+		expect(userBlock.grouped).toBe(true); // swallowed into the group, same as every other kind
 
-		// Still fed to the completion prompt as context, even though never folded.
+		// Still fed to the completion prompt as context (as every block is, verbatim or not).
 		expect(host.completeLog[0].prompt).toContain("USER-2");
-	});
-});
-
-describe("NaiveCompactionConductor — an oversized user message is no longer lossy (PR #82 task 3, sol P1/P2 #5)", () => {
-	// Pre-#82, a user block was swallowed into the SAME non-recoverable group as everything else,
-	// capped at MAX_SUMMARY_TOKENS(8000) output with ANY nonempty result accepted — a user message
-	// larger than the cap was mathematically impossible to preserve verbatim, exactly as the
-	// (then-)system prompt promised. Post-fix, `includeInGroup` makes a user block structurally
-	// ineligible for folding at all, so its size relative to the cap is irrelevant: it is never a
-	// candidate for the fold in the first place.
-	it("a user message far larger than the 8000-token output cap survives compaction fully intact", async () => {
-		const bigText = "USER-BIG " + "x".repeat(20_000 * 4); // ~20,000 tokens — 2.5x MAX_SUMMARY_TOKENS
-		const host = new TestHost();
-		host.setBudget(1000);
-		host.setProtect(0);
-		host.appendBlocks([mkBlock(idOf(0), 0, "text", 100, "TEXT-0"), mkBlock(idOf(1), 1, "user", 20_000, bigText), mkBlock(idOf(2), 2, "text", 100, "TEXT-2")]);
-		const conductor = new NaiveCompactionConductor();
-		conductor.attach(host);
-		host.queueCompletion({ text: SUMMARY_A });
-
-		host.commitTurn();
-		await flush();
-
-		expect(host.truth.groups.some((g) => g.memberIds.includes(idOf(1)))).toBe(false); // never a group member
-		const userBlock = host.get(idOf(1))!;
-		expect(userBlock.folded).toBe(false);
-		expect(userBlock.grouped).toBe(false);
-		expect(userBlock.text).toBe(bigText); // full content, byte-identical, still live on the wire
-		expect(host.completeLog[0].prompt).toContain(bigText); // still visible to the model as context
 	});
 });
 

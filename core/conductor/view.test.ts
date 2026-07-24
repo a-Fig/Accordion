@@ -17,7 +17,10 @@ class ScriptedConductor extends ViewConductor {
 	readonly label = "Scripted";
 	desired: Command[] | null = [];
 	lastView: ConductorView | null = null;
+	/** Counts every `conduct()` invocation — used to detect a reentrant self-triggered loop. */
+	conductCalls = 0;
 	conduct(view: ConductorView): Command[] | null {
+		this.conductCalls++;
 		this.lastView = view;
 		return this.desired;
 	}
@@ -25,6 +28,13 @@ class ScriptedConductor extends ViewConductor {
 	runNow(): Promise<void> {
 		return this.rerun();
 	}
+}
+
+/** Flush the microtask queue so a fire-and-forget `rerun()` triggered by a non-awaitable Truth
+ *  event (e.g. `setBudget`/`setProtect`, which fire via `TestHost`'s synchronous `fire()`, not
+ *  `fireAwaitable()`) has settled before assertions run. */
+async function flush(times = 5): Promise<void> {
+	for (let i = 0; i < times; i++) await Promise.resolve();
 }
 
 function liveHostWith(n: number): TestHost {
@@ -177,5 +187,42 @@ describe("ViewConductor — lifecycle", () => {
 		c.desired = [{ kind: "fold", ids: ["a:b0:p0"] }];
 		await host.departWire(); // holdWireUpToMs defaults to 0 → no rerun
 		expect(host.truth.isFolded(host.truth.get("a:b0:p0")!)).toBe(false);
+	});
+});
+
+describe("ViewConductor — state-changed reruns immediately (Fix 4, restores main's per-pass UX)", () => {
+	it("a config change (budget/protect) triggers a rerun WITHOUT waiting for a turn to commit", async () => {
+		const host = liveHostWith(4);
+		const c = new ScriptedConductor();
+		c.attach(host);
+		c.desired = [{ kind: "fold", ids: ["a:b0:p0"] }];
+
+		// No commitTurn() anywhere — only a config dial change (`setBudget` emits a Truth "config"
+		// event, which `hostAdapter.ts`'s `hostEventsFromTruthEvent` maps to `state-changed`).
+		host.setBudget(500);
+		await flush();
+
+		expect(host.truth.isFolded(host.truth.get("a:b0:p0")!)).toBe(true);
+	});
+
+	it("a conductor's own successful propose does not recursively re-trigger itself (busy guard)", async () => {
+		const host = liveHostWith(4);
+		const c = new ScriptedConductor();
+		c.attach(host);
+		c.desired = [{ kind: "fold", ids: ["a:b0:p0"] }];
+
+		// turn-committed -> rerun -> conduct() #1 -> propose folds b0 -> Truth.apply fires
+		// ops-applied SYNCHRONOUSLY (inside the same call stack as propose itself) -> state-changed
+		// -> onHostEvent -> would call rerun() again if not guarded by `busy`.
+		await host.commitTurn();
+
+		expect(c.conductCalls).toBe(1); // the self-triggered state-changed must NOT cause a second call
+		expect(host.truth.isFolded(host.truth.get("a:b0:p0")!)).toBe(true);
+
+		// The guard only suppresses the reentrant self-triggered event — a genuinely later, external
+		// state-changed still reacts normally (the guard does not wedge shut).
+		host.setBudget(700);
+		await flush();
+		expect(c.conductCalls).toBe(2);
 	});
 });

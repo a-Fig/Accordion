@@ -56,7 +56,7 @@ go. Today's answers are dumb and dumber:
 ## The proof — early, but pointed
 
 Accordion ships with a catalog of interchangeable **Conductors**. The strongest so far,
-**[Thermocline](conductors/thermocline/)**, scores each block relevance to the most recent context using the attention from a 500M parameter model as a proxy.
+**[Thermocline](conductors/ws/thermocline/)**, scores each block relevance to the most recent context using the attention from a 500M parameter model as a proxy.
 
 In a test run on **SlopCodeBench** (a long-horizon coding benchmark), Thermocline at a
 100k-token budget outperformed naive compaction with the same constrained context budget. Both used deepseekV4Pro.

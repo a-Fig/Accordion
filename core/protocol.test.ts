@@ -31,11 +31,12 @@ import type {
 	HoldReleaseMessage,
 	CancelCompleteMessage,
 	WireCommand,
+	NoticeMessage,
 } from "./protocol";
 
 describe("PROTOCOL_VERSION", () => {
-	it("is bumped to 16 for single-controller + the stable door (ADR 0024)", () => {
-		expect(PROTOCOL_VERSION).toBe(16);
+	it("is bumped to 17 for the generic `notice` broadcast (native-compaction surfacing)", () => {
+		expect(PROTOCOL_VERSION).toBe(17);
 	});
 });
 
@@ -226,6 +227,18 @@ describe("v16 — controller/claimController message guards", () => {
 		const refused: CommandResultMessage = { type: "commandResult", seq: 3, results: [], rev: 9, refused: "read-only" };
 		expect(isServerMessage(refused)).toBe(true);
 		expect(refused.refused).toBe("read-only");
+	});
+});
+
+// ── v17: the generic `notice` broadcast ───────────────────────────────────────
+describe("v17 — notice message guard", () => {
+	it("accepts a notice broadcast (server→client)", () => {
+		const msg: NoticeMessage = { type: "notice", text: "pi compacted the session natively — Accordion's map has been rebuilt to match." };
+		expect(isServerMessage(msg)).toBe(true);
+	});
+
+	it("rejects an unrecognized type (guards don't merely check for a `text` field)", () => {
+		expect(isServerMessage({ type: "notic", text: "typo'd type" })).toBe(false);
 	});
 });
 

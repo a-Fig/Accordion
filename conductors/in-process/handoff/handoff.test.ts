@@ -1,5 +1,5 @@
 /*
- * core/conductors/handoff/handoff.test.ts — golden tests for the ported "Handoff (fresh start)"
+ * conductors/in-process/handoff/handoff.test.ts — golden tests for the ported "Handoff (fresh start)"
  * conductor, driven against `TestHost` (a real `Truth` instance) per `core/conductor/testhost.ts`'s
  * own doc comment ("Phase-D agents golden-test conductors against this").
  *
@@ -11,8 +11,8 @@
  * replace).
  */
 import { describe, it, expect } from "vitest";
-import { TestHost } from "../../conductor/testhost";
-import type { Block, ParsedSession } from "../../types";
+import { TestHost } from "../../../core/conductor/testhost";
+import type { Block, ParsedSession } from "../../../core/types";
 import { HandoffConductor, neutralizeSentinels, truncateForStatus, sumTokens, blockLabel } from "./handoff";
 
 const META = { format: "pi" as const, title: "t", cwd: "", model: "test-model" };
@@ -188,6 +188,55 @@ describe("HandoffConductor — sticky failure status", () => {
 		expect(host.completeLog.length).toBe(1);
 		const afterSecondPass = host.statusLog[host.statusLog.length - 1];
 		expect(afterSecondPass.text).toBe(afterReject.text);
+	});
+});
+
+describe("HandoffConductor — link-unavailable path (Fix 3, main parity)", () => {
+	// Main's contract pre-checked `host.can("complete")` and reported unavailability WITHOUT ever
+	// recording an attempt, so the very next pass retried automatically once the live model link
+	// returned. The v2 contract has no pre-check; a rejected `complete()` IS the only signal, so
+	// `isUnavailableError` (agedSummaryConductor.ts) classifies the rejection itself by the exact
+	// message `runCompletion` (extension/accordion.ts) throws when there is no live model.
+	it("shows the calm 'unavailable — waiting for live model link' status and retries on the very next pass, without new content aging in", async () => {
+		const { host } = setup(session(5, 200), 1000);
+		host.queueCompletionError(new Error("no model available"));
+
+		host.commitTurn();
+		expect(host.completeLog.length).toBe(1);
+		await flush();
+
+		expect(host.truth.groups.length).toBe(0); // still raw — nothing to fold yet
+		const afterFirst = host.statusLog[host.statusLog.length - 1];
+		expect(afterFirst.text).toBe("Handoff unavailable — waiting for live model link");
+
+		// SAME aged set as the failed attempt, no new content — yet this retries, unlike a genuine
+		// rejection (see "sticky failure status" above), because the unavailable branch clears
+		// lastAttemptKey.
+		host.queueCompletion({ text: "recovered handoff" });
+		host.commitTurn();
+		expect(host.completeLog.length).toBe(2); // retried automatically
+		await flush();
+
+		expect(host.truth.groups.length).toBe(1);
+		const afterRecover = host.statusLog[host.statusLog.length - 1];
+		expect(afterRecover.text).toBeNull();
+	});
+
+	it("classification is conservative: a generic rejection (even one mentioning \"unavailable\") is NOT treated as link-down", async () => {
+		const { host } = setup(session(5, 200), 1000);
+		host.queueCompletionError(new Error("The model provider returned 503 Service Unavailable"));
+
+		host.commitTurn();
+		expect(host.completeLog.length).toBe(1);
+		await flush();
+
+		const afterFirst = host.statusLog[host.statusLog.length - 1];
+		expect(afterFirst.text).toMatch(/503 Service Unavailable/); // handoff's real-error rejectMessage, not the calm one
+		expect(afterFirst.text).not.toMatch(/waiting for live model link/i);
+
+		// Same aged set, no new content — a genuine rejection must NOT auto-retry.
+		host.commitTurn();
+		expect(host.completeLog.length).toBe(1);
 	});
 });
 

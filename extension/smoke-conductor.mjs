@@ -3,7 +3,7 @@
  *
  * Sibling to smoke.mjs, driven the same way (mock pi hooks + a real WS GUI client), but exercising
  * the one path smoke.mjs does not: a SPAWN conductor. It drives the actual runner spawn — the
- * extension launches `node conductors/thermocline/runner.mjs`, which imports the committed
+ * extension launches `node conductors/ws/thermocline/runner.mjs`, which imports the committed
  * remote-sdk.mjs bundle, dials the session's loopback WS as `role=conductor`, mirrors the live Truth,
  * and drives the real ThermoclineConductor. No part of the spawn/attach/propose path is faked.
  *

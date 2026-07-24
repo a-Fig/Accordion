@@ -561,7 +561,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	function resolveRunnerPath(entryFile: string): string | null {
 		try {
 			const here = path.dirname(fileURLToPath(import.meta.url));
-			const p = path.resolve(here, "..", "conductors", "thermocline", entryFile);
+			const p = path.resolve(here, "..", "conductors", "ws", "thermocline", entryFile);
 			return fs.existsSync(p) ? p : null;
 		} catch {
 			return null;
@@ -875,6 +875,25 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		}
 	}
 
+	/**
+	 * Shared model-window budget-clamp policy. A mid-session swap to a smaller-window model must
+	 * shrink an oversized budget, or the aged-summary conductors' 90%-of-budget trigger only fires
+	 * after the REAL window is already exhausted (the output-reservation path then declines with
+	 * "window too tight"). Clamps DOWN only — never raises budget, so a human's smaller custom
+	 * budget (or a swap to a LARGER window) survives untouched. Applied at every call site that
+	 * learns/changes the window (`buildTruth`'s rebuild path, `model_select`, and the late-learned
+	 * path in `refreshFromCtx`) rather than inside `Truth.setContextWindow` itself — doing it there
+	 * would need the emitted `config` event to carry both fields in one rev-bump, but
+	 * `core/replica.ts`'s `applyWireEvent` replays `budget`/`contextWindow` fields independently via
+	 * the ordinary public setters, so a replica replaying one combined event would double-apply the
+	 * clamp and end up one rev ahead of the host. Calling `setBudget` as a separate, ordinary
+	 * follow-up call (as done here) emits its own single-field `config` event exactly like any other
+	 * human/host budget change, which a replica already replays 1:1 — no protocol change needed.
+	 */
+	function clampBudgetToWindow(t: Truth, window: number): void {
+		if (t.budget > window) t.setBudget(window);
+	}
+
 	/** Adopt a model's id + context window into the live + meta state (best-effort). */
 	function applyModel(m: { id?: string; contextWindow?: number } | undefined): void {
 		if (!m) return;
@@ -905,6 +924,18 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 					contextWindow = u.contextWindow;
 					meta.contextWindow = u.contextWindow;
 				}
+			}
+			// Late-learned window: `buildTruth` may have run with `contextWindow` still null (left the
+			// 70_000 default budget in place), or the window only becomes known/changes here rather
+			// than via `model_select`. Adopt it into the live Truth now, clamping budget DOWN only.
+			// Guarded on an actual change so a steady-state hook tick (this runs before every model
+			// call) doesn't spam a rev bump/broadcast when nothing moved. On a genuine change the
+			// two setters emit config events that reach an attached ViewConductor as `state-changed`,
+			// so a swap tick pays for the conductor's synchronous re-conduct on the hook path —
+			// CPU-only (no disk I/O), one-time per swap, and only with folding + a conductor active.
+			if (truth && contextWindow != null && truth.contextWindow !== contextWindow) {
+				truth.setContextWindow(contextWindow);
+				clampBudgetToWindow(truth, contextWindow);
 			}
 		} catch {
 			/* optional APIs */
@@ -2023,8 +2054,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			// Snap the budget to the model window only on the FIRST build (no prior human dial to
 			// respect). A rebuild already carried `prev`'s budget via `rebuildFrom` — re-snapping it
 			// here on every divergence would silently undo a human's custom budget (part of the same
-			// finding: a rebuild must preserve the human's dials, not just per-block overlay).
+			// finding: a rebuild must preserve the human's dials, not just per-block overlay). But a
+			// rebuild that coincides with (or trails) a swap to a smaller-window model must still
+			// clamp an oversized carried-over budget DOWN — never raise it — same policy as every
+			// other window-change call site (model-window budget clamp fix).
 			if (!prev) t.setBudget(contextWindow);
+			else clampBudgetToWindow(t, contextWindow);
 		}
 		// One subscription drives BOTH the client fan-out (replayable events) and the in-process
 		// conductor's HostEvent stream — the same TruthEvent, projected two ways.
@@ -2338,7 +2373,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// swap without waiting for the next model call.
 	pi.on("model_select", (event) => {
 		applyModel(event?.model as { id?: string; contextWindow?: number } | undefined);
-		if (truth && contextWindow != null) truth.setContextWindow(contextWindow);
+		if (truth && contextWindow != null) {
+			truth.setContextWindow(contextWindow);
+			// A swap to a smaller-window model must shrink an oversized budget too, or the
+			// aged-summary conductors' 90%-of-budget trigger only fires after the REAL window is
+			// already exhausted (model-window budget clamp fix). Never raises budget.
+			clampBudgetToWindow(truth, contextWindow);
+		}
 	});
 
 	// ── turn settled: the canonical re-plan trigger for a turn-based conductor ───
@@ -2379,17 +2420,63 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		for (const msg of event.messages as unknown as PiMessage[]) ingestFinishedMessage(msg);
 	});
 
-	// ── suppress pi's native compaction ONLY while the GUI is driving ───────────
+	// ── suppress pi's native compaction ONLY while folding is actually armed ────
+	// Owner-approved policy: suppression is gated on `foldingEnabled`, NOT on `attached()`. A
+	// connected client with folding OFF (a read-only mirror, or a preview with an attached conductor
+	// but folding disarmed) leaves pi's own overflow safety net fully intact — whoever is actually
+	// rewriting the wire owns overflow, not whoever merely has a socket open. While folding IS armed,
+	// suppression stays unconditional (no hard-overflow escape valve) — Accordion's own budget/fold
+	// state is the only thing standing between the session and overflow at that point, so pi's native
+	// compaction must not race it. When a native compaction DOES run because folding was off, the
+	// paired `session_compact` handler below immediately reconciles the Truth against the compacted
+	// history (the same `ingestMessages` → `rebuildTruth` structural-divergence path the hooks use —
+	// including conductor resync via `liveHost.dispatchResync()`) and then notifies.
 	pi.on("session_before_compact", (_event, ctx: ExtensionContext) => {
-		if (attached()) {
+		if (foldingEnabled) {
 			try {
-				ctx.ui.notify("Accordion attached — native compaction suppressed.", "info");
+				ctx.ui.notify("Accordion folding armed — native compaction suppressed.", "info");
 			} catch {
 				/* ignore */
 			}
 			return { cancel: true };
 		}
-		// detached → let pi protect itself
+		// folding off (whether or not a client is attached) → let pi protect itself natively
+	});
+
+	// ── native compaction ran while folding was off: rebuild NOW + notify ──────
+	// Fires AFTER pi has actually saved a compaction (the one above did not cancel it, since folding
+	// was off). Reconcile the Truth HERE rather than waiting for the next `agent_end`/`message_end`/
+	// `context` pass: pi's MANUAL `/compact` path saves the compaction, emits this event, and returns
+	// with NO follow-up model call, so an attached map would otherwise show pre-compaction history
+	// until the human's next prompt — while the toast below claims it was rebuilt. `readSessionMessages`
+	// resolves the post-compaction history via pi's own `buildSessionContext()` (collapses the
+	// compaction to exactly what the next model call will see); `ingestMessages` detects the
+	// structural divergence and rebuilds (forced client resnapshot + conductor resync). For the
+	// AUTOMATIC (threshold/overflow) trigger a retry's `context` hook follows immediately and would
+	// reconcile anyway — this same-path ingest just lands moments earlier and the retry's ingest
+	// becomes a cheap no-divergence walk. Best-effort like all discovery I/O: an EMPTY read means the
+	// session state could not be resolved — keep the current Truth and let the normal reconciliation
+	// catch up, rather than rebuilding an empty map (a real post-compaction branch is never empty:
+	// it always contains at least the compaction summary entry). Not the `context` hook path, so the
+	// no-disk-I/O-on-hook invariant is untouched.
+	//
+	// The human-facing note then goes out two ways: `ctx.ui.notify` for whoever is watching pi's own
+	// CLI/log, and — v17 — a `notice` broadcast (`core/protocol.ts`) to every connected GUI client,
+	// so a browser-served tab or a desktop window that isn't looking at pi's terminal still sees why
+	// the map just changed shape. The map itself already visibly changed on the forced resnapshot;
+	// the notice is the accompanying explanation of why.
+	pi.on("session_compact", (_event, ctx: ExtensionContext) => {
+		latestCtx = ctx;
+		const msgs = readSessionMessages(ctx);
+		if (msgs.length > 0) ingestMessages(msgs);
+		if (!attached()) return;
+		const text = "pi compacted the session natively — Accordion's map has been rebuilt to match.";
+		try {
+			ctx.ui.notify(text, "info");
+		} catch {
+			/* ignore */
+		}
+		broadcast({ type: "notice", text });
 	});
 
 	pi.on("session_shutdown", () => {
