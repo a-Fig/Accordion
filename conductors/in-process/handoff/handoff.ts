@@ -52,8 +52,8 @@
  *
  *   1. Everything the `AgedSummaryConductor` base now owns (`../agedSummaryConductor.ts`'s own
  *      banner documents these in full): no `host.can()` pre-flight; `this.rerun()` in place of the
- *      old `host.requestRerun()`; the raw trigger baseline reconstructed from
- *      `sumTokens(view.blocks)` rather than `view.liveTokens`; `foreignGroupedIds()` in place of
+ *      old `host.requestRerun()`; the trigger reading `view.liveTokens` as the authoritative
+ *      visible window (see `conduct()`); `foreignGroupedIds()` in place of
  *      the blanket `ViewBlock.grouped`; and the sticky reject/empty-output/window-too-tight status.
  *      These were originally documented per-conductor (this file first established the fix
  *      pattern that `compaction-naive`'s port followed); they now live once, in the base class.

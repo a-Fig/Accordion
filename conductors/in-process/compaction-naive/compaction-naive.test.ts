@@ -181,14 +181,15 @@ describe("NaiveCompactionConductor — hysteresis", () => {
 	});
 
 	// The test above passes trivially: with nothing appended, `newlyAged.length === 0` short-
-	// circuits `needSummary` before the visible-window arithmetic is ever evaluated. This test
+	// circuits `needSummary` before the visible-window check is ever evaluated. This test
 	// exercises a genuine PARTIAL REFILL: `newlyAged` is non-empty (the old protected tail plus one
-	// new block ages in) but the correct visible-window math still stays below the high-water mark,
-	// so the arithmetic itself — not the short-circuit — is what must decide to hold.
+	// new block ages in) but the visible window still stays below the high-water mark, so the
+	// window check itself — not the short-circuit — is what must decide to hold.
 	//
-	// After runPass1(), blocks 0-8 (900 raw tokens) are compacted into SUMMARY_A. summaryTokenCost
-	// = estTokens("[Compacted summary of 9 earlier messages]\n\nAlpha summary body.") = 16, so
-	// savedTokens = 900 - 16 = 884.
+	// After runPass1(), blocks 0-8 are collapsed into ONE group whose digest is SUMMARY_A, costing
+	// the wire estTokens("[Compacted summary of 9 earlier messages]\n\nAlpha summary body.") = 16
+	// plus one BLOCK_OVERHEAD = 20 tokens in total (`Truth.runWireTok`), with the other 8 members
+	// costing 0.
 	//
 	// Appending 4 more 100-token blocks (indices 12-15) makes 16 blocks total, so
 	// protectedFromIndex = 16 - 3 = 13 (Truth's uniform-100-token tail formula — see the file
@@ -196,8 +197,8 @@ describe("NaiveCompactionConductor — hysteresis", () => {
 	// protected tail 9,10,11 aging in, plus new block 12) — non-empty, so `needSummary`'s
 	// short-circuit does NOT apply here.
 	//
-	// rawTotal = 16 * 100 = 1600. visible = 1600 - 884 = 716, comfortably under the 900 high-water
-	// mark, so the correct arithmetic must decide to STAY HELD without relaunching.
+	// visible = view.liveTokens = 20 (the collapsed run) + 7 * 100 (blocks 9-15, still live) = 720,
+	// comfortably under the 900 high-water mark, so the conductor must STAY HELD without relaunching.
 	it("holds on a genuine partial refill — newlyAged is non-empty but the visible window stays under the high-water mark", async () => {
 		const { host } = await runPass1();
 
@@ -205,37 +206,36 @@ describe("NaiveCompactionConductor — hysteresis", () => {
 		host.commitTurn();
 		await flush();
 
-		expect(host.completeLog.length).toBe(1); // no relaunch — visible (716) < 900
+		expect(host.completeLog.length).toBe(1); // no relaunch — visible (720) < 900
 		expect(host.truth.groups.length).toBe(1); // unchanged
 		const summary = host.truth.groupSummary(host.truth.groups[0]);
 		expect(summary).toBe(`[Compacted summary of 9 earlier messages]\n\n${SUMMARY_A}`); // still pass 1's summary, untouched
 	});
 });
 
-describe("NaiveCompactionConductor — trigger math uses the full raw token baseline, not view.liveTokens", () => {
-	// Regression coverage for PORT FIDELITY §3: the raw baseline MUST be `sumTokens(view.blocks)`
-	// (every block's full, un-folded token cost), never `view.liveTokens` (which already reflects
-	// this conductor's own group folding and would double-count the saving). The existing
-	// recursive-pass test above happens to add exactly 15 new blocks — a count where the two
-	// formulas agree (both trigger) — so it would NOT catch a regression back to `view.liveTokens`.
-	// This test picks 10 new blocks, inside the 6-14 range where the formulas DIVERGE.
+describe("NaiveCompactionConductor — the visible window IS view.liveTokens, with nothing subtracted from it", () => {
+	// `view.liveTokens` (Truth's own `stats().liveTokens`) is the authoritative visible-wire number
+	// and the whole of the trigger's input — see `conduct()` in ../agedSummaryConductor.ts. It
+	// ALREADY reflects this conductor's own group folding, so subtracting a separately-derived
+	// "saved tokens" term from it double-counts the saving and starves the trigger. This test pins
+	// that: the existing recursive-pass test above happens to add exactly 15 new blocks, a count
+	// where both the correct and the double-subtracting formula trigger, so it would not catch the
+	// regression. 10 new blocks lands inside the range where they DIVERGE.
 	//
-	// After runPass1(), blocks 0-8 (9 blocks) are compacted into SUMMARY_A, savedTokens = 884 (see
-	// the hysteresis test above for the derivation).
+	// After runPass1(), blocks 0-8 are one group whose collapsed run costs the wire
+	// estTokens(summary) + BLOCK_OVERHEAD = 16 + 4 = 20 tokens, the other 8 members costing 0.
 	//
 	// Appending 10 more 100-token blocks makes 22 blocks total: protectedFromIndex = 22 - 3 = 19,
 	// so aged = indices 0-18 (19 blocks) and newlyAged = indices 9-18 (10 blocks).
 	//
-	// CORRECT baseline: rawTotal = sumTokens(view.blocks) = 22 * 100 = 2200.
-	//   visible = 2200 - 884 = 1316 >= 900 → TRIGGERS a second compaction.
+	// CORRECT: visible = view.liveTokens = 20 (the collapsed run) + 13 * 100 (still-ungrouped
+	//   blocks) = 1320 >= 900 → TRIGGERS a second compaction.
 	//
-	// BUGGY baseline (raw = view.liveTokens): the compacted run (blocks 0-8) collapses in Truth's
-	// group-wire accounting to one carrier block costing estTokens(summary) + BLOCK_OVERHEAD
-	// = 16 + 4 = 20 tokens, with the other 8 members costing 0 — so
-	//   view.liveTokens = 20 (carrier) + 0*8 (collapsed) + 13*100 (the 13 still-ungrouped blocks) = 1320.
-	//   buggy visible = 1320 - 884 = 436 < 900 → would NOT trigger — silently stuck on the stale
-	//   pass-1 summary while 10 more blocks' worth of history ages in unaccounted for.
-	it("triggers a genuine second compaction at 10 new blocks — a count where the correct and view.liveTokens baselines diverge", async () => {
+	// DOUBLE-SUBTRACTING: the pre-review formula's `savedTokens` for this state is
+	//   sumTokens(covered survivors) − estTokens(summary) = 900 − 16 = 884, so a `liveTokens −
+	//   savedTokens` visible = 1320 − 884 = 436 < 900 → would NOT trigger — silently stuck on the
+	//   stale pass-1 summary while 10 more blocks' worth of history ages in unaccounted for.
+	it("triggers a genuine second compaction at 10 new blocks — a count where subtracting a saving from liveTokens would not", async () => {
 		const { host } = await runPass1();
 
 		host.appendBlocks(Array.from({ length: 10 }, (_, i) => mkBlock(idOf(12 + i), 12 + i, "text", TOK, `NEW2-${12 + i}`)));
@@ -416,15 +416,12 @@ describe("NaiveCompactionConductor — fragmentation does not grow the wire (iss
 	// `r:` → toolResult), NOT from `Block.kind` — so `buildPass1Blocks()`'s shared `idOf` (every id
 	// prefixed `a:`) makes EVERY block "assistant" for this floor's purposes regardless of `kind`.
 	// Dropping a whole run between two other `a:`-prefixed survivors therefore welds two "assistant"
-	// messages together — a real, pre-existing mechanism wholly unrelated to issue #90, but one that
-	// turns the drop into a PAID recap stub and makes the trigger's accounting under-count the true
-	// wire by that recap's cost. So "accounting equals wire" is NOT exact in general: it holds
-	// precisely when no dropped run degrades (this test's fixture — a genuine `u:`-prefixed held
-	// block keeps the drop's surviving neighbors on different roles, so the drop is truly free), and
-	// otherwise under-counts by ~one recap (~25 tokens including its BLOCK_OVERHEAD) per degraded
-	// run — a bounded, small residual (vs. the unbounded K× full-summary error issue #90 removed),
-	// pinned exactly by the "degraded-recap residual" test below so it can never grow silently.
-	it("accounting matches the wire: the trigger's computed visible-window size equals the true post-fold wire size (within BLOCK_OVERHEAD's fixed per-run framing, already unaccounted by the K=1 formula today)", async () => {
+	// messages together and turns the drop into a PAID recap stub. That is exactly the term a
+	// conductor-side reconstruction of the visible window cannot model — and, post-#90-review, the
+	// reason the trigger reads `view.liveTokens` instead of reconstructing anything. The two tests
+	// below pin both fixture shapes (drop free / drop degraded) to the SAME invariant: the number
+	// the trigger acts on IS the number the wire carries, exactly.
+	it("accounting matches the wire exactly when the dropped run is genuinely free (a u:-prefixed held block keeps its neighbours on different roles)", async () => {
 		const host = new TestHost();
 		host.setBudget(BUDGET);
 		host.setProtect(PROTECT);
@@ -441,37 +438,24 @@ describe("NaiveCompactionConductor — fragmentation does not grow the wire (iss
 
 		expect(host.truth.groups.length).toBe(2);
 
-		// Reconstruct the conductor's own `visible` computation from the SAME public facts its
-		// `conduct()` reads (rawTotal = sumTokens(view.blocks); savedTokens = coveredSurvivorTokens −
-		// textTokenCost()) — see `conduct()` in ../agedSummaryConductor.ts. Survivors are the 8 aged,
-		// non-held, covered blocks (0,1,2,3,5,6,7,8); the held block (4) and the protected tail
-		// (9,10,11) are never survivors.
-		const rawTotal = host.truth.fullTokens(); // 1200
+		// The wire, derived from first principles: the protected tail (9,10,11) plus the held block
+		// (4) stay live at full cost; the carrier run [0-3] costs its verbatim digest + one
+		// BLOCK_OVERHEAD (`Truth.runWireTok`); the dropped run [5-8] costs nothing (no degradation).
 		const summaryText = `[Compacted summary of 8 earlier messages]\n\n${SUMMARY_A}`;
-		const textTokenCost = Math.ceil(summaryText.length / 4);
-		const survivorTokens = 8 * 100;
-		const savedTokens = survivorTokens - textTokenCost;
-		const conductorVisible = rawTotal - savedTokens;
-
-		// The true wire size adds back exactly one `BLOCK_OVERHEAD` (core/tokens.ts) — the fixed
-		// per-carrier framing cost `Truth.runWireTok` charges a REPLACE run that this conductor's own
-		// `textTokenCost()` has never modeled, in the K=1 case either (out of scope for issue #90 —
-		// K=1 must stay byte-identical). With exactly one surviving full-text carrier (the fix's
-		// entire point) and the dropped run genuinely free (no role-floor degradation — see the
-		// banner comment above), that is the ONLY discrepancy between the two numbers.
-		expect(host.truth.liveTokens()).toBe(conductorVisible + BLOCK_OVERHEAD);
+		const expectedWire = 4 * TOK + estTokens(summaryText) + BLOCK_OVERHEAD;
+		expect(host.truth.liveTokens()).toBe(expectedWire);
+		// …and that is precisely the number `conduct()` triggers on (`view.liveTokens`).
+		expect(host.stats().liveTokens).toBe(expectedWire);
 	});
 
-	// The bounded residual named in the banner above, pinned exactly. `buildPass1Blocks()`'s
-	// all-`a:`-prefixed ids make every block "assistant" to the role-validity floor, so dropping run
-	// [5-8] welds the pinned block 4 against tail block 9 — same-role adjacency — and
-	// `computeDegradedDropRuns` degrades the drop into a paid `roleFloorRecap` stub. The trigger's
-	// charge-once accounting knows nothing of that stub, so it under-counts the true wire by exactly
-	// the stub's cost. This test asserts (a) non-growth STILL holds with the stub paid, and (b) the
-	// under-count is EXACTLY one recap + BLOCK_OVERHEAD for the one degraded run — pinning the
-	// residual so any future change that silently grows it (more degraded runs, a costlier stub, a
-	// second unmodeled term) fails here instead of shipping.
-	it("degraded-recap residual: when the role floor degrades the dropped run, non-growth holds and the accounting under-count is exactly one recap + BLOCK_OVERHEAD", async () => {
+	// The same shape with the drop DEGRADED. `buildPass1Blocks()`'s all-`a:`-prefixed ids make every
+	// block "assistant" to the role-validity floor, so dropping run [5-8] welds the pinned block 4
+	// against tail block 9 — same-role adjacency — and `computeDegradedDropRuns` degrades the drop
+	// into a paid `roleFloorRecap` stub. Pre-review the trigger's charge-once reconstruction knew
+	// nothing of that stub and under-counted the wire by its cost (sol5.6 P1 #1); now the stub is
+	// simply part of `liveTokens`, so there is NO residual left to bound — this test pins that the
+	// gap is zero and that non-growth still holds with the stub paid.
+	it("degraded drop run: the stub is paid, non-growth still holds, and the trigger's number equals the wire with no residual", async () => {
 		const { host } = setupHost();
 		const rawTotal = host.truth.fullTokens(); // 1200
 
@@ -488,15 +472,16 @@ describe("NaiveCompactionConductor — fragmentation does not grow the wire (iss
 		// increases live wire tokens versus the raw baseline.
 		expect(host.truth.liveTokens()).toBeLessThan(rawTotal);
 
-		// (b) The residual, pinned. The conductor's `visible` (rawTotal − savedTokens, per
-		// `conduct()`): survivors are the 8 covered blocks; textTokenCost is the summary's estimate.
+		// (b) The wire from first principles: the held block (4) + protected tail (9,10,11) live at
+		// full cost, the carrier run [0-3] at its digest + BLOCK_OVERHEAD, and the degraded run [5-8]
+		// at the EXACT text `applyPlan` synthesizes (`roleFloorRecap(groupId, messageCount)`; that run
+		// is 4 single-block messages) + BLOCK_OVERHEAD.
 		const summaryText = `[Compacted summary of 8 earlier messages]\n\n${SUMMARY_A}`;
-		const conductorVisible = rawTotal - (8 * TOK - estTokens(summaryText));
-		// The true wire adds the carrier's framing (one BLOCK_OVERHEAD, same as the exact-match test
-		// above) PLUS the degraded run's recap stub at the exact text `applyPlan` synthesizes —
-		// `roleFloorRecap(groupId, messageCount)`; run [5-8] is 4 single-block messages.
 		const recapCost = estTokens(roleFloorRecap(gDrop.id, 4)) + BLOCK_OVERHEAD;
-		expect(host.truth.liveTokens()).toBe(conductorVisible + BLOCK_OVERHEAD + recapCost);
+		const expectedWire = 4 * TOK + estTokens(summaryText) + BLOCK_OVERHEAD + recapCost;
+		expect(host.truth.liveTokens()).toBe(expectedWire);
+		// (c) No residual: the trigger acts on exactly this number, stub included.
+		expect(host.stats().liveTokens).toBe(expectedWire);
 	});
 
 	it("K=3 runs (two held blocks): only the FIRST (earliest) run carries the summary — every later run is dropped, not just the second", async () => {
@@ -522,6 +507,128 @@ describe("NaiveCompactionConductor — fragmentation does not grow the wire (iss
 	});
 });
 
+describe("NaiveCompactionConductor — heavy fragmentation never grows the wire (#90 review, sol5.6 P1 #1)", () => {
+	// sol5.6's fixture: 101 alternating assistant/user blocks of 10 tokens each (1010 raw), every
+	// `user` block human-held, so the aged region fragments into 51 SINGLE-BLOCK survivor runs. The
+	// ids carry the WIRE role the role-validity floor reads (`wireRoleOfId`: `a:` → assistant,
+	// `u:` → user), so dropping any interior run welds two `user` survivors together and
+	// `computeDegradedDropRuns` degrades it into a paid ~25-token recap stub — a cost that is FLAT
+	// per run regardless of run size. Pre-review the conductor dropped all 50 interior runs: the
+	// wire GREW from 1010 to ~1744 tokens while the trigger's reconstruction believed ~516.
+	const FRAG_TOK = 10;
+	const FRAG_N = 101;
+	const fragId = (i: number): string => (i % 2 === 0 ? `a:f${i}:p0` : `u:${i}`);
+	/** The fixture, with every odd (`user`-role) block already human-held. */
+	function setupFragmented(): TestHost {
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(0); // whole session ages in
+		host.appendBlocks(
+			Array.from({ length: FRAG_N }, (_, i) => mkBlock(fragId(i), i, i % 2 === 0 ? "text" : "user", FRAG_TOK, `FRAG-${i}`)),
+		);
+		// Pin BEFORE attaching: each pin is a `state-changed` the conductor would otherwise react to,
+		// launching 50 completions against 50 successively-different aged sets.
+		for (let i = 1; i < FRAG_N; i += 2) host.humanPin(fragId(i));
+		return host;
+	}
+
+	it("proposes only the summary carrier — every interior drop that cannot pay for its own recap stub is left live", async () => {
+		const host = setupFragmented();
+		const rawTotal = host.truth.fullTokens(); // 101 * 10 = 1010
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+
+		// ONE group: the first (earliest) survivor run, carrying the summary. The other 50 runs are
+		// 10 tokens each — less than the recap stub a degraded drop would cost — so dropping them can
+		// only ever lose, and they stay live instead.
+		expect(host.truth.groups.length).toBe(1);
+		const g = host.truth.groups[0];
+		expect(g.memberIds).toEqual([fragId(0)]);
+		const summary = `[Compacted summary of 51 earlier messages]\n\n${SUMMARY_A}`;
+		expect(host.truth.groupSummary(g)).toBe(summary);
+
+		// The wire from first principles: 100 of the 101 blocks still live at full cost, plus the one
+		// collapsed run's verbatim digest + BLOCK_OVERHEAD.
+		const carrierCost = estTokens(summary) + BLOCK_OVERHEAD;
+		const expectedWire = (FRAG_N - 1) * FRAG_TOK + carrierCost;
+		expect(host.truth.liveTokens()).toBe(expectedWire);
+		// The trigger acts on exactly that number — no reconstruction, no residual (pre-review the two
+		// diverged by ~1228 tokens on this fixture).
+		expect(host.stats().liveTokens).toBe(expectedWire);
+		// Growth is bounded by the summary carrier's own cost — the conductor's entire product, and
+		// the only thing it still writes here. Pre-review this fixture reached ~1744.
+		expect(host.truth.liveTokens()).toBeLessThanOrEqual(rawTotal + carrierCost);
+	});
+
+	it("the trigger sees the true wire: one more aged block relaunches, where a reconstructed visible window would have held", async () => {
+		const host = setupFragmented();
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+
+		// visible is now 1020 — over the 900 high-water mark — so one genuinely new aged block is
+		// enough to relaunch. The pre-review reconstruction (rawTotal − coveredSurvivors + summary)
+		// would have computed 1020 − 510 + 16 ≈ 526 here and stayed silently held forever.
+		host.appendBlocks([mkBlock(`a:f${FRAG_N}:p0`, FRAG_N, "text", FRAG_TOK, `FRAG-${FRAG_N}`)]);
+		host.queueCompletion({ text: SUMMARY_B });
+		await host.commitTurn();
+		await flush();
+
+		expect(host.completeLog.length).toBe(2);
+	});
+});
+
+describe("NaiveCompactionConductor — a run with no viable carrier is never proposed (#90 review, sol5.6 P1 #2)", () => {
+	// sol5.6's repro: the aged region opens with a `tool_call` whose paired `tool_result` is HELD, so
+	// the tool_call sits alone in its own survivor run. `Truth.opGroup` rejects a group over that run
+	// outright ("nothing collapses (all stragglers)" — the pair is unbalanced), but `Truth.apply`
+	// validates each op INDEPENDENTLY and `ViewConductor.applyDesired` silently drops the failures:
+	// pre-review the conductor proposed the summary on that doomed first run and `digest: ""` on the
+	// following text run, so the DROP committed while the summary did not — 750 tokens left the wire
+	// with no summary anywhere. `hasCollapsibleCarrier` (core/groupShape.ts — the SAME fixpoint
+	// `Truth.classifyGroup` runs) now excludes the doomed run before it is ever proposed.
+	it("excludes the doomed run, moves the summary to the first viable one, and never drops content without a committed carrier", async () => {
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(0); // whole session ages in
+		host.appendBlocks([
+			mkBlock("a:c0:p0", 0, "tool_call", 200, "CALL-0", { callId: "call-1", toolName: "run" }),
+			mkBlock("r:call-1", 1, "tool_result", 200, "RESULT-1", { callId: "call-1", toolName: "run" }),
+			...Array.from({ length: 5 }, (_, i) => mkBlock(idOf(2 + i), 2 + i, "text", 150, `TEXT-${2 + i}`)),
+		]);
+		host.humanPin("r:call-1"); // the tool_call's other half is held OUTSIDE any survivor run
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+
+		// The tool_call's run is never proposed — it stays live and ungrouped, exactly as a held block
+		// keeps itself out of a run.
+		expect(host.truth.groups.some((g) => g.memberIds.includes("a:c0:p0"))).toBe(false);
+
+		// The summary lands on the first VIABLE run instead of vanishing with the rejected one.
+		expect(host.truth.groups.length).toBe(1);
+		const g = host.truth.groups[0];
+		expect(g.memberIds).toEqual([idOf(2), idOf(3), idOf(4), idOf(5), idOf(6)]);
+		const summary = `[Compacted summary of 6 earlier messages]\n\n${SUMMARY_A}`;
+		expect(host.truth.groupSummary(g)).toBe(summary);
+
+		// THE INVARIANT: no committed group removes content while its summary is absent. Pre-review
+		// this fixture produced exactly one group whose digest was "" — a bare DROP of 750 tokens.
+		for (const grp of host.truth.groups) expect(host.truth.groupSummary(grp)).not.toBe("");
+
+		// The wire: the tool_call + its held result live at full cost, the collapsed run at its digest.
+		expect(host.truth.liveTokens()).toBe(400 + estTokens(summary) + BLOCK_OVERHEAD);
+	});
+});
+
 describe("NaiveCompactionConductor — K=1 regression: zero fragmentation stays byte-identical (issue #90)", () => {
 	// The common case (no held/pinned blocks, no foreign groups splitting the aged run) must be
 	// completely unaffected by the fix: same single group, same verbatim digest, same accounting.
@@ -536,12 +643,11 @@ describe("NaiveCompactionConductor — K=1 regression: zero fragmentation stays 
 		expect(summary).toBe(`[Compacted summary of 9 earlier messages]\n\n${SUMMARY_A}`);
 		expect(summary).not.toBe(""); // K=1: never dropped
 
-		// Accounting: unchanged from before this fix — savedTokens = sumTokens(survivors) − textTokenCost.
-		const textTokenCost = Math.ceil(summary.length / 4); // 16
-		const savedTokens = 9 * 100 - textTokenCost; // 900 - 16 = 884
-		const rawTotal = host.truth.fullTokens(); // 1200 (12 blocks * 100)
-		const conductorVisible = rawTotal - savedTokens;
-		expect(conductorVisible).toBe(1200 - 884);
+		// Accounting: the visible window is the wire — the collapsed run's verbatim digest plus one
+		// BLOCK_OVERHEAD, and the 3 protected-tail blocks still live at full cost.
+		const expectedWire = estTokens(summary) + BLOCK_OVERHEAD + 3 * TOK;
+		expect(host.truth.liveTokens()).toBe(expectedWire);
+		expect(host.stats().liveTokens).toBe(expectedWire);
 	});
 });
 
