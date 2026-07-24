@@ -52,6 +52,9 @@ const accordionLive = mod.default;
 if (typeof accordionLive !== "function") throw new Error("default export is not a function");
 // Compute fold codes exactly as the engine does (to correlate a folded digest to its unfold code).
 const { foldCode } = await jiti.import("../core/digest.ts");
+// The LIVE protocol version, not a hardcoded literal — so a version bump doesn't silently desync
+// this smoke test from `core/protocol.ts` (the same rationale as smoke-mock.mjs's import).
+const { PROTOCOL_VERSION } = await jiti.import("../core/protocol.ts");
 
 const fails = [];
 
@@ -103,7 +106,7 @@ const entry = readOnlyEntry();
 if (!(entry.port > 0)) fails.push(`registry port not assigned (got ${entry.port})`);
 if (entry.registryProtocol !== 1) fails.push(`registry protocol mismatch (${entry.registryProtocol})`);
 if (entry.model !== "test/model") fails.push(`model not captured (${entry.model})`);
-if (entry.protocolVersion !== 16) fails.push(`protocol version expected 16, got ${entry.protocolVersion}`);
+if (entry.protocolVersion !== PROTOCOL_VERSION) fails.push(`protocol version expected ${PROTOCOL_VERSION}, got ${entry.protocolVersion}`);
 const PORT = entry.port;
 
 // Durable-id messages (a:/u: prefixes) the whole protocol flow builds on.
@@ -273,7 +276,7 @@ await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2
 );
 {
 	const hello = a.inbox.hello[0];
-	if (hello && hello.protocolVersion !== 16) fails.push(`hello.protocolVersion expected 16, got ${hello?.protocolVersion}`);
+	if (hello && hello.protocolVersion !== PROTOCOL_VERSION) fails.push(`hello.protocolVersion expected ${PROTOCOL_VERSION}, got ${hello?.protocolVersion}`);
 	if (hello && hello.role !== "gui") fails.push(`hello.role expected "gui", got ${hello?.role}`);
 	// Phase C: hello advertises the available-conductor catalog (the GUI picker renders from this).
 	if (hello && (!Array.isArray(hello.conductors) || !hello.conductors.some((c) => c.id === "doorman")))
@@ -671,8 +674,17 @@ if (unfoldTool && foldCodeStr) {
 	// dedicated "zero clients" rerun here is not repeated; it would require tearing down both `a` and
 	// `b`, which every later section in this file depends on staying open.)
 	notifications.length = 0;
+	a.inbox.notice = [];
+	b.inbox.notice = [];
 	await Promise.resolve(handlers.session_compact({ reason: "overflow", fromExtension: false, willRetry: false }, ctx));
 	if (!notifications.some((n) => n.message.includes("compacted"))) fails.push("session_compact (attached) did not notify about the native compaction");
+	// v17: the SAME event also broadcasts a `notice` to every connected GUI client (not just whoever
+	// is watching pi's own CLI) — assert both already-connected clients (`a`/`b`) receive it.
+	await waitFor(() => (a.inbox.notice || []).length > 0 && (b.inbox.notice || []).length > 0, 2000, "notice broadcast on native compaction").catch(
+		() => fails.push("session_compact did not broadcast a `notice` message to connected clients"),
+	);
+	if ((a.inbox.notice || []).some((n) => typeof n.text !== "string" || !n.text.includes("compacted")))
+		fails.push("notice broadcast text did not mention the native compaction");
 
 	// Restore folding ON for the sections that follow, which assume it.
 	a.inbox.folding.length = 0;

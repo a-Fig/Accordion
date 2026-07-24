@@ -78,13 +78,21 @@
  *    `CommandResultMessage` gains `refused:"read-only"` — a mutating command from a surface that is
  *    not the fresh lease-holder is refused before it touches Truth. Bumped so a pre-v16 peer (which
  *    has none of this vocabulary) cannot pair with a v16 host/client that assumes it.
+ *  - v17: a NEW server→client `notice { text }` — a minimal, generic informational toast broadcast
+ *    to every connected GUI client. First (and so far only) use: pi compacted the session natively
+ *    while folding was off (`session_compact` in extension/accordion.ts), so every attached UI —
+ *    not just whoever reads the extension-local `ctx.ui.notify` — sees why the map just changed
+ *    shape. Deliberately NOT the start of a notification framework: no `kind`, no queue, no
+ *    client→server counterpart. Bumped so a pre-v17 peer (which doesn't know this type) still can't
+ *    silently pair with a v17 host/client — same policy as every prior bump, even though an unknown
+ *    message type alone is harmless (`isServerMessage`/a conductor's `default:` case both ignore it).
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import { sanitizeOps, type Op, type OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 16;
+export const PROTOCOL_VERSION = 17;
 
 /**
  * The DOOR: a fixed, well-known loopback port that exactly ONE extension binds at a time as an
@@ -388,6 +396,19 @@ export interface ConductorStatusMessage {
 }
 
 /**
+ * Broadcast to EVERY connected GUI client (v17): a minimal, generic informational toast. First use
+ * is `session_compact` in extension/accordion.ts, surfacing pi's native compaction (when folding was
+ * off) beyond the existing extension-local `ctx.ui.notify`. Deliberately kept to a single `text`
+ * field — this is not the start of a notification framework; add fields only when a second real use
+ * needs them. No client→server counterpart, so it never goes through `sanitizeCommand` (that gate is
+ * client→server ingress only).
+ */
+export interface NoticeMessage {
+	type: "notice";
+	text: string;
+}
+
+/**
  * Sent ONLY to the client holding the `"conductor"` role: the wire is about to depart to the
  * model. The wire host-adapter equivalent (`hostAdapter.ts → wireDepartingEvent`) already computes
  * the same `rev`/`liveTokens`/`budget`/`freshIds`; `holdMs` is this attached conductor's own
@@ -449,7 +470,8 @@ export type ServerMessage =
 	| TurnCommittedMessage
 	| ProposeResultMessage
 	| CompleteResultMessage
-	| ControllerMessage;
+	| ControllerMessage
+	| NoticeMessage;
 
 // ── Client → server ──────────────────────────────────────────────────────────
 
@@ -580,6 +602,7 @@ const SERVER_TYPES = new Set([
 	"proposeResult",
 	"completeResult",
 	"controller",
+	"notice",
 ]);
 
 export function isServerMessage(v: unknown): v is ServerMessage {
