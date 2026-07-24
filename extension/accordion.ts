@@ -929,7 +929,10 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			// 70_000 default budget in place), or the window only becomes known/changes here rather
 			// than via `model_select`. Adopt it into the live Truth now, clamping budget DOWN only.
 			// Guarded on an actual change so a steady-state hook tick (this runs before every model
-			// call) doesn't spam a rev bump/broadcast when nothing moved.
+			// call) doesn't spam a rev bump/broadcast when nothing moved. On a genuine change the
+			// two setters emit config events that reach an attached ViewConductor as `state-changed`,
+			// so a swap tick pays for the conductor's synchronous re-conduct on the hook path —
+			// CPU-only (no disk I/O), one-time per swap, and only with folding + a conductor active.
 			if (truth && contextWindow != null && truth.contextWindow !== contextWindow) {
 				truth.setContextWindow(contextWindow);
 				clampBudgetToWindow(truth, contextWindow);
