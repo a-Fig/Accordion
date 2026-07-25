@@ -23,7 +23,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 11.740771
+      "ms": 11.106874
     },
     {
       "candidate": "ast-exact",
@@ -41,7 +41,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 1.447821
+      "ms": 1.442484
     },
     {
       "candidate": "ast-exact",
@@ -59,7 +59,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 2.659031
+      "ms": 2.430077
     },
     {
       "candidate": "ast-exact",
@@ -77,7 +77,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 11.527189
+      "ms": 11.100105
     },
     {
       "candidate": "ast-exact",
@@ -95,7 +95,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.295445
+      "ms": 5.371537
     },
     {
       "candidate": "ast-exact",
@@ -113,7 +113,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.397527
+      "ms": 2.884398
     },
     {
       "candidate": "ast-exact",
@@ -131,7 +131,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 9.870944
+      "ms": 8.872239
     },
     {
       "candidate": "ast-exact",
@@ -149,7 +149,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 9.334
+      "ms": 5.961479
     },
     {
       "candidate": "ast-exact",
@@ -172,7 +172,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 5.076453
+      "ms": 5.166396
     },
     {
       "candidate": "ast-exact",
@@ -190,7 +190,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 15.79957
+      "ms": 18.766114
     },
     {
       "candidate": "ast-exact",
@@ -208,7 +208,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 8.162355
+      "ms": 8.264891
     },
     {
       "candidate": "ast-exact",
@@ -234,7 +234,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 9.035235
+      "ms": 9.82717
     },
     {
       "candidate": "ast-exact",
@@ -252,7 +252,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 29.745242
+      "ms": 24.696377
     },
     {
       "candidate": "ast-exact",
@@ -270,7 +270,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 12.286259
+      "ms": 11.136202
     },
     {
       "candidate": "ast-exact",
@@ -309,7 +309,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 16.629187
+      "ms": 13.771162
     },
     {
       "candidate": "ast-exact",
@@ -327,7 +327,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 4.927755
+      "ms": 3.686091
     },
     {
       "candidate": "ast-exact",
@@ -345,7 +345,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.426295
+      "ms": 2.650829
     },
     {
       "candidate": "ast-exact",
@@ -378,7 +378,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.420883
+      "ms": 2.504055
     },
     {
       "candidate": "ast-exact",
@@ -396,7 +396,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.272728
+      "ms": 2.987305
     },
     {
       "candidate": "ast-exact",
@@ -414,7 +414,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 1.236925
+      "ms": 1.178044
     },
     {
       "candidate": "ast-exact",
@@ -447,7 +447,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 1.435117
+      "ms": 1.007213
     },
     {
       "candidate": "ast-exact",
@@ -465,7 +465,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.833766
+      "ms": 1.141087
     },
     {
       "candidate": "ast-exact",
@@ -483,7 +483,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.327684
+      "ms": 0.409026
     },
     {
       "candidate": "ast-exact",
@@ -506,7 +506,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.265749
+      "ms": 0.341132
     },
     {
       "candidate": "ast-exact",
@@ -524,7 +524,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 5.50027
+      "ms": 6.665714
     },
     {
       "candidate": "ast-exact",
@@ -542,7 +542,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 4.107059
+      "ms": 7.32594
     },
     {
       "candidate": "ast-exact",
@@ -581,7 +581,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.42495
+      "ms": 2.819027
     },
     {
       "candidate": "ast-exact",
@@ -599,7 +599,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 5.164041
+      "ms": 4.353045
     },
     {
       "candidate": "ast-exact",
@@ -617,7 +617,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.349587
+      "ms": 3.547665
     },
     {
       "candidate": "ast-exact",
@@ -656,7 +656,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.098906
+      "ms": 3.818179
     },
     {
       "candidate": "ast-exact",
@@ -674,7 +674,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 35.37245
+      "ms": 37.196696
     },
     {
       "candidate": "ast-exact",
@@ -692,7 +692,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 34.528502
+      "ms": 31.90854
     },
     {
       "candidate": "ast-exact",
@@ -716,7 +716,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 32.010167
+      "ms": 30.711721
     },
     {
       "candidate": "ast-exact",
@@ -734,7 +734,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 32.116493
+      "ms": 30.317181
     },
     {
       "candidate": "ast-exact",
@@ -752,7 +752,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 29.813603
+      "ms": 32.152449
     },
     {
       "candidate": "ast-exact",
@@ -789,7 +789,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 32.405746
+      "ms": 31.135748
     },
     {
       "candidate": "ast-exact",
@@ -807,7 +807,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 32.69957
+      "ms": 45.659349
     },
     {
       "candidate": "ast-exact",
@@ -825,7 +825,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 34.17733
+      "ms": 34.92067
     },
     {
       "candidate": "ast-exact",
@@ -855,7 +855,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 31.440765
+      "ms": 33.749916
     },
     {
       "candidate": "ast-exact",
@@ -879,7 +879,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 36.805561
+      "ms": 39.299764
     },
     {
       "candidate": "ast-exact",
@@ -903,7 +903,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 35.504487
+      "ms": 35.431138
     },
     {
       "candidate": "ast-exact",
@@ -942,7 +942,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 38.5908
+      "ms": 36.382068
     },
     {
       "candidate": "ast-exact",
@@ -960,7 +960,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 40.123878
+      "ms": 41.346966
     },
     {
       "candidate": "ast-exact",
@@ -978,7 +978,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 38.843353
+      "ms": 39.309147
     },
     {
       "candidate": "ast-exact",
@@ -1017,7 +1017,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 39.348501
+      "ms": 42.074091
     },
     {
       "candidate": "ast-exact",
@@ -1041,7 +1041,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 50.424094
+      "ms": 61.250763
     },
     {
       "candidate": "ast-exact",
@@ -1065,7 +1065,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 49.253484
+      "ms": 55.388709
     },
     {
       "candidate": "ast-exact",
@@ -1104,7 +1104,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 46.633031
+      "ms": 49.41003
     },
     {
       "candidate": "ast-exact",
@@ -1122,7 +1122,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 1.430111
+      "ms": 1.66588
     },
     {
       "candidate": "ast-exact",
@@ -1140,7 +1140,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.773513
+      "ms": 0.778375
     },
     {
       "candidate": "ast-exact",
@@ -1161,7 +1161,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.951109
+      "ms": 0.959192
     },
     {
       "candidate": "ast-exact",
@@ -1179,7 +1179,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.152943
+      "ms": 3.284197
     },
     {
       "candidate": "ast-exact",
@@ -1197,7 +1197,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 5.19376
+      "ms": 3.054418
     },
     {
       "candidate": "ast-exact",
@@ -1236,7 +1236,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.617658
+      "ms": 2.67962
     },
     {
       "candidate": "ast-exact",
@@ -1254,7 +1254,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.947847
+      "ms": 1.110674
     },
     {
       "candidate": "ast-exact",
@@ -1272,7 +1272,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.547068
+      "ms": 0.676535
     },
     {
       "candidate": "ast-exact",
@@ -1290,7 +1290,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.632174
+      "ms": 0.542917
     },
     {
       "candidate": "ast-exact",
@@ -1312,7 +1312,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 31.08882
+      "ms": 32.854743
     },
     {
       "candidate": "ast-exact",
@@ -1334,7 +1334,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 32.292284
+      "ms": 32.56823
     },
     {
       "candidate": "ast-exact",
@@ -1359,7 +1359,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 29.916717
+      "ms": 34.059039
     },
     {
       "candidate": "ast-exact",
@@ -1377,7 +1377,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 1.360004
+      "ms": 0.915921
     },
     {
       "candidate": "ast-exact",
@@ -1395,7 +1395,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.343799
+      "ms": 0.454062
     },
     {
       "candidate": "ast-exact",
@@ -1413,7 +1413,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.450597
+      "ms": 0.431922
     },
     {
       "candidate": "topline",
@@ -1431,7 +1431,7 @@
       "errorCount": 2,
       "validLenient": false,
       "deterministic": true,
-      "ms": 3.757171
+      "ms": 3.81852
     },
     {
       "candidate": "topline",
@@ -1449,7 +1449,7 @@
       "errorCount": 5,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.705707
+      "ms": 0.508439
     },
     {
       "candidate": "topline",
@@ -1467,7 +1467,7 @@
       "errorCount": 5,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.360204
+      "ms": 0.303186
     },
     {
       "candidate": "topline",
@@ -1485,7 +1485,7 @@
       "errorCount": 3,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.557896
+      "ms": 0.590613
     },
     {
       "candidate": "topline",
@@ -1503,7 +1503,7 @@
       "errorCount": 3,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.673545
+      "ms": 0.5553
     },
     {
       "candidate": "topline",
@@ -1521,7 +1521,7 @@
       "errorCount": 3,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.247517
+      "ms": 0.224402
     },
     {
       "candidate": "topline",
@@ -1548,7 +1548,7 @@
       "errorCount": 37,
       "validLenient": false,
       "deterministic": true,
-      "ms": 2.656684
+      "ms": 1.853743
     },
     {
       "candidate": "topline",
@@ -1566,7 +1566,7 @@
       "errorCount": 39,
       "validLenient": false,
       "deterministic": true,
-      "ms": 2.716766
+      "ms": 1.618556
     },
     {
       "candidate": "topline",
@@ -1594,7 +1594,7 @@
       "errorCount": 37,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.787953
+      "ms": 1.044317
     },
     {
       "candidate": "topline",
@@ -1615,7 +1615,7 @@
       "errorCount": 6,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.178815
+      "ms": 1.230625
     },
     {
       "candidate": "topline",
@@ -1633,7 +1633,7 @@
       "errorCount": 12,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.145781
+      "ms": 1.19171
     },
     {
       "candidate": "topline",
@@ -1659,7 +1659,7 @@
       "errorCount": 8,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.38718
+      "ms": 0.711645
     },
     {
       "candidate": "topline",
@@ -1698,7 +1698,7 @@
       "errorCount": 7,
       "validLenient": false,
       "deterministic": true,
-      "ms": 2.745971
+      "ms": 2.918044
     },
     {
       "candidate": "topline",
@@ -1734,7 +1734,7 @@
       "errorCount": 134,
       "validLenient": false,
       "deterministic": true,
-      "ms": 2.860702
+      "ms": 3.018182
     },
     {
       "candidate": "topline",
@@ -1773,7 +1773,7 @@
       "errorCount": 79,
       "validLenient": false,
       "deterministic": true,
-      "ms": 2.075696
+      "ms": 1.317546
     },
     {
       "candidate": "topline",
@@ -1799,7 +1799,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.512389
+      "ms": 0.548229
     },
     {
       "candidate": "topline",
@@ -1820,7 +1820,7 @@
       "errorCount": 12,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.468663
+      "ms": 0.50455
     },
     {
       "candidate": "topline",
@@ -1858,7 +1858,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.5995
+      "ms": 0.338351
     },
     {
       "candidate": "topline",
@@ -1876,7 +1876,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.507069
+      "ms": 0.592502
     },
     {
       "candidate": "topline",
@@ -1894,7 +1894,7 @@
       "errorCount": 10,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.193815
+      "ms": 0.185679
     },
     {
       "candidate": "topline",
@@ -1915,7 +1915,7 @@
       "errorCount": 2,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.16989
+      "ms": 0.163849
     },
     {
       "candidate": "topline",
@@ -1933,7 +1933,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.134301
+      "ms": 0.090827
     },
     {
       "candidate": "topline",
@@ -1955,7 +1955,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.083901
+      "ms": 0.13506
     },
     {
       "candidate": "topline",
@@ -1978,7 +1978,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.066336
+      "ms": 0.0655
     },
     {
       "candidate": "topline",
@@ -1996,7 +1996,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.456655
+      "ms": 0.385283
     },
     {
       "candidate": "topline",
@@ -2017,7 +2017,7 @@
       "errorCount": 29,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.374079
+      "ms": 0.365824
     },
     {
       "candidate": "topline",
@@ -2056,7 +2056,7 @@
       "errorCount": 14,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.311525
+      "ms": 0.292585
     },
     {
       "candidate": "topline",
@@ -2074,7 +2074,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.784035
+      "ms": 0.86897
     },
     {
       "candidate": "topline",
@@ -2113,7 +2113,7 @@
       "errorCount": 2,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.698329
+      "ms": 0.706403
     },
     {
       "candidate": "topline",
@@ -2152,7 +2152,7 @@
       "errorCount": 23,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.595357
+      "ms": 0.578716
     },
     {
       "candidate": "topline",
@@ -2173,7 +2173,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.70753
+      "ms": 1.133263
     },
     {
       "candidate": "topline",
@@ -2194,7 +2194,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.49333
+      "ms": 0.313152
     },
     {
       "candidate": "topline",
@@ -2217,7 +2217,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.647227
+      "ms": 0.760644
     },
     {
       "candidate": "topline",
@@ -2241,7 +2241,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.655762
+      "ms": 0.661446
     },
     {
       "candidate": "topline",
@@ -2259,7 +2259,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.614479
+      "ms": 0.696361
     },
     {
       "candidate": "topline",
@@ -2285,7 +2285,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.483606
+      "ms": 0.543677
     },
     {
       "candidate": "topline",
@@ -2308,7 +2308,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.729225
+      "ms": 0.953197
     },
     {
       "candidate": "topline",
@@ -2326,7 +2326,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.541716
+      "ms": 0.715402
     },
     {
       "candidate": "topline",
@@ -2355,7 +2355,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.459581
+      "ms": 0.550157
     },
     {
       "candidate": "topline",
@@ -2388,7 +2388,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.508419
+      "ms": 1.453757
     },
     {
       "candidate": "topline",
@@ -2412,7 +2412,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.53078
+      "ms": 1.841507
     },
     {
       "candidate": "topline",
@@ -2451,7 +2451,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.008369
+      "ms": 1.462534
     },
     {
       "candidate": "topline",
@@ -2481,7 +2481,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.918153
+      "ms": 3.397649
     },
     {
       "candidate": "topline",
@@ -2499,7 +2499,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 4.449375
+      "ms": 2.726502
     },
     {
       "candidate": "topline",
@@ -2538,7 +2538,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.608037
+      "ms": 1.284785
     },
     {
       "candidate": "topline",
@@ -2568,7 +2568,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 6.008689
+      "ms": 6.681855
     },
     {
       "candidate": "topline",
@@ -2598,7 +2598,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 4.92993
+      "ms": 4.502781
     },
     {
       "candidate": "topline",
@@ -2637,7 +2637,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 2.878941
+      "ms": 2.131265
     },
     {
       "candidate": "topline",
@@ -2658,7 +2658,7 @@
       "errorCount": 5,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.210645
+      "ms": 0.249508
     },
     {
       "candidate": "topline",
@@ -2676,7 +2676,7 @@
       "errorCount": 5,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.188952
+      "ms": 0.190368
     },
     {
       "candidate": "topline",
@@ -2697,7 +2697,7 @@
       "errorCount": 6,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.158432
+      "ms": 0.130421
     },
     {
       "candidate": "topline",
@@ -2736,7 +2736,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.099822
+      "ms": 0.066882
     },
     {
       "candidate": "topline",
@@ -2775,7 +2775,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.016006
+      "ms": 0.0165
     },
     {
       "candidate": "topline",
@@ -2814,7 +2814,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.014387
+      "ms": 0.012769
     },
     {
       "candidate": "topline",
@@ -2835,7 +2835,7 @@
       "errorCount": 2,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.142119
+      "ms": 0.12849
     },
     {
       "candidate": "topline",
@@ -2856,7 +2856,7 @@
       "errorCount": 3,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.104599
+      "ms": 0.193812
     },
     {
       "candidate": "topline",
@@ -2877,7 +2877,7 @@
       "errorCount": 3,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.182285
+      "ms": 0.107407
     },
     {
       "candidate": "topline",
@@ -2901,7 +2901,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.434791
+      "ms": 0.380513
     },
     {
       "candidate": "topline",
@@ -2925,7 +2925,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.20976
+      "ms": 0.219752
     },
     {
       "candidate": "topline",
@@ -2949,7 +2949,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.322038
+      "ms": 0.317424
     },
     {
       "candidate": "topline",
@@ -2973,7 +2973,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.189626
+      "ms": 0.171973
     },
     {
       "candidate": "topline",
@@ -2997,7 +2997,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.195459
+      "ms": 0.084006
     },
     {
       "candidate": "topline",
@@ -3021,7 +3021,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 0.134131
+      "ms": 0.07536
     },
     {
       "candidate": "tree-sitter",
@@ -3039,7 +3039,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 13.420754
+      "ms": 13.45715
     },
     {
       "candidate": "tree-sitter",
@@ -3057,7 +3057,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 2.059264
+      "ms": 1.918926
     },
     {
       "candidate": "tree-sitter",
@@ -3075,7 +3075,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.351265
+      "ms": 1.385218
     },
     {
       "candidate": "tree-sitter",
@@ -3093,7 +3093,7 @@
       "errorCount": 3,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.336676
+      "ms": 3.03948
     },
     {
       "candidate": "tree-sitter",
@@ -3111,7 +3111,7 @@
       "errorCount": 3,
       "validLenient": true,
       "deterministic": true,
-      "ms": 2.305975
+      "ms": 2.220867
     },
     {
       "candidate": "tree-sitter",
@@ -3129,7 +3129,7 @@
       "errorCount": 3,
       "validLenient": true,
       "deterministic": true,
-      "ms": 2.423748
+      "ms": 2.569469
     },
     {
       "candidate": "tree-sitter",
@@ -3147,7 +3147,7 @@
       "errorCount": 7,
       "validLenient": true,
       "deterministic": true,
-      "ms": 8.423187
+      "ms": 8.773963
     },
     {
       "candidate": "tree-sitter",
@@ -3165,7 +3165,7 @@
       "errorCount": 7,
       "validLenient": true,
       "deterministic": true,
-      "ms": 7.521539
+      "ms": 5.787054
     },
     {
       "candidate": "tree-sitter",
@@ -3188,7 +3188,7 @@
       "errorCount": 6,
       "validLenient": true,
       "deterministic": true,
-      "ms": 5.838092
+      "ms": 4.768332
     },
     {
       "candidate": "tree-sitter",
@@ -3206,7 +3206,7 @@
       "errorCount": 14,
       "validLenient": true,
       "deterministic": true,
-      "ms": 7.85578
+      "ms": 12.380214
     },
     {
       "candidate": "tree-sitter",
@@ -3224,7 +3224,7 @@
       "errorCount": 14,
       "validLenient": true,
       "deterministic": true,
-      "ms": 8.09162
+      "ms": 7.783412
     },
     {
       "candidate": "tree-sitter",
@@ -3250,7 +3250,7 @@
       "errorCount": 10,
       "validLenient": false,
       "deterministic": true,
-      "ms": 8.171613
+      "ms": 7.489049
     },
     {
       "candidate": "tree-sitter",
@@ -3268,7 +3268,7 @@
       "errorCount": 91,
       "validLenient": false,
       "deterministic": true,
-      "ms": 16.391358
+      "ms": 15.712126
     },
     {
       "candidate": "tree-sitter",
@@ -3286,7 +3286,7 @@
       "errorCount": 91,
       "validLenient": true,
       "deterministic": true,
-      "ms": 16.323261
+      "ms": 15.168349
     },
     {
       "candidate": "tree-sitter",
@@ -3325,7 +3325,7 @@
       "errorCount": 58,
       "validLenient": true,
       "deterministic": true,
-      "ms": 16.564859
+      "ms": 16.057968
     },
     {
       "candidate": "tree-sitter",
@@ -3343,7 +3343,7 @@
       "errorCount": 16,
       "validLenient": true,
       "deterministic": true,
-      "ms": 5.126725
+      "ms": 4.717561
     },
     {
       "candidate": "tree-sitter",
@@ -3361,7 +3361,7 @@
       "errorCount": 16,
       "validLenient": true,
       "deterministic": true,
-      "ms": 4.879831
+      "ms": 4.614552
     },
     {
       "candidate": "tree-sitter",
@@ -3393,7 +3393,7 @@
       "errorCount": 8,
       "validLenient": true,
       "deterministic": true,
-      "ms": 4.664635
+      "ms": 4.812971
     },
     {
       "candidate": "tree-sitter",
@@ -3411,7 +3411,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 2.05502
+      "ms": 1.89514
     },
     {
       "candidate": "tree-sitter",
@@ -3429,7 +3429,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 1.872825
+      "ms": 1.679403
     },
     {
       "candidate": "tree-sitter",
@@ -3450,7 +3450,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.969522
+      "ms": 0.975011
     },
     {
       "candidate": "tree-sitter",
@@ -3468,7 +3468,7 @@
       "errorCount": 1,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.578682
+      "ms": 3.336594
     },
     {
       "candidate": "tree-sitter",
@@ -3486,7 +3486,7 @@
       "errorCount": 1,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.723817
+      "ms": 0.6087
     },
     {
       "candidate": "tree-sitter",
@@ -3506,7 +3506,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.614369
+      "ms": 0.605409
     },
     {
       "candidate": "tree-sitter",
@@ -3524,7 +3524,7 @@
       "errorCount": 5,
       "validLenient": true,
       "deterministic": true,
-      "ms": 6.515178
+      "ms": 6.032857
     },
     {
       "candidate": "tree-sitter",
@@ -3542,7 +3542,7 @@
       "errorCount": 5,
       "validLenient": true,
       "deterministic": true,
-      "ms": 6.142374
+      "ms": 5.709906
     },
     {
       "candidate": "tree-sitter",
@@ -3564,7 +3564,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 5.009944
+      "ms": 3.952665
     },
     {
       "candidate": "tree-sitter",
@@ -3582,7 +3582,7 @@
       "errorCount": 25,
       "validLenient": true,
       "deterministic": true,
-      "ms": 6.425748
+      "ms": 6.159106
     },
     {
       "candidate": "tree-sitter",
@@ -3600,7 +3600,7 @@
       "errorCount": 25,
       "validLenient": true,
       "deterministic": true,
-      "ms": 6.416415
+      "ms": 6.394312
     },
     {
       "candidate": "tree-sitter",
@@ -3639,7 +3639,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 6.203712
+      "ms": 5.014955
     },
     {
       "candidate": "tree-sitter",
@@ -3657,7 +3657,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.953774
+      "ms": 6.594466
     },
     {
       "candidate": "tree-sitter",
@@ -3675,7 +3675,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 2.024508
+      "ms": 2.134774
     },
     {
       "candidate": "tree-sitter",
@@ -3698,7 +3698,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 2.557211
+      "ms": 2.479838
     },
     {
       "candidate": "tree-sitter",
@@ -3716,7 +3716,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 4.415387
+      "ms": 4.255868
     },
     {
       "candidate": "tree-sitter",
@@ -3734,7 +3734,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 3.87857
+      "ms": 4.249904
     },
     {
       "candidate": "tree-sitter",
@@ -3759,7 +3759,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 3.326618
+      "ms": 3.502922
     },
     {
       "candidate": "tree-sitter",
@@ -3777,7 +3777,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 4.801256
+      "ms": 4.838962
     },
     {
       "candidate": "tree-sitter",
@@ -3795,7 +3795,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 4.753236
+      "ms": 3.835224
     },
     {
       "candidate": "tree-sitter",
@@ -3824,7 +3824,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 4.91836
+      "ms": 3.822417
     },
     {
       "candidate": "tree-sitter",
@@ -3842,7 +3842,7 @@
       "errorCount": 1,
       "validLenient": true,
       "deterministic": true,
-      "ms": 8.458047
+      "ms": 7.131497
     },
     {
       "candidate": "tree-sitter",
@@ -3860,7 +3860,7 @@
       "errorCount": 1,
       "validLenient": true,
       "deterministic": true,
-      "ms": 11.025867
+      "ms": 7.315069
     },
     {
       "candidate": "tree-sitter",
@@ -3899,7 +3899,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 7.469746
+      "ms": 10.072301
     },
     {
       "candidate": "tree-sitter",
@@ -3917,7 +3917,7 @@
       "errorCount": 1,
       "validLenient": true,
       "deterministic": true,
-      "ms": 14.877452
+      "ms": 13.277145
     },
     {
       "candidate": "tree-sitter",
@@ -3935,7 +3935,7 @@
       "errorCount": 1,
       "validLenient": true,
       "deterministic": true,
-      "ms": 13.72949
+      "ms": 13.324641
     },
     {
       "candidate": "tree-sitter",
@@ -3974,7 +3974,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 13.957402
+      "ms": 13.012744
     },
     {
       "candidate": "tree-sitter",
@@ -3996,7 +3996,7 @@
       "errorCount": 1,
       "validLenient": true,
       "deterministic": true,
-      "ms": 27.233803
+      "ms": 22.521777
     },
     {
       "candidate": "tree-sitter",
@@ -4018,7 +4018,7 @@
       "errorCount": 1,
       "validLenient": true,
       "deterministic": true,
-      "ms": 24.437324
+      "ms": 23.480587
     },
     {
       "candidate": "tree-sitter",
@@ -4057,7 +4057,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 21.912555
+      "ms": 55.226947
     },
     {
       "candidate": "tree-sitter",
@@ -4075,7 +4075,7 @@
       "errorCount": 3,
       "validLenient": false,
       "deterministic": true,
-      "ms": 3.432705
+      "ms": 7.338002
     },
     {
       "candidate": "tree-sitter",
@@ -4093,7 +4093,7 @@
       "errorCount": 3,
       "validLenient": false,
       "deterministic": true,
-      "ms": 2.272229
+      "ms": 4.523263
     },
     {
       "candidate": "tree-sitter",
@@ -4111,7 +4111,7 @@
       "errorCount": 2,
       "validLenient": false,
       "deterministic": true,
-      "ms": 1.629106
+      "ms": 3.633183
     },
     {
       "candidate": "tree-sitter",
@@ -4129,7 +4129,7 @@
       "errorCount": 25,
       "validLenient": true,
       "deterministic": true,
-      "ms": 6.013811
+      "ms": 15.062228
     },
     {
       "candidate": "tree-sitter",
@@ -4147,7 +4147,7 @@
       "errorCount": 25,
       "validLenient": true,
       "deterministic": true,
-      "ms": 12.926402
+      "ms": 10.088009
     },
     {
       "candidate": "tree-sitter",
@@ -4186,7 +4186,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 11.188241
+      "ms": 8.283741
     },
     {
       "candidate": "tree-sitter",
@@ -4204,7 +4204,7 @@
       "errorCount": 5,
       "validLenient": true,
       "deterministic": true,
-      "ms": 2.244416
+      "ms": 1.594596
     },
     {
       "candidate": "tree-sitter",
@@ -4222,7 +4222,7 @@
       "errorCount": 5,
       "validLenient": true,
       "deterministic": true,
-      "ms": 1.992144
+      "ms": 1.332584
     },
     {
       "candidate": "tree-sitter",
@@ -4240,7 +4240,7 @@
       "errorCount": 5,
       "validLenient": true,
       "deterministic": true,
-      "ms": 1.327943
+      "ms": 1.251937
     },
     {
       "candidate": "tree-sitter",
@@ -4262,7 +4262,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 1.923833
+      "ms": 1.867741
     },
     {
       "candidate": "tree-sitter",
@@ -4284,7 +4284,7 @@
       "errorCount": 0,
       "validLenient": true,
       "deterministic": true,
-      "ms": 1.260872
+      "ms": 1.804783
     },
     {
       "candidate": "tree-sitter",
@@ -4307,7 +4307,7 @@
       "errorCount": 1,
       "validLenient": false,
       "deterministic": true,
-      "ms": 3.098265
+      "ms": 3.314818
     },
     {
       "candidate": "tree-sitter",
@@ -4325,7 +4325,7 @@
       "errorCount": 5,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.896434
+      "ms": 0.763793
     },
     {
       "candidate": "tree-sitter",
@@ -4343,7 +4343,7 @@
       "errorCount": 5,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.689258
+      "ms": 0.767809
     },
     {
       "candidate": "tree-sitter",
@@ -4361,7 +4361,7 @@
       "errorCount": 5,
       "validLenient": true,
       "deterministic": true,
-      "ms": 0.529244
+      "ms": 0.606139
     }
   ]
 }
