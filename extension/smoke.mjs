@@ -1184,6 +1184,36 @@ if (unfoldTool && foldCodeStr) {
 	if (typeof kAfter !== "number") fails.push("issue #93: expected a calibration observation on the snapshot after system-prompt capture");
 	else if (typeof kBefore === "number" && kAfter >= kBefore)
 		fails.push(`issue #93 (ADR 0025 un-smearing): expected calibration to shift DOWN once the system prompt is included in pendingWireEst (before=${kBefore}, after=${kAfter})`);
+
+	// Review regression: a prompt capture belongs to exactly one pi session. Force the NEXT
+	// session_start's best-effort refresh to throw before it can read getSystemPrompt(); the new
+	// Truth must still start with no prompt rather than inheriting SMOKE_SYSTEM_PROMPT from the
+	// process-level cache. This is the failure path that leaked one session's prompt into another.
+	const beforeResetMeta = await new Promise((resolve, reject) => {
+		http.get({ host: "127.0.0.1", port: PORT, path: "/__accordion/meta" }, (res) => {
+			let buf = "";
+			res.on("data", (d) => (buf += d));
+			res.on("end", () => {
+				try { resolve(JSON.parse(buf)); } catch (e) { reject(e); }
+			});
+		}).on("error", reject);
+	});
+	const savedGetContextUsage = ctx.getContextUsage;
+	const savedGetSystemPrompt = ctx.getSystemPrompt;
+	ctx.getContextUsage = () => { throw new Error("intentional session-start refresh failure"); };
+	handlers.session_start({ type: "session_start", reason: "new" }, ctx);
+	ctx.getContextUsage = savedGetContextUsage;
+	ctx.getSystemPrompt = savedGetSystemPrompt;
+
+	a.inbox.snapshot.length = 0;
+	a.ws.send(JSON.stringify({ type: "resnapshot" }));
+	await waitFor(() => a.inbox.snapshot.length > 0, 2000, "snapshot after prompt-cache reset").catch(
+		() => fails.push("issue #93 review: resnapshot after session-start prompt-cache reset produced no snapshot"),
+	);
+	const resetSp = a.inbox.snapshot.at(-1)?.state?.systemPrompt;
+	if (resetSp !== null)
+		fails.push(`issue #93 review: new session inherited the prior system prompt after refresh failure (${JSON.stringify(resetSp)})`);
+	try { fs.unlinkSync(path.join(SESSIONS_DIR, `${beforeResetMeta.sessionId}.json`)); } catch { /* already gone */ }
 }
 
 a.ws.close();

@@ -104,12 +104,13 @@ export function hostEventsFromTruthEvent(truth: Truth, e: TruthEvent): HostEvent
 		return changes.length ? [{ type: "state-changed", changes, rev: e.rev }] : [];
 	}
 	if (e.type === "config") {
-		// `calibration` (v18, issue #11 stage 1) and `systemPrompt` (v19, issue #93) are both
-		// DISPLAY-only (a conductor reads `systemPrompt` via `ConductorHost.systemPrompt()` directly
-		// instead) and must stay invisible as a `state-changed` notification — neither carries a
-		// `budget`/`protectTokens`/`contextWindow` field, so without this guard either would fall
-		// through to the `budget !== undefined ? "budget" : "protect"` default and get mislabeled a
-		// "protect" change, waking every subscribed conductor for a dial it was never meant to see.
+		// A system-prompt change moves `stats().liveTokens`/`fullTokens`, so it is decision-bearing
+		// for ViewConductors even though the prompt itself is read-only. Surface a distinct change
+		// rather than leaving compaction/handoff planned against the previous total until the next
+		// turn. Calibration remains host/display plumbing and intentionally emits no HostEvent.
+		if (e.systemPrompt !== undefined) {
+			return [{ type: "state-changed", changes: [{ what: "systemPrompt", by: "you" }], rev: e.rev }];
+		}
 		if (e.budget === undefined && e.protectTokens === undefined && e.contextWindow === undefined) return [];
 		const what: StateChange["what"] = e.budget !== undefined ? "budget" : "protect";
 		return [{ type: "state-changed", changes: [{ what, by: "you" }], rev: e.rev }];
