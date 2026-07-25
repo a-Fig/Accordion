@@ -34,8 +34,33 @@ function countLines(text) {
   return n;
 }
 
+/**
+ * Strip comment trivia from a fragment of TS/JS source using ts's own
+ * scanner — NOT a regex — so string/template literals containing `//` or
+ * `/*` (e.g. a URL) are never mistaken for a comment. Used exclusively by
+ * `collapse()` (the L3 "API card" renderer): L3 drops ALL comments, but a
+ * raw interface/type-alias/enum body is emitted as one un-walked text slice
+ * rather than member-by-member, so embedded JSDoc has to be swept out here
+ * instead of via `leadingDoc`'s per-node gating.
+ */
+function stripComments(text) {
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, /* skipTrivia */ false, ts.LanguageVariant.Standard, text);
+  const out = [];
+  let kind = scanner.scan();
+  while (kind !== ts.SyntaxKind.EndOfFileToken) {
+    if (kind !== ts.SyntaxKind.SingleLineCommentTrivia && kind !== ts.SyntaxKind.MultiLineCommentTrivia) {
+      out.push(scanner.getTokenText());
+    } else {
+      out.push(" ");
+    }
+    kind = scanner.scan();
+  }
+  return out.join("");
+}
+
+/** Collapse to single-line, comment-free text — the L3 "API card" form. */
 function collapse(text) {
-  return text.replace(/\s+/g, " ").trim();
+  return stripComments(text).replace(/\s+/g, " ").trim();
 }
 
 function excerpt(source, headChars = 500, tailChars = 500) {
@@ -112,13 +137,17 @@ function renderFunctionLike(node, sf, source, doc, decs) {
     const n = countLines(source.slice(body.getStart(sf), body.getEnd()));
     return doc + decs + sig + ` { /* … ${n} lines */ }`;
   }
-  // concise arrow body (non-block expression)
+  // concise arrow body (non-block expression) — only ArrowFunction reaches here (a
+  // FunctionDeclaration/FunctionExpression/method body is always a Block). A bare
+  // `/* comment */` after "=>" is NOT a valid expression, so an elided concise body
+  // must become a real (trivial) expression, not just a comment, to stay parseable.
   const bodyText = source.slice(body.getStart(sf), body.getEnd());
   if (bodyText.length <= SMALL_INIT_MAX && !bodyText.includes("\n")) {
     return doc + decs + sig + " " + bodyText;
   }
   const n = countLines(bodyText);
-  return doc + decs + sig + ` /* … elided, ${n} lines */`;
+  // plain `undefined` (not a TS type assertion) stays valid in .js/.jsx too
+  return doc + decs + sig + ` undefined /* … elided, ${n} lines */`;
 }
 
 /** Elide a variable/property initializer: verbatim if small & primitive,
@@ -141,7 +170,8 @@ function elideInitializer(init, sf, source) {
     return `[ /* … ${n} items */ ]`;
   }
   if (text.length <= SMALL_INIT_MAX && !text.includes("\n")) return text;
-  return `/* … elided, ${text.length} chars */`;
+  // must stay a valid expression (a bare comment is not one) — see the arrow-body fix above
+  return `undefined /* … elided, ${text.length} chars */`;
 }
 
 function renderVarDeclarator(d, sf, source) {
@@ -190,38 +220,39 @@ function renderClassMember(m, sf, source, level) {
   ) {
     return doc + decs + renderFunctionLike(m, sf, source, "", "");
   }
+  const memberIndent = indentAtPos(source, m.getStart(sf));
   if (ts.isPropertyDeclaration(m)) {
     // m.getStart(sf) is already post-decorator (decorators are sliced separately above).
     const base = m.type
       ? source.slice(m.getStart(sf), m.type.getEnd())
       : source.slice(m.getStart(sf), m.name.getEnd());
     const suffix = m.type ? "" : (m.questionToken ? "?" : "") + (m.exclamationToken ? "!" : "");
-    if (!m.initializer) return doc + decs + base + suffix + ";";
-    return doc + decs + base + suffix + " = " + elideInitializer(m.initializer, sf, source) + ";";
+    if (!m.initializer) return doc + decs + memberIndent + base + suffix + ";";
+    return doc + decs + memberIndent + base + suffix + " = " + elideInitializer(m.initializer, sf, source) + ";";
   }
   if (m.kind === ts.SyntaxKind.IndexSignature || ts.isIndexSignatureDeclaration(m)) {
-    return doc + decs + source.slice(m.getStart(sf), m.getEnd()) + ";";
+    return doc + decs + memberIndent + source.slice(m.getStart(sf), m.getEnd()) + ";";
   }
   if (ts.isClassStaticBlockDeclaration && ts.isClassStaticBlockDeclaration(m)) {
     const n = countLines(source.slice(m.body.getStart(sf), m.body.getEnd()));
-    return doc + `static { /* … ${n} lines */ }`;
+    return doc + memberIndent + `static { /* … ${n} lines */ }`;
   }
   // fallback: unknown member kind, keep verbatim if small else elide
   const text = source.slice(m.getStart(sf), m.getEnd());
-  if (text.length <= 160 && !text.includes("\n")) return doc + decs + text;
-  return doc + decs + `/* … member elided, ${countLines(text)} lines */`;
+  if (text.length <= 160 && !text.includes("\n")) return doc + decs + memberIndent + text;
+  return doc + decs + memberIndent + `/* … member elided, ${countLines(text)} lines */`;
 }
 
 function renderClass(node, sf, source, level) {
   const doc = leadingDoc(node, sf, source, level);
   const decs = decoratorsText(node, sf, source, level);
   const braceStart = classHeaderBraceStart(node, sf, source);
-  const header = source.slice(node.getStart(sf), braceStart).trimEnd() + " {";
+  const header = indentAtPos(source, node.getStart(sf)) + source.slice(node.getStart(sf), braceStart).trimEnd() + " {";
   const lines = [doc + decs + header];
   for (const m of node.members) {
     const rendered = renderClassMember(m, sf, source, level);
     if (rendered === null) continue;
-    for (const ln of rendered.split("\n")) lines.push("  " + ln);
+    for (const ln of rendered.split("\n")) lines.push(ln);
   }
   lines.push("}");
   return lines.join("\n");
@@ -231,15 +262,15 @@ function renderNamespace(node, sf, source, level) {
   const doc = leadingDoc(node, sf, source, level);
   if (!node.body || !ts.isModuleBlock(node.body)) {
     // ambient/declared namespace with no block body we can walk — keep verbatim
-    return doc + source.slice(node.getStart(sf), node.getEnd());
+    return doc + indentAtPos(source, node.getStart(sf)) + source.slice(node.getStart(sf), node.getEnd());
   }
   const headerEnd = node.body.getStart(sf);
-  const header = source.slice(node.getStart(sf), headerEnd).trimEnd() + " {";
+  const header = indentAtPos(source, node.getStart(sf)) + source.slice(node.getStart(sf), headerEnd).trimEnd() + " {";
   const lines = [doc + header];
   for (const stmt of node.body.statements) {
     const rendered = renderTopStatement(stmt, sf, source, level);
     if (rendered === null) continue;
-    for (const ln of rendered.split("\n")) lines.push("  " + ln);
+    for (const ln of rendered.split("\n")) lines.push(ln);
   }
   lines.push("}");
   return lines.join("\n");
@@ -247,24 +278,24 @@ function renderNamespace(node, sf, source, level) {
 
 function renderGenericStatement(stmt, sf, source, level) {
   const doc = leadingDoc(stmt, sf, source, level);
-  const text = source.slice(stmt.getStart(sf), stmt.getEnd());
+  const text = indentAtPos(source, stmt.getStart(sf)) + source.slice(stmt.getStart(sf), stmt.getEnd());
   if (text.length <= 160 && !text.includes("\n")) return doc + text;
   const n = countLines(text);
-  return doc + `/* … top-level statement elided, ${n} lines */`;
+  return doc + indentAtPos(source, stmt.getStart(sf)) + `/* … top-level statement elided, ${n} lines */`;
 }
 
 function renderTopStatement(stmt, sf, source, level) {
   if (ts.isImportDeclaration(stmt) || ts.isImportEqualsDeclaration(stmt)) {
     const doc = leadingDoc(stmt, sf, source, level);
-    return doc + source.slice(stmt.getStart(sf), stmt.getEnd());
+    return doc + indentAtPos(source, stmt.getStart(sf)) + source.slice(stmt.getStart(sf), stmt.getEnd());
   }
   if (ts.isExportDeclaration(stmt) || ts.isExportAssignment(stmt)) {
     const doc = leadingDoc(stmt, sf, source, level);
-    return doc + source.slice(stmt.getStart(sf), stmt.getEnd());
+    return doc + indentAtPos(source, stmt.getStart(sf)) + source.slice(stmt.getStart(sf), stmt.getEnd());
   }
   if (ts.isTypeAliasDeclaration(stmt) || ts.isInterfaceDeclaration(stmt) || ts.isEnumDeclaration(stmt)) {
     const doc = leadingDoc(stmt, sf, source, level);
-    return doc + source.slice(stmt.getStart(sf), stmt.getEnd());
+    return doc + indentAtPos(source, stmt.getStart(sf)) + source.slice(stmt.getStart(sf), stmt.getEnd());
   }
   if (ts.isModuleDeclaration(stmt)) {
     return renderNamespace(stmt, sf, source, level);
@@ -277,7 +308,7 @@ function renderTopStatement(stmt, sf, source, level) {
     const decs = decoratorsText(stmt, sf, source, level);
     if (!stmt.body) {
       // overload signature — no body to elide
-      return doc + decs + source.slice(stmt.getStart(sf), stmt.getEnd());
+      return doc + decs + indentAtPos(source, stmt.getStart(sf)) + source.slice(stmt.getStart(sf), stmt.getEnd());
     }
     return doc + decs + renderFunctionLike(stmt, sf, source, "", "");
   }
