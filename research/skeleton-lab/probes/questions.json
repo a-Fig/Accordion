@@ -1,0 +1,178 @@
+{
+  "files": {
+    "corpus/files/agentView.ts": [
+      {
+        "id": "agentView-q1",
+        "category": "structural",
+        "question": "In agentView.ts, what are the field names and their types on the `RecallContent` interface?",
+        "answer": "code: string; label: string; text: string; ids: string[]",
+        "gradingNote": "Correct if all four fields (code, label, text, ids) are named with matching types; order doesn't matter."
+      },
+      {
+        "id": "agentView-q2",
+        "category": "structural",
+        "question": "In agentView.ts, what is the declared return type of the function `resolveRecall`?",
+        "answer": "{ restored: RecallContent[]; missing: string[] }",
+        "gradingNote": "Correct if the answer names both fields (restored: RecallContent[], missing: string[]) regardless of exact formatting."
+      },
+      {
+        "id": "agentView-q3",
+        "category": "structural",
+        "question": "In agentView.ts, what single parameter does the function `blockLabel` take (name and type), and what type does it return?",
+        "answer": "Parameter: b: Block. Returns: string.",
+        "gradingNote": "Correct if parameter name/type (b: Block) and return type (string) are both given."
+      },
+      {
+        "id": "agentView-q4",
+        "category": "structural",
+        "question": "In agentView.ts, which exported interface has a field typed `Block[\"kind\"]`, and what is that field's name?",
+        "answer": "UnfoldRestored; the field is named `kind`.",
+        "gradingNote": "Correct if interface name UnfoldRestored and field name kind are both given."
+      },
+      {
+        "id": "agentView-q5",
+        "category": "structural",
+        "question": "In agentView.ts, list every symbol imported from \"./digest\" and every symbol imported from \"./wire\".",
+        "answer": "From \"./digest\": foldCode, wireFoldable. From \"./wire\": isDurableId.",
+        "gradingNote": "Correct if both digest symbols (foldCode, wireFoldable) and the wire symbol (isDurableId) are correctly attributed to their module."
+      },
+      {
+        "id": "agentView-q6",
+        "category": "body-only",
+        "question": "Inside `resolveUnfold` in agentView.ts, when a matched group satisfies `g.folded && foldCode(g.id) === code`, what op `kind` string is passed to `truth.apply`?",
+        "answer": "\"unfoldGroup\"",
+        "gradingNote": "Correct answer is the literal string 'unfoldGroup'. A skeleton-only reader should say this cannot be determined since it's inside the function body."
+      },
+      {
+        "id": "agentView-q7",
+        "category": "body-only",
+        "question": "In `resolveRecall` in agentView.ts, under what condition does the per-block loop `continue` (skip) a matched block, and what is the stated reason in the inline comment?",
+        "answer": "When `truth.groupOf(b)?.folded` is true (the block's group is itself folded); the comment says the group branch already returns the whole range.",
+        "gradingNote": "Correct if answer identifies the group-folded condition and the 'group branch already returns the whole range' rationale. Skeleton-only should say undeterminable."
+      },
+      {
+        "id": "agentView-q8",
+        "category": "body-only",
+        "question": "In `resolveUnfold`'s per-block match loop in agentView.ts, what boolean variable determines whether a block is recorded as restored, and what happens in the code when that variable is true?",
+        "answer": "`stillFolded`; when true, the loop does `continue`, so the block is NOT pushed to `restored` and `hit` is not set to true.",
+        "gradingNote": "Correct if the variable name stillFolded is given and the effect (skip recording as restored) is described. Skeleton-only should say undeterminable."
+      }
+    ],
+    "corpus/files/wire.ts": [
+      {
+        "id": "wire-q1",
+        "category": "structural",
+        "question": "In wire.ts, what are the parameter names and types in the signature of the function `blockId`, and what does it return?",
+        "answer": "m: PiMessage, i: number, partIndex?: number; returns string.",
+        "gradingNote": "Correct if all three parameters with their types are given and the return type (string) is stated."
+      },
+      {
+        "id": "wire-q2",
+        "category": "structural",
+        "question": "In wire.ts, what exact hexadecimal literal is assigned to the module-level constant `FNV_PRIME`?",
+        "answer": "0x01000193",
+        "gradingNote": "Correct only if the exact hex literal 0x01000193 is given. Note: this constant is a top-level statement, not inside a function body, so it IS visible in a good skeleton."
+      },
+      {
+        "id": "wire-q3",
+        "category": "structural",
+        "question": "In wire.ts, what is the full expression that defines the constant `tokensFor`?",
+        "answer": "const tokensFor = (text: string): number => estTokens(text) + BLOCK_OVERHEAD;",
+        "gradingNote": "Correct if the answer captures 'estTokens(text) + BLOCK_OVERHEAD' as the arrow function body. This is a top-level one-line const, visible in a good skeleton."
+      },
+      {
+        "id": "wire-q4",
+        "category": "structural",
+        "question": "In wire.ts, which exported interface extends `MsgInfo`, and what additional field does it add beyond MsgInfo's own fields?",
+        "answer": "WireMsgShape extends MsgInfo, adding the field `role: string`.",
+        "gradingNote": "Correct if interface name WireMsgShape and the added field role: string are both given."
+      },
+      {
+        "id": "wire-q5",
+        "category": "structural",
+        "question": "In wire.ts, `BLOCK_OVERHEAD` is imported from a module that also supplies one other named symbol. Name the module and that other symbol.",
+        "answer": "Module \"./tokens\"; the other symbol is `estTokens`.",
+        "gradingNote": "Correct if module ./tokens and symbol estTokens are both given."
+      },
+      {
+        "id": "wire-q6",
+        "category": "body-only",
+        "question": "Inside `blockId`'s \"assistant\" case in wire.ts, when `m.responseId` is null/undefined but `m.timestamp` is not, what string is used as the anchor (before the `:p<partIndex>` suffix is appended)?",
+        "answer": "`t${m.timestamp}` — the literal character \"t\" prefixed to the timestamp.",
+        "gradingNote": "Correct if the answer identifies the 't' + timestamp construction. Skeleton-only should say undeterminable (this logic is inside the function body)."
+      },
+      {
+        "id": "wire-q7",
+        "category": "body-only",
+        "question": "Inside `linearize`'s internal `push` helper in wire.ts, under exactly what condition is a block NOT pushed to the output array (dropped)?",
+        "answer": "When `!text && kind !== \"tool_result\"` — i.e. the text is empty/falsy and the kind is anything other than tool_result.",
+        "gradingNote": "Correct if the condition (empty text AND kind is not tool_result) is captured. Skeleton-only should say undeterminable."
+      },
+      {
+        "id": "wire-q8",
+        "category": "body-only",
+        "question": "In `foldOne` in wire.ts, when folding a message with role `toolResult`, what exact content array is assigned to the new message's `content`?",
+        "answer": "[{ type: \"text\", text: op.digestText }]",
+        "gradingNote": "Correct if the answer matches a single-element array with type: 'text' and text: op.digestText. Skeleton-only should say undeterminable."
+      }
+    ],
+    "corpus/files/reprlib.py": [
+      {
+        "id": "reprlib-q1",
+        "category": "structural",
+        "question": "In reprlib.py, what is the default value of the `fillvalue` parameter in the `recursive_repr` function's signature?",
+        "answer": "'...' (the three-character string of three dots)",
+        "gradingNote": "Correct if the answer is the string '...' matching `recursive_repr(fillvalue='...')`."
+      },
+      {
+        "id": "reprlib-q2",
+        "category": "structural",
+        "question": "What is the one-line module docstring at the very top of reprlib.py?",
+        "answer": "\"Redo the builtin repr() (representation) but with limits on most sizes.\"",
+        "gradingNote": "Correct if the meaning/text of the module docstring is substantially reproduced."
+      },
+      {
+        "id": "reprlib-q3",
+        "category": "structural",
+        "question": "What three names does reprlib.py's `__all__` list export?",
+        "answer": "Repr, repr, recursive_repr",
+        "gradingNote": "Correct if all three names are given, in any order."
+      },
+      {
+        "id": "reprlib-q4",
+        "category": "structural",
+        "question": "What are the parameter names, in order, of the `Repr._repr_iterable` method (including any default value shown in the signature)?",
+        "answer": "self, x, level, left, right, maxiter, trail='' ",
+        "gradingNote": "Correct if x, level, left, right, maxiter, trail are listed in order with trail's default of '' (self may be included or omitted)."
+      },
+      {
+        "id": "reprlib-q5",
+        "category": "structural",
+        "question": "reprlib.py has two `from <module> import <name>` style imports. Name both modules and the symbol imported from each.",
+        "answer": "from itertools import islice; from _thread import get_ident.",
+        "gradingNote": "Correct if both module/symbol pairs (itertools->islice, _thread->get_ident) are given."
+      },
+      {
+        "id": "reprlib-q6",
+        "category": "body-only",
+        "question": "In `Repr.__init__` in reprlib.py, what integer value is `self.maxstring` set to?",
+        "answer": "30",
+        "gradingNote": "Correct only if the literal value 30 is given. Skeleton-only should say undeterminable (this assignment is inside the elided __init__ body)."
+      },
+      {
+        "id": "reprlib-q7",
+        "category": "body-only",
+        "question": "Inside `Repr.repr_int` in reprlib.py, when the repr string of `x` is longer than `self.maxlong`, how is the resulting truncated string constructed?",
+        "answer": "It computes i = max(0, (maxlong-3)//2) and j = max(0, maxlong-3-i), then builds s[:i] + self.fillvalue + s[len(s)-j:] — keeping a prefix and suffix of the original repr and splicing the fillvalue ('...') in the middle.",
+        "gradingNote": "Correct if the answer describes keeping a head/tail slice of the string and inserting the fillvalue in between. Skeleton-only should say undeterminable."
+      },
+      {
+        "id": "reprlib-q8",
+        "category": "body-only",
+        "question": "In `Repr.repr_instance` in reprlib.py, what exception type is caught around the call to `builtins.repr(x)`?",
+        "answer": "Exception",
+        "gradingNote": "Correct only if 'Exception' (the bare except Exception clause) is given. Skeleton-only should say undeterminable."
+      }
+    ]
+  }
+}

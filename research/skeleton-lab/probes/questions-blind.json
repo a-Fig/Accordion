@@ -1,0 +1,130 @@
+{
+  "files": {
+    "corpus/files/agentView.ts": [
+      {
+        "id": "agentView-q1",
+        "category": "structural",
+        "question": "In agentView.ts, what are the field names and their types on the `RecallContent` interface?"
+      },
+      {
+        "id": "agentView-q2",
+        "category": "structural",
+        "question": "In agentView.ts, what is the declared return type of the function `resolveRecall`?"
+      },
+      {
+        "id": "agentView-q3",
+        "category": "structural",
+        "question": "In agentView.ts, what single parameter does the function `blockLabel` take (name and type), and what type does it return?"
+      },
+      {
+        "id": "agentView-q4",
+        "category": "structural",
+        "question": "In agentView.ts, which exported interface has a field typed `Block[\"kind\"]`, and what is that field's name?"
+      },
+      {
+        "id": "agentView-q5",
+        "category": "structural",
+        "question": "In agentView.ts, list every symbol imported from \"./digest\" and every symbol imported from \"./wire\"."
+      },
+      {
+        "id": "agentView-q6",
+        "category": "body-only",
+        "question": "Inside `resolveUnfold` in agentView.ts, when a matched group satisfies `g.folded && foldCode(g.id) === code`, what op `kind` string is passed to `truth.apply`?"
+      },
+      {
+        "id": "agentView-q7",
+        "category": "body-only",
+        "question": "In `resolveRecall` in agentView.ts, under what condition does the per-block loop `continue` (skip) a matched block, and what is the stated reason in the inline comment?"
+      },
+      {
+        "id": "agentView-q8",
+        "category": "body-only",
+        "question": "In `resolveUnfold`'s per-block match loop in agentView.ts, what boolean variable determines whether a block is recorded as restored, and what happens in the code when that variable is true?"
+      }
+    ],
+    "corpus/files/wire.ts": [
+      {
+        "id": "wire-q1",
+        "category": "structural",
+        "question": "In wire.ts, what are the parameter names and types in the signature of the function `blockId`, and what does it return?"
+      },
+      {
+        "id": "wire-q2",
+        "category": "structural",
+        "question": "In wire.ts, what exact hexadecimal literal is assigned to the module-level constant `FNV_PRIME`?"
+      },
+      {
+        "id": "wire-q3",
+        "category": "structural",
+        "question": "In wire.ts, what is the full expression that defines the constant `tokensFor`?"
+      },
+      {
+        "id": "wire-q4",
+        "category": "structural",
+        "question": "In wire.ts, which exported interface extends `MsgInfo`, and what additional field does it add beyond MsgInfo's own fields?"
+      },
+      {
+        "id": "wire-q5",
+        "category": "structural",
+        "question": "In wire.ts, `BLOCK_OVERHEAD` is imported from a module that also supplies one other named symbol. Name the module and that other symbol."
+      },
+      {
+        "id": "wire-q6",
+        "category": "body-only",
+        "question": "Inside `blockId`'s \"assistant\" case in wire.ts, when `m.responseId` is null/undefined but `m.timestamp` is not, what string is used as the anchor (before the `:p<partIndex>` suffix is appended)?"
+      },
+      {
+        "id": "wire-q7",
+        "category": "body-only",
+        "question": "Inside `linearize`'s internal `push` helper in wire.ts, under exactly what condition is a block NOT pushed to the output array (dropped)?"
+      },
+      {
+        "id": "wire-q8",
+        "category": "body-only",
+        "question": "In `foldOne` in wire.ts, when folding a message with role `toolResult`, what exact content array is assigned to the new message's `content`?"
+      }
+    ],
+    "corpus/files/reprlib.py": [
+      {
+        "id": "reprlib-q1",
+        "category": "structural",
+        "question": "In reprlib.py, what is the default value of the `fillvalue` parameter in the `recursive_repr` function's signature?"
+      },
+      {
+        "id": "reprlib-q2",
+        "category": "structural",
+        "question": "What is the one-line module docstring at the very top of reprlib.py?"
+      },
+      {
+        "id": "reprlib-q3",
+        "category": "structural",
+        "question": "What three names does reprlib.py's `__all__` list export?"
+      },
+      {
+        "id": "reprlib-q4",
+        "category": "structural",
+        "question": "What are the parameter names, in order, of the `Repr._repr_iterable` method (including any default value shown in the signature)?"
+      },
+      {
+        "id": "reprlib-q5",
+        "category": "structural",
+        "question": "reprlib.py has two `from <module> import <name>` style imports. Name both modules and the symbol imported from each."
+      },
+      {
+        "id": "reprlib-q6",
+        "category": "body-only",
+        "question": "In `Repr.__init__` in reprlib.py, what integer value is `self.maxstring` set to?"
+      },
+      {
+        "id": "reprlib-q7",
+        "category": "body-only",
+        "question": "Inside `Repr.repr_int` in reprlib.py, when the repr string of `x` is longer than `self.maxlong`, how is the resulting truncated string constructed?"
+      },
+      {
+        "id": "reprlib-q8",
+        "category": "body-only",
+        "question": "In `Repr.repr_instance` in reprlib.py, what exception type is caught around the call to `builtins.repr(x)`?"
+      }
+    ]
+  }
+}
