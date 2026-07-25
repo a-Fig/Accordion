@@ -210,7 +210,17 @@ function sanitizeElisionForLenient(skeleton, lang) {
   return sanitized;
 }
 
-/** validity() after stripping/neutralizing elision-marker punctuation. */
+/**
+ * validity() after stripping/neutralizing elision-marker punctuation.
+ *
+ * Lenient is monotone by definition: a skeleton that already parses strictly is
+ * lenient-valid without running the sanitizer. (The sanitizer's blanket "…"
+ * replacement can CORRUPT already-valid text — e.g. "…" inside a `/* … *​/`
+ * comment becomes a nested comment that closes the outer one early — so it must
+ * only ever be applied as a second chance for strictly-invalid skeletons.)
+ */
 export function validityLenient(skeleton, lang) {
+  const strict = validity(skeleton, lang);
+  if (strict.valid) return strict;
   return validity(sanitizeElisionForLenient(skeleton, lang), lang);
 }
