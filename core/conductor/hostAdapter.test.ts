@@ -167,6 +167,16 @@ describe("hostEventsFromTruthEvent — TruthEvent → HostEvent[] mapping", () =
 		expect(captured).toEqual([{ type: "state-changed", changes: [{ what: "protect", by: "you" }], rev: t.rev }]);
 	});
 
+	it("config (calibration) / config (systemPrompt) → NO HostEvent (both DISPLAY-only, invisible to a conductor)", () => {
+		const t = bulk(seq(2, 1000));
+		let captured: HostEvent[] = [];
+		t.onEvent((e) => (captured = hostEventsFromTruthEvent(t, e)));
+		t.setCalibration(1.5);
+		expect(captured).toEqual([]);
+		t.setSystemPrompt("a captured prompt", 5);
+		expect(captured).toEqual([]);
+	});
+
 	it("reset → resync", () => {
 		const t = bulk(seq(2, 1000));
 		t.setProtect(0);
