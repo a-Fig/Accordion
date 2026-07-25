@@ -1,0 +1,4688 @@
+{
+  "corpus/files/types.ts": {
+    "symbols": [
+      {
+        "name": "BlockKind",
+        "kind": "type",
+        "exported": true,
+        "line": 16
+      },
+      {
+        "name": "Actor",
+        "kind": "type",
+        "exported": true,
+        "line": 31
+      },
+      {
+        "name": "Override",
+        "kind": "type",
+        "exported": true,
+        "line": 40
+      },
+      {
+        "name": "Block",
+        "kind": "interface",
+        "exported": true,
+        "line": 42
+      },
+      {
+        "name": "Group",
+        "kind": "interface",
+        "exported": true,
+        "line": 103
+      },
+      {
+        "name": "SessionMeta",
+        "kind": "interface",
+        "exported": true,
+        "line": 118
+      },
+      {
+        "name": "ParsedSession",
+        "kind": "interface",
+        "exported": true,
+        "line": 125
+      }
+    ]
+  },
+  "corpus/files/agentView.ts": {
+    "symbols": [
+      {
+        "name": "UnfoldRestored",
+        "kind": "interface",
+        "exported": true,
+        "line": 20
+      },
+      {
+        "name": "RecallContent",
+        "kind": "interface",
+        "exported": true,
+        "line": 29
+      },
+      {
+        "name": "blockLabel",
+        "kind": "function",
+        "exported": true,
+        "line": 38
+      },
+      {
+        "name": "resolveUnfold",
+        "kind": "function",
+        "exported": true,
+        "line": 50
+      },
+      {
+        "name": "resolveRecall",
+        "kind": "function",
+        "exported": true,
+        "line": 88
+      }
+    ]
+  },
+  "corpus/files/protocol.ts": {
+    "symbols": [
+      {
+        "name": "PROTOCOL_VERSION",
+        "kind": "const",
+        "exported": true,
+        "line": 95
+      },
+      {
+        "name": "DOOR_PORT",
+        "kind": "const",
+        "exported": true,
+        "line": 104
+      },
+      {
+        "name": "DEFAULT_PORT",
+        "kind": "const",
+        "exported": true,
+        "line": 112
+      },
+      {
+        "name": "WireBlock",
+        "kind": "interface",
+        "exported": true,
+        "line": 124
+      },
+      {
+        "name": "FoldOp",
+        "kind": "interface",
+        "exported": true,
+        "line": 143
+      },
+      {
+        "name": "GroupOp",
+        "kind": "interface",
+        "exported": true,
+        "line": 153
+      },
+      {
+        "name": "Role",
+        "kind": "type",
+        "exported": true,
+        "line": 160
+      },
+      {
+        "name": "SessionMetaWire",
+        "kind": "interface",
+        "exported": true,
+        "line": 163
+      },
+      {
+        "name": "ActiveConductorMeta",
+        "kind": "interface",
+        "exported": true,
+        "line": 176
+      },
+      {
+        "name": "ControllerInfo",
+        "kind": "interface",
+        "exported": true,
+        "line": 194
+      },
+      {
+        "name": "WireOverlay",
+        "kind": "interface",
+        "exported": true,
+        "line": 201
+      },
+      {
+        "name": "SnapshotState",
+        "kind": "interface",
+        "exported": true,
+        "line": 214
+      },
+      {
+        "name": "WireEvent",
+        "kind": "type",
+        "exported": true,
+        "line": 261
+      },
+      {
+        "name": "HelloMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 272
+      },
+      {
+        "name": "SnapshotMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 288
+      },
+      {
+        "name": "EventMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 294
+      },
+      {
+        "name": "FoldingMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 300
+      },
+      {
+        "name": "RecallObservationMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 310
+      },
+      {
+        "name": "TelemetryMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 323
+      },
+      {
+        "name": "CommandResultMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 335
+      },
+      {
+        "name": "ControllerMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 358
+      },
+      {
+        "name": "StreamMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 369
+      },
+      {
+        "name": "ConductorStateMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 382
+      },
+      {
+        "name": "ConductorStatusMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 392
+      },
+      {
+        "name": "NoticeMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 406
+      },
+      {
+        "name": "WireDepartingMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 420
+      },
+      {
+        "name": "TurnCommittedMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 431
+      },
+      {
+        "name": "ProposeResultMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 438
+      },
+      {
+        "name": "CompleteResultMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 447
+      },
+      {
+        "name": "ServerMessage",
+        "kind": "type",
+        "exported": true,
+        "line": 458
+      },
+      {
+        "name": "WireCommand",
+        "kind": "type",
+        "exported": true,
+        "line": 485
+      },
+      {
+        "name": "CommandMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 492
+      },
+      {
+        "name": "ProposeMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 503
+      },
+      {
+        "name": "CompleteRequestMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 515
+      },
+      {
+        "name": "SetConductorStatusMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 526
+      },
+      {
+        "name": "HoldReleaseMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 541
+      },
+      {
+        "name": "CancelCompleteMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 552
+      },
+      {
+        "name": "ResnapshotMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 562
+      },
+      {
+        "name": "ClaimControllerMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 573
+      },
+      {
+        "name": "ClientMessage",
+        "kind": "type",
+        "exported": true,
+        "line": 577
+      },
+      {
+        "name": "SERVER_TYPES",
+        "kind": "const",
+        "exported": false,
+        "line": 589
+      },
+      {
+        "name": "isServerMessage",
+        "kind": "function",
+        "exported": true,
+        "line": 608
+      },
+      {
+        "name": "CLIENT_TYPES",
+        "kind": "const",
+        "exported": false,
+        "line": 613
+      },
+      {
+        "name": "isClientMessage",
+        "kind": "function",
+        "exported": true,
+        "line": 615
+      },
+      {
+        "name": "WIRE_KINDS",
+        "kind": "const",
+        "exported": false,
+        "line": 620
+      },
+      {
+        "name": "isWireBlock",
+        "kind": "function",
+        "exported": true,
+        "line": 627
+      },
+      {
+        "name": "sanitizeDialValue",
+        "kind": "function",
+        "exported": false,
+        "line": 642
+      },
+      {
+        "name": "sanitizeCommand",
+        "kind": "function",
+        "exported": true,
+        "line": 658
+      },
+      {
+        "name": "MAX_SURFACE_ID_LEN",
+        "kind": "const",
+        "exported": true,
+        "line": 684
+      },
+      {
+        "name": "MAX_SURFACE_LABEL_LEN",
+        "kind": "const",
+        "exported": true,
+        "line": 686
+      },
+      {
+        "name": "sanitizeSurfaceId",
+        "kind": "function",
+        "exported": true,
+        "line": 696
+      },
+      {
+        "name": "sanitizeSurfaceLabel",
+        "kind": "function",
+        "exported": true,
+        "line": 709
+      }
+    ]
+  },
+  "corpus/files/wire.ts": {
+    "symbols": [
+      {
+        "name": "PiTextPart",
+        "kind": "interface",
+        "exported": true,
+        "line": 30
+      },
+      {
+        "name": "PiThinkingPart",
+        "kind": "interface",
+        "exported": true,
+        "line": 34
+      },
+      {
+        "name": "PiToolCallPart",
+        "kind": "interface",
+        "exported": true,
+        "line": 38
+      },
+      {
+        "name": "PiPart",
+        "kind": "type",
+        "exported": true,
+        "line": 44
+      },
+      {
+        "name": "PiMessage",
+        "kind": "interface",
+        "exported": true,
+        "line": 46
+      },
+      {
+        "name": "blockId",
+        "kind": "function",
+        "exported": true,
+        "line": 69
+      },
+      {
+        "name": "isDurableId",
+        "kind": "function",
+        "exported": true,
+        "line": 101
+      },
+      {
+        "name": "textOf",
+        "kind": "function",
+        "exported": false,
+        "line": 105
+      },
+      {
+        "name": "tokensFor",
+        "kind": "const",
+        "exported": false,
+        "line": 115
+      },
+      {
+        "name": "linearize",
+        "kind": "function",
+        "exported": true,
+        "line": 128
+      },
+      {
+        "name": "wireToBlock",
+        "kind": "function",
+        "exported": true,
+        "line": 185
+      },
+      {
+        "name": "MsgInfo",
+        "kind": "interface",
+        "exported": true,
+        "line": 204
+      },
+      {
+        "name": "messageInfo",
+        "kind": "function",
+        "exported": true,
+        "line": 216
+      },
+      {
+        "name": "FNV_PRIME",
+        "kind": "const",
+        "exported": false,
+        "line": 269
+      },
+      {
+        "name": "fnvStr",
+        "kind": "function",
+        "exported": false,
+        "line": 270
+      },
+      {
+        "name": "fnvByte",
+        "kind": "function",
+        "exported": false,
+        "line": 278
+      },
+      {
+        "name": "fnvContent",
+        "kind": "function",
+        "exported": false,
+        "line": 281
+      },
+      {
+        "name": "contentFingerprint",
+        "kind": "function",
+        "exported": true,
+        "line": 328
+      },
+      {
+        "name": "WireMsgShape",
+        "kind": "interface",
+        "exported": true,
+        "line": 381
+      },
+      {
+        "name": "computeDegradedDropRuns",
+        "kind": "function",
+        "exported": true,
+        "line": 405
+      },
+      {
+        "name": "foldOne",
+        "kind": "function",
+        "exported": false,
+        "line": 525
+      },
+      {
+        "name": "applyPlan",
+        "kind": "function",
+        "exported": true,
+        "line": 624
+      },
+      {
+        "name": "roleFloorRecap",
+        "kind": "function",
+        "exported": true,
+        "line": 708
+      }
+    ]
+  },
+  "corpus/files/truth.ts": {
+    "symbols": [
+      {
+        "name": "GroupShape",
+        "kind": "interface",
+        "exported": false,
+        "line": 27
+      },
+      {
+        "name": "TruthStats",
+        "kind": "interface",
+        "exported": true,
+        "line": 37
+      },
+      {
+        "name": "PROTECT_OVERFLOW_CAP",
+        "kind": "const",
+        "exported": false,
+        "line": 49
+      },
+      {
+        "name": "LEADING_FOLD_TAG",
+        "kind": "const",
+        "exported": false,
+        "line": 53
+      },
+      {
+        "name": "messageKey",
+        "kind": "function",
+        "exported": true,
+        "line": 61
+      },
+      {
+        "name": "wireRoleOfId",
+        "kind": "function",
+        "exported": false,
+        "line": 88
+      },
+      {
+        "name": "messageCountOfRun",
+        "kind": "function",
+        "exported": false,
+        "line": 103
+      },
+      {
+        "name": "Truth",
+        "kind": "class",
+        "exported": true,
+        "line": 116
+      },
+      {
+        "name": "Truth.wireAttached",
+        "kind": "method",
+        "exported": true,
+        "line": 138
+      },
+      {
+        "name": "Truth.wireAttached",
+        "kind": "method",
+        "exported": true,
+        "line": 141
+      },
+      {
+        "name": "Truth.constructor",
+        "kind": "method",
+        "exported": true,
+        "line": 181
+      },
+      {
+        "name": "Truth.reindex",
+        "kind": "method",
+        "exported": false,
+        "line": 191
+      },
+      {
+        "name": "Truth.adoptSnapshot",
+        "kind": "method",
+        "exported": true,
+        "line": 210
+      },
+      {
+        "name": "Truth.rebuildFrom",
+        "kind": "method",
+        "exported": true,
+        "line": 264
+      },
+      {
+        "name": "Truth.onEvent",
+        "kind": "method",
+        "exported": true,
+        "line": 334
+      },
+      {
+        "name": "Truth.emit",
+        "kind": "method",
+        "exported": false,
+        "line": 338
+      },
+      {
+        "name": "Truth.rev",
+        "kind": "method",
+        "exported": true,
+        "line": 341
+      },
+      {
+        "name": "Truth.blocks",
+        "kind": "method",
+        "exported": true,
+        "line": 346
+      },
+      {
+        "name": "Truth.groups",
+        "kind": "method",
+        "exported": true,
+        "line": 349
+      },
+      {
+        "name": "Truth.get",
+        "kind": "method",
+        "exported": true,
+        "line": 352
+      },
+      {
+        "name": "Truth.protectTokens",
+        "kind": "method",
+        "exported": true,
+        "line": 356
+      },
+      {
+        "name": "Truth.budget",
+        "kind": "method",
+        "exported": true,
+        "line": 359
+      },
+      {
+        "name": "Truth.contextWindow",
+        "kind": "method",
+        "exported": true,
+        "line": 362
+      },
+      {
+        "name": "Truth.locks",
+        "kind": "method",
+        "exported": true,
+        "line": 365
+      },
+      {
+        "name": "Truth.lockHolder",
+        "kind": "method",
+        "exported": true,
+        "line": 368
+      },
+      {
+        "name": "Truth.birthFoldedIds",
+        "kind": "method",
+        "exported": true,
+        "line": 372
+      },
+      {
+        "name": "Truth.carriedSentIds",
+        "kind": "method",
+        "exported": true,
+        "line": 376
+      },
+      {
+        "name": "Truth.activeTailTokens",
+        "kind": "method",
+        "exported": true,
+        "line": 380
+      },
+      {
+        "name": "Truth.isLocked",
+        "kind": "method",
+        "exported": true,
+        "line": 383
+      },
+      {
+        "name": "Truth.sentThroughOrder",
+        "kind": "method",
+        "exported": true,
+        "line": 390
+      },
+      {
+        "name": "Truth.sent",
+        "kind": "method",
+        "exported": true,
+        "line": 400
+      },
+      {
+        "name": "Truth.isSent",
+        "kind": "method",
+        "exported": true,
+        "line": 405
+      },
+      {
+        "name": "Truth.held",
+        "kind": "method",
+        "exported": true,
+        "line": 410
+      },
+      {
+        "name": "Truth.isFolded",
+        "kind": "method",
+        "exported": true,
+        "line": 414
+      },
+      {
+        "name": "Truth.effTokens",
+        "kind": "method",
+        "exported": true,
+        "line": 422
+      },
+      {
+        "name": "Truth.digestOf",
+        "kind": "method",
+        "exported": true,
+        "line": 430
+      },
+      {
+        "name": "Truth.foldedTokensOf",
+        "kind": "method",
+        "exported": true,
+        "line": 434
+      },
+      {
+        "name": "Truth.liveTokens",
+        "kind": "method",
+        "exported": true,
+        "line": 437
+      },
+      {
+        "name": "Truth.fullTokens",
+        "kind": "method",
+        "exported": true,
+        "line": 442
+      },
+      {
+        "name": "Truth.foldedCount",
+        "kind": "method",
+        "exported": true,
+        "line": 447
+      },
+      {
+        "name": "Truth.stats",
+        "kind": "method",
+        "exported": true,
+        "line": 453
+      },
+      {
+        "name": "Truth.canFold",
+        "kind": "method",
+        "exported": true,
+        "line": 471
+      },
+      {
+        "name": "Truth.protectedFromIndex",
+        "kind": "method",
+        "exported": true,
+        "line": 490
+      },
+      {
+        "name": "Truth.computeProtectedFromIndex",
+        "kind": "method",
+        "exported": false,
+        "line": 496
+      },
+      {
+        "name": "Truth.isProtected",
+        "kind": "method",
+        "exported": true,
+        "line": 512
+      },
+      {
+        "name": "Truth.protectedTokens",
+        "kind": "method",
+        "exported": true,
+        "line": 515
+      },
+      {
+        "name": "Truth.groupOf",
+        "kind": "method",
+        "exported": true,
+        "line": 523
+      },
+      {
+        "name": "Truth.groupById",
+        "kind": "method",
+        "exported": true,
+        "line": 527
+      },
+      {
+        "name": "Truth.groupMembers",
+        "kind": "method",
+        "exported": true,
+        "line": 530
+      },
+      {
+        "name": "Truth.inFoldedGroup",
+        "kind": "method",
+        "exported": true,
+        "line": 538
+      },
+      {
+        "name": "Truth.isDropGroup",
+        "kind": "method",
+        "exported": true,
+        "line": 542
+      },
+      {
+        "name": "Truth.groupSummary",
+        "kind": "method",
+        "exported": true,
+        "line": 545
+      },
+      {
+        "name": "Truth.groupFullTokens",
+        "kind": "method",
+        "exported": true,
+        "line": 551
+      },
+      {
+        "name": "Truth.groupLiveTokens",
+        "kind": "method",
+        "exported": true,
+        "line": 556
+      },
+      {
+        "name": "Truth.groupSavedTokens",
+        "kind": "method",
+        "exported": true,
+        "line": 568
+      },
+      {
+        "name": "Truth.groupStragglerCount",
+        "kind": "method",
+        "exported": true,
+        "line": 571
+      },
+      {
+        "name": "Truth.groupWire",
+        "kind": "method",
+        "exported": false,
+        "line": 575
+      },
+      {
+        "name": "Truth.runWireTok",
+        "kind": "method",
+        "exported": false,
+        "line": 610
+      },
+      {
+        "name": "Truth.degradedRunKeys",
+        "kind": "method",
+        "exported": false,
+        "line": 648
+      },
+      {
+        "name": "Truth.buildWireShapes",
+        "kind": "method",
+        "exported": false,
+        "line": 664
+      },
+      {
+        "name": "Truth.classifyGroup",
+        "kind": "method",
+        "exported": false,
+        "line": 697
+      },
+      {
+        "name": "Truth.setGroups",
+        "kind": "method",
+        "exported": true,
+        "line": 775
+      },
+      {
+        "name": "Truth.snappedRange",
+        "kind": "method",
+        "exported": false,
+        "line": 780
+      },
+      {
+        "name": "Truth.append",
+        "kind": "method",
+        "exported": true,
+        "line": 797
+      },
+      {
+        "name": "Truth.setBudget",
+        "kind": "method",
+        "exported": true,
+        "line": 819
+      },
+      {
+        "name": "Truth.setContextWindow",
+        "kind": "method",
+        "exported": true,
+        "line": 831
+      },
+      {
+        "name": "Truth.setProtect",
+        "kind": "method",
+        "exported": true,
+        "line": 837
+      },
+      {
+        "name": "Truth.markSent",
+        "kind": "method",
+        "exported": true,
+        "line": 848
+      },
+      {
+        "name": "Truth.setLocks",
+        "kind": "method",
+        "exported": true,
+        "line": 856
+      },
+      {
+        "name": "Truth.clearLocks",
+        "kind": "method",
+        "exported": true,
+        "line": 884
+      },
+      {
+        "name": "Truth.releaseLockedDomains",
+        "kind": "method",
+        "exported": false,
+        "line": 900
+      },
+      {
+        "name": "Truth.housekeep",
+        "kind": "method",
+        "exported": false,
+        "line": 921
+      },
+      {
+        "name": "Truth.pruneProtectedGroups",
+        "kind": "method",
+        "exported": false,
+        "line": 925
+      },
+      {
+        "name": "Truth.healProtected",
+        "kind": "method",
+        "exported": false,
+        "line": 953
+      },
+      {
+        "name": "Truth.protectedFromIndexUncached",
+        "kind": "method",
+        "exported": false,
+        "line": 969
+      },
+      {
+        "name": "Truth.apply",
+        "kind": "method",
+        "exported": true,
+        "line": 974
+      },
+      {
+        "name": "Truth.stale",
+        "kind": "method",
+        "exported": false,
+        "line": 1000
+      },
+      {
+        "name": "Truth.applyOne",
+        "kind": "method",
+        "exported": false,
+        "line": 1006
+      },
+      {
+        "name": "Truth.done",
+        "kind": "method",
+        "exported": false,
+        "line": 1036
+      },
+      {
+        "name": "Truth.clamp",
+        "kind": "method",
+        "exported": false,
+        "line": 1040
+      },
+      {
+        "name": "Truth.eachId",
+        "kind": "method",
+        "exported": false,
+        "line": 1049
+      },
+      {
+        "name": "Truth.opFold",
+        "kind": "method",
+        "exported": false,
+        "line": 1067
+      },
+      {
+        "name": "Truth.opReplace",
+        "kind": "method",
+        "exported": false,
+        "line": 1098
+      },
+      {
+        "name": "Truth.opUnfold",
+        "kind": "method",
+        "exported": false,
+        "line": 1125
+      },
+      {
+        "name": "Truth.opPin",
+        "kind": "method",
+        "exported": false,
+        "line": 1164
+      },
+      {
+        "name": "Truth.opUnpin",
+        "kind": "method",
+        "exported": false,
+        "line": 1189
+      },
+      {
+        "name": "Truth.opAuto",
+        "kind": "method",
+        "exported": false,
+        "line": 1204
+      },
+      {
+        "name": "Truth.opGroup",
+        "kind": "method",
+        "exported": false,
+        "line": 1229
+      },
+      {
+        "name": "Truth.opUngroup",
+        "kind": "method",
+        "exported": false,
+        "line": 1247
+      },
+      {
+        "name": "Truth.opFoldGroup",
+        "kind": "method",
+        "exported": false,
+        "line": 1258
+      },
+      {
+        "name": "Truth.opUnfoldGroup",
+        "kind": "method",
+        "exported": false,
+        "line": 1271
+      },
+      {
+        "name": "Truth.opReset",
+        "kind": "method",
+        "exported": false,
+        "line": 1285
+      },
+      {
+        "name": "Truth.opFreeze",
+        "kind": "method",
+        "exported": false,
+        "line": 1314
+      },
+      {
+        "name": "Truth.serializeWire",
+        "kind": "method",
+        "exported": true,
+        "line": 1345
+      },
+      {
+        "name": "Truth.computeFoldOps",
+        "kind": "method",
+        "exported": true,
+        "line": 1348
+      },
+      {
+        "name": "Truth.computeGroupOps",
+        "kind": "method",
+        "exported": true,
+        "line": 1361
+      }
+    ]
+  },
+  "corpus/files/liveClient.svelte.ts": {
+    "symbols": [
+      {
+        "name": "socket",
+        "kind": "var",
+        "exported": false,
+        "line": 40
+      },
+      {
+        "name": "manualClose",
+        "kind": "var",
+        "exported": false,
+        "line": 41
+      },
+      {
+        "name": "commandSeq",
+        "kind": "var",
+        "exported": false,
+        "line": 42
+      },
+      {
+        "name": "connectSeq",
+        "kind": "var",
+        "exported": false,
+        "line": 45
+      },
+      {
+        "name": "awaitingSnapshot",
+        "kind": "var",
+        "exported": false,
+        "line": 48
+      },
+      {
+        "name": "pendingMeta",
+        "kind": "var",
+        "exported": false,
+        "line": 50
+      },
+      {
+        "name": "freshTelemetry",
+        "kind": "function",
+        "exported": false,
+        "line": 53
+      },
+      {
+        "name": "live",
+        "kind": "const",
+        "exported": true,
+        "line": 66
+      },
+      {
+        "name": "conductors",
+        "kind": "const",
+        "exported": true,
+        "line": 93
+      },
+      {
+        "name": "conductorState",
+        "kind": "const",
+        "exported": true,
+        "line": 100
+      },
+      {
+        "name": "conductorStatus",
+        "kind": "const",
+        "exported": true,
+        "line": 107
+      },
+      {
+        "name": "controllerState",
+        "kind": "const",
+        "exported": true,
+        "line": 118
+      },
+      {
+        "name": "mySurfaceLabel",
+        "kind": "function",
+        "exported": true,
+        "line": 124
+      },
+      {
+        "name": "isController",
+        "kind": "function",
+        "exported": true,
+        "line": 129
+      },
+      {
+        "name": "anotherSurfaceControls",
+        "kind": "function",
+        "exported": true,
+        "line": 137
+      },
+      {
+        "name": "claimController",
+        "kind": "function",
+        "exported": true,
+        "line": 144
+      },
+      {
+        "name": "isControllerInfo",
+        "kind": "function",
+        "exported": false,
+        "line": 155
+      },
+      {
+        "name": "isConductorMeta",
+        "kind": "function",
+        "exported": false,
+        "line": 164
+      },
+      {
+        "name": "resetConductorState",
+        "kind": "function",
+        "exported": false,
+        "line": 180
+      },
+      {
+        "name": "sendCommand",
+        "kind": "function",
+        "exported": false,
+        "line": 191
+      },
+      {
+        "name": "requestResnapshot",
+        "kind": "function",
+        "exported": false,
+        "line": 202
+      },
+      {
+        "name": "setArmed",
+        "kind": "function",
+        "exported": true,
+        "line": 219
+      },
+      {
+        "name": "selectConductor",
+        "kind": "function",
+        "exported": true,
+        "line": 229
+      },
+      {
+        "name": "adoptSnapshot",
+        "kind": "function",
+        "exported": false,
+        "line": 234
+      },
+      {
+        "name": "orphanReplica",
+        "kind": "function",
+        "exported": false,
+        "line": 265
+      },
+      {
+        "name": "connectLive",
+        "kind": "function",
+        "exported": true,
+        "line": 270
+      },
+      {
+        "name": "disconnectLive",
+        "kind": "function",
+        "exported": true,
+        "line": 472
+      }
+    ]
+  },
+  "corpus/files/lib.es2015.collection.d.ts": {
+    "symbols": [
+      {
+        "name": "Map",
+        "kind": "interface",
+        "exported": true,
+        "line": 19
+      },
+      {
+        "name": "MapConstructor",
+        "kind": "interface",
+        "exported": true,
+        "line": 48
+      },
+      {
+        "name": "Map",
+        "kind": "var",
+        "exported": true,
+        "line": 53
+      },
+      {
+        "name": "ReadonlyMap",
+        "kind": "interface",
+        "exported": true,
+        "line": 55
+      },
+      {
+        "name": "WeakMap",
+        "kind": "interface",
+        "exported": true,
+        "line": 62
+      },
+      {
+        "name": "WeakMapConstructor",
+        "kind": "interface",
+        "exported": true,
+        "line": 83
+      },
+      {
+        "name": "WeakMap",
+        "kind": "var",
+        "exported": true,
+        "line": 87
+      },
+      {
+        "name": "Set",
+        "kind": "interface",
+        "exported": true,
+        "line": 89
+      },
+      {
+        "name": "SetConstructor",
+        "kind": "interface",
+        "exported": true,
+        "line": 115
+      },
+      {
+        "name": "Set",
+        "kind": "var",
+        "exported": true,
+        "line": 119
+      },
+      {
+        "name": "ReadonlySet",
+        "kind": "interface",
+        "exported": true,
+        "line": 121
+      },
+      {
+        "name": "WeakSet",
+        "kind": "interface",
+        "exported": true,
+        "line": 127
+      },
+      {
+        "name": "WeakSetConstructor",
+        "kind": "interface",
+        "exported": true,
+        "line": 143
+      },
+      {
+        "name": "WeakSet",
+        "kind": "var",
+        "exported": true,
+        "line": 147
+      }
+    ]
+  },
+  "corpus/files/build-extension.mjs": {
+    "symbols": [
+      {
+        "name": "here",
+        "kind": "const",
+        "exported": false,
+        "line": 25
+      },
+      {
+        "name": "entry",
+        "kind": "const",
+        "exported": false,
+        "line": 26
+      },
+      {
+        "name": "outfile",
+        "kind": "const",
+        "exported": false,
+        "line": 27
+      },
+      {
+        "name": "result",
+        "kind": "const",
+        "exported": false,
+        "line": 29
+      }
+    ]
+  },
+  "corpus/files/smoke-conductor.mjs": {
+    "symbols": [
+      {
+        "name": "HOME",
+        "kind": "const",
+        "exported": false,
+        "line": 37
+      },
+      {
+        "name": "SESSIONS_DIR",
+        "kind": "const",
+        "exported": false,
+        "line": 45
+      },
+      {
+        "name": "jiti",
+        "kind": "const",
+        "exported": false,
+        "line": 46
+      },
+      {
+        "name": "mod",
+        "kind": "const",
+        "exported": false,
+        "line": 47
+      },
+      {
+        "name": "accordionLive",
+        "kind": "const",
+        "exported": false,
+        "line": 48
+      },
+      {
+        "name": "fails",
+        "kind": "const",
+        "exported": false,
+        "line": 51
+      },
+      {
+        "name": "waitFor",
+        "kind": "function",
+        "exported": false,
+        "line": 52
+      },
+      {
+        "name": "sleep",
+        "kind": "const",
+        "exported": false,
+        "line": 60
+      },
+      {
+        "name": "handlers",
+        "kind": "const",
+        "exported": false,
+        "line": 63
+      },
+      {
+        "name": "flags",
+        "kind": "const",
+        "exported": false,
+        "line": 64
+      },
+      {
+        "name": "pi",
+        "kind": "const",
+        "exported": false,
+        "line": 65
+      },
+      {
+        "name": "ctx",
+        "kind": "const",
+        "exported": false,
+        "line": 74
+      },
+      {
+        "name": "entryFile",
+        "kind": "const",
+        "exported": false,
+        "line": 82
+      },
+      {
+        "name": "entry",
+        "kind": "const",
+        "exported": false,
+        "line": 83
+      },
+      {
+        "name": "PORT",
+        "kind": "const",
+        "exported": false,
+        "line": 84
+      },
+      {
+        "name": "T0",
+        "kind": "const",
+        "exported": false,
+        "line": 92
+      },
+      {
+        "name": "PAIRS",
+        "kind": "const",
+        "exported": false,
+        "line": 93
+      },
+      {
+        "name": "BIG",
+        "kind": "const",
+        "exported": false,
+        "line": 94
+      },
+      {
+        "name": "messages",
+        "kind": "const",
+        "exported": false,
+        "line": 95
+      },
+      {
+        "name": "GUI_SURFACE",
+        "kind": "const",
+        "exported": false,
+        "line": 110
+      },
+      {
+        "name": "ws",
+        "kind": "const",
+        "exported": false,
+        "line": 111
+      },
+      {
+        "name": "inbox",
+        "kind": "const",
+        "exported": false,
+        "line": 112
+      },
+      {
+        "name": "seq",
+        "kind": "var",
+        "exported": false,
+        "line": 118
+      },
+      {
+        "name": "sendCmd",
+        "kind": "const",
+        "exported": false,
+        "line": 119
+      },
+      {
+        "name": "resnapshot",
+        "kind": "const",
+        "exported": false,
+        "line": 120
+      },
+      {
+        "name": "seenGroupOp",
+        "kind": "const",
+        "exported": false,
+        "line": 161
+      },
+      {
+        "name": "pumped",
+        "kind": "var",
+        "exported": false,
+        "line": 163
+      },
+      {
+        "name": "pumpDeadline",
+        "kind": "const",
+        "exported": false,
+        "line": 164
+      },
+      {
+        "name": "landedGroups",
+        "kind": "var",
+        "exported": false,
+        "line": 175
+      },
+      {
+        "name": "holdTimeouts",
+        "kind": "var",
+        "exported": false,
+        "line": 217
+      },
+      {
+        "name": "lastHoldMs",
+        "kind": "var",
+        "exported": false,
+        "line": 217
+      }
+    ]
+  },
+  "corpus/files/mock-server.mjs": {
+    "symbols": [
+      {
+        "name": "__dirname",
+        "kind": "const",
+        "exported": false,
+        "line": 58
+      },
+      {
+        "name": "jiti",
+        "kind": "const",
+        "exported": false,
+        "line": 62
+      },
+      {
+        "name": "PORT",
+        "kind": "const",
+        "exported": false,
+        "line": 78
+      },
+      {
+        "name": "CONTROL_PORT",
+        "kind": "const",
+        "exported": false,
+        "line": 79
+      },
+      {
+        "name": "CW",
+        "kind": "const",
+        "exported": false,
+        "line": 80
+      },
+      {
+        "name": "GROW",
+        "kind": "const",
+        "exported": false,
+        "line": 81
+      },
+      {
+        "name": "SAMPLE",
+        "kind": "const",
+        "exported": false,
+        "line": 82
+      },
+      {
+        "name": "sleep",
+        "kind": "const",
+        "exported": false,
+        "line": 84
+      },
+      {
+        "name": "GENERATED",
+        "kind": "const",
+        "exported": false,
+        "line": 85
+      },
+      {
+        "name": "kindPrefix",
+        "kind": "function",
+        "exported": false,
+        "line": 91
+      },
+      {
+        "name": "loadBaseBlocks",
+        "kind": "function",
+        "exported": false,
+        "line": 97
+      },
+      {
+        "name": "toBlock",
+        "kind": "function",
+        "exported": false,
+        "line": 109
+      },
+      {
+        "name": "playing",
+        "kind": "var",
+        "exported": false,
+        "line": 172
+      },
+      {
+        "name": "tps",
+        "kind": "var",
+        "exported": false,
+        "line": 173
+      },
+      {
+        "name": "epoch",
+        "kind": "var",
+        "exported": false,
+        "line": 174
+      },
+      {
+        "name": "loop",
+        "kind": "var",
+        "exported": false,
+        "line": 175
+      },
+      {
+        "name": "idx",
+        "kind": "var",
+        "exported": false,
+        "line": 176
+      },
+      {
+        "name": "startedAt",
+        "kind": "const",
+        "exported": false,
+        "line": 177
+      },
+      {
+        "name": "apps",
+        "kind": "const",
+        "exported": false,
+        "line": 179
+      },
+      {
+        "name": "controls",
+        "kind": "const",
+        "exported": false,
+        "line": 180
+      },
+      {
+        "name": "sessionId",
+        "kind": "const",
+        "exported": false,
+        "line": 181
+      },
+      {
+        "name": "send",
+        "kind": "const",
+        "exported": false,
+        "line": 182
+      },
+      {
+        "name": "broadcastApps",
+        "kind": "function",
+        "exported": false,
+        "line": 189
+      },
+      {
+        "name": "truth",
+        "kind": "var",
+        "exported": false,
+        "line": 206
+      },
+      {
+        "name": "unsubTruth",
+        "kind": "var",
+        "exported": false,
+        "line": 207
+      },
+      {
+        "name": "foldingEnabled",
+        "kind": "var",
+        "exported": false,
+        "line": 208
+      },
+      {
+        "name": "metaForTruth",
+        "kind": "function",
+        "exported": false,
+        "line": 210
+      },
+      {
+        "name": "metaWire",
+        "kind": "function",
+        "exported": false,
+        "line": 213
+      },
+      {
+        "name": "setFolding",
+        "kind": "function",
+        "exported": false,
+        "line": 216
+      },
+      {
+        "name": "buildTruth",
+        "kind": "function",
+        "exported": false,
+        "line": 221
+      },
+      {
+        "name": "applyCommand",
+        "kind": "function",
+        "exported": false,
+        "line": 238
+      },
+      {
+        "name": "statusObj",
+        "kind": "function",
+        "exported": false,
+        "line": 263
+      },
+      {
+        "name": "pushStatus",
+        "kind": "function",
+        "exported": false,
+        "line": 280
+      },
+      {
+        "name": "emitBlock",
+        "kind": "function",
+        "exported": false,
+        "line": 290
+      },
+      {
+        "name": "doRestart",
+        "kind": "function",
+        "exported": false,
+        "line": 297
+      },
+      {
+        "name": "pacedWait",
+        "kind": "function",
+        "exported": false,
+        "line": 308
+      },
+      {
+        "name": "genLoop",
+        "kind": "function",
+        "exported": false,
+        "line": 319
+      },
+      {
+        "name": "accordionHome",
+        "kind": "const",
+        "exported": false,
+        "line": 358
+      },
+      {
+        "name": "sessionsDir",
+        "kind": "const",
+        "exported": false,
+        "line": 359
+      },
+      {
+        "name": "entryPath",
+        "kind": "const",
+        "exported": false,
+        "line": 360
+      },
+      {
+        "name": "writeEntry",
+        "kind": "function",
+        "exported": false,
+        "line": 361
+      },
+      {
+        "name": "removeEntry",
+        "kind": "function",
+        "exported": false,
+        "line": 382
+      },
+      {
+        "name": "focusPath",
+        "kind": "const",
+        "exported": false,
+        "line": 391
+      },
+      {
+        "name": "writeFocus",
+        "kind": "function",
+        "exported": false,
+        "line": 392
+      },
+      {
+        "name": "heartbeat",
+        "kind": "const",
+        "exported": false,
+        "line": 402
+      },
+      {
+        "name": "shuttingDown",
+        "kind": "var",
+        "exported": false,
+        "line": 404
+      },
+      {
+        "name": "shutdown",
+        "kind": "function",
+        "exported": false,
+        "line": 405
+      },
+      {
+        "name": "piWss",
+        "kind": "const",
+        "exported": false,
+        "line": 420
+      },
+      {
+        "name": "controlHtmlPath",
+        "kind": "const",
+        "exported": false,
+        "line": 457
+      },
+      {
+        "name": "httpServer",
+        "kind": "const",
+        "exported": false,
+        "line": 458
+      },
+      {
+        "name": "controlWss",
+        "kind": "const",
+        "exported": false,
+        "line": 474
+      }
+    ]
+  },
+  "corpus/files/reprlib.py": {
+    "symbols": [
+      {
+        "name": "__all__",
+        "kind": "const",
+        "exported": false,
+        "line": 3
+      },
+      {
+        "name": "recursive_repr",
+        "kind": "function",
+        "exported": true,
+        "line": 9
+      },
+      {
+        "name": "Repr",
+        "kind": "class",
+        "exported": true,
+        "line": 36
+      },
+      {
+        "name": "Repr.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 38
+      },
+      {
+        "name": "Repr.repr",
+        "kind": "method",
+        "exported": true,
+        "line": 52
+      },
+      {
+        "name": "Repr.repr1",
+        "kind": "method",
+        "exported": true,
+        "line": 55
+      },
+      {
+        "name": "Repr._repr_iterable",
+        "kind": "method",
+        "exported": false,
+        "line": 65
+      },
+      {
+        "name": "Repr.repr_tuple",
+        "kind": "method",
+        "exported": true,
+        "line": 80
+      },
+      {
+        "name": "Repr.repr_list",
+        "kind": "method",
+        "exported": true,
+        "line": 83
+      },
+      {
+        "name": "Repr.repr_array",
+        "kind": "method",
+        "exported": true,
+        "line": 86
+      },
+      {
+        "name": "Repr.repr_set",
+        "kind": "method",
+        "exported": true,
+        "line": 92
+      },
+      {
+        "name": "Repr.repr_frozenset",
+        "kind": "method",
+        "exported": true,
+        "line": 98
+      },
+      {
+        "name": "Repr.repr_deque",
+        "kind": "method",
+        "exported": true,
+        "line": 105
+      },
+      {
+        "name": "Repr.repr_dict",
+        "kind": "method",
+        "exported": true,
+        "line": 108
+      },
+      {
+        "name": "Repr.repr_str",
+        "kind": "method",
+        "exported": true,
+        "line": 126
+      },
+      {
+        "name": "Repr.repr_int",
+        "kind": "method",
+        "exported": true,
+        "line": 135
+      },
+      {
+        "name": "Repr.repr_instance",
+        "kind": "method",
+        "exported": true,
+        "line": 143
+      },
+      {
+        "name": "_possibly_sorted",
+        "kind": "function",
+        "exported": false,
+        "line": 157
+      },
+      {
+        "name": "aRepr",
+        "kind": "const",
+        "exported": false,
+        "line": 166
+      },
+      {
+        "name": "repr",
+        "kind": "const",
+        "exported": true,
+        "line": 167
+      }
+    ]
+  },
+  "corpus/files/json_decoder.py": {
+    "symbols": [
+      {
+        "name": "c_scanstring",
+        "kind": "const",
+        "exported": false,
+        "line": 9
+      },
+      {
+        "name": "__all__",
+        "kind": "const",
+        "exported": false,
+        "line": 11
+      },
+      {
+        "name": "FLAGS",
+        "kind": "const",
+        "exported": false,
+        "line": 13
+      },
+      {
+        "name": "NaN",
+        "kind": "const",
+        "exported": false,
+        "line": 15
+      },
+      {
+        "name": "PosInf",
+        "kind": "const",
+        "exported": false,
+        "line": 16
+      },
+      {
+        "name": "NegInf",
+        "kind": "const",
+        "exported": false,
+        "line": 17
+      },
+      {
+        "name": "JSONDecodeError",
+        "kind": "class",
+        "exported": true,
+        "line": 20
+      },
+      {
+        "name": "JSONDecodeError.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 31
+      },
+      {
+        "name": "JSONDecodeError.__reduce__",
+        "kind": "method",
+        "exported": false,
+        "line": 42
+      },
+      {
+        "name": "_CONSTANTS",
+        "kind": "const",
+        "exported": false,
+        "line": 46
+      },
+      {
+        "name": "STRINGCHUNK",
+        "kind": "const",
+        "exported": false,
+        "line": 53
+      },
+      {
+        "name": "BACKSLASH",
+        "kind": "const",
+        "exported": false,
+        "line": 54
+      },
+      {
+        "name": "_decode_uXXXX",
+        "kind": "function",
+        "exported": false,
+        "line": 59
+      },
+      {
+        "name": "py_scanstring",
+        "kind": "function",
+        "exported": false,
+        "line": 69
+      },
+      {
+        "name": "scanstring",
+        "kind": "const",
+        "exported": false,
+        "line": 130
+      },
+      {
+        "name": "WHITESPACE",
+        "kind": "const",
+        "exported": false,
+        "line": 132
+      },
+      {
+        "name": "WHITESPACE_STR",
+        "kind": "const",
+        "exported": false,
+        "line": 133
+      },
+      {
+        "name": "JSONObject",
+        "kind": "function",
+        "exported": false,
+        "line": 136
+      },
+      {
+        "name": "JSONArray",
+        "kind": "function",
+        "exported": false,
+        "line": 217
+      },
+      {
+        "name": "JSONDecoder",
+        "kind": "class",
+        "exported": true,
+        "line": 254
+      },
+      {
+        "name": "JSONDecoder.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 284
+      },
+      {
+        "name": "JSONDecoder.decode",
+        "kind": "method",
+        "exported": true,
+        "line": 332
+      },
+      {
+        "name": "JSONDecoder.raw_decode",
+        "kind": "method",
+        "exported": true,
+        "line": 343
+      }
+    ]
+  },
+  "corpus/files/textwrap.py": {
+    "symbols": [
+      {
+        "name": "__all__",
+        "kind": "const",
+        "exported": false,
+        "line": 10
+      },
+      {
+        "name": "_whitespace",
+        "kind": "const",
+        "exported": false,
+        "line": 15
+      },
+      {
+        "name": "TextWrapper",
+        "kind": "class",
+        "exported": true,
+        "line": 17
+      },
+      {
+        "name": "TextWrapper.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 112
+      },
+      {
+        "name": "TextWrapper._munge_whitespace",
+        "kind": "method",
+        "exported": false,
+        "line": 143
+      },
+      {
+        "name": "TextWrapper._split",
+        "kind": "method",
+        "exported": false,
+        "line": 157
+      },
+      {
+        "name": "TextWrapper._fix_sentence_endings",
+        "kind": "method",
+        "exported": false,
+        "line": 179
+      },
+      {
+        "name": "TextWrapper._handle_long_word",
+        "kind": "method",
+        "exported": false,
+        "line": 197
+      },
+      {
+        "name": "TextWrapper._wrap_chunks",
+        "kind": "method",
+        "exported": false,
+        "line": 238
+      },
+      {
+        "name": "TextWrapper._split_chunks",
+        "kind": "method",
+        "exported": false,
+        "line": 341
+      },
+      {
+        "name": "TextWrapper.wrap",
+        "kind": "method",
+        "exported": true,
+        "line": 347
+      },
+      {
+        "name": "TextWrapper.fill",
+        "kind": "method",
+        "exported": true,
+        "line": 361
+      },
+      {
+        "name": "wrap",
+        "kind": "function",
+        "exported": true,
+        "line": 373
+      },
+      {
+        "name": "fill",
+        "kind": "function",
+        "exported": true,
+        "line": 386
+      },
+      {
+        "name": "shorten",
+        "kind": "function",
+        "exported": true,
+        "line": 398
+      },
+      {
+        "name": "_whitespace_only_re",
+        "kind": "const",
+        "exported": false,
+        "line": 416
+      },
+      {
+        "name": "_leading_whitespace_re",
+        "kind": "const",
+        "exported": false,
+        "line": 417
+      },
+      {
+        "name": "dedent",
+        "kind": "function",
+        "exported": true,
+        "line": 419
+      },
+      {
+        "name": "indent",
+        "kind": "function",
+        "exported": true,
+        "line": 470
+      }
+    ]
+  },
+  "corpus/files/asyncio_tasks.py": {
+    "symbols": [
+      {
+        "name": "__all__",
+        "kind": "const",
+        "exported": false,
+        "line": 3
+      },
+      {
+        "name": "_task_name_counter",
+        "kind": "const",
+        "exported": false,
+        "line": 32
+      },
+      {
+        "name": "current_task",
+        "kind": "function",
+        "exported": true,
+        "line": 35
+      },
+      {
+        "name": "all_tasks",
+        "kind": "function",
+        "exported": true,
+        "line": 42
+      },
+      {
+        "name": "_set_task_name",
+        "kind": "function",
+        "exported": false,
+        "line": 65
+      },
+      {
+        "name": "Task",
+        "kind": "class",
+        "exported": true,
+        "line": 78
+      },
+      {
+        "name": "Task.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 106
+      },
+      {
+        "name": "Task.__del__",
+        "kind": "method",
+        "exported": false,
+        "line": 133
+      },
+      {
+        "name": "Task.__repr__",
+        "kind": "method",
+        "exported": false,
+        "line": 146
+      },
+      {
+        "name": "Task.get_coro",
+        "kind": "method",
+        "exported": true,
+        "line": 149
+      },
+      {
+        "name": "Task.get_name",
+        "kind": "method",
+        "exported": true,
+        "line": 152
+      },
+      {
+        "name": "Task.set_name",
+        "kind": "method",
+        "exported": true,
+        "line": 155
+      },
+      {
+        "name": "Task.set_result",
+        "kind": "method",
+        "exported": true,
+        "line": 158
+      },
+      {
+        "name": "Task.set_exception",
+        "kind": "method",
+        "exported": true,
+        "line": 161
+      },
+      {
+        "name": "Task.get_stack",
+        "kind": "method",
+        "exported": true,
+        "line": 164
+      },
+      {
+        "name": "Task.print_stack",
+        "kind": "method",
+        "exported": true,
+        "line": 187
+      },
+      {
+        "name": "Task.cancel",
+        "kind": "method",
+        "exported": true,
+        "line": 198
+      },
+      {
+        "name": "Task.cancelling",
+        "kind": "method",
+        "exported": true,
+        "line": 240
+      },
+      {
+        "name": "Task.uncancel",
+        "kind": "method",
+        "exported": true,
+        "line": 248
+      },
+      {
+        "name": "Task.__step",
+        "kind": "method",
+        "exported": false,
+        "line": 260
+      },
+      {
+        "name": "Task.__wakeup",
+        "kind": "method",
+        "exported": false,
+        "line": 347
+      },
+      {
+        "name": "_PyTask",
+        "kind": "const",
+        "exported": false,
+        "line": 364
+      },
+      {
+        "name": "Task",
+        "kind": "const",
+        "exported": true,
+        "line": 373
+      },
+      {
+        "name": "_CTask",
+        "kind": "const",
+        "exported": false,
+        "line": 373
+      },
+      {
+        "name": "create_task",
+        "kind": "function",
+        "exported": true,
+        "line": 376
+      },
+      {
+        "name": "FIRST_COMPLETED",
+        "kind": "const",
+        "exported": true,
+        "line": 394
+      },
+      {
+        "name": "FIRST_EXCEPTION",
+        "kind": "const",
+        "exported": true,
+        "line": 395
+      },
+      {
+        "name": "ALL_COMPLETED",
+        "kind": "const",
+        "exported": true,
+        "line": 396
+      },
+      {
+        "name": "wait",
+        "kind": "function",
+        "exported": true,
+        "line": 399
+      },
+      {
+        "name": "_release_waiter",
+        "kind": "function",
+        "exported": false,
+        "line": 431
+      },
+      {
+        "name": "wait_for",
+        "kind": "function",
+        "exported": true,
+        "line": 436
+      },
+      {
+        "name": "_wait",
+        "kind": "function",
+        "exported": false,
+        "line": 507
+      },
+      {
+        "name": "_cancel_and_wait",
+        "kind": "function",
+        "exported": false,
+        "line": 551
+      },
+      {
+        "name": "as_completed",
+        "kind": "function",
+        "exported": true,
+        "line": 568
+      },
+      {
+        "name": "__sleep0",
+        "kind": "function",
+        "exported": false,
+        "line": 626
+      },
+      {
+        "name": "sleep",
+        "kind": "function",
+        "exported": true,
+        "line": 637
+      },
+      {
+        "name": "ensure_future",
+        "kind": "function",
+        "exported": true,
+        "line": 654
+      },
+      {
+        "name": "_ensure_future",
+        "kind": "function",
+        "exported": false,
+        "line": 662
+      },
+      {
+        "name": "_wrap_awaitable",
+        "kind": "function",
+        "exported": false,
+        "line": 688
+      },
+      {
+        "name": "_GatheringFuture",
+        "kind": "class",
+        "exported": false,
+        "line": 699
+      },
+      {
+        "name": "_GatheringFuture.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 707
+      },
+      {
+        "name": "_GatheringFuture.cancel",
+        "kind": "method",
+        "exported": true,
+        "line": 713
+      },
+      {
+        "name": "gather",
+        "kind": "function",
+        "exported": true,
+        "line": 728
+      },
+      {
+        "name": "shield",
+        "kind": "function",
+        "exported": true,
+        "line": 851
+      },
+      {
+        "name": "run_coroutine_threadsafe",
+        "kind": "function",
+        "exported": true,
+        "line": 917
+      },
+      {
+        "name": "_all_tasks",
+        "kind": "const",
+        "exported": false,
+        "line": 941
+      },
+      {
+        "name": "_current_tasks",
+        "kind": "const",
+        "exported": false,
+        "line": 945
+      },
+      {
+        "name": "_register_task",
+        "kind": "function",
+        "exported": false,
+        "line": 948
+      },
+      {
+        "name": "_enter_task",
+        "kind": "function",
+        "exported": false,
+        "line": 953
+      },
+      {
+        "name": "_leave_task",
+        "kind": "function",
+        "exported": false,
+        "line": 961
+      },
+      {
+        "name": "_unregister_task",
+        "kind": "function",
+        "exported": false,
+        "line": 969
+      },
+      {
+        "name": "_py_register_task",
+        "kind": "const",
+        "exported": false,
+        "line": 974
+      },
+      {
+        "name": "_py_unregister_task",
+        "kind": "const",
+        "exported": false,
+        "line": 975
+      },
+      {
+        "name": "_py_enter_task",
+        "kind": "const",
+        "exported": false,
+        "line": 976
+      },
+      {
+        "name": "_py_leave_task",
+        "kind": "const",
+        "exported": false,
+        "line": 977
+      },
+      {
+        "name": "_c_register_task",
+        "kind": "const",
+        "exported": false,
+        "line": 987
+      },
+      {
+        "name": "_c_unregister_task",
+        "kind": "const",
+        "exported": false,
+        "line": 988
+      },
+      {
+        "name": "_c_enter_task",
+        "kind": "const",
+        "exported": false,
+        "line": 989
+      },
+      {
+        "name": "_c_leave_task",
+        "kind": "const",
+        "exported": false,
+        "line": 990
+      }
+    ]
+  },
+  "corpus/files/dataclasses.py": {
+    "symbols": [
+      {
+        "name": "__all__",
+        "kind": "const",
+        "exported": false,
+        "line": 15
+      },
+      {
+        "name": "FrozenInstanceError",
+        "kind": "class",
+        "exported": true,
+        "line": 173
+      },
+      {
+        "name": "_HAS_DEFAULT_FACTORY_CLASS",
+        "kind": "class",
+        "exported": false,
+        "line": 178
+      },
+      {
+        "name": "_HAS_DEFAULT_FACTORY_CLASS.__repr__",
+        "kind": "method",
+        "exported": false,
+        "line": 179
+      },
+      {
+        "name": "_HAS_DEFAULT_FACTORY",
+        "kind": "const",
+        "exported": false,
+        "line": 181
+      },
+      {
+        "name": "_MISSING_TYPE",
+        "kind": "class",
+        "exported": false,
+        "line": 185
+      },
+      {
+        "name": "MISSING",
+        "kind": "const",
+        "exported": true,
+        "line": 187
+      },
+      {
+        "name": "_KW_ONLY_TYPE",
+        "kind": "class",
+        "exported": false,
+        "line": 191
+      },
+      {
+        "name": "KW_ONLY",
+        "kind": "const",
+        "exported": true,
+        "line": 193
+      },
+      {
+        "name": "_EMPTY_METADATA",
+        "kind": "const",
+        "exported": false,
+        "line": 197
+      },
+      {
+        "name": "_FIELD_BASE",
+        "kind": "class",
+        "exported": false,
+        "line": 200
+      },
+      {
+        "name": "_FIELD_BASE.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 201
+      },
+      {
+        "name": "_FIELD_BASE.__repr__",
+        "kind": "method",
+        "exported": false,
+        "line": 203
+      },
+      {
+        "name": "_FIELD",
+        "kind": "const",
+        "exported": false,
+        "line": 205
+      },
+      {
+        "name": "_FIELD_CLASSVAR",
+        "kind": "const",
+        "exported": false,
+        "line": 206
+      },
+      {
+        "name": "_FIELD_INITVAR",
+        "kind": "const",
+        "exported": false,
+        "line": 207
+      },
+      {
+        "name": "_FIELDS",
+        "kind": "const",
+        "exported": false,
+        "line": 211
+      },
+      {
+        "name": "_PARAMS",
+        "kind": "const",
+        "exported": false,
+        "line": 215
+      },
+      {
+        "name": "_POST_INIT_NAME",
+        "kind": "const",
+        "exported": false,
+        "line": 219
+      },
+      {
+        "name": "_MODULE_IDENTIFIER_RE",
+        "kind": "const",
+        "exported": false,
+        "line": 224
+      },
+      {
+        "name": "_recursive_repr",
+        "kind": "function",
+        "exported": false,
+        "line": 228
+      },
+      {
+        "name": "InitVar",
+        "kind": "class",
+        "exported": true,
+        "line": 246
+      },
+      {
+        "name": "InitVar.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 249
+      },
+      {
+        "name": "InitVar.__repr__",
+        "kind": "method",
+        "exported": false,
+        "line": 252
+      },
+      {
+        "name": "InitVar.__class_getitem__",
+        "kind": "method",
+        "exported": false,
+        "line": 260
+      },
+      {
+        "name": "Field",
+        "kind": "class",
+        "exported": true,
+        "line": 273
+      },
+      {
+        "name": "Field.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 287
+      },
+      {
+        "name": "Field.__repr__",
+        "kind": "method",
+        "exported": false,
+        "line": 304
+      },
+      {
+        "name": "Field.__set_name__",
+        "kind": "method",
+        "exported": false,
+        "line": 327
+      },
+      {
+        "name": "_DataclassParams",
+        "kind": "class",
+        "exported": false,
+        "line": 337
+      },
+      {
+        "name": "_DataclassParams.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 346
+      },
+      {
+        "name": "_DataclassParams.__repr__",
+        "kind": "method",
+        "exported": false,
+        "line": 354
+      },
+      {
+        "name": "field",
+        "kind": "function",
+        "exported": true,
+        "line": 368
+      },
+      {
+        "name": "_fields_in_init_order",
+        "kind": "function",
+        "exported": false,
+        "line": 392
+      },
+      {
+        "name": "_tuple_str",
+        "kind": "function",
+        "exported": false,
+        "line": 401
+      },
+      {
+        "name": "_create_fn",
+        "kind": "function",
+        "exported": false,
+        "line": 413
+      },
+      {
+        "name": "_field_assign",
+        "kind": "function",
+        "exported": false,
+        "line": 437
+      },
+      {
+        "name": "_field_init",
+        "kind": "function",
+        "exported": false,
+        "line": 449
+      },
+      {
+        "name": "_init_param",
+        "kind": "function",
+        "exported": false,
+        "line": 509
+      },
+      {
+        "name": "_init_fn",
+        "kind": "function",
+        "exported": false,
+        "line": 528
+      },
+      {
+        "name": "_repr_fn",
+        "kind": "function",
+        "exported": false,
+        "line": 588
+      },
+      {
+        "name": "_frozen_get_del_attr",
+        "kind": "function",
+        "exported": false,
+        "line": 599
+      },
+      {
+        "name": "_cmp_fn",
+        "kind": "function",
+        "exported": false,
+        "line": 624
+      },
+      {
+        "name": "_hash_fn",
+        "kind": "function",
+        "exported": false,
+        "line": 638
+      },
+      {
+        "name": "_is_classvar",
+        "kind": "function",
+        "exported": false,
+        "line": 646
+      },
+      {
+        "name": "_is_initvar",
+        "kind": "function",
+        "exported": false,
+        "line": 654
+      },
+      {
+        "name": "_is_kw_only",
+        "kind": "function",
+        "exported": false,
+        "line": 660
+      },
+      {
+        "name": "_is_type",
+        "kind": "function",
+        "exported": false,
+        "line": 664
+      },
+      {
+        "name": "_get_field",
+        "kind": "function",
+        "exported": false,
+        "line": 723
+      },
+      {
+        "name": "_set_qualname",
+        "kind": "function",
+        "exported": false,
+        "line": 820
+      },
+      {
+        "name": "_set_new_attribute",
+        "kind": "function",
+        "exported": false,
+        "line": 827
+      },
+      {
+        "name": "_hash_set_none",
+        "kind": "function",
+        "exported": false,
+        "line": 842
+      },
+      {
+        "name": "_hash_add",
+        "kind": "function",
+        "exported": false,
+        "line": 845
+      },
+      {
+        "name": "_hash_exception",
+        "kind": "function",
+        "exported": false,
+        "line": 849
+      },
+      {
+        "name": "_hash_action",
+        "kind": "const",
+        "exported": false,
+        "line": 863
+      },
+      {
+        "name": "_process_class",
+        "kind": "function",
+        "exported": false,
+        "line": 884
+      },
+      {
+        "name": "_dataclass_getstate",
+        "kind": "function",
+        "exported": false,
+        "line": 1123
+      },
+      {
+        "name": "_dataclass_setstate",
+        "kind": "function",
+        "exported": false,
+        "line": 1127
+      },
+      {
+        "name": "_get_slots",
+        "kind": "function",
+        "exported": false,
+        "line": 1133
+      },
+      {
+        "name": "_add_slots",
+        "kind": "function",
+        "exported": false,
+        "line": 1149
+      },
+      {
+        "name": "dataclass",
+        "kind": "function",
+        "exported": true,
+        "line": 1204
+      },
+      {
+        "name": "fields",
+        "kind": "function",
+        "exported": true,
+        "line": 1235
+      },
+      {
+        "name": "_is_dataclass_instance",
+        "kind": "function",
+        "exported": false,
+        "line": 1253
+      },
+      {
+        "name": "is_dataclass",
+        "kind": "function",
+        "exported": true,
+        "line": 1258
+      },
+      {
+        "name": "asdict",
+        "kind": "function",
+        "exported": true,
+        "line": 1265
+      },
+      {
+        "name": "_asdict_inner",
+        "kind": "function",
+        "exported": false,
+        "line": 1289
+      },
+      {
+        "name": "astuple",
+        "kind": "function",
+        "exported": true,
+        "line": 1330
+      },
+      {
+        "name": "_astuple_inner",
+        "kind": "function",
+        "exported": false,
+        "line": 1354
+      },
+      {
+        "name": "make_dataclass",
+        "kind": "function",
+        "exported": true,
+        "line": 1381
+      },
+      {
+        "name": "replace",
+        "kind": "function",
+        "exported": true,
+        "line": 1455
+      }
+    ]
+  },
+  "corpus/files/argparse.py": {
+    "symbols": [
+      {
+        "name": "__version__",
+        "kind": "const",
+        "exported": false,
+        "line": 65
+      },
+      {
+        "name": "__all__",
+        "kind": "const",
+        "exported": false,
+        "line": 66
+      },
+      {
+        "name": "_",
+        "kind": "function",
+        "exported": false,
+        "line": 97
+      },
+      {
+        "name": "ngettext",
+        "kind": "function",
+        "exported": false,
+        "line": 99
+      },
+      {
+        "name": "SUPPRESS",
+        "kind": "const",
+        "exported": true,
+        "line": 105
+      },
+      {
+        "name": "OPTIONAL",
+        "kind": "const",
+        "exported": true,
+        "line": 107
+      },
+      {
+        "name": "ZERO_OR_MORE",
+        "kind": "const",
+        "exported": true,
+        "line": 108
+      },
+      {
+        "name": "ONE_OR_MORE",
+        "kind": "const",
+        "exported": true,
+        "line": 109
+      },
+      {
+        "name": "PARSER",
+        "kind": "const",
+        "exported": true,
+        "line": 110
+      },
+      {
+        "name": "REMAINDER",
+        "kind": "const",
+        "exported": true,
+        "line": 111
+      },
+      {
+        "name": "_UNRECOGNIZED_ARGS_ATTR",
+        "kind": "const",
+        "exported": false,
+        "line": 112
+      },
+      {
+        "name": "_AttributeHolder",
+        "kind": "class",
+        "exported": false,
+        "line": 118
+      },
+      {
+        "name": "_AttributeHolder.__repr__",
+        "kind": "method",
+        "exported": false,
+        "line": 127
+      },
+      {
+        "name": "_AttributeHolder._get_kwargs",
+        "kind": "method",
+        "exported": false,
+        "line": 142
+      },
+      {
+        "name": "_AttributeHolder._get_args",
+        "kind": "method",
+        "exported": false,
+        "line": 145
+      },
+      {
+        "name": "_copy_items",
+        "kind": "function",
+        "exported": false,
+        "line": 149
+      },
+      {
+        "name": "HelpFormatter",
+        "kind": "class",
+        "exported": true,
+        "line": 166
+      },
+      {
+        "name": "HelpFormatter.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 173
+      },
+      {
+        "name": "HelpFormatter._indent",
+        "kind": "method",
+        "exported": false,
+        "line": 207
+      },
+      {
+        "name": "HelpFormatter._dedent",
+        "kind": "method",
+        "exported": false,
+        "line": 211
+      },
+      {
+        "name": "HelpFormatter._Section",
+        "kind": "class",
+        "exported": false,
+        "line": 216
+      },
+      {
+        "name": "HelpFormatter._Section.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 218
+      },
+      {
+        "name": "HelpFormatter._Section.format_help",
+        "kind": "method",
+        "exported": true,
+        "line": 224
+      },
+      {
+        "name": "HelpFormatter._add_item",
+        "kind": "method",
+        "exported": false,
+        "line": 248
+      },
+      {
+        "name": "HelpFormatter.start_section",
+        "kind": "method",
+        "exported": true,
+        "line": 254
+      },
+      {
+        "name": "HelpFormatter.end_section",
+        "kind": "method",
+        "exported": true,
+        "line": 260
+      },
+      {
+        "name": "HelpFormatter.add_text",
+        "kind": "method",
+        "exported": true,
+        "line": 264
+      },
+      {
+        "name": "HelpFormatter.add_usage",
+        "kind": "method",
+        "exported": true,
+        "line": 268
+      },
+      {
+        "name": "HelpFormatter.add_argument",
+        "kind": "method",
+        "exported": true,
+        "line": 273
+      },
+      {
+        "name": "HelpFormatter.add_arguments",
+        "kind": "method",
+        "exported": true,
+        "line": 291
+      },
+      {
+        "name": "HelpFormatter.format_help",
+        "kind": "method",
+        "exported": true,
+        "line": 298
+      },
+      {
+        "name": "HelpFormatter._join_parts",
+        "kind": "method",
+        "exported": false,
+        "line": 305
+      },
+      {
+        "name": "HelpFormatter._format_usage",
+        "kind": "method",
+        "exported": false,
+        "line": 310
+      },
+      {
+        "name": "HelpFormatter._format_actions_usage",
+        "kind": "method",
+        "exported": false,
+        "line": 406
+      },
+      {
+        "name": "HelpFormatter._format_text",
+        "kind": "method",
+        "exported": false,
+        "line": 521
+      },
+      {
+        "name": "HelpFormatter._format_action",
+        "kind": "method",
+        "exported": false,
+        "line": 528
+      },
+      {
+        "name": "HelpFormatter._format_action_invocation",
+        "kind": "method",
+        "exported": false,
+        "line": 576
+      },
+      {
+        "name": "HelpFormatter._metavar_formatter",
+        "kind": "method",
+        "exported": false,
+        "line": 600
+      },
+      {
+        "name": "HelpFormatter._format_args",
+        "kind": "method",
+        "exported": false,
+        "line": 616
+      },
+      {
+        "name": "HelpFormatter._expand_help",
+        "kind": "method",
+        "exported": false,
+        "line": 644
+      },
+      {
+        "name": "HelpFormatter._iter_indented_subactions",
+        "kind": "method",
+        "exported": false,
+        "line": 657
+      },
+      {
+        "name": "HelpFormatter._split_lines",
+        "kind": "method",
+        "exported": false,
+        "line": 667
+      },
+      {
+        "name": "HelpFormatter._fill_text",
+        "kind": "method",
+        "exported": false,
+        "line": 674
+      },
+      {
+        "name": "HelpFormatter._get_help_string",
+        "kind": "method",
+        "exported": false,
+        "line": 681
+      },
+      {
+        "name": "HelpFormatter._get_default_metavar_for_optional",
+        "kind": "method",
+        "exported": false,
+        "line": 684
+      },
+      {
+        "name": "HelpFormatter._get_default_metavar_for_positional",
+        "kind": "method",
+        "exported": false,
+        "line": 687
+      },
+      {
+        "name": "RawDescriptionHelpFormatter",
+        "kind": "class",
+        "exported": true,
+        "line": 691
+      },
+      {
+        "name": "RawDescriptionHelpFormatter._fill_text",
+        "kind": "method",
+        "exported": false,
+        "line": 698
+      },
+      {
+        "name": "RawTextHelpFormatter",
+        "kind": "class",
+        "exported": true,
+        "line": 702
+      },
+      {
+        "name": "RawTextHelpFormatter._split_lines",
+        "kind": "method",
+        "exported": false,
+        "line": 709
+      },
+      {
+        "name": "ArgumentDefaultsHelpFormatter",
+        "kind": "class",
+        "exported": true,
+        "line": 713
+      },
+      {
+        "name": "ArgumentDefaultsHelpFormatter._get_help_string",
+        "kind": "method",
+        "exported": false,
+        "line": 720
+      },
+      {
+        "name": "MetavarTypeHelpFormatter",
+        "kind": "class",
+        "exported": true,
+        "line": 742
+      },
+      {
+        "name": "MetavarTypeHelpFormatter._get_default_metavar_for_optional",
+        "kind": "method",
+        "exported": false,
+        "line": 750
+      },
+      {
+        "name": "MetavarTypeHelpFormatter._get_default_metavar_for_positional",
+        "kind": "method",
+        "exported": false,
+        "line": 753
+      },
+      {
+        "name": "_get_action_name",
+        "kind": "function",
+        "exported": false,
+        "line": 761
+      },
+      {
+        "name": "ArgumentError",
+        "kind": "class",
+        "exported": true,
+        "line": 776
+      },
+      {
+        "name": "ArgumentError.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 783
+      },
+      {
+        "name": "ArgumentError.__str__",
+        "kind": "method",
+        "exported": false,
+        "line": 787
+      },
+      {
+        "name": "ArgumentTypeError",
+        "kind": "class",
+        "exported": true,
+        "line": 796
+      },
+      {
+        "name": "Action",
+        "kind": "class",
+        "exported": true,
+        "line": 805
+      },
+      {
+        "name": "Action.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 856
+      },
+      {
+        "name": "Action._get_kwargs",
+        "kind": "method",
+        "exported": false,
+        "line": 878
+      },
+      {
+        "name": "Action.format_usage",
+        "kind": "method",
+        "exported": true,
+        "line": 893
+      },
+      {
+        "name": "Action.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 896
+      },
+      {
+        "name": "BooleanOptionalAction",
+        "kind": "class",
+        "exported": true,
+        "line": 900
+      },
+      {
+        "name": "BooleanOptionalAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 901
+      },
+      {
+        "name": "BooleanOptionalAction.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 931
+      },
+      {
+        "name": "BooleanOptionalAction.format_usage",
+        "kind": "method",
+        "exported": true,
+        "line": 935
+      },
+      {
+        "name": "_StoreAction",
+        "kind": "class",
+        "exported": false,
+        "line": 939
+      },
+      {
+        "name": "_StoreAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 941
+      },
+      {
+        "name": "_StoreAction.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 970
+      },
+      {
+        "name": "_StoreConstAction",
+        "kind": "class",
+        "exported": false,
+        "line": 974
+      },
+      {
+        "name": "_StoreConstAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 976
+      },
+      {
+        "name": "_StoreConstAction.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 993
+      },
+      {
+        "name": "_StoreTrueAction",
+        "kind": "class",
+        "exported": false,
+        "line": 997
+      },
+      {
+        "name": "_StoreTrueAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 999
+      },
+      {
+        "name": "_StoreFalseAction",
+        "kind": "class",
+        "exported": false,
+        "line": 1014
+      },
+      {
+        "name": "_StoreFalseAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1016
+      },
+      {
+        "name": "_AppendAction",
+        "kind": "class",
+        "exported": false,
+        "line": 1031
+      },
+      {
+        "name": "_AppendAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1033
+      },
+      {
+        "name": "_AppendAction.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 1062
+      },
+      {
+        "name": "_AppendConstAction",
+        "kind": "class",
+        "exported": false,
+        "line": 1069
+      },
+      {
+        "name": "_AppendConstAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1071
+      },
+      {
+        "name": "_AppendConstAction.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 1089
+      },
+      {
+        "name": "_CountAction",
+        "kind": "class",
+        "exported": false,
+        "line": 1096
+      },
+      {
+        "name": "_CountAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1098
+      },
+      {
+        "name": "_CountAction.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 1112
+      },
+      {
+        "name": "_HelpAction",
+        "kind": "class",
+        "exported": false,
+        "line": 1119
+      },
+      {
+        "name": "_HelpAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1121
+      },
+      {
+        "name": "_HelpAction.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 1133
+      },
+      {
+        "name": "_VersionAction",
+        "kind": "class",
+        "exported": false,
+        "line": 1138
+      },
+      {
+        "name": "_VersionAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1140
+      },
+      {
+        "name": "_VersionAction.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 1156
+      },
+      {
+        "name": "_SubParsersAction",
+        "kind": "class",
+        "exported": false,
+        "line": 1166
+      },
+      {
+        "name": "_SubParsersAction._ChoicesPseudoAction",
+        "kind": "class",
+        "exported": false,
+        "line": 1168
+      },
+      {
+        "name": "_SubParsersAction._ChoicesPseudoAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1170
+      },
+      {
+        "name": "_SubParsersAction.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1178
+      },
+      {
+        "name": "_SubParsersAction.add_parser",
+        "kind": "method",
+        "exported": true,
+        "line": 1201
+      },
+      {
+        "name": "_SubParsersAction._get_subactions",
+        "kind": "method",
+        "exported": false,
+        "line": 1231
+      },
+      {
+        "name": "_SubParsersAction.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 1234
+      },
+      {
+        "name": "_ExtendAction",
+        "kind": "class",
+        "exported": false,
+        "line": 1266
+      },
+      {
+        "name": "_ExtendAction.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 1267
+      },
+      {
+        "name": "FileType",
+        "kind": "class",
+        "exported": true,
+        "line": 1277
+      },
+      {
+        "name": "FileType.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1294
+      },
+      {
+        "name": "FileType.__call__",
+        "kind": "method",
+        "exported": false,
+        "line": 1300
+      },
+      {
+        "name": "FileType.__repr__",
+        "kind": "method",
+        "exported": false,
+        "line": 1320
+      },
+      {
+        "name": "Namespace",
+        "kind": "class",
+        "exported": true,
+        "line": 1332
+      },
+      {
+        "name": "Namespace.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1339
+      },
+      {
+        "name": "Namespace.__eq__",
+        "kind": "method",
+        "exported": false,
+        "line": 1343
+      },
+      {
+        "name": "Namespace.__contains__",
+        "kind": "method",
+        "exported": false,
+        "line": 1348
+      },
+      {
+        "name": "_ActionsContainer",
+        "kind": "class",
+        "exported": false,
+        "line": 1352
+      },
+      {
+        "name": "_ActionsContainer.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1354
+      },
+      {
+        "name": "_ActionsContainer.register",
+        "kind": "method",
+        "exported": true,
+        "line": 1407
+      },
+      {
+        "name": "_ActionsContainer._registry_get",
+        "kind": "method",
+        "exported": false,
+        "line": 1411
+      },
+      {
+        "name": "_ActionsContainer.set_defaults",
+        "kind": "method",
+        "exported": true,
+        "line": 1417
+      },
+      {
+        "name": "_ActionsContainer.get_default",
+        "kind": "method",
+        "exported": true,
+        "line": 1426
+      },
+      {
+        "name": "_ActionsContainer.add_argument",
+        "kind": "method",
+        "exported": true,
+        "line": 1436
+      },
+      {
+        "name": "_ActionsContainer.add_argument_group",
+        "kind": "method",
+        "exported": true,
+        "line": 1487
+      },
+      {
+        "name": "_ActionsContainer.add_mutually_exclusive_group",
+        "kind": "method",
+        "exported": true,
+        "line": 1492
+      },
+      {
+        "name": "_ActionsContainer._add_action",
+        "kind": "method",
+        "exported": false,
+        "line": 1497
+      },
+      {
+        "name": "_ActionsContainer._remove_action",
+        "kind": "method",
+        "exported": false,
+        "line": 1518
+      },
+      {
+        "name": "_ActionsContainer._add_container_actions",
+        "kind": "method",
+        "exported": false,
+        "line": 1521
+      },
+      {
+        "name": "_ActionsContainer._get_positional_kwargs",
+        "kind": "method",
+        "exported": false,
+        "line": 1561
+      },
+      {
+        "name": "_ActionsContainer._get_optional_kwargs",
+        "kind": "method",
+        "exported": false,
+        "line": 1577
+      },
+      {
+        "name": "_ActionsContainer._pop_action_class",
+        "kind": "method",
+        "exported": false,
+        "line": 1611
+      },
+      {
+        "name": "_ActionsContainer._get_handler",
+        "kind": "method",
+        "exported": false,
+        "line": 1615
+      },
+      {
+        "name": "_ActionsContainer._check_conflict",
+        "kind": "method",
+        "exported": false,
+        "line": 1624
+      },
+      {
+        "name": "_ActionsContainer._handle_conflict_error",
+        "kind": "method",
+        "exported": false,
+        "line": 1638
+      },
+      {
+        "name": "_ActionsContainer._handle_conflict_resolve",
+        "kind": "method",
+        "exported": false,
+        "line": 1647
+      },
+      {
+        "name": "_ArgumentGroup",
+        "kind": "class",
+        "exported": false,
+        "line": 1662
+      },
+      {
+        "name": "_ArgumentGroup.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1664
+      },
+      {
+        "name": "_ArgumentGroup._add_action",
+        "kind": "method",
+        "exported": false,
+        "line": 1686
+      },
+      {
+        "name": "_ArgumentGroup._remove_action",
+        "kind": "method",
+        "exported": false,
+        "line": 1691
+      },
+      {
+        "name": "_ArgumentGroup.add_argument_group",
+        "kind": "method",
+        "exported": true,
+        "line": 1695
+      },
+      {
+        "name": "_MutuallyExclusiveGroup",
+        "kind": "class",
+        "exported": false,
+        "line": 1704
+      },
+      {
+        "name": "_MutuallyExclusiveGroup.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1706
+      },
+      {
+        "name": "_MutuallyExclusiveGroup._add_action",
+        "kind": "method",
+        "exported": false,
+        "line": 1711
+      },
+      {
+        "name": "_MutuallyExclusiveGroup._remove_action",
+        "kind": "method",
+        "exported": false,
+        "line": 1719
+      },
+      {
+        "name": "_MutuallyExclusiveGroup.add_mutually_exclusive_group",
+        "kind": "method",
+        "exported": true,
+        "line": 1723
+      },
+      {
+        "name": "ArgumentParser",
+        "kind": "class",
+        "exported": true,
+        "line": 1732
+      },
+      {
+        "name": "ArgumentParser.__init__",
+        "kind": "method",
+        "exported": false,
+        "line": 1754
+      },
+      {
+        "name": "ArgumentParser._get_kwargs",
+        "kind": "method",
+        "exported": false,
+        "line": 1820
+      },
+      {
+        "name": "ArgumentParser.add_subparsers",
+        "kind": "method",
+        "exported": true,
+        "line": 1834
+      },
+      {
+        "name": "ArgumentParser._add_action",
+        "kind": "method",
+        "exported": false,
+        "line": 1865
+      },
+      {
+        "name": "ArgumentParser._get_optional_actions",
+        "kind": "method",
+        "exported": false,
+        "line": 1872
+      },
+      {
+        "name": "ArgumentParser._get_positional_actions",
+        "kind": "method",
+        "exported": false,
+        "line": 1877
+      },
+      {
+        "name": "ArgumentParser.parse_args",
+        "kind": "method",
+        "exported": true,
+        "line": 1885
+      },
+      {
+        "name": "ArgumentParser.parse_known_args",
+        "kind": "method",
+        "exported": true,
+        "line": 1892
+      },
+      {
+        "name": "ArgumentParser._parse_known_args",
+        "kind": "method",
+        "exported": false,
+        "line": 1930
+      },
+      {
+        "name": "ArgumentParser._read_args_from_files",
+        "kind": "method",
+        "exported": false,
+        "line": 2189
+      },
+      {
+        "name": "ArgumentParser.convert_arg_line_to_args",
+        "kind": "method",
+        "exported": true,
+        "line": 2214
+      },
+      {
+        "name": "ArgumentParser._match_argument",
+        "kind": "method",
+        "exported": false,
+        "line": 2217
+      },
+      {
+        "name": "ArgumentParser._match_arguments_partial",
+        "kind": "method",
+        "exported": false,
+        "line": 2239
+      },
+      {
+        "name": "ArgumentParser._parse_optional",
+        "kind": "method",
+        "exported": false,
+        "line": 2255
+      },
+      {
+        "name": "ArgumentParser._get_option_tuples",
+        "kind": "method",
+        "exported": false,
+        "line": 2312
+      },
+      {
+        "name": "ArgumentParser._get_nargs_pattern",
+        "kind": "method",
+        "exported": false,
+        "line": 2354
+      },
+      {
+        "name": "ArgumentParser.parse_intermixed_args",
+        "kind": "method",
+        "exported": true,
+        "line": 2403
+      },
+      {
+        "name": "ArgumentParser.parse_known_intermixed_args",
+        "kind": "method",
+        "exported": true,
+        "line": 2410
+      },
+      {
+        "name": "ArgumentParser._get_values",
+        "kind": "method",
+        "exported": false,
+        "line": 2487
+      },
+      {
+        "name": "ArgumentParser._get_value",
+        "kind": "method",
+        "exported": false,
+        "line": 2543
+      },
+      {
+        "name": "ArgumentParser._check_value",
+        "kind": "method",
+        "exported": false,
+        "line": 2569
+      },
+      {
+        "name": "ArgumentParser.format_usage",
+        "kind": "method",
+        "exported": true,
+        "line": 2580
+      },
+      {
+        "name": "ArgumentParser.format_help",
+        "kind": "method",
+        "exported": true,
+        "line": 2586
+      },
+      {
+        "name": "ArgumentParser._get_formatter",
+        "kind": "method",
+        "exported": false,
+        "line": 2609
+      },
+      {
+        "name": "ArgumentParser.print_usage",
+        "kind": "method",
+        "exported": true,
+        "line": 2615
+      },
+      {
+        "name": "ArgumentParser.print_help",
+        "kind": "method",
+        "exported": true,
+        "line": 2620
+      },
+      {
+        "name": "ArgumentParser._print_message",
+        "kind": "method",
+        "exported": false,
+        "line": 2625
+      },
+      {
+        "name": "ArgumentParser.exit",
+        "kind": "method",
+        "exported": true,
+        "line": 2636
+      },
+      {
+        "name": "ArgumentParser.error",
+        "kind": "method",
+        "exported": true,
+        "line": 2641
+      }
+    ]
+  },
+  "corpus/files/ops_truncated.ts": {
+    "symbols": [
+      {
+        "name": "Op",
+        "kind": "type",
+        "exported": true,
+        "line": 17
+      },
+      {
+        "name": "ClampReason",
+        "kind": "type",
+        "exported": true,
+        "line": 64
+      },
+      {
+        "name": "OpResult",
+        "kind": "interface",
+        "exported": true,
+        "line": 94
+      },
+      {
+        "name": "TxnResult",
+        "kind": "interface",
+        "exported": true,
+        "line": 115
+      },
+      {
+        "name": "HOST_ONLY_OP_KINDS",
+        "kind": "const",
+        "exported": true,
+        "line": 131
+      },
+      {
+        "name": "isHostOnlyOp",
+        "kind": "function",
+        "exported": true,
+        "line": 139
+      },
+      {
+        "name": "OP_KINDS",
+        "kind": "const",
+        "exported": false,
+        "line": 144
+      },
+      {
+        "name": "isStringArray",
+        "kind": "function",
+        "exported": false,
+        "line": 148
+      },
+      {
+        "name": "isValidOp",
+        "kind": "function",
+        "exported": true,
+        "line": 165
+      }
+    ]
+  },
+  "corpus/files/mock-server.min.js": {
+    "symbols": [
+      {
+        "name": "CONTROL_PORT",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "CW",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "GENERATED",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "GROW",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "PORT",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "SAMPLE",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "__dirname",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "accordionHome",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "applyCommand",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "apps",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "broadcastApps",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "buildTruth",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "controlHtmlPath",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "controlWss",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "controls",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "doRestart",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "emitBlock",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "entryPath",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "epoch",
+        "kind": "var",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "focusPath",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "foldingEnabled",
+        "kind": "var",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "genLoop",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "heartbeat",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "httpServer",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "idx",
+        "kind": "var",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "jiti",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "kindPrefix",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "loadBaseBlocks",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "loop",
+        "kind": "var",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "metaForTruth",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "metaWire",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "pacedWait",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "piWss",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "playing",
+        "kind": "var",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "pushStatus",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "removeEntry",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "send",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "sessionId",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "sessionsDir",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "setFolding",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "shutdown",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "shuttingDown",
+        "kind": "var",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "sleep",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "startedAt",
+        "kind": "const",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "statusObj",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "toBlock",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "tps",
+        "kind": "var",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "truth",
+        "kind": "var",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "unsubTruth",
+        "kind": "var",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "writeEntry",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      },
+      {
+        "name": "writeFocus",
+        "kind": "function",
+        "exported": false,
+        "line": 1
+      }
+    ]
+  },
+  "corpus/files/string-hell.ts": {
+    "symbols": [
+      {
+        "name": "QuerySpec",
+        "kind": "interface",
+        "exported": true,
+        "line": 10
+      },
+      {
+        "name": "buildQuery",
+        "kind": "function",
+        "exported": true,
+        "line": 17
+      },
+      {
+        "name": "FAKE_JSON_BLOB",
+        "kind": "const",
+        "exported": true,
+        "line": 29
+      },
+      {
+        "name": "renderBanner",
+        "kind": "function",
+        "exported": true,
+        "line": 34
+      },
+      {
+        "name": "nestDeep",
+        "kind": "function",
+        "exported": true,
+        "line": 44
+      },
+      {
+        "name": "TemplateBook",
+        "kind": "class",
+        "exported": true,
+        "line": 52
+      },
+      {
+        "name": "TemplateBook.describe",
+        "kind": "method",
+        "exported": true,
+        "line": 59
+      },
+      {
+        "name": "WeirdToken",
+        "kind": "type",
+        "exported": true,
+        "line": 65
+      },
+      {
+        "name": "classify",
+        "kind": "function",
+        "exported": true,
+        "line": 67
+      }
+    ]
+  },
+  "corpus/files/decorator_maze.py": {
+    "symbols": [
+      {
+        "name": "trace",
+        "kind": "function",
+        "exported": true,
+        "line": 27
+      },
+      {
+        "name": "retry",
+        "kind": "function",
+        "exported": true,
+        "line": 40
+      },
+      {
+        "name": "Config",
+        "kind": "class",
+        "exported": true,
+        "line": 60
+      },
+      {
+        "name": "Outer",
+        "kind": "class",
+        "exported": true,
+        "line": 75
+      },
+      {
+        "name": "Outer.Inner",
+        "kind": "class",
+        "exported": false,
+        "line": 78
+      },
+      {
+        "name": "Outer.Inner.run",
+        "kind": "method",
+        "exported": true,
+        "line": 83
+      },
+      {
+        "name": "Outer.Inner.make",
+        "kind": "method",
+        "exported": true,
+        "line": 87
+      },
+      {
+        "name": "Outer.Inner.DeepestInner",
+        "kind": "class",
+        "exported": false,
+        "line": 90
+      },
+      {
+        "name": "Outer.Inner.DeepestInner.value",
+        "kind": "method",
+        "exported": true,
+        "line": 94
+      },
+      {
+        "name": "Outer.compute",
+        "kind": "method",
+        "exported": true,
+        "line": 99
+      },
+      {
+        "name": "Outer.from_config",
+        "kind": "method",
+        "exported": true,
+        "line": 103
+      },
+      {
+        "name": "Outer.session",
+        "kind": "method",
+        "exported": true,
+        "line": 107
+      },
+      {
+        "name": "Outer.fetch",
+        "kind": "method",
+        "exported": true,
+        "line": 110
+      },
+      {
+        "name": "Outer.fetch_many",
+        "kind": "method",
+        "exported": true,
+        "line": 116
+      },
+      {
+        "name": "top_level_async",
+        "kind": "function",
+        "exported": true,
+        "line": 124
+      },
+      {
+        "name": "make_closure",
+        "kind": "function",
+        "exported": false,
+        "line": 129
+      },
+      {
+        "name": "MODULE_CONSTANT",
+        "kind": "const",
+        "exported": false,
+        "line": 138
+      },
+      {
+        "name": "__all__",
+        "kind": "const",
+        "exported": false,
+        "line": 142
+      }
+    ]
+  },
+  "corpus/files/mixed-eol-indent.ts": {
+    "symbols": [
+      {
+        "name": "LockName",
+        "kind": "type",
+        "exported": true,
+        "line": 9
+      },
+      {
+        "name": "LOCK_NAMES",
+        "kind": "const",
+        "exported": true,
+        "line": 11
+      },
+      {
+        "name": "LOCK_LABELS",
+        "kind": "const",
+        "exported": true,
+        "line": 13
+      },
+      {
+        "name": "hasLock",
+        "kind": "function",
+        "exported": true,
+        "line": 20
+      },
+      {
+        "name": "isExclusive",
+        "kind": "function",
+        "exported": true,
+        "line": 28
+      },
+      {
+        "name": "LockTable",
+        "kind": "class",
+        "exported": true,
+        "line": 32
+      },
+      {
+        "name": "LockTable.acquire",
+        "kind": "method",
+        "exported": true,
+        "line": 35
+      },
+      {
+        "name": "LockTable.release",
+        "kind": "method",
+        "exported": true,
+        "line": 39
+      },
+      {
+        "name": "LockTable.holderOf",
+        "kind": "method",
+        "exported": true,
+        "line": 43
+      }
+    ]
+  }
+}

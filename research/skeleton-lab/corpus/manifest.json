@@ -1,0 +1,149 @@
+[
+  {
+    "file": "corpus/files/types.ts",
+    "lang": "ts",
+    "category": "typical",
+    "origin": "Accordion core/types.ts",
+    "note": "small, type-declaration-heavy: BlockKind unions, Block/Group interfaces"
+  },
+  {
+    "file": "corpus/files/agentView.ts",
+    "lang": "ts",
+    "category": "typical",
+    "origin": "Accordion core/agentView.ts",
+    "note": "small, function-heavy: resolveUnfold/resolveRecall pure logic"
+  },
+  {
+    "file": "corpus/files/protocol.ts",
+    "lang": "ts",
+    "category": "typical",
+    "origin": "Accordion core/protocol.ts",
+    "note": "large, interface-heavy: v17 wire protocol message union types"
+  },
+  {
+    "file": "corpus/files/wire.ts",
+    "lang": "ts",
+    "category": "typical",
+    "origin": "Accordion core/wire.ts",
+    "note": "large, function/logic-heavy: linearize/applyPlan wire-plan algorithms"
+  },
+  {
+    "file": "corpus/files/truth.ts",
+    "lang": "ts",
+    "category": "typical",
+    "origin": "Accordion core/truth.ts",
+    "note": "very large (1373 lines), class-heavy: the canonical Truth class, many methods"
+  },
+  {
+    "file": "corpus/files/liveClient.svelte.ts",
+    "lang": "ts",
+    "category": "typical",
+    "origin": "Accordion app/src/lib/live/liveClient.svelte.ts",
+    "note": "Svelte-free UI-adjacent logic file (runes-based reactive WS client), no template"
+  },
+  {
+    "file": "corpus/files/lib.es2015.collection.d.ts",
+    "lang": "ts",
+    "category": "typical",
+    "origin": "typescript npm package lib/lib.es2015.collection.d.ts (node_modules)",
+    "note": "interface-heavy .d.ts ambient declaration file (Map/Set/WeakMap/WeakSet interfaces)"
+  },
+  {
+    "file": "corpus/files/build-extension.mjs",
+    "lang": "js",
+    "category": "typical",
+    "origin": "Accordion extension/build-extension.mjs",
+    "note": "small real repo build script (esbuild bundling)"
+  },
+  {
+    "file": "corpus/files/smoke-conductor.mjs",
+    "lang": "js",
+    "category": "typical",
+    "origin": "Accordion extension/smoke-conductor.mjs",
+    "note": "medium real repo script: out-of-process conductor spawn e2e smoke test"
+  },
+  {
+    "file": "corpus/files/mock-server.mjs",
+    "lang": "js",
+    "category": "typical",
+    "origin": "Accordion extension/mock-server.mjs",
+    "note": "large real repo script: mock WS/HTTP server for dev testing"
+  },
+  {
+    "file": "corpus/files/reprlib.py",
+    "lang": "py",
+    "category": "typical",
+    "origin": "/usr/lib/python3.11/reprlib.py (CPython stdlib)",
+    "note": "small, decorator-heavy: recursive_repr decorator factory + Repr class"
+  },
+  {
+    "file": "corpus/files/json_decoder.py",
+    "lang": "py",
+    "category": "typical",
+    "origin": "/usr/lib/python3.11/json/decoder.py (CPython stdlib)",
+    "note": "moderate, class-heavy: JSONDecoder + scanner functions"
+  },
+  {
+    "file": "corpus/files/textwrap.py",
+    "lang": "py",
+    "category": "typical",
+    "origin": "/usr/lib/python3.11/textwrap.py (CPython stdlib)",
+    "note": "moderate, plain-function style with one TextWrapper class"
+  },
+  {
+    "file": "corpus/files/asyncio_tasks.py",
+    "lang": "py",
+    "category": "typical",
+    "origin": "/usr/lib/python3.11/asyncio/tasks.py (CPython stdlib)",
+    "note": "large, async-def-heavy: Task class + many async helper functions"
+  },
+  {
+    "file": "corpus/files/dataclasses.py",
+    "lang": "py",
+    "category": "typical",
+    "origin": "/usr/lib/python3.11/dataclasses.py (CPython stdlib)",
+    "note": "large, decorator-heavy: the @dataclass decorator implementation itself"
+  },
+  {
+    "file": "corpus/files/argparse.py",
+    "lang": "py",
+    "category": "typical",
+    "origin": "/usr/lib/python3.11/argparse.py (CPython stdlib)",
+    "note": "very large (2652 lines), class-heavy: ArgumentParser class hierarchy"
+  },
+  {
+    "file": "corpus/files/ops_truncated.ts",
+    "lang": "ts",
+    "category": "adversarial",
+    "origin": "Accordion core/ops.ts, truncated mid-function-body",
+    "note": "real file cut mid-expression inside isValidOp's switch (case \"group\": return ...); unbalanced braces, no trailing newline"
+  },
+  {
+    "file": "corpus/files/mock-server.min.js",
+    "lang": "js",
+    "category": "adversarial",
+    "origin": "derived from Accordion extension/mock-server.mjs via a small custom string/template-aware whitespace-collapsing minifier (no terser/esbuild available offline)",
+    "note": "single huge line (~10.6KB, 0 newlines), comments stripped, strings/templates preserved intact"
+  },
+  {
+    "file": "corpus/files/string-hell.ts",
+    "lang": "ts",
+    "category": "adversarial",
+    "origin": "synthesized for skeleton-lab",
+    "note": "string/template literals packed with braces, quotes, escaped quotes, and nested ${${${...}}} template interpolation"
+  },
+  {
+    "file": "corpus/files/decorator_maze.py",
+    "lang": "py",
+    "category": "adversarial",
+    "origin": "synthesized for skeleton-lab",
+    "note": "stacked decorators, triply-nested classes, async defs, and triple-quoted docstrings containing fake 'def fake():' / 'class NotReal' text"
+  },
+  {
+    "file": "corpus/files/mixed-eol-indent.ts",
+    "lang": "ts",
+    "category": "adversarial",
+    "origin": "derived from Accordion core/locks.ts, whitespace/line-endings deliberately corrupted",
+    "note": "alternating CRLF/LF line endings and tabs/spaces indentation mixed within the same block"
+  }
+]
