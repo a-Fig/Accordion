@@ -1,8 +1,9 @@
 # ADR 0025 — Provider-anchored token calibration
 
 **Status:** accepted, stage 1 + stage 2 shipped (plumbing + display, then decision math; see the
-Stage 2 section below)
-**Date:** 2026-07-24 (stage 1) / 2026-07-24 (stage 2)
+Stage 2 section below); system-prompt un-smearing addendum shipped alongside issue #93 (see the
+Addendum section below)
+**Date:** 2026-07-24 (stage 1) / 2026-07-24 (stage 2) / 2026-07-24 (issue #93 addendum)
 **Builds on:** [ADR 0021](0021-truth-in-the-extension.md) (the Truth that owns every config dial in
 the pi extension process, and whose `context` hook is the one place the departing wire and pi's own
 `getContextUsage()` are both in scope), [ADR 0011](0011-conductor-involvement-locks.md) (the config-
@@ -184,7 +185,9 @@ each — never a per-block calibration inside `liveTokens()`/`fullTokens()` them
 raw accessors every other internal caller (`effTokens`, group accounting, `serializeWire`) still needs
 untouched. `budget`/`protectTokens`/`contextWindow`/`protectedFromIndex`/`blockCount` are unconverted
 (the first three are literal dial values under the convention above; the last two are already
-calibration-aware or structural facts, not token sums).
+calibration-aware or structural facts, not token sums). Issue #93's addendum (below) adds the system
+prompt's raw estimate into what `liveTokens()`/`fullTokens()` sum — the calibration mechanism here is
+otherwise unchanged, it's just summing one more raw quantity before the single `calTokens` call.
 
 ### The app: closing the hero/bar/flag disagreement stage 1 accepted
 
@@ -207,11 +210,11 @@ itself untouched) so a tile's visual weight matches its calibrated readout.
   (once per model reply) even though no block actually changed size — this was called out as an
   expected stage-2 consequence in the original version of this ADR, and stage 2 confirms it: it is the
   direct, intended effect of sizing the tail in real tokens rather than raw estimate tokens.
-- **Smearing is still real and visible per-block.** Unchanged from stage 1 — a single multiplier
-  cannot separate "this block is genuinely bigger than we estimated" from "the system prompt is bigger
-  than we estimated." Stage 2 makes the smeared number load-bearing for MORE decisions (the protected
-  boundary, a conductor's trigger) than stage 1 did (display only), so this caveat now matters more,
-  not less.
+- **Smearing is still real and visible per-block — for tool-call schemas.** Stage 2 makes the smeared
+  number load-bearing for MORE decisions (the protected boundary, a conductor's trigger) than stage 1
+  did (display only), so this caveat matters. The issue-#93 addendum (below) removed the system
+  prompt's contribution to this smear; a single multiplier still cannot separate "this block is
+  genuinely bigger than we estimated" from "the tool-call schemas are bigger than we estimated."
 - **One-turn lag, still present.** `k` reflects the LAST completed request — a session whose content
   shape just changed sharply sees the new `k`, and therefore the new protected-boundary/trigger
   behavior, only after that shift's own reply lands.
@@ -228,3 +231,31 @@ itself untouched) so a tile's visual weight matches its calibrated readout.
   far; the pure multiplier remains a documented simplification, not a placeholder.
 - **Smoothing / outlier rejection.** Once there is an affine fit to smooth, raw-snap-per-observation
   stops being the obviously-simplest option; revisit together with the affine work, not before.
+
+## Addendum (issue #93) — the system prompt is un-smeared from `k`
+
+Issue #93 made the system prompt a captured, visible fact (`Truth.systemPrompt`, `extension/
+accordion.ts`'s `refreshFromCtx` reading `ExtensionContext.getSystemPrompt()` on every `context` hook).
+That gave this ADR's "smearing caveat" a real fix for one of its two named terms.
+
+**Before:** `est` (`Truth.liveTokens()`/`fullTokens()`, what `pendingWireEst` records) summed block
+tokens only. `real` (the paired provider usage) always included the system prompt. `k = real/est`
+therefore absorbed the system prompt's actual cost, smeared proportionally across every block —
+exactly the "Smearing is still real and visible per-block" consequence stage 2 called out.
+
+**After:** `liveTokens()`/`fullTokens()` now add the system prompt's own raw `estTokens` estimate
+before summing blocks. `pendingWireEst` inherits this automatically (it reads `truth.liveTokens()`/
+`fullTokens()` directly, no separate change needed at its call site). `k` no longer needs to correct
+for a term it now has independently: only tool-call-schema overhead (the other, still-unaddressed
+"belongs to no block" term named in the original smearing caveat) remains folded into the multiplier.
+
+**Consequence:** `k` will visibly shift — expected downward — on a session's first calibration
+observation after upgrade, since a real, previously-hidden source of numerator inflation is now
+accounted for directly rather than smeared. This is a one-time, expected transition, not drift to
+investigate. Sessions with a large system prompt relative to their block content see the bigger shift;
+a session with a tiny or empty system prompt sees essentially none.
+
+**Scope note:** this is not the affine fit from Deferred above — `k` is still a single, un-clamped,
+un-smoothed multiplier (the Update Rule section is unchanged). It is a partial, mechanical
+un-smearing of ONE known-named fixed-cost term, made tractable only because issue #93 needed the
+system prompt's own token estimate captured anyway — not a step toward `base` as a fitted parameter.

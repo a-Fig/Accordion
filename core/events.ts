@@ -16,9 +16,18 @@ export type TruthEvent =
 	| { type: "appended"; blocks: Block[]; rev: number }
 	/** An `apply` transaction changed overlay/group state. `results` is the per-op outcome. */
 	| { type: "ops-applied"; by: Actor; results: OpResult[]; rev: number }
-	/** A config dial moved (budget / contextWindow / protectTokens / calibration). Only the changed
-	 *  field(s). `calibration` (v18) is HOST-set only — see `Truth.setCalibration`. */
-	| { type: "config"; budget?: number; contextWindow?: number | null; protectTokens?: number; calibration?: number; rev: number }
+	/** A config dial moved (budget / contextWindow / protectTokens / calibration / systemPrompt). Only
+	 *  the changed field(s). `calibration` (v18) is HOST-set only — see `Truth.setCalibration`.
+	 *  `systemPrompt` (v19, issue #93) is HOST-set only — see `Truth.setSystemPrompt`. */
+	| {
+			type: "config";
+			budget?: number;
+			contextWindow?: number | null;
+			protectTokens?: number;
+			calibration?: number;
+			systemPrompt?: { text: string; tokens: number };
+			rev: number;
+	  }
 	/** The involvement lock-set changed (setLocks / clearLocks). */
 	| { type: "locks"; locks: readonly LockName[]; holder: string | null; tailTokens: number; rev: number }
 	/** The sent cursor advanced (a plan actually reached the model). */

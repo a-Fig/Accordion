@@ -1140,6 +1140,82 @@ if (unfoldTool && foldCodeStr) {
 	}
 }
 
+// Issue #93: the one true end-to-end path for system-prompt capture — a REAL `ExtensionContext`
+// (well, this file's mock of one, but exercising the REAL `accordion.ts` hook code, not TestHost)
+// exposing `getSystemPrompt()`, fired through the real `context` hook, landing on the real live
+// Truth, and reaching a real client over the real WS wire as part of a real `snapshot` message.
+// ALSO proves the ADR 0025 un-smearing effect with a CONTROLLED A/B pair, both run here (not
+// compared against leftover calibration state from earlier in this file, which reflects DIFFERENT
+// fabricated real-usage values and would make any before/after comparison meaningless): the exact
+// SAME fabricated real usage is paired twice, once BEFORE the system prompt is captured and once
+// immediately AFTER — the only thing that changes between the two is `pendingWireEst` gaining the
+// system prompt's raw tokens, so `k` must shift DOWN, exactly the "expected downward" consequence
+// the ADR's addendum documents.
+{
+	const SMOKE_SYSTEM_PROMPT = "You are Accordion's smoke-test system prompt." + "x".repeat(4000); // large enough for its token cost to move k measurably
+	const PROBE_USAGE = { input: 5000, output: 999_999, cacheRead: 100, cacheWrite: 50 }; // real = 5150, output excluded — SAME for both probes below
+
+	// Probe 1 (baseline, no system prompt captured yet).
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
+	handlers.message_end({ message: { role: "assistant", content: [{ type: "text", text: "probe A" }], responseId: "resp-sp-probe-a", timestamp: T0 + 11, stopReason: "stop", usage: PROBE_USAGE } }, ctx);
+	a.inbox.snapshot.length = 0;
+	a.ws.send(JSON.stringify({ type: "resnapshot" }));
+	await waitFor(() => a.inbox.snapshot.length > 0, 2000, "baseline snapshot before system-prompt capture").catch(
+		() => fails.push("issue #93: baseline resnapshot before system-prompt capture produced no snapshot"),
+	);
+	const kBefore = a.inbox.snapshot.at(-1)?.state?.calibration;
+	if (typeof kBefore !== "number") fails.push("issue #93: expected a calibration observation on the baseline snapshot");
+
+	// Probe 2 (system prompt now captured — same messages, same real usage, larger estimate).
+	ctx.getSystemPrompt = () => SMOKE_SYSTEM_PROMPT;
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx)); // captures the prompt AND records the new (larger) pendingWireEst
+	handlers.message_end({ message: { role: "assistant", content: [{ type: "text", text: "probe B" }], responseId: "resp-sp-probe-b", timestamp: T0 + 12, stopReason: "stop", usage: PROBE_USAGE } }, ctx);
+	a.inbox.snapshot.length = 0;
+	a.ws.send(JSON.stringify({ type: "resnapshot" }));
+	await waitFor(() => a.inbox.snapshot.length > 0, 2000, "snapshot after system-prompt capture").catch(
+		() => fails.push("issue #93: resnapshot after system-prompt capture produced no snapshot"),
+	);
+	const snap = a.inbox.snapshot.at(-1);
+	const sp = snap?.state?.systemPrompt;
+	if (!sp || sp.text !== SMOKE_SYSTEM_PROMPT) fails.push(`issue #93: snapshot.state.systemPrompt.text expected ${JSON.stringify(SMOKE_SYSTEM_PROMPT)}, got ${JSON.stringify(sp)}`);
+	if (!sp || typeof sp.tokens !== "number" || sp.tokens <= 0) fails.push(`issue #93: snapshot.state.systemPrompt.tokens expected a positive number, got ${JSON.stringify(sp?.tokens)}`);
+
+	const kAfter = snap?.state?.calibration;
+	if (typeof kAfter !== "number") fails.push("issue #93: expected a calibration observation on the snapshot after system-prompt capture");
+	else if (typeof kBefore === "number" && kAfter >= kBefore)
+		fails.push(`issue #93 (ADR 0025 un-smearing): expected calibration to shift DOWN once the system prompt is included in pendingWireEst (before=${kBefore}, after=${kAfter})`);
+
+	// Review regression: a prompt capture belongs to exactly one pi session. Force the NEXT
+	// session_start's best-effort refresh to throw before it can read getSystemPrompt(); the new
+	// Truth must still start with no prompt rather than inheriting SMOKE_SYSTEM_PROMPT from the
+	// process-level cache. This is the failure path that leaked one session's prompt into another.
+	const beforeResetMeta = await new Promise((resolve, reject) => {
+		http.get({ host: "127.0.0.1", port: PORT, path: "/__accordion/meta" }, (res) => {
+			let buf = "";
+			res.on("data", (d) => (buf += d));
+			res.on("end", () => {
+				try { resolve(JSON.parse(buf)); } catch (e) { reject(e); }
+			});
+		}).on("error", reject);
+	});
+	const savedGetContextUsage = ctx.getContextUsage;
+	const savedGetSystemPrompt = ctx.getSystemPrompt;
+	ctx.getContextUsage = () => { throw new Error("intentional session-start refresh failure"); };
+	handlers.session_start({ type: "session_start", reason: "new" }, ctx);
+	ctx.getContextUsage = savedGetContextUsage;
+	ctx.getSystemPrompt = savedGetSystemPrompt;
+
+	a.inbox.snapshot.length = 0;
+	a.ws.send(JSON.stringify({ type: "resnapshot" }));
+	await waitFor(() => a.inbox.snapshot.length > 0, 2000, "snapshot after prompt-cache reset").catch(
+		() => fails.push("issue #93 review: resnapshot after session-start prompt-cache reset produced no snapshot"),
+	);
+	const resetSp = a.inbox.snapshot.at(-1)?.state?.systemPrompt;
+	if (resetSp !== null)
+		fails.push(`issue #93 review: new session inherited the prior system prompt after refresh failure (${JSON.stringify(resetSp)})`);
+	try { fs.unlinkSync(path.join(SESSIONS_DIR, `${beforeResetMeta.sessionId}.json`)); } catch { /* already gone */ }
+}
+
 a.ws.close();
 b.ws.close();
 await new Promise((r) => setTimeout(r, 50));
