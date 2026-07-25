@@ -35,8 +35,8 @@ import type {
 } from "./protocol";
 
 describe("PROTOCOL_VERSION", () => {
-	it("is bumped to 17 for the generic `notice` broadcast (native-compaction surfacing)", () => {
-		expect(PROTOCOL_VERSION).toBe(17);
+	it("is bumped to 18 for provider-anchored token calibration (issue #11 stage 1, ADR 0025)", () => {
+		expect(PROTOCOL_VERSION).toBe(18);
 	});
 });
 

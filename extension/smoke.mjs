@@ -310,6 +310,100 @@ await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2
 	// telemetry's hold fields stay pinned at 0 and the hook stays sync-fast (identical to pre-Phase-C).
 	if (tel && (tel.lastHoldMs !== 0 || tel.holdTimeouts !== 0))
 		fails.push(`default path paid a hold with no conductor (lastHoldMs=${tel.lastHoldMs}, holdTimeouts=${tel.holdTimeouts})`);
+	// Issue #11 stage 1 (protocol v18): cold start — no calibration observation has landed yet, so
+	// both ingredients stay null.
+	if (tel && tel.realTokens !== null) fails.push(`telemetry.realTokens should be null before any calibration observation lands (got ${tel.realTokens})`);
+	if (tel && tel.estWireTokens !== null) fails.push(`telemetry.estWireTokens should be null before any calibration observation lands (got ${tel.estWireTokens})`);
+}
+
+// ── issue #11 stage 1: provider-anchored token calibration (protocol v18) ────
+// Fire a context hook (records the departing wire's own estimate as `pendingWireEst`), then finish
+// it with a fabricated assistant message carrying REAL provider usage — the pairing
+// `maybeObserveCalibration` snaps `truth.calibration` from. `usage.output` is deliberately huge and
+// DIFFERENT from input/cacheRead/cacheWrite so an implementation that mistakenly summed it in
+// (matching pi's own forward-looking `calculateContextTokens`, which is NOT the pairing this project
+// chose) would fail the realTokens assertion below.
+{
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx)); // records pendingWireEst
+	const calibAssistant = {
+		role: "assistant",
+		content: [{ type: "text", text: "calibration probe reply" }],
+		responseId: "resp-calib-probe",
+		timestamp: T0 + 10,
+		stopReason: "stop",
+		usage: { input: 5000, output: 999_999, cacheRead: 100, cacheWrite: 50 },
+	};
+	handlers.message_end({ message: calibAssistant }, ctx); // pairs + raw-snaps truth.calibration
+
+	// `message_end` does not itself broadcast telemetry (only the `context` hook does) — fire one more
+	// hook so `telemetryMsg()` streams the just-observed realTokens/estWireTokens.
+	a.inbox.telemetry.length = 0;
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
+	await waitFor(() => a.inbox.telemetry.length > 0, 2000, "telemetry after calibration probe").catch(
+		() => fails.push("context hook did not stream telemetry after the calibration probe"),
+	);
+	const tel = a.inbox.telemetry.at(-1);
+	if (tel.realTokens !== 5150) fails.push(`telemetry.realTokens expected 5150 (5000 input + 100 cacheRead + 50 cacheWrite, output excluded), got ${tel.realTokens}`);
+	if (typeof tel.estWireTokens !== "number" || tel.estWireTokens <= 0) fails.push(`telemetry.estWireTokens expected a positive number, got ${tel.estWireTokens}`);
+
+	a.inbox.snapshot.length = 0;
+	a.ws.send(JSON.stringify({ type: "resnapshot" }));
+	await waitFor(() => a.inbox.snapshot.length > 0, 2000, "snapshot after calibration probe").catch(
+		() => fails.push("resnapshot after the calibration probe produced no snapshot"),
+	);
+	const snap = a.inbox.snapshot.at(-1);
+	const expectedK = tel.realTokens / tel.estWireTokens;
+	if (typeof snap.state.calibration !== "number" || Math.abs(snap.state.calibration - expectedK) > 1e-9)
+		fails.push(`snapshot.calibration expected ${expectedK} (realTokens/estWireTokens), got ${snap.state.calibration}`);
+	if (snap.state.calibration === 1) fails.push("calibration probe did not move the dial away from the cold-start default");
+}
+
+// ── F3 (issue #11, ADR 0025): the agent_end backstop must not let an EARLIER newly-appended ──
+// assistant message consume `pendingWireEst` — only the run's FINAL assistant message may pair.
+// Simulate a two-call run where `message_end` was missed for BOTH calls (the exact gap the backstop
+// exists to cover): fire the `context` hook twice (each records ITS OWN departing wire's estimate,
+// the second overwriting the first — normal, expected behavior), then replay [earlier, final]
+// through `agent_end` with neither ever routed through `message_end`. Pre-fix, `earlierAssistant`
+// (the first newly-appended message the backstop's loop reaches) would consume whatever
+// `pendingWireEst` was left — the SECOND call's estimate, which actually describes the wire that
+// produced `finalOfRun`, not `earlierAssistant` — corrupting the observation and starving
+// `finalOfRun` of the pairing it should have gotten. `usage.input` differs sharply between the two
+// (1234 vs 8765) so a wrong pairing is unmistakable in `telemetry.realTokens`.
+{
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx)); // call 1 → pendingWireEst = est(wire that produced "earlier")
+	const earlierAssistant = {
+		role: "assistant",
+		content: [{ type: "text", text: "earlier reply in the run — message_end missed for this one" }],
+		responseId: "resp-f3-earlier",
+		timestamp: T0 + 30,
+		stopReason: "stop",
+		usage: { input: 1234, output: 777_777, cacheRead: 0, cacheWrite: 0 }, // real = 1234
+	};
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx)); // call 2 → pendingWireEst overwritten = est(wire that produced "final")
+	const finalOfRun = {
+		role: "assistant",
+		content: [{ type: "text", text: "final reply of the run" }],
+		responseId: "resp-f3-final",
+		timestamp: T0 + 31,
+		stopReason: "stop",
+		usage: { input: 8765, output: 111_111, cacheRead: 10, cacheWrite: 5 }, // real = 8780
+	};
+
+	a.inbox.telemetry.length = 0;
+	handlers.agent_end({ type: "agent_end", messages: [earlierAssistant, finalOfRun] }, ctx);
+
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx)); // stream telemetry
+	await waitFor(() => a.inbox.telemetry.length > 0, 2000, "telemetry after F3 backstop probe").catch(
+		() => fails.push("context hook did not stream telemetry after the F3 backstop probe"),
+	);
+	const tel = a.inbox.telemetry.at(-1);
+	if (tel.realTokens !== 8780)
+		fails.push(
+			`F3: agent_end backstop paired the WRONG message (expected finalOfRun's real=8780, got ${tel.realTokens}) — an earlier newly-appended assistant message consumed pendingWireEst`,
+		);
+
+	// Restore the three-message baseline used by later checks.
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
 }
 
 // ── agent_end is a RUN-LOCAL delta, never a full-history snapshot ─────────────

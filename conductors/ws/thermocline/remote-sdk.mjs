@@ -403,6 +403,21 @@ var Truth = class _Truth {
   budgetTok = 7e4;
   contextWindowTok = null;
   protectTokensTarget = 2e4;
+  /**
+   * Provider-anchored calibration multiplier (issue #11, ADR 0025): `k = realTokens /
+   * estimatedTokens` for the same request, snapped by the HOST ONLY (`setCalibration`, called from
+   * the extension after pairing an assistant reply's real usage against the wire estimate that
+   * produced it). Default 1 — a session that never observes a real pairing (cold start; read-only /
+   * demo / CC / file sessions, which have no live host to ever call the setter) stays at 1 forever.
+   * Stage 1 (display) shipped this dial as read-only plumbing; stage 2 (this) additionally feeds it
+   * into the DECISION surface: `protectedFromIndex()` sizes the protected tail against a calibrated
+   * threshold (see that method's doc), and `stats()` reports calibrated `liveTokens`/`fullTokens`
+   * so a conductor's own budget-trigger math runs on real numbers. `canFold` itself still carries no
+   * token threshold at all (verified — it only ever calls `isProtected`, never compares a token
+   * count), so nothing there needed to change directly; it inherits the calibrated boundary
+   * transitively through `isProtected`/`protectedFromIndex`. See `calTokens`.
+   */
+  calibrationMul = 1;
   activeLocks = [];
   activeTailTok = 0;
   holderLabel = null;
@@ -475,6 +490,13 @@ var Truth = class _Truth {
    * otherwise invisible. `carriedSent` MUST round-trip (v15) for the same silent-divergence reason:
    * a replica that lost it reclassifies a block the host recorded as already-sent back to fresh
    * (birth-fold-eligible / re-listed in `freshIds`), again with both revs still advancing in step.
+   * `calibration` (v18) now FEEDS DECISION MATH (stage 2, see the field's own doc comment) — a
+   * replica that lost it falls back to the safe default (1), which is a decision-affecting
+   * divergence in principle (a different `protectedFromIndex()`/`stats()` reading than the host's);
+   * in practice this can only happen via a stale/test literal omitting the field, never a real
+   * replica (the host serializer always emits it, and a replica that ever legitimately lost track
+   * would already have mismatched `rev` on the very next event and resnapshotted before the
+   * divergence could matter).
    */
   adoptSnapshot(s) {
     this.blockLog = s.blocks.slice();
@@ -490,6 +512,7 @@ var Truth = class _Truth {
     this.sentThroughOrderValue = s.sentThroughOrder;
     this.birthFolded = new Set(s.birthFolded);
     this.carriedSent = new Set(s.carriedSent);
+    this.calibrationMul = Number.isFinite(s.calibration) && s.calibration > 0 ? s.calibration : 1;
     this.lastChangedRev.clear();
     this.revCounter = s.rev;
     this.pfiCache = { rev: -1, value: 0 };
@@ -522,6 +545,7 @@ var Truth = class _Truth {
     next.activeLocks = prev.activeLocks.slice();
     next.holderLabel = prev.holderLabel;
     next.activeTailTok = prev.activeTailTok;
+    next.calibrationMul = prev.calibrationMul;
     for (const b of next.blockLog) {
       const old = prev.get(b.id);
       if (!old) continue;
@@ -582,6 +606,28 @@ var Truth = class _Truth {
   }
   get contextWindow() {
     return this.contextWindowTok;
+  }
+  /** The current provider-anchored calibration multiplier (default 1). See `calibrationMul`'s doc. */
+  get calibration() {
+    return this.calibrationMul;
+  }
+  /**
+   * Calibrated value of a raw token estimate — `Math.round(n * calibration)`. A pure helper a
+   * caller routes a number it ALREADY computed (`liveTokens()`, `effTokens(b)`, a per-kind sum, …)
+   * through to opt into calibration. Stage 1 (issue #11, ADR 0025) used this for DISPLAY only;
+   * stage 2 additionally routes it through `stats()` (so `TruthStats.liveTokens`/`fullTokens` are
+   * calibrated) and through the conductor-facing `ViewBlock.tokens`/`foldedTokens`
+   * (`core/conductor/hostAdapter.ts`'s `viewBlockOf`) and `ConductorHost.countTokens` — see the
+   * "convention" note on `TruthStats` for why calibrating every conductor read surface (rather than
+   * leaving per-block reads raw) is the coherent choice. `protectedFromIndex()` does NOT call this
+   * helper — it converts the TARGET into raw-estimate space with one division instead (see that
+   * method's doc for why). One multiplier necessarily SMEARS the fixed system-prompt/tool-schema
+   * overhead (which belongs to no block) proportionally across every block rather than carrying it
+   * as its own line item — `real = base + k·est` would be the honest affine model; this ships the
+   * pure multiplier knowingly (ADR 0025's Deferred section).
+   */
+  calTokens(n) {
+    return Math.round(n * this.calibrationMul);
   }
   get locks() {
     return this.activeLocks;
@@ -671,8 +717,8 @@ var Truth = class _Truth {
   stats() {
     return {
       rev: this.revCounter,
-      liveTokens: this.liveTokens(),
-      fullTokens: this.fullTokens(),
+      liveTokens: this.calTokens(this.liveTokens()),
+      fullTokens: this.calTokens(this.fullTokens()),
       budget: this.budgetTok,
       contextWindow: this.contextWindowTok,
       protectTokens: this.protectTokensTarget,
@@ -698,6 +744,16 @@ var Truth = class _Truth {
     return true;
   }
   // ── protected working tail ──────────────────────────────────────────────
+  /**
+   * The first block index inside the protected working tail. Issue #11 stage 2 (ADR 0025):
+   * `protectTokens` (and a `tail-size` holder's enforced `activeTailTokens`) is the USER-MEANINGFUL
+   * dial — sized in REAL tokens — so the walk below must size the tail against a CALIBRATED
+   * reading of the block log, not the raw chars/4 sum it used to compare against directly.
+   *
+   * See `computeProtectedFromIndex` for the exact mechanism (one division of the target, not a
+   * `calTokens` multiplication per block) and why that choice is the deterministic one across a
+   * host/replica pair.
+   */
   protectedFromIndex() {
     if (this.pfiCache.rev === this.revCounter) return this.pfiCache.value;
     const value = this.computeProtectedFromIndex();
@@ -707,8 +763,9 @@ var Truth = class _Truth {
   computeProtectedFromIndex() {
     const blocks = this.blockLog;
     if (!blocks.length) return 0;
-    const target = this.isLocked("tail-size") ? this.activeTailTok : this.protectTokensTarget;
-    if (target === 0) return blocks.length;
+    const targetReal = this.isLocked("tail-size") ? this.activeTailTok : this.protectTokensTarget;
+    if (targetReal === 0) return blocks.length;
+    const target = targetReal / this.calibrationMul;
     const cap = target * PROTECT_OVERFLOW_CAP;
     let sum = blocks[blocks.length - 1].tokens;
     if (sum >= target) return blocks.length - 1;
@@ -1043,6 +1100,34 @@ var Truth = class _Truth {
     const rev = ++this.revCounter;
     for (const id of touched) this.lastChangedRev.set(id, rev);
     this.emit({ type: "config", protectTokens: this.protectTokensTarget, rev });
+  }
+  /**
+   * HOST-ONLY calibration snap (issue #11 stage 1, ADR 0025): `k = realTokens / estWireTokens` for
+   * the request that just completed. Raw snap, no clamp, no smoothing/EMA — owner-approved v1
+   * policy: the dial always reflects the MOST RECENT observation, not a running average. There is
+   * no `WireCommand` kind for this — a client can never call it; only the extension's own host code
+   * does, after pairing an assistant message's real usage against the estimate of the wire that
+   * produced it (see `extension/accordion.ts`'s `maybeObserveCalibration`). A non-finite or
+   * non-positive `k` is refused (poisons the dial / forks replicas via JSON `null`), the same guard
+   * shape as `setBudget`/`setProtect`.
+   *
+   * HOUSEKEEP (issue #11 stage 2 F2, ADR 0025): `protectedFromIndex()` sizes the protected tail
+   * against a calibration-converted threshold (`targetReal / calibration` — see
+   * `computeProtectedFromIndex`'s doc), so `calibration` is a THIRD boundary-moving dial alongside
+   * `budget`/`protectTokens` — a `k` decrease grows the raw-estimate threshold and can leave folds/
+   * groups standing inside the now-larger protected tail. Run `housekeep()` + stamp
+   * `lastChangedRev` exactly like `setBudget`/`setProtect` do, so a k-decrease heals any fold/group
+   * the tail just grew over in the SAME rev it moved, instead of leaving it stale until the next
+   * unrelated mutation happens to call `housekeep()`.
+   */
+  setCalibration(k) {
+    if (!Number.isFinite(k) || k <= 0) return;
+    this.calibrationMul = k;
+    const touched = /* @__PURE__ */ new Set();
+    this.housekeep(touched);
+    const rev = ++this.revCounter;
+    for (const id of touched) this.lastChangedRev.set(id, rev);
+    this.emit({ type: "config", calibration: this.calibrationMul, rev });
   }
   markSent(order) {
     if (order <= this.sentThroughOrderValue) return;
@@ -1567,6 +1652,9 @@ function hydrateSnapshot(meta, state) {
     // still type-checks — the version bump is the real cross-version gate; the host serializer
     // always emits it. Default `[]` (a session that never rebuilt has no carried sent-ness).
     carriedSent: state.carriedSent ?? [],
+    // Optional on the wire (v18, same treatment as v15's `carriedSent` above); default to the
+    // cold-start value `1` for a peer/test literal that omits it — the host serializer always emits it.
+    calibration: state.calibration ?? 1,
     rev: state.rev
   });
   return truth;
@@ -1583,6 +1671,7 @@ function applyWireEvent(truth, ev) {
       if (ev.budget !== void 0) truth.setBudget(ev.budget);
       if (ev.contextWindow !== void 0 && ev.contextWindow !== null) truth.setContextWindow(ev.contextWindow);
       if (ev.protectTokens !== void 0) truth.setProtect(ev.protectTokens);
+      if (ev.calibration !== void 0) truth.setCalibration(ev.calibration);
       return;
     case "locks":
       if (ev.locks.length) truth.setLocks(ev.locks, ev.holder ?? "", ev.tailTokens);
@@ -1604,8 +1693,8 @@ function viewBlockOf(truth, b) {
     kind: b.kind,
     turn: b.turn,
     order: b.order,
-    tokens: b.tokens,
-    foldedTokens: truth.foldedTokensOf(b),
+    tokens: truth.calTokens(b.tokens),
+    foldedTokens: truth.calTokens(truth.foldedTokensOf(b)),
     toolName: b.toolName,
     callId: b.callId,
     isError: b.isError,
@@ -1660,6 +1749,7 @@ function hostEventsFromTruthEvent(truth, e) {
     return changes.length ? [{ type: "state-changed", changes, rev: e.rev }] : [];
   }
   if (e.type === "config") {
+    if (e.budget === void 0 && e.protectTokens === void 0 && e.contextWindow === void 0) return [];
     const what = e.budget !== void 0 ? "budget" : "protect";
     return [{ type: "state-changed", changes: [{ what, by: "you" }], rev: e.rev }];
   }
@@ -1673,7 +1763,7 @@ function recallHostEvent(ids, by, rev) {
 }
 
 // core/protocol.ts
-var PROTOCOL_VERSION = 17;
+var PROTOCOL_VERSION = 18;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
   "snapshot",
@@ -1815,7 +1905,7 @@ function runRemoteConductor(conductor, opts) {
           return replica.stats();
         },
         countTokens(text) {
-          return estTokens(text);
+          return replica.calTokens(estTokens(text));
         },
         digestOf(id) {
           const b = replica.get(id);
@@ -2881,8 +2971,17 @@ var ThermoclineConductor = class {
       // baseline where none of our folds/strata are applied. In the new engine our folds PERSIST,
       // so stats.liveTokens ALREADY reflects them — feeding that in would double-count our own
       // folding (fill/projection would read far too low). Because we hold `human-steering`, the
-      // ONLY foldable overlay is ours, so the raw "none-of-mine-folded" baseline is exactly
-      // stats.fullTokens; `project(view, appliedForProject())` then reproduces stats.liveTokens.
+      // ONLY foldable overlay is ours, so the "none-of-mine-folded" baseline is exactly
+      // stats.fullTokens (both calibrated aggregates, ADR 0025). CORRECTED (issue #11 F1):
+      // `project(view, appliedForProject())` only APPROXIMATES stats.liveTokens with our folds
+      // applied, not reproduces it exactly — every per-fold/per-stratum term it subtracts
+      // (`ViewBlock.tokens`/`foldedTokens`, and `summaryTokens`, which MUST come from the host's
+      // calibrated `countTokens` — see `planWithRealStratumTokens`) is itself calibrated, but
+      // `project()` sums PER-BLOCK calibrated terms while `stats.liveTokens` calibrates the raw
+      // sum ONCE, so the two can drift by a few tokens of rounding smear once `calibration !== 1`
+      // (the same per-block-vs-aggregate smearing ADR 0025's Consequences section already names),
+      // never by an order of magnitude — an uncalibrated `summaryTokens` was the order-of-
+      // magnitude bug (F1), not this rounding smear.
       liveTokens: stats.fullTokens,
       protectedFromIndex: stats.protectedFromIndex,
       protectTokens: stats.protectTokens
@@ -2900,7 +2999,12 @@ var ThermoclineConductor = class {
   appliedForProject() {
     return {
       foldedIds: new Set(this.appliedFolds.keys()),
-      strata: this.appliedStrata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens }))
+      // Applied strata can outlive a calibration observation. Recount the exact wire summary
+      // so project() compares values measured under the host's current calibration.
+      strata: this.appliedStrata.map((s) => ({
+        memberIds: s.memberIds,
+        summaryTokens: s.summary == null ? 0 : this.host.countTokens(s.summary)
+      }))
     };
   }
   /**
@@ -3081,7 +3185,7 @@ var ThermoclineConductor = class {
   async commit(view, plan, digests) {
     const touched = unionSet(this.agentTouched, this.recalledThisEpoch);
     let working = reconcilePlan(plan, touched);
-    working = planWithRealStratumTokens(working, digests);
+    working = planWithRealStratumTokens(working, digests, (t) => this.host.countTokens(t));
     working = this.topUpToCap(working, view, working.cap || capOf(view));
     const finalProjected = project(view, appliedShapeOf(working));
     const finalCap = working.cap || capOf(view);
@@ -3308,8 +3412,14 @@ var ThermoclineConductor = class {
     const savedStrata = Array.isArray(saved.strata) ? saved.strata.filter((s) => Array.isArray(s.unitIds) && s.unitIds.length > 0) : [];
     if (savedStrata.length) {
       this.appliedStrata = savedStrata.map((s) => ({ ...s, unitIds: s.unitIds.slice(), memberIds: s.memberIds.slice() }));
-      for (const s of savedStrata) {
-        if (s.summary != null) this.digestCache.set(`stratum:${s.firstId}`, stripTag(s.summary));
+      for (const s of this.appliedStrata) {
+        if (s.summary == null) {
+          s.summaryTokens = 0;
+          continue;
+        }
+        const bare = stripTag(s.summary);
+        this.digestCache.set(`stratum:${s.firstId}`, bare);
+        s.summaryTokens = this.host.countTokens(bare);
       }
       this.appliedPlan = {
         folds: [],
@@ -3451,13 +3561,13 @@ function reconcilePlan(plan, touched) {
   if (folds.length === plan.folds.length && strata.length === plan.strata.length) return plan;
   return { ...plan, folds, strata };
 }
-function planWithRealStratumTokens(plan, digests) {
+function planWithRealStratumTokens(plan, digests, countTokens) {
   const d = digests ?? /* @__PURE__ */ new Map();
   const strata = plan.strata.map((s) => {
     if (s.digestKind === "drop") return s;
     const summary = d.get(`stratum:${s.ids[0]}`);
     if (summary == null) return s;
-    return { ...s, summaryTokens: Math.ceil(summary.length / 4) };
+    return { ...s, summaryTokens: countTokens(summary) };
   });
   return { ...plan, strata };
 }

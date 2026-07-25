@@ -338,8 +338,17 @@ export class ThermoclineConductor implements Conductor {
 			// baseline where none of our folds/strata are applied. In the new engine our folds PERSIST,
 			// so stats.liveTokens ALREADY reflects them — feeding that in would double-count our own
 			// folding (fill/projection would read far too low). Because we hold `human-steering`, the
-			// ONLY foldable overlay is ours, so the raw "none-of-mine-folded" baseline is exactly
-			// stats.fullTokens; `project(view, appliedForProject())` then reproduces stats.liveTokens.
+			// ONLY foldable overlay is ours, so the "none-of-mine-folded" baseline is exactly
+			// stats.fullTokens (both calibrated aggregates, ADR 0025). CORRECTED (issue #11 F1):
+			// `project(view, appliedForProject())` only APPROXIMATES stats.liveTokens with our folds
+			// applied, not reproduces it exactly — every per-fold/per-stratum term it subtracts
+			// (`ViewBlock.tokens`/`foldedTokens`, and `summaryTokens`, which MUST come from the host's
+			// calibrated `countTokens` — see `planWithRealStratumTokens`) is itself calibrated, but
+			// `project()` sums PER-BLOCK calibrated terms while `stats.liveTokens` calibrates the raw
+			// sum ONCE, so the two can drift by a few tokens of rounding smear once `calibration !== 1`
+			// (the same per-block-vs-aggregate smearing ADR 0025's Consequences section already names),
+			// never by an order of magnitude — an uncalibrated `summaryTokens` was the order-of-
+			// magnitude bug (F1), not this rounding smear.
 			liveTokens: stats.fullTokens,
 			protectedFromIndex: stats.protectedFromIndex,
 			protectTokens: stats.protectTokens,
@@ -359,7 +368,12 @@ export class ThermoclineConductor implements Conductor {
 	private appliedForProject(): Applied {
 		return {
 			foldedIds: new Set(this.appliedFolds.keys()),
-			strata: this.appliedStrata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens })),
+			// Applied strata can outlive a calibration observation. Recount the exact wire summary
+			// so project() compares values measured under the host's current calibration.
+			strata: this.appliedStrata.map((s) => ({
+				memberIds: s.memberIds,
+				summaryTokens: s.summary == null ? 0 : this.host.countTokens(s.summary),
+			})),
 		};
 	}
 
@@ -601,7 +615,7 @@ export class ThermoclineConductor implements Conductor {
 		let working = reconcilePlan(plan, touched);
 		// (2) substitute REAL summary tokens so the projection reflects the actual wire, then
 		// (3) top up deterministically until projected ≤ cap with those real tokens.
-		working = planWithRealStratumTokens(working, digests);
+		working = planWithRealStratumTokens(working, digests, (t) => this.host.countTokens(t));
 		working = this.topUpToCap(working, view, working.cap || capOf(view));
 
 		const finalProjected = project(view, appliedShapeOf(working));
@@ -907,8 +921,22 @@ export class ThermoclineConductor implements Conductor {
 			: [];
 		if (savedStrata.length) {
 			this.appliedStrata = savedStrata.map((s) => ({ ...s, unitIds: s.unitIds.slice(), memberIds: s.memberIds.slice() }));
-			for (const s of savedStrata) {
-				if (s.summary != null) this.digestCache.set(`stratum:${s.firstId}`, stripTag(s.summary));
+			for (const s of this.appliedStrata) {
+				if (s.summary == null) {
+					s.summaryTokens = 0;
+					continue;
+				}
+				const bare = stripTag(s.summary);
+				this.digestCache.set(`stratum:${s.firstId}`, bare);
+				// RECOUNT on restore (issue #11 F1, ADR 0025): the persisted `summaryTokens` was counted
+				// under whatever `calibration` was in effect when it was written to disk — a value that
+				// need not match THIS process's current `k` (a fresh session starts at `k=1` until its
+				// own first observation re-anchors it; a model switch can also leave the two sessions on
+				// different multipliers). Trusting the stale number would let `appliedForProject()`'s
+				// subtraction mix units with `ViewBlock.tokens` (always calibrated to the CURRENT `k`) the
+				// same way the raw chars/4 bug did. Recount via the host's calibrated `countTokens` so
+				// restored strata start in the same unit as everything else `project()` reads.
+				s.summaryTokens = this.host.countTokens(bare);
 			}
 			// A synthetic plan so holdOrResend can emit the restored strata on the first tick. No folds
 			// (those re-derive from scores). projected/cap/targetTokens are sentinels (unused by hold).
@@ -1117,14 +1145,27 @@ export function reconcilePlan(plan: Plan, touched: Set<string>): Plan {
 }
 
 /** Substitute REAL LLM-summary token counts into a plan's strata (the digest text length), so the
- *  projection reflects what the agent will actually receive — not planEpoch's ~12% estimate. */
-export function planWithRealStratumTokens(plan: Plan, digests: Map<string, string> | undefined): Plan {
+ *  projection reflects what the agent will actually receive — not planEpoch's ~12% estimate.
+ *
+ *  `countTokens` MUST be the host's CALIBRATED counter (`ConductorHost.countTokens`, issue #11
+ *  stage 2 / ADR 0025) — `project()` (`policy.ts`) subtracts `summaryTokens` from a calibrated
+ *  `members` sum (`ViewBlock.tokens` is calibrated) in the SAME expression, so a raw chars/4
+ *  `summaryTokens` would understate the subtrahend by a factor of `calibration` and overstate every
+ *  committed stratum's saving by `(k−1)·digestTokens`, letting `project()` under-report the real wire
+ *  size while the hard-budget invariant (this file's tick check and `onWireDeparting`'s emergency
+ *  check) both read the corrupted, too-low number. This function stays pure — the caller (`commit`)
+ *  threads the host's counter in rather than this module reaching for a host itself. */
+export function planWithRealStratumTokens(
+	plan: Plan,
+	digests: Map<string, string> | undefined,
+	countTokens: (text: string) => number,
+): Plan {
 	const d = digests ?? new Map<string, string>();
 	const strata = plan.strata.map((s) => {
 		if (s.digestKind === "drop") return s; // a drop contributes 0 — no real text
 		const summary = d.get(`stratum:${s.ids[0]}`);
 		if (summary == null) return s; // no LLM text yet → keep the estimate
-		return { ...s, summaryTokens: Math.ceil(summary.length / 4) };
+		return { ...s, summaryTokens: countTokens(summary) };
 	});
 	return { ...plan, strata };
 }

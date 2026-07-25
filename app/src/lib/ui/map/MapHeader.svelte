@@ -54,7 +54,36 @@
 		return m;
 	});
 
-	const denom = $derived(Math.max(store.fullTokens, store.budget, 1));
+	// ── provider-anchored calibration (issue #11, ADR 0025) ──────────────────
+	// Stage 2: `budget`/`protectTokens` are real-token DIAL values (the literal number the user set —
+	// stage 2 does not multiply them), so every read that gates/warns/draws against them now
+	// calibrates the OTHER side of the comparison (a raw Truth aggregate) instead, rather than
+	// inflating the dial itself. `calBudget` therefore is now just `store.budget` — kept as its own
+	// derived name (not inlined) so every existing read site below stays a one-word swap-in and the
+	// hero denominator visibly matches what `store.overBudget`/the bar actually compare against (the
+	// stage-1 version of this derived `calTokens(store.budget)`'d it, which is what let the hero
+	// number and the color/bar disagree — see ADR 0025's stage-1 Consequences). `calLiveTokens` is
+	// still the one side that genuinely needs `calTokens` — `store.liveTokens` stays the raw Truth
+	// accessor. `notAnchored` is the "≈" marker gate: `calibration === 1` alone — covers BOTH cold
+	// start (the session's own default before any observation has landed) AND every read-only/demo/
+	// CC/file session (k pinned at 1 forever, ADR 0025's "Cold start, model switch, and read-only
+	// sessions" section) in the one check, matching `ContextMap`/`Inspector`'s gate exactly (F4,
+	// issue #11 review round). `readOnly` alone used to ALSO gate this — dropped: an ORPHANED live
+	// session (was live, lost its host, `readOnly` flips true) keeps whatever `k != 1` it last
+	// observed, and showing "≈" over that factually-anchored number (while the other two surfaces
+	// showed it bare) was a real disagreement, not a hedge — the anchored numbers now stay bare
+	// everywhere, consistently, even once a session goes read-only.
+	const calLiveTokens = $derived(store.calTokens(store.liveTokens));
+	const calBudget = $derived(store.budget);
+	const calOverBy = $derived(calLiveTokens - calBudget);
+	const calFullTokens = $derived(store.calTokens(store.fullTokens));
+	const calProtectedTokens = $derived(store.calTokens(store.protectedTokens));
+	const notAnchored = $derived(store.calibration === 1);
+
+	// `denom` is the composition bar's whole token axis — `budget`/`protectTarget` are already
+	// real-token dial values, so `calFullTokens` (not the raw `store.fullTokens`) is what keeps this
+	// axis in the SAME basis as those dials (and as `calLiveTokens`/`calBudget` above).
+	const denom = $derived(Math.max(calFullTokens, store.budget, 1));
 	// fmt/k formatters must round their input because AnimatedNumber passes a float mid-tween
 	const fmt = (n: number) => Math.round(n).toLocaleString();
 	const k = (n: number) => {
@@ -118,7 +147,7 @@
 	const targetTokens = $derived(dragTokens ?? protectTarget);
 	// Headroom: the slack between what's used and the budget ceiling. Only present when
 	// the budget exceeds the full (unfolded) size — i.e. denom === budget.
-	const headroomPct = $derived(Math.max(0, ((denom - store.fullTokens) / denom) * 100));
+	const headroomPct = $derived(Math.max(0, ((denom - calFullTokens) / denom) * 100));
 	// What "Revert to auto" will clear: every block carrying a manual/agent override.
 	const editCount = $derived(store.blocks.filter((b) => b.override !== null).length);
 
@@ -220,12 +249,13 @@
 		<div class="nums">
 			<div class="hero-line">
 				<span class="hero-stat mono tnum" class:over={store.overBudget}>
-					<AnimatedNumber value={store.liveTokens} format={fmt} />
+					{#if notAnchored}<span class="approx" title="estimated — not yet anchored to a real provider response" aria-hidden="true">≈</span>{/if}
+					<AnimatedNumber value={calLiveTokens} format={fmt} />
 				</span>
-				<span class="budget-denom mono tnum">/ <AnimatedNumber value={store.budget} format={fmt} /></span>
+				<span class="budget-denom mono tnum">/ <AnimatedNumber value={calBudget} format={fmt} /></span>
 				{#if store.overBudget}
 					<span class="over-flag mono tnum">
-						over by <AnimatedNumber value={store.liveTokens - store.budget} format={fmtOverBy} />
+						over by <AnimatedNumber value={calOverBy} format={fmtOverBy} />
 					</span>
 				{/if}
 			</div>
@@ -329,7 +359,7 @@
 					? lockTip + ` (the active strategy now owns the tail — enforcing ${fmt(protectTarget)} tokens)`
 					: notController
 						? readOnlyTip("steer")
-						: `Actual protected tail: ${fmt(store.protectedTokens)} tokens; target: ${fmt(store.protectTokens)} tokens — click the value or drag the handle to change it`}
+						: `Actual protected tail: ${fmt(calProtectedTokens)} tokens; target: ${fmt(store.protectTokens)} tokens — click the value or drag the handle to change it`}
 			>
 				<span class="ctl-eyebrow mono">
 					<Icon name="lock" size={10} />
@@ -351,8 +381,8 @@
 								)}
 						/>
 					{/if}
-					{#if Math.abs(store.protectedTokens - protectTarget) > 500}
-						<span class="kl-target tnum">({k(store.protectedTokens)})</span>
+					{#if Math.abs(calProtectedTokens - protectTarget) > 500}
+						<span class="kl-target tnum">({k(calProtectedTokens)})</span>
 					{/if}
 				</span>
 			</div>
@@ -428,15 +458,17 @@
 		<div class="bar" bind:this={barEl} role="img" aria-label="Context composition">
 			{#each LADDER as seg (seg.kind)}
 				{@const v = liveByKind[seg.kind]}
+				{@const calV = store.calTokens(v)}
 				{#if v > 0}
-					<span class="seg k-{seg.kind}" style:width="{(v / denom) * 100}%" title="{seg.label}: {fmt(v)} live"></span>
+					<span class="seg k-{seg.kind}" style:width="{(calV / denom) * 100}%" title="{seg.label}: {fmt(calV)} live"></span>
 				{/if}
 			{/each}
 			{#if store.savedTokens > 0}
-				<span class="seg saved-seg" style:width="{(store.savedTokens / denom) * 100}%" title="folded away: {fmt(store.savedTokens)}"></span>
+				{@const calSaved = store.calTokens(store.savedTokens)}
+				<span class="seg saved-seg" style:width="{(calSaved / denom) * 100}%" title="folded away: {fmt(calSaved)}"></span>
 			{/if}
 			{#if headroomPct > 0.5}
-				<span class="headroom" style:left="{100 - headroomPct}%" style:width="{headroomPct}%" title="headroom: {fmt(store.budget - store.fullTokens)} under budget"></span>
+				<span class="headroom" style:left="{100 - headroomPct}%" style:width="{headroomPct}%" title="headroom: {fmt(store.budget - calFullTokens)} under budget"></span>
 			{/if}
 			<!-- protected extent, clipped to the bar -->
 			<span class="prot-tint" style:width="{handlePct}%" aria-hidden="true"></span>
@@ -533,6 +565,12 @@
 		font-size: var(--fs-sm);
 		color: var(--faint);
 		align-self: baseline;
+	}
+
+	/* "≈" marker — a bare (not provider-anchored) estimate. Monochrome, no new color (issue #11). */
+	.approx {
+		color: var(--muted);
+		margin-right: 0.1em;
 	}
 
 	/* Over-budget flag — danger, no pill chrome */

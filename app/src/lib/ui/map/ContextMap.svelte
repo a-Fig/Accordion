@@ -69,8 +69,12 @@
 		{ f: 5, lbl: "up to 15k tok" },
 		{ f: 6, lbl: "past 15k tok" },
 	] as const;
-	// Use the canonical faceFor from tileDraw (single source of truth).
-	const faceFor = faceForLib;
+	// Use the canonical faceFor from tileDraw (single source of truth) — every call site below feeds
+	// it a CALIBRATED token count (issue #11 stage 2, ADR 0025) so a tile's die-face weight matches
+	// what the rest of the UI now reports as that block's real size, not the raw chars/4 estimate.
+	// Wrapped once here (rather than at each call site) so `faceFor(x)` stays a drop-in raw-tokens-in
+	// call everywhere it's already used; the canvas/sprite machinery `faceForLib` feeds is untouched.
+	const faceFor = (tokens: number) => faceForLib(store.calTokens(tokens));
 
 	// Color = kind legend (toolbar). Each block kind owns one spectrum hue (--k-*);
 	// this names them so the grid's colours are self-explaining. Order follows the
@@ -380,10 +384,16 @@
 	});
 
 	const k = (n: number) => { n = Math.round(n); return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`; };
+	// issue #11 stage 1: "≈" marker gate for the transcript's visible token badge — `calibration === 1`
+	// covers BOTH cold start (no observation yet) and every read-only/demo/CC/file session (no live
+	// host ever calibrates those), so no separate `readOnly` prop plumbing is needed here.
+	const notAnchored = $derived(store.calibration === 1);
 	function tip(b: Block, prot = false): string {
 		const tool = b.toolName ? ` ${b.toolName}` : "";
 		const folded = store.isFolded(b);
-		const f = folded ? ` · folded ${b.tokens}→${store.effTokens(b)}` : "";
+		// Token readouts calibrated (issue #11 stage 1) — display only, the fold/protect gating logic
+		// below this stays on the raw `store.canFold`/`prot` decision.
+		const f = folded ? ` · folded ${store.calTokens(b.tokens)}→${store.calTokens(store.effTokens(b))}` : "";
 		// The hint mirrors what a double-click actually DOES — steerLocked makes it a no-op, else
 		// store.toggle gated by canFold — so the tile never advertises a fold the gate would refuse:
 		// a human-steering lock, read-only (v16, ADR 0024), a live user/tool_call, a pin, or the
@@ -401,12 +411,12 @@
 							: b.override === "pinned"
 								? "click to inspect · pinned — held live"
 								: "click to inspect · this kind never folds";
-		return `${b.kind}${tool} · ${b.tokens.toLocaleString()} tok${f}\n${action}`;
+		return `${b.kind}${tool} · ${store.calTokens(b.tokens).toLocaleString()} tok${f}\n${action}`;
 	}
 	function groupTip(g: Group): string {
 		const members = store.groupMembers(g);
-		const full = store.groupFullTokens(g);
-		const saved = store.groupSavedTokens(g);
+		const full = store.calTokens(store.groupFullTokens(g));
+		const saved = store.calTokens(store.groupSavedTokens(g));
 		const strag = store.groupStragglerCount(g);
 		const turns = members.length > 0
 			? `turns ${members[0].turn}–${members[members.length - 1].turn}`
@@ -424,9 +434,9 @@
 
 	/** Title for an ungrouped fold's cocoa block — the digest now standing in for the block.
 	 *  The dice face on the cocoa shows ITS size (the digest); the sliver beside it carries the
-	 *  original block's weight. */
+	 *  original block's weight. Token readout calibrated (issue #11 stage 1) — display only. */
 	function foldTip(b: Block): string {
-		return `folded · ${k(b.tokens)}→${k(store.effTokens(b))} tok · click to inspect · double-click to unfold`;
+		return `folded · ${k(store.calTokens(b.tokens))}→${k(store.calTokens(store.effTokens(b)))} tok · click to inspect · double-click to unfold`;
 	}
 
 	// ---- range selection state (local — for creating groups) ----------------
@@ -1056,7 +1066,7 @@
 					class:inrange={rangeSet.has(b.id)}
 					style:height="{cell}px"
 					data-id={interactive ? b.id : undefined}
-					title={interactive ? foldTip(b) : `folded · ${k(b.tokens)} tok · grouped`}
+					title={interactive ? foldTip(b) : `folded · ${k(store.calTokens(b.tokens))} tok · grouped`}
 				>
 					{#each { length: face } as _, n}
 						<div class="bar" style:top="{barStart + n * gap}px"></div>
@@ -1208,7 +1218,7 @@
 							<span class="tr-role">{ROLE[b.kind]}</span>
 							{#if b.toolName}<span class="tr-tool mono">{b.toolName}</span>{/if}
 							<span class="tr-tok mono tnum">
-								{k(store.effTokens(b))}{#if folded}<span class="dim">/{k(b.tokens)}</span>{/if} tok
+								{#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}{k(store.calTokens(store.effTokens(b)))}{#if folded}<span class="dim">/{k(store.calTokens(b.tokens))}</span>{/if} tok
 							</span>
 							{#if prot}
 								<span class="tr-flag" title="protected working tail — never folds"><Icon name="lock" size={10} /></span>
@@ -1303,6 +1313,10 @@
 		font-size: var(--fs-xs);
 	}
 	.dim {
+		color: var(--faint);
+	}
+	/* "≈" marker — a bare (not provider-anchored) estimate, issue #11 stage 1. Monochrome, no new color. */
+	.approx {
 		color: var(--faint);
 	}
 
