@@ -153,12 +153,6 @@ export interface ConductorHost {
 	/** Aggregate readout of the current state. CALIBRATED — see `TruthStats`'s doc comment. */
 	stats(): TruthStats;
 	/**
-	 * The current effective system prompt, or `null` if none has been captured yet (issue #93).
-	 * Read-only — there is no `Op` kind for it, so it can never be a legal `propose()` target; it is a
-	 * scalar `Truth` fact, not a `Block`.
-	 */
-	systemPrompt(): { text: string; tokens: number } | null;
-	/**
 	 * Synchronous token estimate using the host's tokenizer, CALIBRATED (issue #11 stage 2, ADR 0025)
 	 * against the session's current `Truth.calibration` — same convention as `ViewBlock.tokens` /
 	 * `stats()`, so a conductor mixing this with either in one comparison (e.g. reserving output room

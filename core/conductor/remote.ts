@@ -229,9 +229,6 @@ export function runRemoteConductor(conductor: Conductor, opts: RemoteConductorOp
 				stats() {
 					return replica!.stats();
 				},
-				systemPrompt() {
-					return replica!.systemPrompt;
-				},
 				countTokens(text: string): number {
 					// Calibrated (issue #11 stage 2, ADR 0025) — see `ConductorHost.countTokens`'s doc. The
 					// replica carries the same `calibration` the host does (replicated via `config` events),

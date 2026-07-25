@@ -150,17 +150,6 @@ export class Truth {
 	private contextWindowTok: number | null = null;
 	private protectTokensTarget = 20_000;
 	/**
-	 * The current effective system prompt (issue #93), captured by the HOST ONLY from
-	 * `ExtensionContext.getSystemPrompt()` on every `context` hook firing (never at `session_start`,
-	 * which can race pi's own `resources_discover`-driven rebuild — see `extension/accordion.ts`'s
-	 * `refreshFromCtx`). `null` until the first capture — cold start, and every read-only/demo/CC/file
-	 * session forever (no live host ever calls the setter). Deliberately NOT a `Block`: it has no
-	 * index, so `canFold`/`isProtected`/grouping/pin never see it — structurally, not just policy,
-	 * exempt from folding. See `systemPrompt` getter and `setSystemPrompt`.
-	 */
-	private systemPromptText: string | null = null;
-	private systemPromptTokensVal = 0;
-	/**
 	 * Provider-anchored calibration multiplier (issue #11, ADR 0025): `k = realTokens /
 	 * estimatedTokens` for the same request, snapped by the HOST ONLY (`setCalibration`, called from
 	 * the extension after pairing an assistant reply's real usage against the wire estimate that
@@ -281,7 +270,6 @@ export class Truth {
 		birthFolded: readonly string[];
 		carriedSent: readonly string[];
 		calibration: number;
-		systemPrompt: { text: string; tokens: number } | null;
 		rev: number;
 	}): void {
 		this.blockLog = s.blocks.slice();
@@ -298,12 +286,6 @@ export class Truth {
 		this.birthFolded = new Set(s.birthFolded);
 		this.carriedSent = new Set(s.carriedSent);
 		this.calibrationMul = Number.isFinite(s.calibration) && s.calibration > 0 ? s.calibration : 1;
-		// Self-validated exactly like `calibration` above — a malformed shape (bad `text`/`tokens` type,
-		// e.g. from a hand-built test literal or a corrupted wire frame) falls back to unset rather than
-		// poisoning `liveTokens()`/`fullTokens()` with NaN.
-		const sp = s.systemPrompt;
-		this.systemPromptText = sp && typeof sp.text === "string" && Number.isFinite(sp.tokens) && sp.tokens >= 0 ? sp.text : null;
-		this.systemPromptTokensVal = this.systemPromptText === null ? 0 : Math.round(sp!.tokens);
 		this.lastChangedRev.clear();
 		this.revCounter = s.rev;
 		// Rev-keyed read caches are stamped stale so they recompute against the adopted rev.
@@ -339,12 +321,6 @@ export class Truth {
 		next.holderLabel = prev.holderLabel;
 		next.activeTailTok = prev.activeTailTok;
 		next.calibrationMul = prev.calibrationMul;
-		// Issue #93: carried, unlike `contextWindow` — the system prompt IS a preserved captured fact,
-		// not a live re-derived one. `refreshFromCtx` runs before a rebuild can be triggered (it's called
-		// at the top of the `context` hook, before `ingestMessages`), so without this carry `next` would
-		// go stale until the extension's own post-build re-apply catches up on the NEXT hook tick.
-		next.systemPromptText = prev.systemPromptText;
-		next.systemPromptTokensVal = prev.systemPromptTokensVal;
 		for (const b of next.blockLog) {
 			const old = prev.get(b.id);
 			if (!old) continue;
@@ -438,10 +414,6 @@ export class Truth {
 	get contextWindow(): number | null {
 		return this.contextWindowTok;
 	}
-	/** The current effective system prompt, or `null` if none has been captured yet. See the private field's doc. */
-	get systemPrompt(): { text: string; tokens: number } | null {
-		return this.systemPromptText === null ? null : { text: this.systemPromptText, tokens: this.systemPromptTokensVal };
-	}
 	/** The current provider-anchored calibration multiplier (default 1). See `calibrationMul`'s doc. */
 	get calibration(): number {
 		return this.calibrationMul;
@@ -456,12 +428,10 @@ export class Truth {
 	 * "convention" note on `TruthStats` for why calibrating every conductor read surface (rather than
 	 * leaving per-block reads raw) is the coherent choice. `protectedFromIndex()` does NOT call this
 	 * helper — it converts the TARGET into raw-estimate space with one division instead (see that
-	 * method's doc for why). One multiplier necessarily SMEARS the fixed tool-schema overhead (which
-	 * belongs to no block) proportionally across every block rather than carrying it as its own line
-	 * item — `real = base + k·est` would be the honest affine model; this ships the pure multiplier
-	 * knowingly (ADR 0025's Deferred section). As of issue #93, the system prompt is no longer part of
-	 * that smear: `liveTokens()`/`fullTokens()` include it directly, so only tool-call-schema overhead
-	 * remains folded into `k` (see `liveTokens()`'s doc and ADR 0025's addendum).
+	 * method's doc for why). One multiplier necessarily SMEARS the fixed system-prompt/tool-schema
+	 * overhead (which belongs to no block) proportionally across every block rather than carrying it
+	 * as its own line item — `real = base + k·est` would be the honest affine model; this ships the
+	 * pure multiplier knowingly (ADR 0025's Deferred section).
 	 */
 	calTokens(n: number): number {
 		return Math.round(n * this.calibrationMul);
@@ -538,22 +508,13 @@ export class Truth {
 	foldedTokensOf(b: Block): number {
 		return b.subst !== undefined ? substTokens(b.subst) : digestTokens(b);
 	}
-	/**
-	 * Issue #93: includes the system prompt's raw token estimate (0 when uncaptured — every CC/demo/
-	 * file session, and a live session before its first `context` hook). This un-smears the system
-	 * prompt out of `extension/accordion.ts`'s calibration pairing (`pendingWireEst`), which reads this
-	 * method directly — ADR 0025's documented "smearing caveat" previously absorbed the system prompt's
-	 * real cost into `k` because `est` excluded it while `real` (provider usage) never did. Tool-schema
-	 * overhead (also belonging to no block) remains smeared; only the system prompt's contribution is
-	 * now a real, separately-estimated term. See the ADR's issue-#93 addendum.
-	 */
 	liveTokens(): number {
-		let n = this.systemPromptTokensVal;
+		let n = 0;
 		for (const b of this.blockLog) n += this.effTokens(b);
 		return n;
 	}
 	fullTokens(): number {
-		let n = this.systemPromptTokensVal;
+		let n = 0;
 		for (const b of this.blockLog) n += b.tokens;
 		return n;
 	}
@@ -975,21 +936,6 @@ export class Truth {
 		this.contextWindowTok = n;
 		const rev = ++this.revCounter;
 		this.emit({ type: "config", contextWindow: this.contextWindowTok, rev });
-	}
-	/**
-	 * HOST-ONLY (issue #93): set the current effective system prompt. Called from
-	 * `extension/accordion.ts`'s `refreshFromCtx` on every `context` hook firing, only when the value
-	 * actually changed (the caller diffs against `this.systemPrompt` first) — so in the common case
-	 * this fires once near session start and never again. No `housekeep()` call: unlike `budget`/
-	 * `protectTokens`/`calibration`, the system prompt occupies no block index and can never move
-	 * `protectedFromIndex()`, so there is nothing to heal.
-	 */
-	setSystemPrompt(text: string, tokens: number): void {
-		if (typeof text !== "string" || !Number.isFinite(tokens) || tokens < 0) return;
-		this.systemPromptText = text;
-		this.systemPromptTokensVal = Math.round(tokens);
-		const rev = ++this.revCounter;
-		this.emit({ type: "config", systemPrompt: { text: this.systemPromptText, tokens: this.systemPromptTokensVal }, rev });
 	}
 	setProtect(n: number): void {
 		// The human can no longer resize the tail under the `tail-size` lock (the holder owns it).
