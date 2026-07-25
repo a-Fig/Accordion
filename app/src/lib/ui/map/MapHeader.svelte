@@ -252,7 +252,7 @@
 					{#if notAnchored}<span class="approx" title="estimated — not yet anchored to a real provider response" aria-hidden="true">≈</span>{/if}
 					<AnimatedNumber value={calLiveTokens} format={fmt} />
 				</span>
-				<span class="budget-denom mono tnum">/ {#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}<AnimatedNumber value={calBudget} format={fmt} /></span>
+				<span class="budget-denom mono tnum">/ <AnimatedNumber value={calBudget} format={fmt} /></span>
 				{#if store.overBudget}
 					<span class="over-flag mono tnum">
 						over by <AnimatedNumber value={calOverBy} format={fmtOverBy} />
