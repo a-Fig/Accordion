@@ -109,10 +109,6 @@
 	// mutator and NEVER touches `group.folded`. Only the explicit "Unfold to context"
 	// button changes the wire. Mutated immutably (reassign a new Set) so `displayRows`
 	// re-derives.
-	// Issue #93: local expand/collapse for the system-prompt panel — it has no block id, so it has no
-	// Inspector route of its own; a self-contained toggle is the whole UI for it.
-	let spExpanded = $state(false);
-
 	let peeked = $state(new Set<string>());
 	function enterPeek(gid: string) {
 		const next = new Set(peeked);
@@ -1199,27 +1195,6 @@
 					</div>
 				</section>
 				{/if}
-				{#if store.systemPrompt}
-				<!-- Issue #93: the system prompt. Never a Block — no id, so nothing here can ever
-				     select/fold/pin/group it. Visually related to .box.prot (same accent-dim border
-				     language, "this box is structurally special") but deliberately distinct from it
-				     (dashed, dimmer fill) since a protected tail and the system prompt mean different
-				     things. Its tokens are already counted into the hero readout via
-				     Truth.liveTokens()/fullTokens() — no separate total shown here. -->
-				<section class="box sysprompt">
-					<header class="sp-head">
-						<Icon name="terminal" size={12} />
-						<span class="sp-label">System prompt</span>
-						<span class="sp-tok mono tnum">
-							{#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}{k(store.calTokens(store.systemPrompt.tokens))} tok
-						</span>
-						<button class="sp-toggle" onclick={() => (spExpanded = !spExpanded)}>{spExpanded ? "Hide" : "View"}</button>
-					</header>
-					{#if spExpanded}
-						<pre class="sp-text">{store.systemPrompt.text}</pre>
-					{/if}
-				</section>
-				{/if}
 			</div>
 		{:else}
 			<!-- TRANSCRIPT: the concretion. Blocks in conversation order, full text when live,
@@ -1665,57 +1640,6 @@
 		border: 3px solid var(--accent-dim);
 		background: var(--panel);
 		box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent), var(--shadow-1);
-	}
-	/* the system-prompt panel (issue #93): riffs on .box.prot's "structurally special" accent-dim
-	   border language for family resemblance, but dashed + the plain .box fill (not .box.prot's
-	   brighter one) so it reads as a DIFFERENT kind of special — never confused with the protected
-	   tail. Never a Block: no fold/pin/group affordance lives here, ever. */
-	.box.sysprompt {
-		border: 2px dashed var(--accent-dim);
-		background: var(--panel-2);
-		gap: var(--sp-2);
-	}
-	.sp-head {
-		display: flex;
-		align-items: center;
-		gap: var(--sp-2);
-		color: var(--muted);
-	}
-	.sp-label {
-		font-size: var(--fs-sm);
-		font-weight: 600;
-		flex: 1;
-	}
-	.sp-tok {
-		font-size: var(--fs-xs);
-		color: var(--faint);
-	}
-	.sp-toggle {
-		font-size: var(--fs-xs);
-		color: var(--muted);
-		background: transparent;
-		border: 1px solid var(--line);
-		border-radius: var(--radius-sm);
-		padding: 2px var(--sp-2);
-		cursor: pointer;
-	}
-	.sp-toggle:hover {
-		color: var(--text);
-		border-color: var(--accent-dim);
-	}
-	.sp-text {
-		margin: 0;
-		max-height: 320px;
-		overflow: auto;
-		white-space: pre-wrap;
-		word-break: break-word;
-		font-family: var(--mono);
-		font-size: var(--fs-xs);
-		color: var(--text);
-		background: var(--panel);
-		border: 1px solid var(--line);
-		border-radius: var(--radius-sm);
-		padding: var(--sp-2);
 	}
 
 	/* canvas-fill: flex wrapper for TileCanvas inside a box (fills the space after the rail). */
