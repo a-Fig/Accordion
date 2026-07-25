@@ -1,0 +1,101 @@
+{
+  "candidate": "ast-exact",
+  "answers": [
+    {
+      "id": "agentView-q1",
+      "answer": "code: string; label: string; text: string (comment: the block's ORIGINAL full text (NOT the folded digest) — for a group, its members joined); ids: string[]"
+    },
+    {
+      "id": "agentView-q2",
+      "answer": "{ restored: RecallContent[]; missing: string[] }"
+    },
+    {
+      "id": "agentView-q3",
+      "answer": "Parameter: b: Block. Return type: string."
+    },
+    {
+      "id": "agentView-q4",
+      "answer": "UnfoldRestored has a field typed Block[\"kind\"], named `kind`."
+    },
+    {
+      "id": "agentView-q5",
+      "answer": "From \"./digest\": foldCode, wireFoldable. From \"./wire\": isDurableId."
+    },
+    {
+      "id": "agentView-q6",
+      "answer": "CANNOT DETERMINE from skeleton"
+    },
+    {
+      "id": "agentView-q7",
+      "answer": "CANNOT DETERMINE from skeleton"
+    },
+    {
+      "id": "agentView-q8",
+      "answer": "CANNOT DETERMINE from skeleton"
+    },
+    {
+      "id": "wire-q1",
+      "answer": "Parameters: m: PiMessage, i: number, partIndex?: number (partIndex optional). Returns: string."
+    },
+    {
+      "id": "wire-q2",
+      "answer": "0x01000193"
+    },
+    {
+      "id": "wire-q3",
+      "answer": "(text: string): number => estTokens(text) + BLOCK_OVERHEAD"
+    },
+    {
+      "id": "wire-q4",
+      "answer": "WireMsgShape extends MsgInfo, adding the field `role: string`."
+    },
+    {
+      "id": "wire-q5",
+      "answer": "Module: \"./tokens\". Other named symbol imported alongside BLOCK_OVERHEAD: estTokens."
+    },
+    {
+      "id": "wire-q6",
+      "answer": "CANNOT DETERMINE from skeleton"
+    },
+    {
+      "id": "wire-q7",
+      "answer": "CANNOT DETERMINE from skeleton"
+    },
+    {
+      "id": "wire-q8",
+      "answer": "CANNOT DETERMINE from skeleton"
+    },
+    {
+      "id": "reprlib-q1",
+      "answer": "'...'"
+    },
+    {
+      "id": "reprlib-q2",
+      "answer": "Redo the builtin repr() (representation) but with limits on most sizes."
+    },
+    {
+      "id": "reprlib-q3",
+      "answer": "[\"Repr\", \"repr\", \"recursive_repr\"]"
+    },
+    {
+      "id": "reprlib-q4",
+      "answer": "self, x, level, left, right, maxiter, trail='' (trail has default value '')"
+    },
+    {
+      "id": "reprlib-q5",
+      "answer": "from itertools import islice; from _thread import get_ident"
+    },
+    {
+      "id": "reprlib-q6",
+      "answer": "CANNOT DETERMINE from skeleton"
+    },
+    {
+      "id": "reprlib-q7",
+      "answer": "CANNOT DETERMINE from skeleton"
+    },
+    {
+      "id": "reprlib-q8",
+      "answer": "CANNOT DETERMINE from skeleton"
+    }
+  ]
+}
