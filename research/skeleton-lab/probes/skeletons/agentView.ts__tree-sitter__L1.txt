@@ -1,0 +1,42 @@
+/*
+ * agentView.ts — the live agent's `unfold` / `recall` resolution, run LOCALLY against the
+ * ...
+ */
+import type { Block } from "./types";
+import type { Truth } from "./truth";
+import { foldCode, wireFoldable } from "./digest";
+import { isDurableId } from "./wire";
+
+/** One block/group restored by `resolveUnfold`. */
+export interface UnfoldRestored {
+	code: string;
+	kind: Block["kind"];
+	label: string;
+	/** The block ids this restore actually touched (≥1; >1 on a hash collision or a group unfold). */
+	ids: string[];
+}
+
+/** One block/group's original content returned by `resolveRecall`. */
+export interface RecallContent {
+	code: string;
+	label: string;
+	/** The block's ORIGINAL full text (NOT the folded digest) — for a group, its members joined. */
+	text: string;
+	ids: string[];
+}
+
+/** Short, human-readable label for a confirmation (e.g. "tool_result read_file · turn 12"). */
+export function blockLabel(b: Block): string { … }
+
+/**
+ * Resolve an agent `unfold` request against the Truth. For each code (read from a `{#<code> FOLDED}`
+ * ...
+ */
+export function resolveUnfold(truth: Truth, codes: string[]): { restored: UnfoldRestored[]; missing: string[] } { … }
+
+/**
+ * Resolve an agent `recall` request against the Truth — a pure READ. Returns each matched folded
+ * block's ORIGINAL full content (never the digest, never a mutation). Same match set as
+ * `resolveUnfold` / the wire fold; a group returns its members' full text joined.
+ */
+export function resolveRecall(truth: Truth, codes: string[]): { restored: RecallContent[]; missing: string[] } { … }

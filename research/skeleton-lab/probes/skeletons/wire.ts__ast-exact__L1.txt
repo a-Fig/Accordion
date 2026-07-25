@@ -1,0 +1,320 @@
+/*
+ * wire.ts — the message ↔ block bridge for the live pi link (was live/mapping.ts).
+ *
+ * SHARED by the GUI and the pi extension, so the provider-safety rules live in exactly
+ * one place. Pure + framework-free — part of `core/`.
+ *
+ *   linearize(messages) → WireBlock[]   (pi's in-memory messages → our blocks)
+ *   applyPlan(messages, ops) → messages (fold a block in place, provider-safely)
+ *
+ * Block ids are durable and content-anchored — identical whether derived now or
+ * after the message array shifts position:
+ *   • user          → `u:<timestamp>`
+ *   • assistant part j (thinking/text/tool_call) → `a:<responseId ?? "t"+timestamp>:p<j>`
+ *   • tool_result   → `r:<toolCallId>`
+ *   • summary/other → `s:<timestamp>`
+ * Fallback (missing anchor): `m<i>:u`, `m<i>:p<j>`, `m<i>:r`, `m<i>:s` (position-based,
+ * same as the old scheme) — so nothing crashes on malformed messages.
+ *
+ * NOTE ON THE PROTOCOL IMPORT: `WireBlock`/`FoldOp`/`GroupOp` are wire-message shapes that now
+ * live in `core/protocol.ts` (relocated in Phase B; `app/src/lib/live/protocol.ts` is a re-export
+ * shim). We import them TYPE-ONLY, so the reference is erased at compile time.
+ */
+import type { WireBlock, FoldOp, GroupOp } from "./protocol";
+
+import type { Block } from "./types";
+
+import { estTokens, BLOCK_OVERHEAD } from "./tokens";
+
+import { foldTag } from "./digest";
+
+// ── Minimal structural types for pi's in-memory AgentMessage ─────────────────
+// (We only model the fields we read; pi owns the real types.)
+export interface PiTextPart {
+	type: "text";
+	text: string;
+}
+
+export interface PiThinkingPart {
+	type: "thinking";
+	thinking: string;
+}
+
+export interface PiToolCallPart {
+	type: "toolCall";
+	id: string;
+	name: string;
+	arguments?: Record<string, unknown>;
+}
+
+export type PiPart = PiTextPart | PiThinkingPart | PiToolCallPart | { type: string; [k: string]: unknown };
+
+export interface PiMessage {
+	role: string;
+	content?: string | PiPart[] | Array<{ type: string; text?: string }>;
+	model?: string;
+	toolCallId?: string;
+	toolName?: string;
+	isError?: boolean;
+	summary?: string;
+	/** Set once at message creation; the primary anchor for user/summary/assistant fallback ids. */
+	timestamp?: number;
+	/** Provider-assigned response id; preferred anchor for assistant-message part ids. */
+	responseId?: string;
+}
+
+/**
+ * Compute a durable, content-anchored block id that is IDENTICAL regardless of
+ * where the message sits in the array. Both `linearize` and `applyPlan` must call
+ * this — never inline the formula — so the two can never drift.
+ *
+ * @param m         the pi message
+ * @param i         the message's current array index (used ONLY as a fallback)
+ * @param partIndex for assistant messages, the content-part index; omit for others
+ */
+export function blockId(m: PiMessage, i: number, partIndex?: number): string { /* … 15 lines */ }
+
+/**
+ * Is `id` a durable, content-anchored block id (vs. a positional fallback)?
+ *
+ * `blockId()` prefers a durable anchor (`u:`, `a:`, `r:`, `s:` — keyed off the
+ * message timestamp / responseId / toolCallId), and only falls back to a
+ * POSITIONAL id (`m<i>:…`) when that anchor is missing. The distinction matters
+ * for folding: a positional id encodes the message's *current array index*, and
+ * that index is NOT stable once the array shifts. Folding itself makes the
+ * context non-append-only (a later structural change can renumber positions), so
+ * a positional id can silently come to point at a DIFFERENT block. We therefore
+ * must never emit a fold op for a block we can't durably re-identify — otherwise
+ * applyPlan could fold the wrong part (or, worse, a tool_call). This guard is the
+ * gate: fold only durable ids.
+ *
+ * Kept in lockstep with the formats `blockId()` produces above.
+ */
+export function isDurableId(id: string): boolean { /* … 3 lines */ }
+
+function textOf(content: unknown): string { /* … 9 lines */ }
+
+const tokensFor = (text: string): number => estTokens(text) + BLOCK_OVERHEAD;
+
+/**
+ * Linearize pi's in-memory message array into wire blocks, mirroring the on-disk
+ * parser (engine/parse.ts → parsePi) but operating on live messages. Deterministic:
+ * same messages → same blocks/ids.
+ *
+ * `orderStart` / `turnStart` let a caller linearize a SUFFIX with globally-correct numbering
+ * (Phase B incremental append): pass the count of blocks already appended as `orderStart` and the
+ * current turn number as `turnStart`, so the suffix's `order` continues contiguously and its `turn`
+ * continues from the last block's turn (a leading user message advances to `turnStart + 1`). Both
+ * default to 0 — a full linearize is unchanged.
+ */
+export function linearize(messages: PiMessage[], orderStart = 0, turnStart = 0): WireBlock[] { /* … 55 lines */ }
+
+/** Convert a wire block back into a full engine Block (fresh, auto-controlled). */
+export function wireToBlock(w: WireBlock): Block { /* … 17 lines */ }
+
+/** The durable block ids a single message emits + its tool-pair callIds (mirrors `linearize`). */
+export interface MsgInfo {
+	ids: string[];
+	calls: string[]; // callIds of this message's tool_call parts
+	results: string[]; // callId of this message, if it is a tool_result
+	hasNonDurable: boolean; // any emitted id is positional → message is never group-removable
+}
+
+/**
+ * The durable ids + tool-pair callIds one message contributes (mirror of `linearize`). Exported
+ * from `core/` so the Truth core's group-classification can reuse the exact wire semantics
+ * rather than re-deriving them.
+ */
+export function messageInfo(m: PiMessage, i: number): MsgInfo { /* … 38 lines */ }
+
+// ── content fingerprint (E1 reconciliation, sol P1 hardening) ────────────────
+//
+// `messageInfo` proves SHAPE identity (which durable blocks a message emits, in what order).
+// `contentFingerprint` is its sibling: it proves CONTENT identity (did any block's payload change
+// under a stable anchor). The extension's per-hook reconcile compares BOTH — same shape + same
+// fingerprint ⇒ append-a-suffix; either differs ⇒ divergence rebuild. Lives here, dependency-free,
+// next to `messageInfo` so the wire semantics it mirrors stay in one place.
+/**
+ * FNV-1a 32-bit rolling hash primitives (no deps, deterministic, non-crypto). Each 16-bit code unit
+ * is folded LOW byte then HIGH byte so the hash depends on the full unit — a same-low-byte non-ASCII
+ * swap (e.g. U+3042 vs U+3142) still moves the hash. `Math.imul` keeps every step in 32-bit; callers
+ * finish with `h >>> 0` for an unsigned result.
+ */
+const FNV_PRIME = 0x01000193;
+
+function fnvStr(h: number, s: string): number { /* … 8 lines */ }
+
+function fnvByte(h: number, b: number): number { /* … 3 lines */ }
+
+function fnvContent(h: number, content: unknown): number { /* … 9 lines */ }
+
+/**
+ * Real CONTENT fingerprint for one message — the counterpart to `messageInfo`'s durable ids, compared
+ * alongside them by the extension's `sameMessageIdentity` (E1, external review round; hardened per sol
+ * P1). Durable ids alone prove only the SHAPE (which blocks exist, in what order) is unchanged — they
+ * say nothing about whether pi or a peer extension rewrote a block's payload IN PLACE while keeping the
+ * same anchor (same timestamp / responseId / toolCallId). Without this, `Truth.append`'s id-based
+ * idempotency keeps the OLD payload forever: the GUI, `recall`, and a folded block's wire digest all
+ * silently keep serving stale content even though the model itself now sees something new — and a stale
+ * strategy subst could put the old text back on the wire.
+ *
+ * WHAT IT COVERS (every mutable field `linearize`/`wireToBlock` bake into a Block that the durable id
+ * does NOT already pin — i.e. everything a same-id rewrite could flip):
+ *   • text / thinking / user / tool_result / summary TEXT;
+ *   • tool_call `name` + serialized `arguments` (sol P1 gap #2 — a same-id argument rewrite was
+ *     previously invisible; serialized with the SAME `JSON.stringify(arguments ?? {})` `linearize`
+ *     uses to build the block text, so the two agree). Assumes pi's per-hook deep copy preserves key
+ *     order for an UNCHANGED message, so a stable arguments object re-serializes identically; if it
+ *     ever did not, the only cost is a spurious rebuild (safe — never a MISSED change);
+ *   • tool_result `isError` (gap #3 — a success→error flip with identical text kept a stale flag that
+ *     the doorman conductor then classified from) and `toolName`; assistant `model`.
+ * A per-field tag byte separates parts so "text 'ab'" ≠ "text 'a' + thinking 'b'".
+ *
+ * COST (the ADR 0021 hot-path promise: the `context` hook stays local + fast). This is O(chars in the
+ * message) — a real pass over the text, unlike the length-sum it replaces. The extension CACHES each
+ * message's fingerprint at ingest, so a hook re-hashes only the fresh INCOMING copy pi hands it (object
+ * identity never survives the deep copy). Measured on the ~130k-token dev sample
+ * (`app/static/sample-session.jsonl`, ~585KB of text): a full two-byte FNV pass over the WHOLE context
+ * is ~3.2ms — comfortably under the ~10ms budget at which a sampled/strided hybrid would be needed, and
+ * well under the LATENCY badge's 250ms amber. Full fidelity is worth it for the redaction cases here.
+ *
+ * RESIDUAL GAP: a same-length in-place rewrite (fixed-width redaction) is NO LONGER an accepted gap —
+ * it now moves the hash and forces a rebuild. What remains is the FNV-1a 32-bit collision floor: two
+ * genuinely different messages hash-collide with probability ~2^-32, in which case a real rewrite would
+ * be missed. Accepted over a crypto hash (orders of magnitude slower on this hot path) for a vanishingly
+ * rare, non-adversarial-by-construction event — a peer extension is first-party; no attacker is choosing
+ * colliding rewrites.
+ */
+export function contentFingerprint(m: PiMessage): number { /* … 39 lines */ }
+
+/**
+ * One logical wire message's role + tool-pairing shape (`MsgInfo` plus its wire `role`) — the
+ * exact fields the role-validity floor and Phase A ownership cascade need, abstracted away from
+ * the concrete representation so BOTH `applyPlan` (real `PiMessage[]`) and `Truth`'s group-token
+ * accounting (which only ever holds `Block`s — the GUI/replica never sees pi's live messages) can
+ * build the identical input and land on the identical verdict.
+ *
+ * `role` is the message's RAW role string (e.g. `"user" | "assistant" | "toolResult" | …`) —
+ * deliberately NOT pre-collapsed to just assistant/non-assistant, because the floor below only
+ * does that collapsing at specific points (a synthesized survivor's role vs. a genuine survivor's
+ * own role); a caller that pre-collapsed everything would silently change which messages compare
+ * equal and could mask a real same-role adjacency.
+ */
+export interface WireMsgShape extends MsgInfo {
+	role: string;
+}
+
+/**
+ * The role-validity floor's decision, extracted to ONE function so `applyPlan` and `Truth`'s
+ * group-token accounting can never drift apart. Drift here is not cosmetic: it would mean the
+ * UI's claimed savings lies about what the model actually receives — the one thing this repo
+ * promises never happens (CLAUDE.md). Two things come out:
+ *
+ *   • `owner` — Phase A's message→group cascade (a message may be removed by at most ONE group,
+ *     and only if every tool-call/tool_result pair it holds is fully inside the removal set — see
+ *     the fixpoint below). `applyPlan`'s Phase B needs this to know which messages one group's
+ *     run spans; `Truth` does not (it already has each group's own `memberIds`), so it only reads
+ *     `degradeStart`.
+ *   • `degradeStart` — indices (into `msgs`) of a PURE DROP run (`summaryText === null`) whose
+ *     removal would leave the surviving wire structurally invalid (a non-"user" leading message,
+ *     or two adjacent same-role survivors) and must therefore synthesize a one-message recap
+ *     instead of vanishing (see `applyPlan`'s doc comment for the full rationale).
+ *
+ * Pure function of `msgs`/`groups` — no I/O, no randomness: same shapes in, same verdict out,
+ * on the host AND on a replica that reconstructs `msgs` from its own `Block`s (see
+ * `Truth.degradedRunKeys`).
+ */
+export function computeDegradedDropRuns(
+	msgs: readonly WireMsgShape[],
+	groups: readonly GroupOp[],
+): { owner: (GroupOp | null)[]; degradeStart: Set<number> } { /* … 109 lines */ }
+
+/** Apply one message's in-place FoldOps (the original substitution path). Returns the same
+ *  message by reference when nothing folds; clones lazily otherwise. `mark()` flags a change.
+ *  An op whose id matches a `tool_call` part (or any non-text/thinking kind) is deliberately
+ *  never applied — substituting it would orphan its result. The wire trusts the engine's plan:
+ *  the engine is the single foldability gate and it never folds a protected block, so no
+ *  separate wire-side position protection is needed here. The durable-id + structural guards
+ *  (kind checks, non-empty digest) remain the safety floor. */
+function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () => void): PiMessage { /* … 33 lines */ }
+
+/**
+ * Apply a fold plan to pi's messages and return a NEW array (touched messages are
+ * cloned; untouched ones are passed through by reference). Pure: the caller's array
+ * is never mutated, so correctness never depends on pi's copy semantics.
+ *
+ * Two kinds of op:
+ *
+ *   • `FoldOp` — IN-PLACE content substitution (ADR 0001–0005), each defended by a kind
+ *     check so a mis-mapped id can never fold the wrong part:
+ *       tool_result → one text part (keep toolCallId/toolName/isError) · text/thinking →
+ *       the (non-empty) digest · tool_call → NEVER (orphans its result) · user/other → NEVER.
+ *
+ *   • `GroupOp` — RANGE COLLAPSE (ADR 0006): remove a contiguous run of WHOLE messages and
+ *     insert ONE synthetic summary message. The ONLY op that changes the message count.
+ *     Two independent guards, re-derived here (never trusting the GUI):
+ *       1. whole + durable — a message is removable only if EVERY block it emits is durable
+ *          and a member of one group (a partially-covered or positional-id message stays);
+ *       2. balanced pairs — a removed tool_call must have its tool_result removed too, to a
+ *          fixpoint; an unbalanced message is demoted to stay-live (the straggler).
+ *     The wire trusts the engine's plan: the engine is the single foldability gate and never
+ *     folds a protected block, so no separate wire-side position backstop is needed.
+ *     Each maximal run of same-group removable messages becomes one message (role = the
+ *     run's first message's role, mapped to user/assistant; content = the summary text) —
+ *     UNLESS `summaryText === null` (DROP: consume the run, push nothing), subject to the
+ *     role-validity floor immediately below.
+ *
+ * ── Role-validity floor (P3, review-confirmed; ADR 0006 named this as an open watch item) ──
+ * A DROP run pushes NOTHING onto the wire, so it can silently build a message array a provider
+ * rejects: (a) if the run sits at the very front of the surviving wire, the first message left
+ * may not be `role: "user"` (Anthropic requires `messages[0].role === "user"`); (b) if it sits
+ * between two survivors of the SAME role, removing it welds them into an adjacent same-role
+ * pair (`user_k` directly followed by `user_k+1`) that some providers reject or mis-merge. This
+ * floor is unconditional: it runs for every caller (conductor, GUI command, replica), not just
+ * Thermocline's stratum drops — the same shape a raw GUI command can send.
+ *
+ * The repair DEGRADES the offending run from a true drop to a one-message recap — the same
+ * shape as the `summary: undefined` default-recap (the `Group.digest` three-state contract:
+ * undefined → recap, null/"" → drop, string → verbatim), just synthesized HERE instead of by
+ * `Truth.groupSummary` (which needs `Block[]`; this function only has `PiMessage[]`). The
+ * recap's role follows the exact mapping an ordinary REPLACE run already uses (`assistant` if
+ * the run's first message was `assistant`, else `user`), and its tag is `foldTag(g.id)` — the
+ * IDENTICAL code `resolveUnfold` already matches against `truth.groups` (a drop group is a
+ * folded `Group` too), so an agent that unfolds this recap genuinely restores the group (Truth
+ * flips `folded:false`; the next `serializeWire` stops dropping it) — no new plumbing needed.
+ *
+ * REJECTED ALTERNATIVE: refuse to drop just the run's boundary message (keep it live in place)
+ * instead of synthesizing a recap. Simpler, but it cascades: if that boundary message holds one
+ * half of a tool-call/tool_result pair whose OTHER half is deeper in the same run, keeping it
+ * live orphans the pair, forcing the tool-pair fixpoint above to un-own the rest of the run too
+ * — a small balanced-pair run can unwind to a complete no-op just to keep one message alive. The
+ * recap avoids this: the WHOLE run (calls and results alike) is still removed exactly as Phase A
+ * decided; only what Phase B EMITS in its place changes, so it can never re-open an orphan.
+ *
+ * ACCOUNTING (`core/truth.ts`): `Truth.groupLiveTokens` charges a DROP group's collapsed run(s)
+ * per-RUN, not a single 0-for-everything shortcut, precisely BECAUSE this floor can degrade one
+ * run of a group while its siblings still vanish for free. `Truth.degradedRunKeys` reconstructs
+ * `WireMsgShape[]` from its own `Block` log and feeds the SAME `computeDegradedDropRuns` this
+ * function calls below — the identical decision, not a re-derived approximation — so the GUI's
+ * live-token readout matches what the model actually receives even for a degraded run.
+ *
+ * On ANY doubt a message passes through untouched; the output is never structurally invalid
+ * (no orphaned tool pair, no emptied message, no role-invalid leading or adjacent message). Safe
+ * because this output feeds the model only — the GUI's block sync/cursor run off the
+ * un-collapsed `linearize`, so removals never desync the view (ADR 0006 §4).
+ */
+export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[] = []): PiMessage[] { /* … 71 lines */ }
+
+/**
+ * The role-validity floor's fallback recap for a DROP run it had to degrade (see `applyPlan`'s
+ * doc comment). Same `{#code FOLDED}` tag convention as a real group summary, and the SAME code
+ * (`foldTag(groupId)`) — so an agent `unfold` of it hits the real group via `resolveUnfold`'s
+ * existing `foldCode(g.id) === code` match (a drop group is a folded `Group` too) and genuinely
+ * restores it. No new recall/unfold plumbing needed; this just reuses the existing group path.
+ *
+ * Exported (not just used by `applyPlan`) so `Truth.groupLiveTokens` can estimate a degraded
+ * run's REAL wire cost from the EXACT text the wire will emit, rather than duplicating this
+ * string format and risking the two silently drifting apart. Takes a bare `groupId: string`
+ * (not a whole `GroupOp`/`Group`) so either caller's own group shape works with no coupling.
+ */
+export function roleFloorRecap(groupId: string, runLength: number): string { /* … 3 lines */ }

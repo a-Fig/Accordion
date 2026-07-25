@@ -1,0 +1,46 @@
+"""Redo the builtin repr() (representation) but with limits on most sizes."""
+# ⋯ (3 lines)
+import builtins
+from itertools import islice
+from _thread import get_ident
+# ⋯ (1 line)
+def recursive_repr(fillvalue='...'):
+    # ⋯ (2 lines)
+    def decorating_function(user_function):
+        # ⋯ (2 lines)
+        def wrapper(self):
+# ⋯ (20 lines)
+class Repr:
+    # ⋯ (1 line)
+    def __init__(self):
+    # ⋯ (13 lines)
+    def repr(self, x):
+    # ⋯ (2 lines)
+    def repr1(self, x, level):
+    # ⋯ (9 lines)
+    def _repr_iterable(self, x, level, left, right, maxiter, trail=''):
+    # ⋯ (14 lines)
+    def repr_tuple(self, x, level):
+    # ⋯ (2 lines)
+    def repr_list(self, x, level):
+    # ⋯ (2 lines)
+    def repr_array(self, x, level):
+    # ⋯ (5 lines)
+    def repr_set(self, x, level):
+    # ⋯ (5 lines)
+    def repr_frozenset(self, x, level):
+    # ⋯ (6 lines)
+    def repr_deque(self, x, level):
+    # ⋯ (2 lines)
+    def repr_dict(self, x, level):
+    # ⋯ (17 lines)
+    def repr_str(self, x, level):
+    # ⋯ (8 lines)
+    def repr_int(self, x, level):
+    # ⋯ (7 lines)
+    def repr_instance(self, x, level):
+# ⋯ (13 lines)
+def _possibly_sorted(x):
+    # Since not all sequences of items can be sorted and comparison
+    # functions may raise arbitrary exceptions, return an unsorted
+    # ⋯ (9 lines)

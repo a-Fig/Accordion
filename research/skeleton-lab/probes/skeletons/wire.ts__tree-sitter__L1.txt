@@ -1,0 +1,140 @@
+/*
+ * wire.ts — the message ↔ block bridge for the live pi link (was live/mapping.ts).
+ * ...
+ */
+import type { WireBlock, FoldOp, GroupOp } from "./protocol";
+import type { Block } from "./types";
+import { estTokens, BLOCK_OVERHEAD } from "./tokens";
+import { foldTag } from "./digest";
+
+// ── Minimal structural types for pi's in-memory AgentMessage ─────────────────
+// (We only model the fields we read; pi owns the real types.)
+export interface PiTextPart {
+	type: "text";
+	text: string;
+}
+export interface PiThinkingPart {
+	type: "thinking";
+	thinking: string;
+}
+export interface PiToolCallPart {
+	type: "toolCall";
+	id: string;
+	name: string;
+	arguments?: Record<string, unknown>;
+}
+export type PiPart = PiTextPart | PiThinkingPart | PiToolCallPart | { type: string; [k: string]: unknown };
+
+export interface PiMessage {
+	role: string;
+	content?: string | PiPart[] | Array<{ type: string; text?: string }>;
+	model?: string;
+	toolCallId?: string;
+	toolName?: string;
+	isError?: boolean;
+	summary?: string;
+	/** Set once at message creation; the primary anchor for user/summary/assistant fallback ids. */
+	timestamp?: number;
+	/** Provider-assigned response id; preferred anchor for assistant-message part ids. */
+	responseId?: string;
+}
+
+/**
+ * Compute a durable, content-anchored block id that is IDENTICAL regardless of
+ * ...
+ */
+export function blockId(m: PiMessage, i: number, partIndex?: number): string { … }
+
+/**
+ * Is `id` a durable, content-anchored block id (vs. a positional fallback)?
+ * ...
+ */
+export function isDurableId(id: string): boolean { … }
+
+function textOf(content: unknown): string { … }
+
+const tokensFor = (text: string): number => estTokens(text) + BLOCK_OVERHEAD;
+
+/**
+ * Linearize pi's in-memory message array into wire blocks, mirroring the on-disk
+ * ...
+ */
+export function linearize(messages: PiMessage[], orderStart = 0, turnStart = 0): WireBlock[] { … }
+
+/** Convert a wire block back into a full engine Block (fresh, auto-controlled). */
+export function wireToBlock(w: WireBlock): Block { … }
+
+/** The durable block ids a single message emits + its tool-pair callIds (mirrors `linearize`). */
+export interface MsgInfo {
+	ids: string[];
+	calls: string[]; // callIds of this message's tool_call parts
+	results: string[]; // callId of this message, if it is a tool_result
+	hasNonDurable: boolean; // any emitted id is positional → message is never group-removable
+}
+
+/**
+ * The durable ids + tool-pair callIds one message contributes (mirror of `linearize`). Exported
+ * from `core/` so the Truth core's group-classification can reuse the exact wire semantics
+ * rather than re-deriving them.
+ */
+export function messageInfo(m: PiMessage, i: number): MsgInfo { … }
+
+// ── content fingerprint (E1 reconciliation, sol P1 hardening) ────────────────
+//
+// `messageInfo` proves SHAPE identity (which durable blocks a message emits, in what order).
+// `contentFingerprint` is its sibling: it proves CONTENT identity (did any block's payload change
+// under a stable anchor). The extension's per-hook reconcile compares BOTH — same shape + same
+// fingerprint ⇒ append-a-suffix; either differs ⇒ divergence rebuild. Lives here, dependency-free,
+// next to `messageInfo` so the wire semantics it mirrors stay in one place.
+
+/**
+ * FNV-1a 32-bit rolling hash primitives (no deps, deterministic, non-crypto). Each 16-bit code unit
+ * is folded LOW byte then HIGH byte so the hash depends on the full unit — a same-low-byte non-ASCII
+ * swap (e.g. U+3042 vs U+3142) still moves the hash. `Math.imul` keeps every step in 32-bit; callers
+ * finish with `h >>> 0` for an unsigned result.
+ */
+const FNV_PRIME = 0x01000193;
+function fnvStr(h: number, s: string): number { … }
+function fnvByte(h: number, b: number): number { … }
+function fnvContent(h: number, content: unknown): number { … }
+
+/**
+ * Real CONTENT fingerprint for one message — the counterpart to `messageInfo`'s durable ids, compared
+ * ...
+ */
+export function contentFingerprint(m: PiMessage): number { … }
+
+/**
+ * One logical wire message's role + tool-pairing shape (`MsgInfo` plus its wire `role`) — the
+ * ...
+ */
+export interface WireMsgShape extends MsgInfo {
+	role: string;
+}
+
+/**
+ * The role-validity floor's decision, extracted to ONE function so `applyPlan` and `Truth`'s
+ * ...
+ */
+export function computeDegradedDropRuns(
+	msgs: readonly WireMsgShape[],
+	groups: readonly GroupOp[],
+): { owner: (GroupOp | null)[]; degradeStart: Set<number> } { … }
+
+/** Apply one message's in-place FoldOps (the original substitution path). Returns the same
+ *  message by reference when nothing folds; clones lazily otherwise. `mark()` flags a change.
+ * ...
+ */
+function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () => void): PiMessage { … }
+
+/**
+ * Apply a fold plan to pi's messages and return a NEW array (touched messages are
+ * ...
+ */
+export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[] = []): PiMessage[] { … }
+
+/**
+ * The role-validity floor's fallback recap for a DROP run it had to degrade (see `applyPlan`'s
+ * ...
+ */
+export function roleFloorRecap(groupId: string, runLength: number): string { … }

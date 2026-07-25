@@ -1,0 +1,25 @@
+// ⋯ (13 lines)
+import type { Block } from "./types";
+import type { Truth } from "./truth";
+import { foldCode, wireFoldable } from "./digest";
+import { isDurableId } from "./wire";
+// ⋯ (1 line)
+/** One block/group restored by `resolveUnfold`. */
+export interface UnfoldRestored {
+// ⋯ (7 lines)
+/** One block/group's original content returned by `resolveRecall`. */
+export interface RecallContent {
+// ⋯ (7 lines)
+/** Short, human-readable label for a confirmation (e.g. "tool_result read_file · turn 12"). */
+export function blockLabel(b: Block): string {
+// ⋯ (4 lines)
+/**
+ * Resolve an agent `unfold` request against the Truth. For each code (read from a `{#<code> FOLDED}`
+ * tag) restore EVERY folded block/group carrying it, and record it; a code matching nothing folded
+ * is reported in `missing`. A group is unfolded whole (its members reflow next context). Every
+ * restore is VERIFIED to have taken effect — the engine can refuse (agent-unfold lock, already
+// ⋯ (2 lines)
+export function resolveUnfold(truth: Truth, codes: string[]): { restored: UnfoldRestored[]; missing: string[] } {
+// ⋯ (37 lines)
+export function resolveRecall(truth: Truth, codes: string[]): { restored: RecallContent[]; missing: string[] } {
+// ⋯ (25 lines)
