@@ -34,41 +34,66 @@ import * as path from "node:path";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
-const outfile = path.resolve(repoRoot, "conductors", "ws", "thermocline", "remote-sdk.mjs");
 
-const banner = `// remote-sdk.mjs — GENERATED ARTIFACT, DO NOT EDIT BY HAND.
+/** One committed SDK bundle per spawn conductor. Same esbuild recipe for each; only the entry
+ *  re-exports and the output path differ. `triptych-sdk.mjs` deliberately does NOT bundle the
+ *  tree-sitter engine — `runner.mjs` imports `./skeleton.mjs` separately and injects it, so the
+ *  bundle itself stays runnable with zero node_modules (parity with thermocline). */
+const BUNDLES = [
+	{
+		outfile: path.resolve(repoRoot, "conductors", "ws", "thermocline", "remote-sdk.mjs"),
+		entry:
+			'export { runRemoteConductor } from "./core/conductor/remote";\n' +
+			'export { ThermoclineConductor } from "./conductors/ws/thermocline/thermocline";\n',
+		banner: `// remote-sdk.mjs — GENERATED ARTIFACT, DO NOT EDIT BY HAND.
 // Bundled from core/conductor/remote.ts + conductors/ws/thermocline/thermocline.ts (and their core/
 // graph) by extension/build-remote-sdk.mjs. Regenerate with:
 //     node extension/build-remote-sdk.mjs      (or: npm --prefix extension run build:remote-sdk)
 // Flat ESM, runnable under plain \`node\` (Node 22+ ships the global WebSocket the SDK dials with).
-// \`ws\` is intentionally NOT bundled/required. Exports: runRemoteConductor, ThermoclineConductor.`;
-
-const result = await esbuild.build({
-	// Pin the build's working directory so the bundle's source-path comments (and therefore the
-	// committed artifact's bytes) are identical no matter which directory the script is run from —
-	// drift checks diff this file against a fresh regeneration.
-	absWorkingDir: repoRoot,
-	stdin: {
-		contents:
-			'export { runRemoteConductor } from "./core/conductor/remote";\n' +
-			'export { ThermoclineConductor } from "./conductors/ws/thermocline/thermocline";\n',
-		resolveDir: repoRoot,
-		sourcefile: "remote-sdk-entry.ts",
-		loader: "ts",
+// \`ws\` is intentionally NOT bundled/required. Exports: runRemoteConductor, ThermoclineConductor.`,
+		label: "core/conductor/remote.ts (+ thermocline graph)",
 	},
-	outfile,
-	bundle: true,
-	format: "esm",
-	platform: "node",
-	target: "node20",
-	sourcemap: false,
-	banner: { js: banner },
-	external: ["ws", "typebox", "@earendil-works/pi-ai", "@earendil-works/pi-agent-core", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"],
-	logLevel: "info",
-});
+	{
+		outfile: path.resolve(repoRoot, "conductors", "ws", "triptych", "triptych-sdk.mjs"),
+		entry:
+			'export { runRemoteConductor } from "./core/conductor/remote";\n' +
+			'export { TriptychConductor } from "./conductors/ws/triptych/triptych";\n',
+		banner: `// triptych-sdk.mjs — GENERATED ARTIFACT, DO NOT EDIT BY HAND.
+// Bundled from core/conductor/remote.ts + conductors/ws/triptych/triptych.ts (and their core/ +
+// conductors/in-process graph) by extension/build-remote-sdk.mjs. Regenerate with:
+//     node extension/build-remote-sdk.mjs      (or: npm --prefix extension run build:remote-sdk)
+// Flat ESM, runnable under plain \`node\`. The tree-sitter engine is NOT in here — runner.mjs
+// imports ./skeleton.mjs (this directory's node_modules) and injects it into the conductor.
+// Exports: runRemoteConductor, TriptychConductor.`,
+		label: "core/conductor/remote.ts (+ triptych graph)",
+	},
+];
 
-if (result.errors.length) {
-	console.error(`build-remote-sdk: ${result.errors.length} error(s)`);
-	process.exit(1);
+for (const b of BUNDLES) {
+	const result = await esbuild.build({
+		// Pin the build's working directory so the bundle's source-path comments (and therefore the
+		// committed artifact's bytes) are identical no matter which directory the script is run from —
+		// drift checks diff this file against a fresh regeneration.
+		absWorkingDir: repoRoot,
+		stdin: {
+			contents: b.entry,
+			resolveDir: repoRoot,
+			sourcefile: "remote-sdk-entry.ts",
+			loader: "ts",
+		},
+		outfile: b.outfile,
+		bundle: true,
+		format: "esm",
+		platform: "node",
+		target: "node20",
+		sourcemap: false,
+		banner: { js: b.banner },
+		external: ["ws", "typebox", "@earendil-works/pi-ai", "@earendil-works/pi-agent-core", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"],
+		logLevel: "info",
+	});
+	if (result.errors.length) {
+		console.error(`build-remote-sdk: ${result.errors.length} error(s) building ${b.outfile}`);
+		process.exit(1);
+	}
+	console.log(`build-remote-sdk: ${b.label} → ${b.outfile}`);
 }
-console.log(`build-remote-sdk: core/conductor/remote.ts (+ thermocline graph) → ${outfile}`);
