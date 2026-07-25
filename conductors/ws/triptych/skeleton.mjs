@@ -195,6 +195,11 @@ function spansMoreThanLines(node, n) {
   return node.endPosition.row - node.startPosition.row + 1 > n;
 }
 
+/** "N line"/"N lines" — markers read naturally at N=1 (review nit). */
+function linesLabel(n) {
+  return `${n} line${n === 1 ? "" : "s"}`;
+}
+
 /** Number of lines a text fragment spans (1 for a single line, 0 for ""). */
 function countLines(text) {
   if (text === "") return 0;
@@ -243,15 +248,15 @@ function literalMarker(value, lang) {
     const m = /^[a-zA-Z]*("""|'''|["'`])/.exec(t);
     const open = m ? m[0] : t.slice(0, 1);
     const quote = m ? m[1] : t.slice(0, 1);
-    return `${open}/* ... ${n} lines */${quote}`;
+    return `${open}/* ... ${linesLabel(n)} */${quote}`;
   }
   const first = t.length ? t[0] : "";
   const last = t.length > 1 ? t[t.length - 1] : first;
   if (defsKey(lang) === "py") {
-    return `${first}\n    # ... ${n} lines\n${last}`;
+    return `${first}\n    # ... ${linesLabel(n)}\n${last}`;
   }
-  if (t.length < 2) return `{ /* ... ${n} lines */ }`;
-  return `${first} /* ... ${n} lines */ ${last}`;
+  if (t.length < 2) return `{ /* ... ${linesLabel(n)} */ }`;
+  return `${first} /* ... ${linesLabel(n)} */ ${last}`;
 }
 
 function removeEdit(node) {
@@ -281,7 +286,7 @@ function handleFunctionLike(node, ctx) {
     handlePyBody(body, ctx);
   } else {
     const n = countLines(body.text);
-    ctx.edits.push({ start: body.startIndex, end: body.endIndex, text: `{ /* ... ${n} lines */ }` });
+    ctx.edits.push({ start: body.startIndex, end: body.endIndex, text: `{ /* ... ${linesLabel(n)} */ }` });
   }
 }
 
@@ -293,7 +298,7 @@ function handleFunctionLike(node, ctx) {
  * marker inherits — no indent needs to be computed or reattached. */
 function handlePyBody(body, ctx) {
   const n = countLines(body.text);
-  ctx.edits.push({ start: body.startIndex, end: body.endIndex, text: `...  # ... ${n} lines` });
+  ctx.edits.push({ start: body.startIndex, end: body.endIndex, text: `...  # ... ${linesLabel(n)}` });
 }
 
 function visitL2(node, ctx) {
@@ -373,6 +378,7 @@ function collapseBlankLines(text) {
  * ts/tsx/mts/cts/jsx/js/mjs/cjs/py/pyi, or an internal error occurred.
  * NEVER throws. Byte-deterministic for identical (path, source) inputs. */
 function skeletonize(p, source) {
+  let tree = null;
   try {
     if (!readyFlag) return null;
     if (typeof p !== "string" || p.length === 0) return null;
@@ -382,7 +388,7 @@ function skeletonize(p, source) {
     if (!parser) return null;
     const src = typeof source === "string" ? source : String(source ?? "");
 
-    const tree = parser.parse(src);
+    tree = parser.parse(src);
     if (!tree) return null;
     const root = tree.rootNode;
     const defs = defsFor(lang);
@@ -392,6 +398,15 @@ function skeletonize(p, source) {
     return collapseBlankLines(spliced);
   } catch {
     return null;
+  } finally {
+    // Tree-sitter trees live in wasm memory the JS GC never sees — without an explicit
+    // delete() every call leaks its whole parse tree (~0.5MB/call measured; an adversarial
+    // review probe grew the runner ~1.1GB over 2000 calls, flat with delete()).
+    try {
+      tree?.delete();
+    } catch {
+      /* a tree that failed mid-parse may already be freed */
+    }
   }
 }
 
