@@ -1,0 +1,26 @@
+{
+  "method": "24 questions (15 structural / 9 body-only) over 3 files; blind sonnet answerers saw ONLY the L1 skeleton; graded by hand against probes/questions.json. body-only questions are answerable only from elided bodies — the correct skeleton-reader behavior is abstention.",
+  "grading": {
+    "ast-exact": {
+      "structuralCorrect": 15, "structuralAbstain": 0, "structuralWrong": 0,
+      "bodyOnlyAbstain": 9, "hallucinations": 0
+    },
+    "tree-sitter": {
+      "structuralCorrect": 15, "structuralAbstain": 0, "structuralWrong": 0,
+      "bodyOnlyAbstain": 9, "hallucinations": 0
+    },
+    "topline": {
+      "structuralCorrect": 10, "structuralAbstain": 5, "structuralWrong": 0,
+      "bodyOnlyAbstain": 9, "hallucinations": 0,
+      "abstainedOn": [
+        "agentView-q1 (RecallContent fields — interface body elided)",
+        "agentView-q4 (Block[\"kind\"] field — interface body elided)",
+        "wire-q2 (FNV_PRIME literal — top-level const dropped by budget)",
+        "wire-q3 (tokensFor expression — top-level const dropped by budget)",
+        "reprlib-q3 (__all__ — module-level assignment dropped by budget)"
+      ],
+      "note": "wire-q4 scored correct on interface+field name derived from a kept doc comment, though the explicit `: string` type was not visible."
+    }
+  },
+  "headline": "Zero hallucinations in 72 answers. AST-grade skeletons (ast-exact, tree-sitter) preserved 100% of structurally-answerable facts at L1; line-scoring (topline) preserved 67%, losing interface fields and top-level consts to its budget — and every loss surfaced as an honest abstention, never a wrong answer."
+}
