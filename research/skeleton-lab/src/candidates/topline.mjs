@@ -348,7 +348,7 @@ function scoreLines(lines, lang) {
     const zeroedDoc = c.band === "doc" || c.band === "comment";
     const zeroedPrivate = false; // filled in later by applyLevel() using privateName
 
-    out[i] = { band: c.band, score, tokens: countTokens(raw), zeroedDoc, zeroedPrivate, privateName: c.privateName ?? null };
+    out[i] = { band: c.band, score, tokens: countTokens(raw), zeroedDoc, zeroedPrivate, privateName: c.privateName ?? null, isDecl: c.isDecl === true };
 
     // start a comment/doc carry if this opener isn't closed on the same line
     if (c.closeToken && !raw.includes(c.closeToken)) {

@@ -19,7 +19,7 @@ details in [README.md](README.md); raw numbers in `results/results.json`
 | ast-exact | L3 | 94.9 | 0.45¹ | 0.92 | 63% | 63% | 18 |
 | topline | L1 | 75.6 | 0.88 | 0.93 | 0% | 0% | 1.6 |
 | topline | L2 | 87.9 | 0.89 | 0.97 | 0% | 0% | 1.2 |
-| topline | L3 | 92.8 | 0.55¹ | 0.89 | 13% | 13% | 0.9 |
+| topline | L3 | 92.8 | 0.54¹ | 0.90 | 6% | 6% | 0.9 |
 | tree-sitter | L1 | 62.0 | 1.00 | 1.00 | 31% | 94% | 9 |
 | tree-sitter | L2 | 79.8 | 1.00 | 1.00 | 31% | 100% | 7 |
 | tree-sitter | L3 | 85.5 | 0.69¹ | 0.98 | 19% | 44% | 8 |
@@ -135,6 +135,27 @@ instruction is cheap to replicate in a conductor's digest preamble.)
    flag from ADR 0016) — the probe's honest-abstention result assumes the agent can
    re-read; skeleton + unfold is the combination that makes 0-hallucination hold in
    practice.
+
+## Review-pass corrections and metric caveats
+
+An adversarial review of the lab itself found (and these are fixed in the numbers
+above): topline's L3 private-declaration dropping never actually fired
+(`isDecl` wasn't propagated — per-file recall-all swings up to 2.4× once
+corrected), and ast-exact's Python L3 leaked private identifiers through
+attribute-target assignments (`_priv._attr = x`). Two standing caveats it
+established that are *not* fixed, only disclosed: **signatureRecall is a
+text-presence metric** — a symbol name appearing anywhere in the skeleton
+(a doc comment, an unrelated line) counts as recalled, and `Class.method`
+matching is not scoped to the class's own block, so recall is an upper bound,
+softest on single-class files; and **ground truth counts every top-level
+`const`/`let`/`var` as a required symbol**, which rewards keep-everything styles
+on the recall-all column (recall-exported is the fairer cross-candidate column).
+One probe question (wire-q6) was also mis-scoped: its "body-only" answer is
+actually present verbatim in a module doc comment that ast-exact and topline L1
+retain — the blind answerers abstained anyway (missing recoverable info, a
+conservative miss), so the zero-hallucination result stands but the "9/9
+correct abstention" cell slightly undercounts what those two skeletons could
+have answered.
 
 ## What was NOT tested (honest scope)
 

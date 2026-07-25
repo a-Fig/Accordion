@@ -24,7 +24,10 @@ export async function evaluateOne({ candidate, entry, level, source, symbols }) 
     level,
   };
 
+  // Two INDEPENDENT input objects: a candidate that mutated its input in place
+  // could otherwise contaminate the determinism comparison in either direction.
   const input = { path: entry.file, source, lang: entry.lang, level };
+  const input2 = { path: entry.file, source, lang: entry.lang, level };
 
   let first;
   let second;
@@ -34,7 +37,7 @@ export async function evaluateOne({ candidate, entry, level, source, symbols }) 
     first = await candidate.skeletonize(input);
     const t1 = process.hrtime.bigint();
     ms = Number(t1 - t0) / 1e6;
-    second = await candidate.skeletonize(input);
+    second = await candidate.skeletonize(input2);
   } catch (err) {
     return { ...base, failed: true, error: err?.message ?? String(err) };
   }

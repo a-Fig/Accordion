@@ -22,5 +22,6 @@
       "note": "wire-q4 scored correct on interface+field name derived from a kept doc comment, though the explicit `: string` type was not visible."
     }
   },
+  "caveat": "wire-q6 is mis-scoped as body-only: the answer appears verbatim in wire.ts's module doc comment, which the ast-exact and topline L1 skeletons retain. Both answerers abstained anyway (a conservative miss); only tree-sitter's skeleton genuinely hides it.",
   "headline": "Zero hallucinations in 72 answers. AST-grade skeletons (ast-exact, tree-sitter) preserved 100% of structurally-answerable facts at L1; line-scoring (topline) preserved 67%, losing interface fields and top-level consts to its budget — and every loss surfaced as an honest abstention, never a wrong answer."
 }

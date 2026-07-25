@@ -183,6 +183,23 @@ def _target_text(target_nodes, src):
     return ", ".join(src.text_of(t) for t in target_nodes)
 
 
+def _assign_root_names(targets):
+    """Root identifier of each assignment target, INCLUDING attribute targets.
+
+    Privacy checks must see `_priv._attr = x` as touching `_priv` — checking only
+    ast.Name targets lets attribute assignments leak private identifiers into an
+    L3 skeleton (found by review against asyncio_tasks.py's
+    `_wrap_awaitable._is_coroutine = True`).
+    """
+    names = []
+    for t in targets:
+        while isinstance(t, ast.Attribute):
+            t = t.value
+        if isinstance(t, ast.Name):
+            names.append(t.id)
+    return names
+
+
 def _render_assign(stmt, src):
     target = _target_text(stmt.targets, src)
     val = _elide_value(stmt.value, src)
@@ -356,7 +373,7 @@ def _render_class_l3(node, src):
             out.extend("  " + ln for ln in nested)
         elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-            names = [t.id for t in targets if isinstance(t, ast.Name)]
+            names = _assign_root_names(targets)
             if names and all(_is_private(n) for n in names):
                 private_count += 1
                 continue
@@ -436,7 +453,7 @@ def render_l3(tree, src):
             continue
         if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-            names = [t.id for t in targets if isinstance(t, ast.Name)]
+            names = _assign_root_names(targets)
             if names and all(_is_module_private(n, all_set) for n in names):
                 internal_count += 1
                 continue
