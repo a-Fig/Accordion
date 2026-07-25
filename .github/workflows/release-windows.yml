@@ -11,6 +11,9 @@ on:
         description: "Branch/commit to build"
         required: false
         default: "devmain"
+  push:
+    branches: [devmain]
+    paths: [".github/workflows/release-windows.yml"]
 
 permissions:
   contents: write
@@ -21,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref }}
+          ref: ${{ github.event.inputs.ref || 'devmain' }}
 
       - uses: actions/setup-node@v4
         with:
@@ -42,7 +45,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          gh release upload "${{ github.event.inputs.tag }}" \
+          gh release upload "${{ github.event.inputs.tag || '0.1' }}" \
             app/src-tauri/target/release/bundle/nsis/*.exe \
             app/src-tauri/target/release/bundle/msi/*.msi \
             --clobber --repo "${{ github.repository }}"
