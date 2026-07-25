@@ -96,12 +96,12 @@ def _collapse(text):
     return " ".join(text.split())
 
 
-def _is_dunder(name):
-    return name.startswith("__") and name.endswith("__") and len(name) > 4
-
-
 def _is_private(name):
-    return name.startswith("_") and not _is_dunder(name)
+    # Leading-underscore convention, INCLUDING dunders (__init__, __repr__, ...): the
+    # corpus groundtruth consistently marks every dunder method/variable (__init__,
+    # __all__, __reduce__, __del__, ...) as non-exported, so L3's "public API surface
+    # only" view drops them the same as a single/double-underscore-mangled name.
+    return name.startswith("_")
 
 
 def _is_func(stmt):
@@ -372,11 +372,46 @@ def _render_class_l3(node, src):
     return out
 
 
+def _module_all_set(tree):
+    """If the module declares a literal `__all__ = [...]` / `(...)` of string
+    constants, return that set — the authoritative Python convention for
+    "what this module exports", and how the corpus groundtruth itself
+    defines "exported" (e.g. reprlib's `aRepr` has no leading underscore but
+    is NOT in `__all__`, and groundtruth marks it non-exported all the same).
+    Returns None if there's no such literal `__all__` to fall back to the
+    leading-underscore naming convention.
+    """
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
+            continue
+        if stmt.targets[0].id != "__all__":
+            continue
+        value = stmt.value
+        if not isinstance(value, (ast.List, ast.Tuple)):
+            return None
+        names = []
+        for elt in value.elts:
+            if not (isinstance(elt, ast.Constant) and isinstance(elt.value, str)):
+                return None  # non-literal element — can't trust this statically
+            names.append(elt.value)
+        return set(names)
+    return None
+
+
+def _is_module_private(name, all_set):
+    if all_set is not None:
+        return name not in all_set
+    return _is_private(name)
+
+
 def render_l3(tree, src):
     import_mods = []
     out = []
     internal_count = 0
     module_doc = _docstring_stmt(tree)
+    all_set = _module_all_set(tree)
 
     for i, stmt in enumerate(tree.body):
         if i == 0 and stmt is module_doc:
@@ -388,13 +423,13 @@ def render_l3(tree, src):
             import_mods.append(stmt.module or ("." * (stmt.level or 1)))
             continue
         if _is_func(stmt):
-            if _is_private(stmt.name):
+            if _is_module_private(stmt.name, all_set):
                 internal_count += 1
                 continue
             out.append(_collapsed_signature(stmt, src))
             continue
         if isinstance(stmt, ast.ClassDef):
-            if _is_private(stmt.name):
+            if _is_module_private(stmt.name, all_set):
                 internal_count += 1
                 continue
             out.extend(_render_class_l3(stmt, src))
@@ -402,7 +437,7 @@ def render_l3(tree, src):
         if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
             targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
             names = [t.id for t in targets if isinstance(t, ast.Name)]
-            if names and all(_is_private(n) for n in names):
+            if names and all(_is_module_private(n, all_set) for n in names):
                 internal_count += 1
                 continue
             target = _target_text(targets, src)
