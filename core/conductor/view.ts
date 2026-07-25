@@ -117,8 +117,10 @@ export abstract class ViewConductor implements Conductor {
 	 * Caveat: the "nothing else can run in the window" reasoning holds for IN-PROCESS hosts, whose
 	 * `propose` applies synchronously and resolves on a microtask. Over an out-of-process host the
 	 * awaited propose is a full wire round trip, and a genuinely external `state-changed` arriving
-	 * mid-flight would be skipped until the next host event. No shipped `ViewConductor` runs out of
-	 * process today (thermocline is a raw `Conductor`), so this stays a documented limitation.
+	 * mid-flight would be skipped until the next host event. One shipped `ViewConductor` does run
+	 * out of process (triptych, via the remote SDK; thermocline is a raw `Conductor`) — for it this
+	 * is an accepted, benign miss: the skipped rerun is recomputed from scratch on the next
+	 * `turn-committed`/`state-changed`, and triptych's desired state is a pure function of the view.
 	 */
 	private busy = false;
 
