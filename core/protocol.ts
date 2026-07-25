@@ -97,13 +97,26 @@
  *    client can never set it (only `extension/accordion.ts`'s own hook code calls
  *    `Truth.setCalibration`). Bumped so a pre-v18 peer (which has none of this vocabulary) cannot
  *    pair with a v18 host/client that assumes it.
+ *  - v19: system prompt visibility (issue #93). `SnapshotState` gains optional, nullable
+ *    `systemPrompt: { text, tokens } | null`; the `config` `WireEvent` gains the same optional
+ *    field; `ConductorHost` (`core/conductor/contract.ts`) gains a read-only `systemPrompt()`
+ *    accessor. Deliberately NOT a `Block` — no new `Op` kind, never foldable/groupable/pinnable,
+ *    structurally exempt rather than policy-exempt. `systemPrompt` is HOST-SET ONLY, same
+ *    treatment as `calibration` — there is no new `WireCommand` kind, only
+ *    `extension/accordion.ts`'s own `context`-hook code calls `Truth.setSystemPrompt`. Also
+ *    changes calibration PAIRING behavior: `Truth.liveTokens()`/`fullTokens()` (which
+ *    `pendingWireEst` reads directly) now include the system prompt's raw estimate, un-smearing it
+ *    out of the calibration multiplier `k` per ADR 0025's documented "smearing caveat" — `k` will
+ *    visibly shift (expected downward) on a session's first post-upgrade observation. Bumped so a
+ *    pre-v19 peer (which has none of this vocabulary) cannot pair with a v19 host/client that
+ *    assumes it.
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import { sanitizeOps, type Op, type OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 18;
+export const PROTOCOL_VERSION = 19;
 
 /**
  * The DOOR: a fixed, well-known loopback port that exactly ONE extension binds at a time as an
@@ -261,6 +274,14 @@ export interface SnapshotState {
 	 * back to the safe default, never a decision-affecting silent divergence.
 	 */
 	calibration?: number;
+	/**
+	 * The current effective system prompt (`Truth.systemPrompt`, v19, issue #93) — see the protocol
+	 * History note above. Optional AND nullable: a peer/test literal without the field still
+	 * type-checks (the v19 bump is the real cross-version gate, same treatment as `calibration`), and
+	 * a live session legitimately has `null` before its first `context` hook captures a value. A
+	 * hydrating replica defaults an absent field to `null` (same as an explicit `null`).
+	 */
+	systemPrompt?: { text: string; tokens: number } | null;
 	rev: number;
 }
 
@@ -281,7 +302,15 @@ export interface SnapshotState {
 export type WireEvent =
 	| { kind: "appended"; blocks: WireBlock[]; rev: number }
 	| { kind: "ops"; by: Actor; ops: Op[]; rev: number }
-	| { kind: "config"; budget?: number; contextWindow?: number | null; protectTokens?: number; calibration?: number; rev: number }
+	| {
+			kind: "config";
+			budget?: number;
+			contextWindow?: number | null;
+			protectTokens?: number;
+			calibration?: number;
+			systemPrompt?: { text: string; tokens: number };
+			rev: number;
+	  }
 	| { kind: "locks"; locks: LockName[]; holder: string | null; tailTokens: number; rev: number }
 	| { kind: "sent"; throughOrder: number; rev: number }
 	| { kind: "reset"; by: Actor; rev: number };

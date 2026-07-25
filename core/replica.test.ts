@@ -105,6 +105,55 @@ describe("replica — carriedSent round trip (protocol v15)", () => {
 	});
 });
 
+// Issue #93: the system prompt is a scalar Truth fact (never a Block), captured host-side and
+// pushed to every replica over the same config-dial wire shape `calibration`/`contextWindow` use.
+// Unlike birthFolded/carriedSent, losing it on a stale peer is NOT a decision-affecting divergence
+// (it never feeds canFold/protectedFromIndex) — but it must still round-trip byte-identical so a
+// replica's displayed token total and panel content agree with the host's.
+describe("replica — systemPrompt round trip (protocol v19)", () => {
+	it("serializeSnapshot → hydrateSnapshot preserves the captured system prompt", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		host.setSystemPrompt("You are a helpful assistant.", 8);
+
+		const state = serializeSnapshot(host, false);
+		expect(state.systemPrompt).toEqual({ text: "You are a helpful assistant.", tokens: 8 });
+
+		const replica = hydrateSnapshot(META, state);
+		expect(replica.systemPrompt).toEqual({ text: "You are a helpful assistant.", tokens: 8 });
+		expect(replica.stats().fullTokens).toBe(host.stats().fullTokens);
+	});
+
+	it("a snapshot literal omitting systemPrompt (pre-v19 peer) hydrates to null, not undefined/poisoned", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		const state = serializeSnapshot(host, false);
+		const { systemPrompt: _drop, ...stale } = state;
+		const replica = hydrateSnapshot(META, stale as typeof state);
+		expect(replica.systemPrompt).toBe(null);
+	});
+
+	it("a config WireEvent carrying only systemPrompt replays onto a replica without touching other dials", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		const events: WireEvent[] = [];
+		const off = host.onEvent((e) => {
+			const w = wireEventFromTruthEvent(e);
+			if (w) events.push(w);
+		});
+		host.setSystemPrompt("prompt text", 3);
+		off();
+		const cfgEv = events.find((e) => e.kind === "config");
+
+		const replica = live();
+		replica.append(seq(2, 1000));
+		const budget0 = replica.budget;
+		applyWireEvent(replica, cfgEv!);
+		expect(replica.systemPrompt).toEqual({ text: "prompt text", tokens: 3 });
+		expect(replica.budget).toBe(budget0);
+	});
+});
+
 // Model-window budget clamp fix: a mid-session swap to a smaller-window model must shrink an
 // oversized budget, but the clamp policy lives in the extension's call sites (a plain follow-up
 // `setBudget` after `setContextWindow`), NOT inside `Truth.setContextWindow` itself — merging both
