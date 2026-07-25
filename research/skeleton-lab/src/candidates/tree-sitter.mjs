@@ -93,9 +93,12 @@ async function init() {
   await Promise.all(Object.keys(WASM_FILES).map((k) => getParser(k)));
 }
 
-// tsx shares its grammar shape with ts; "ts" is the canonical key for both.
+// Normalizes to a WASM_FILES key; deliberately does NOT default unrecognized
+// input to "ts" — an unsupported lang must fail the WASM_FILES lookup below
+// so it takes the total-failure fallback path instead of being silently
+// mis-parsed with the wrong grammar.
 function langKey(lang) {
-  return lang === "tsx" ? "tsx" : lang === "py" ? "py" : lang === "js" ? "js" : "ts";
+  return lang;
 }
 function defsKey(lang) {
   return lang === "py" ? "py" : "ts"; // ts/tsx/js all share the same node-type vocabulary
@@ -182,13 +185,33 @@ function isDocstringStatement(node, lang) {
   return !!first && first.id === node.id;
 }
 
+const STRING_LITERAL_TYPES = new Set(["string", "template_string"]);
+
+function spansMoreThanLines(node, n) {
+  return node.endPosition.row - node.startPosition.row + 1 > n;
+}
+
+/** Bounded search for a big multi-line string literal buried inside a value
+ * expression (e.g. `re.compile(r'''...multi-line...''')`) — not just a
+ * direct object/array/dict/list literal. Depth-limited: this is meant to
+ * catch "obviously large constant data", not to become a general expression
+ * walker. */
+function findLargeStringDescendant(node, depth) {
+  if (STRING_LITERAL_TYPES.has(node.type) && spansMoreThanLines(node, 6)) return node;
+  if (depth <= 0) return null;
+  for (const c of node.namedChildren) {
+    if (!c) continue;
+    const hit = findLargeStringDescendant(c, depth - 1);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 function findLargeLiteralValue(node, lang) {
   const value = node.childForFieldName(valueFieldFor(lang));
   if (!value) return null;
-  if (!literalTypesFor(lang).has(value.type)) return null;
-  const lineCount = value.endPosition.row - value.startPosition.row + 1;
-  if (lineCount <= 6) return null;
-  return value;
+  if (literalTypesFor(lang).has(value.type) && spansMoreThanLines(value, 6)) return value;
+  return findLargeStringDescendant(value, 4);
 }
 
 function findLargeLiteralShallow(node, lang) {
@@ -204,6 +227,12 @@ function findLargeLiteralShallow(node, lang) {
 
 function literalMarker(value) {
   const t = value.text;
+  if (STRING_LITERAL_TYPES.has(value.type)) {
+    const m = /^[a-zA-Z]*("""|'''|["'`])/.exec(t);
+    const open = m ? m[0] : t.slice(0, 1);
+    const quote = m ? m[1] : t.slice(0, 1);
+    return `${open} … ${quote}`;
+  }
   if (t.length < 2) return "{ … }";
   return `${t[0]} … ${t[t.length - 1]}`;
 }
@@ -217,15 +246,20 @@ function removeEdit(node) {
 // comment/docstring past this many lines is truncated to its opening lines
 // plus an ellipsis continuation (still a real, syntactically-closed
 // comment/string, never a dangling delimiter).
-const DOC_LINE_THRESHOLD = 8;
-const DOC_HEAD_LINES = 4;
+const DOC_LINE_THRESHOLD = 6;
+const DOC_HEAD_LINES = 2;
 
 function truncateBlockCommentText(text) {
   if (!text.startsWith("/*")) return null; // a `//` line comment is always 1 line already
   const lines = text.split("\n");
   if (lines.length <= DOC_LINE_THRESHOLD) return null;
   const head = lines.slice(0, DOC_HEAD_LINES).join("\n");
-  return `${head}\n * …\n */`;
+  // Deliberately ASCII "..." here, not "…": the harness's lenient-validity
+  // sanitizer blanket-replaces stray U+2026 to check parseability, which
+  // would otherwise reach into this (already validly closed) comment and
+  // splice a second "/* */" inside it. Plain ASCII reads fine as prose and
+  // never collides with that check.
+  return `${head}\n * ...\n */`;
 }
 
 function truncateDocstringText(text) {
@@ -234,7 +268,7 @@ function truncateDocstringText(text) {
   const lines = text.split("\n");
   if (lines.length <= DOC_LINE_THRESHOLD) return null;
   const head = lines.slice(0, DOC_HEAD_LINES).join("\n");
-  return `${head}\n…\n${quote}`;
+  return `${head}\n...\n${quote}`;
 }
 
 function maybeTruncateDocstringNode(strNode, edits) {
@@ -289,6 +323,17 @@ function handlePyBodyL12(node, body, ctx) {
 
 function visitL12(node, ctx) {
   if (node.type === "ERROR") {
+    // tree-sitter's recovery sometimes types a node ERROR while still giving
+    // it a rich set of named children (e.g. a file truncated near the end:
+    // the WHOLE root can come back as ERROR even though 80% of it is
+    // perfectly good sub-structure). Recurse into whatever it recovered
+    // instead of discarding it — only a childless ERROR is a true opaque
+    // blob that needs the head/tail excerpt treatment.
+    const kids = node.namedChildren.filter(Boolean);
+    if (kids.length > 0) {
+      for (const c of kids) visitL12(c, ctx);
+      return;
+    }
     handleErrorNodeEdit(node, ctx.edits);
     return;
   }
