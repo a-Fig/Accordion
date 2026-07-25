@@ -1,0 +1,16 @@
+{
+  "name": "skeleton-lab",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Research harness: deterministic code-skeleton extraction candidates, benchmarked",
+  "type": "module",
+  "scripts": {
+    "bench": "node src/harness/run.mjs",
+    "gallery": "node src/harness/gallery.mjs"
+  },
+  "dependencies": {
+    "typescript": "^5.5.0",
+    "web-tree-sitter": "^0.25.0",
+    "tree-sitter-wasms": "^0.1.11"
+  }
+}
