@@ -60,6 +60,7 @@ export function serializeSnapshot(truth: Truth, foldingEnabled: boolean): Snapsh
 		birthFolded: [...truth.birthFoldedIds],
 		carriedSent: [...truth.carriedSentIds],
 		calibration: truth.calibration,
+		systemPrompt: truth.systemPrompt,
 		rev: truth.rev,
 	};
 }
@@ -100,6 +101,9 @@ export function hydrateSnapshot(meta: SessionMeta, state: SnapshotState): Truth 
 		// Optional on the wire (v18, same treatment as v15's `carriedSent` above); default to the
 		// cold-start value `1` for a peer/test literal that omits it — the host serializer always emits it.
 		calibration: state.calibration ?? 1,
+		// Optional AND nullable on the wire (v19, issue #93); default `null` for a peer/test literal
+		// that omits it — the host serializer always emits the field (as `null` before first capture).
+		systemPrompt: state.systemPrompt ?? null,
 		rev: state.rev,
 	});
 	return truth;
@@ -142,7 +146,15 @@ export function wireEventFromTruthEvent(e: TruthEvent): WireEvent | null {
 			return { kind: "ops", by: e.by, ops, rev: e.rev };
 		}
 		case "config":
-			return { kind: "config", budget: e.budget, contextWindow: e.contextWindow, protectTokens: e.protectTokens, calibration: e.calibration, rev: e.rev };
+			return {
+				kind: "config",
+				budget: e.budget,
+				contextWindow: e.contextWindow,
+				protectTokens: e.protectTokens,
+				calibration: e.calibration,
+				systemPrompt: e.systemPrompt,
+				rev: e.rev,
+			};
 		case "locks":
 			return { kind: "locks", locks: e.locks.slice(), holder: e.holder, tailTokens: e.tailTokens, rev: e.rev };
 		case "sent":
@@ -167,6 +179,7 @@ export function applyWireEvent(truth: Truth, ev: WireEvent): void {
 			if (ev.contextWindow !== undefined && ev.contextWindow !== null) truth.setContextWindow(ev.contextWindow);
 			if (ev.protectTokens !== undefined) truth.setProtect(ev.protectTokens);
 			if (ev.calibration !== undefined) truth.setCalibration(ev.calibration);
+			if (ev.systemPrompt !== undefined) truth.setSystemPrompt(ev.systemPrompt.text, ev.systemPrompt.tokens);
 			return;
 		case "locks":
 			if (ev.locks.length) truth.setLocks(ev.locks, ev.holder ?? "", ev.tailTokens);
