@@ -2411,6 +2411,11 @@ var AgedSummaryConductor = class extends ViewConductor {
    * it broke is a status that is not wiped by the next pass. Cleared exactly when a genuine retry
    * launches or a result commits — every `conduct()` path that would otherwise bare-clear the
    * status bar calls `surfaceIdleStatus()` instead, so a failure is never erased before it is seen.
+   *
+   * PROTECTED (not private) so a subclass with its own out-of-band failure source can join the
+   * same sticky mechanism instead of racing it — triptych's skeleton-engine init failure writes
+   * here so an idle pass surfaces it rather than wiping a bare `setStatus` (adversarial-review
+   * finding: a subclass status set outside this field was cleared by the very next idle pass).
    */
   failureStatus = null;
   // ── lifecycle ────────────────────────────────────────────────────────────────
@@ -3090,7 +3095,8 @@ var TriptychConductor = class extends AgedSummaryConductor {
       () => this.rerun(),
       (err) => {
         const msg = err instanceof Error ? err.message : String(err);
-        this.host.setStatus(truncateForStatus(`Triptych: skeleton engine failed to load \u2014 summaries only (${msg})`));
+        this.failureStatus = truncateForStatus(`Triptych: skeleton engine failed to load \u2014 summaries only (${msg})`);
+        this.host.setStatus(this.failureStatus);
       }
     );
   }
@@ -3141,6 +3147,9 @@ var TriptychConductor = class extends AgedSummaryConductor {
     }
     bottomStart = Math.min(bottomStart, view.protectedFromIndex);
     topEnd = Math.min(topEnd, bottomStart);
+    while (topEnd > 0 && topEnd < view.blocks.length && messageKey(view.blocks[topEnd].id) === messageKey(view.blocks[topEnd - 1].id)) {
+      topEnd--;
+    }
     return { bottomStart, topEnd };
   }
   // ── AgedSummaryConductor hooks ───────────────────────────────────────────────

@@ -229,4 +229,65 @@ describe("TriptychConductor", () => {
 		expect(grouped).toBe(true);
 		for (const g of host.truth.groups) expect(g.digest ?? "").not.toMatch(FOLD_TAG_RE);
 	});
+
+	it("snaps the top-band boundary to a message edge — the lossy group never swallows un-summarized parts", async () => {
+		// Adversarial-review regression: 30 blocks × 200 tok (raw 6000 ≥ 5400 trigger); the raw
+		// 2·cap/3 crossing lands at index 10, which BISECTS a two-part assistant message (blocks 9
+		// and 10 share the message key "a:msplit"). Truth's `group` op snaps outward to whole
+		// messages, so an unsnapped boundary would swallow part p1 into the lossy group even though
+		// the summarizer never saw it. The fix snaps topEnd down to 9: the whole message stays in
+		// the middle band, and neither part is summarized or grouped this round.
+		const blocks: Block[] = [];
+		for (let i = 0; i <= 8; i++) blocks.push(mkBlock(`a:m${i}:p0`, i, "text", 200, `OLD-${i}`));
+		blocks.push(mkBlock("a:msplit:p0", 9, "thinking", 200, "SECRET-THINKING"));
+		blocks.push(mkBlock("a:msplit:p1", 10, "text", 200, "SECRET-TEXT"));
+		for (let i = 11; i <= 29; i++) blocks.push(mkBlock(`a:m${i}:p0`, i, "text", 200, `NEW-${i}`));
+
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(PROTECT);
+		host.appendBlocks(blocks);
+		host.queueCompletion({ text: SUMMARY_A });
+		const { skel } = fakeSkeletonizer();
+		const conductor = new TriptychConductor(skel);
+		conductor.attach(host);
+		await flush();
+		await host.commitTurn();
+		await flush();
+
+		expect(host.completeLog).toHaveLength(1);
+		const prompt = host.completeLog[0].prompt;
+		expect(prompt).toContain("OLD-8");
+		expect(prompt).not.toContain("SECRET-THINKING"); // snapped out of the aged region…
+		expect(prompt).not.toContain("SECRET-TEXT");
+		expect(host.truth.groups).toHaveLength(1);
+		const members = host.truth.groups[0].memberIds;
+		expect(members).not.toContain("a:msplit:p0"); // …and out of the group
+		expect(members).not.toContain("a:msplit:p1");
+	});
+
+	it("a skeleton-engine init failure stays sticky on the status bar across idle passes", async () => {
+		// Adversarial-review regression: the failure used to be a bare setStatus, wiped by the very
+		// next idle pass's surfaceIdleStatus(null). It now joins the base class's sticky
+		// failureStatus mechanism.
+		const skel: Skeletonizer = {
+			init: async () => {
+				throw new Error("wasm load exploded");
+			},
+			ready: () => false,
+			skeletonize: () => null,
+		};
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(PROTECT);
+		host.appendBlocks([mkBlock(idOf(0), 0, "text", 200, "hello")]); // far below the trigger
+		const conductor = new TriptychConductor(skel);
+		conductor.attach(host);
+		await flush();
+		expect(host.statusLog.some((s) => s.text?.includes("skeleton engine failed to load"))).toBe(true);
+		await host.commitTurn(); // idle pass — used to wipe the message
+		await flush();
+		const last = host.statusLog[host.statusLog.length - 1];
+		expect(last.text).toContain("skeleton engine failed to load");
+	});
 });
