@@ -34,6 +34,14 @@ export interface ViewBlock {
 	 * (`../truth`) for the "calibrate every conductor read surface" convention this is part of.
 	 */
 	tokens: number;
+	/**
+	 * Original, uncalibrated wire estimate. Reserved for structural sign checks where multiplying
+	 * both sides by calibration must not change the verdict (for example, proving a DROP removes
+	 * more raw wire tokens than its fallback recap can insert). Never use this for budget, pressure,
+	 * or threshold decisions; those must read calibrated `tokens` / `stats().liveTokens`.
+	 * Optional only for compatibility with hand-built third-party views; every shipped host sets it.
+	 */
+	rawTokens?: number;
 	/** Token cost if folded — the digest/subst size for a foldable kind, else full tokens. Same
 	 *  calibration convention as `tokens`. */
 	foldedTokens: number;
