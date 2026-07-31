@@ -65,11 +65,13 @@ export class AccordionStore {
 	budget = $state(70_000);
 	contextWindow = $state<number | null>(null);
 	protectTokens = $state(20_000);
-	/** Provider-anchored calibration multiplier (issue #11 stage 1) — mirrors `truth.calibration`.
+	/** Provider-anchored affine calibration slope — mirrors `truth.calibration`.
 	 *  Default 1; a demo/CC/file (local-mode) session never calls `setCalibration`, so it stays 1
 	 *  forever (no offline calibration in v1). In live mode this arrives ONLY via the wire's `config`
 	 *  event (host-set, see `commandSink`'s doc comment) — never a local action a UI can trigger. */
 	calibration = $state(1);
+	/** Affine fixed-overhead term (issue #102); null until a provider receipt has landed. */
+	calibrationBase = $state<number | null>(null);
 	/** The current effective system prompt (issue #93) — mirrors `truth.systemPrompt`. `null` until
 	 *  a live host's first `context` hook captures one; a demo/CC/file (local-mode) session never
 	 *  calls `setSystemPrompt`, so it stays `null` forever — an honest absence, not a placeholder. */
@@ -109,6 +111,7 @@ export class AccordionStore {
 		this.contextWindow = this.truth.contextWindow;
 		this.protectTokens = this.truth.protectTokens;
 		this.calibration = this.truth.calibration;
+		this.calibrationBase = this.truth.calibrationBase;
 		this.systemPrompt = this.truth.systemPrompt;
 		this._locks = this.truth.locks;
 		this._holder = this.truth.lockHolder;
@@ -145,6 +148,7 @@ export class AccordionStore {
 				if (e.contextWindow !== undefined) this.contextWindow = e.contextWindow;
 				if (e.protectTokens !== undefined) this.protectTokens = e.protectTokens;
 				if (e.calibration !== undefined) this.calibration = e.calibration;
+				if (e.calibrationBase !== undefined) this.calibrationBase = e.calibrationBase;
 				if (e.systemPrompt !== undefined) this.systemPrompt = e.systemPrompt;
 				break;
 			case "locks":
@@ -266,13 +270,18 @@ export class AccordionStore {
 		void this.version;
 		return this.truth.canFold(b, "you");
 	}
-	/** Calibrated DISPLAY value of a raw token number (issue #11 stage 1) — routes through
+	/** Scale-calibrated value of a component/token delta — routes through
 	 *  `Truth.calTokens`. Never used by decision math (fold gating, budget comparisons, …); a display
 	 *  component opts in by passing a number it already computed. See `Truth.calTokens`'s doc comment
 	 *  for the smearing caveat. */
 	calTokens(n: number): number {
 		void this.version;
 		return this.truth.calTokens(n);
+	}
+	/** Provider-anchored whole-request total: affine base once, plus scaled content. */
+	calTotalTokens(n: number): number {
+		void this.version;
+		return this.truth.calTotalTokens(n);
 	}
 
 	liveTokens = $derived.by(() => (void this.version, this.truth.liveTokens()));
@@ -281,9 +290,9 @@ export class AccordionStore {
 	foldedCount = $derived.by(() => (void this.version, this.truth.foldedCount()));
 	// Issue #11 stage 2 (ADR 0025): compares the CALIBRATED live total against `budget` — `budget` is
 	// itself a real-token target (the dial's literal value; stage 2 does not multiply it), so this
-	// stays unit-consistent with the hero readout's own `calTokens(liveTokens)` and can no longer
+	// stays unit-consistent with the hero readout's own `calTotalTokens(liveTokens)` and can no longer
 	// visually disagree with it the way the stage-1-only raw comparison could.
-	overBudget = $derived.by(() => this.calTokens(this.liveTokens) > this.budget);
+	overBudget = $derived.by(() => this.calTotalTokens(this.liveTokens) > this.budget);
 	protectedFromIndex = $derived.by(() => (void this.version, this.truth.protectedFromIndex()));
 	protectedTokens = $derived.by(() => (void this.version, this.truth.protectedTokens()));
 

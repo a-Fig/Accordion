@@ -37,8 +37,8 @@ interface GroupShape {
 /**
  * Aggregate readout of the Truth state (the conductor host's `stats()`).
  *
- * CALIBRATION CONVENTION (issue #11 stage 2, ADR 0025): `liveTokens`/`fullTokens` are calibrated
- * (`Truth.calTokens` applied once to the aggregate) — real, provider-anchored numbers, not the raw
+ * CALIBRATION CONVENTION (issues #11/#102, ADR 0025): `liveTokens`/`fullTokens` are calibrated
+ * (`Truth.calTotalTokens` applied once to the aggregate) — real, provider-anchored numbers, not the raw
  * chars/4 estimate. `budget`/`protectTokens`/`contextWindow` are NOT converted — they are the
  * literal dial values a human (or a conductor's declared `tailTokens`) set, which stage 2 treats as
  * already meaning REAL tokens (that is the whole point of calibrating the numerator against them:
@@ -46,7 +46,8 @@ interface GroupShape {
  * `protectedFromIndex` is the boundary index itself (unitless), already computed against the
  * calibrated threshold — see `Truth.protectedFromIndex`'s doc.
  *
- * The SAME convention applies to every other conductor-facing read surface — `ViewBlock.tokens` /
+ * The affine base is request-wide and appears once in aggregate totals. The slope-only convention
+ * applies to every component/delta read surface — `ViewBlock.tokens` /
  * `ViewBlock.foldedTokens` (`core/conductor/hostAdapter.ts`'s `viewBlockOf`) and
  * `ConductorHost.countTokens` are ALL calibrated too. This is a deliberate "calibrate at every read
  * surface" choice over the alternative ("stats calibrated, per-block/countTokens stay raw, conductor
@@ -153,10 +154,9 @@ export class Truth {
 	private systemPromptText: string | null = null;
 	private systemPromptTokensVal = 0;
 	/**
-	 * Provider-anchored calibration multiplier (issue #11, ADR 0025): `k = realTokens /
-	 * estimatedTokens` for the same request, snapped by the HOST ONLY (`setCalibration`, called from
-	 * the extension after pairing an assistant reply's real usage against the wire estimate that
-	 * produced it). Default 1 — a session that never observes a real pairing (cold start; read-only /
+	 * Provider-anchored affine calibration slope (issues #11/#102, ADR 0025), fitted by the HOST ONLY
+	 * after pairing assistant replies with the estimates of their departing wires. The paired base
+	 * term lives in `calibrationBaseVal`. Default slope 1 — a session that never observes a real pairing (cold start; read-only /
 	 * demo / CC / file sessions, which have no live host to ever call the setter) stays at 1 forever.
 	 * Stage 1 (display) shipped this dial as read-only plumbing; stage 2 (this) additionally feeds it
 	 * into the DECISION surface: `protectedFromIndex()` sizes the protected tail against a calibrated
@@ -167,6 +167,8 @@ export class Truth {
 	 * transitively through `isProtected`/`protectedFromIndex`. See `calTokens`.
 	 */
 	private calibrationMul = 1;
+	/** Affine fixed-overhead term. `null` means no provider observation has landed yet. */
+	private calibrationBaseVal: number | null = null;
 
 	private activeLocks: readonly LockName[] = [];
 	private activeTailTok = 0;
@@ -273,6 +275,7 @@ export class Truth {
 		birthFolded: readonly string[];
 		carriedSent: readonly string[];
 		calibration: number;
+		calibrationBase: number | null;
 		systemPrompt: { text: string; tokens: number } | null;
 		rev: number;
 	}): void {
@@ -290,6 +293,7 @@ export class Truth {
 		this.birthFolded = new Set(s.birthFolded);
 		this.carriedSent = new Set(s.carriedSent);
 		this.calibrationMul = Number.isFinite(s.calibration) && s.calibration > 0 ? s.calibration : 1;
+		this.calibrationBaseVal = s.calibrationBase === null || Number.isFinite(s.calibrationBase) ? s.calibrationBase : null;
 		// Self-validated exactly like `calibration` above — a malformed shape (bad `text`/`tokens` type,
 		// e.g. from a hand-built test literal or a corrupted wire frame) falls back to unset rather than
 		// poisoning `liveTokens()`/`fullTokens()` with NaN.
@@ -331,6 +335,7 @@ export class Truth {
 		next.holderLabel = prev.holderLabel;
 		next.activeTailTok = prev.activeTailTok;
 		next.calibrationMul = prev.calibrationMul;
+		next.calibrationBaseVal = prev.calibrationBaseVal;
 		// Issue #93: carried, unlike `contextWindow` — the system prompt IS a preserved captured fact,
 		// not a live re-derived one. `refreshFromCtx` runs before a rebuild can be triggered (it's called
 		// at the top of the `context` hook, before `ingestMessages`), so without this carry `next` would
@@ -438,6 +443,10 @@ export class Truth {
 	get calibration(): number {
 		return this.calibrationMul;
 	}
+	/** Fixed request overhead from the affine fit; `null` until the first real receipt. */
+	get calibrationBase(): number | null {
+		return this.calibrationBaseVal;
+	}
 	/**
 	 * Calibrated value of a raw token estimate — `Math.round(n * calibration)`. A pure helper a
 	 * caller routes a number it ALREADY computed (`liveTokens()`, `effTokens(b)`, a per-kind sum, …)
@@ -450,13 +459,16 @@ export class Truth {
 	 * helper — it converts the TARGET into raw-estimate space with one division instead (see that
 	 * method's doc for why). One multiplier necessarily SMEARS the fixed tool-schema overhead (which
 	 * belongs to no block) proportionally across every block rather than carrying it as its own line
-	 * item — `real = base + k·est` would be the honest affine model; this ships the pure multiplier
-	 * knowingly (ADR 0025's Deferred section). As of issue #93, the system prompt is no longer part of
-	 * that smear: `liveTokens()`/`fullTokens()` include it directly, so only tool-call-schema overhead
-	 * remains folded into `k` (see `liveTokens()`'s doc and ADR 0025's addendum).
+	 * item. Issue #102 adds that term to whole-request totals through `calTotalTokens`; this helper
+	 * remains slope-only because component and saving deltas must never receive the fixed base twice.
 	 */
 	calTokens(n: number): number {
 		return Math.round(n * this.calibrationMul);
+	}
+	/** Calibrate a whole request total: fixed overhead once, plus the scaled estimated content. */
+	calTotalTokens(n: number): number {
+		if (this.calibrationBaseVal === null) return this.calTokens(n);
+		return Math.max(0, Math.round(this.calibrationBaseVal + n * this.calibrationMul));
 	}
 	get locks(): readonly LockName[] {
 		return this.activeLocks;
@@ -556,15 +568,15 @@ export class Truth {
 	}
 
 	stats(): TruthStats {
-		// Calibrate the AGGREGATE once (a single `calTokens` call per field), never per-block inside
+		// Calibrate the AGGREGATE once (a single `calTotalTokens` call per field), never per-block inside
 		// `liveTokens()`/`fullTokens()` themselves — those stay the raw accessors every other internal
 		// caller (`effTokens`, group accounting, `serializeWire`) still needs untouched. See
 		// `TruthStats`'s doc for the "calibrate every conductor read surface" convention this
 		// implements alongside `viewBlockOf`/`countTokens`.
 		return {
 			rev: this.revCounter,
-			liveTokens: this.calTokens(this.liveTokens()),
-			fullTokens: this.calTokens(this.fullTokens()),
+			liveTokens: this.calTotalTokens(this.liveTokens()),
+			fullTokens: this.calTotalTokens(this.fullTokens()),
 			budget: this.budgetTok,
 			contextWindow: this.contextWindowTok,
 			protectTokens: this.protectTokensTarget,
@@ -956,9 +968,9 @@ export class Truth {
 		this.emit({ type: "config", protectTokens: this.protectTokensTarget, rev });
 	}
 	/**
-	 * HOST-ONLY calibration snap (issue #11 stage 1, ADR 0025): `k = realTokens / estWireTokens` for
-	 * the request that just completed. Raw snap, no clamp, no smoothing/EMA — owner-approved v1
-	 * policy: the dial always reflects the MOST RECENT observation, not a running average. There is
+	 * HOST-ONLY affine calibration update (issues #11/#102, ADR 0025). `k` is the rolling-fit slope
+	 * and `base` is the fixed request overhead; the fit is always re-anchored through the MOST RECENT
+	 * observation. There is
 	 * no `WireCommand` kind for this — a client can never call it; only the extension's own host code
 	 * does, after pairing an assistant message's real usage against the estimate of the wire that
 	 * produced it (see `extension/accordion.ts`'s `maybeObserveCalibration`). A non-finite or
@@ -974,14 +986,15 @@ export class Truth {
 	 * the tail just grew over in the SAME rev it moved, instead of leaving it stale until the next
 	 * unrelated mutation happens to call `housekeep()`.
 	 */
-	setCalibration(k: number): void {
-		if (!Number.isFinite(k) || k <= 0) return;
+	setCalibration(k: number, base: number | null = null): void {
+		if (!Number.isFinite(k) || k <= 0 || (base !== null && !Number.isFinite(base))) return;
 		this.calibrationMul = k;
+		this.calibrationBaseVal = base;
 		const touched = new Set<string>();
 		this.housekeep(touched);
 		const rev = ++this.revCounter;
 		for (const id of touched) this.lastChangedRev.set(id, rev);
-		this.emit({ type: "config", calibration: this.calibrationMul, rev });
+		this.emit({ type: "config", calibration: this.calibrationMul, calibrationBase: this.calibrationBaseVal, rev });
 	}
 	markSent(order: number): void {
 		if (order <= this.sentThroughOrderValue) return;

@@ -110,13 +110,18 @@
  *    visibly shift (expected downward) on a session's first post-upgrade observation. Bumped so a
  *    pre-v19 peer (which has none of this vocabulary) cannot pair with a v19 host/client that
  *    assumes it.
+ *  - v20: affine token calibration (issue #102). `SnapshotState` and config events gain the
+ *    optional nullable `calibrationBase` fixed-overhead term. Whole-request totals use
+ *    `base + scale * estimate`; per-block/delta reads use the scale only. This prevents a large
+ *    newly appended tool result from inheriting fixed prompt/schema overhead once per token and
+ *    briefly spiking the headline total before the next provider receipt arrives.
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import { sanitizeOps, type Op, type OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 19;
+export const PROTOCOL_VERSION = 20;
 
 /**
  * The DOOR: a fixed, well-known loopback port that exactly ONE extension binds at a time as an
@@ -274,6 +279,8 @@ export interface SnapshotState {
 	 * back to the safe default, never a decision-affecting silent divergence.
 	 */
 	calibration?: number;
+	/** Affine fixed-overhead term (v20, issue #102); null means no provider receipt yet. */
+	calibrationBase?: number | null;
 	/**
 	 * The current effective system prompt (`Truth.systemPrompt`, v19, issue #93) — see the protocol
 	 * History note above. Optional AND nullable: a peer/test literal without the field still
@@ -308,6 +315,7 @@ export type WireEvent =
 			contextWindow?: number | null;
 			protectTokens?: number;
 			calibration?: number;
+			calibrationBase?: number | null;
 			systemPrompt?: { text: string; tokens: number };
 			rev: number;
 	  }

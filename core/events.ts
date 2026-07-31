@@ -25,6 +25,7 @@ export type TruthEvent =
 			contextWindow?: number | null;
 			protectTokens?: number;
 			calibration?: number;
+			calibrationBase?: number | null;
 			systemPrompt?: { text: string; tokens: number };
 			rev: number;
 	  }

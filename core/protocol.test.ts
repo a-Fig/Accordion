@@ -35,8 +35,8 @@ import type {
 } from "./protocol";
 
 describe("PROTOCOL_VERSION", () => {
-	it("is bumped to 19 for system prompt visibility (issue #93)", () => {
-		expect(PROTOCOL_VERSION).toBe(19);
+	it("is bumped to 20 for affine token calibration (issue #102)", () => {
+		expect(PROTOCOL_VERSION).toBe(20);
 	});
 });
 

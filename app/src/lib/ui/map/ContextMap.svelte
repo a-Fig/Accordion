@@ -388,10 +388,10 @@
 	});
 
 	const k = (n: number) => { n = Math.round(n); return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : `${n}`; };
-	// issue #11 stage 1: "≈" marker gate for the transcript's visible token badge — `calibration === 1`
+	// Provider-anchor marker: a null affine base means no real receipt has landed yet.
 	// covers BOTH cold start (no observation yet) and every read-only/demo/CC/file session (no live
 	// host ever calibrates those), so no separate `readOnly` prop plumbing is needed here.
-	const notAnchored = $derived(store.calibration === 1);
+	const notAnchored = $derived(store.calibrationBase === null);
 	function tip(b: Block, prot = false): string {
 		const tool = b.toolName ? ` ${b.toolName}` : "";
 		const folded = store.isFolded(b);

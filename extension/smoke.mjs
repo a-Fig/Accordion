@@ -352,10 +352,11 @@ await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2
 		() => fails.push("resnapshot after the calibration probe produced no snapshot"),
 	);
 	const snap = a.inbox.snapshot.at(-1);
-	const expectedK = tel.realTokens / tel.estWireTokens;
-	if (typeof snap.state.calibration !== "number" || Math.abs(snap.state.calibration - expectedK) > 1e-9)
-		fails.push(`snapshot.calibration expected ${expectedK} (realTokens/estWireTokens), got ${snap.state.calibration}`);
-	if (snap.state.calibration === 1) fails.push("calibration probe did not move the dial away from the cold-start default");
+	const fittedReal = snap.state.calibrationBase + snap.state.calibration * tel.estWireTokens;
+	if (typeof snap.state.calibration !== "number" || typeof snap.state.calibrationBase !== "number")
+		fails.push(`snapshot expected numeric affine calibration fields, got k=${snap.state.calibration}, base=${snap.state.calibrationBase}`);
+	else if (Math.abs(fittedReal - tel.realTokens) > 1e-6)
+		fails.push(`snapshot affine calibration should pass through the latest receipt (${tel.realTokens}), got ${fittedReal}`);
 }
 
 // ── F3 (issue #11, ADR 0025): the agent_end backstop must not let an EARLIER newly-appended ──
@@ -1163,8 +1164,9 @@ if (unfoldTool && foldCodeStr) {
 	await waitFor(() => a.inbox.snapshot.length > 0, 2000, "baseline snapshot before system-prompt capture").catch(
 		() => fails.push("issue #93: baseline resnapshot before system-prompt capture produced no snapshot"),
 	);
-	const kBefore = a.inbox.snapshot.at(-1)?.state?.calibration;
-	if (typeof kBefore !== "number") fails.push("issue #93: expected a calibration observation on the baseline snapshot");
+	const beforeFit = a.inbox.snapshot.at(-1)?.state;
+	if (typeof beforeFit?.calibration !== "number" || typeof beforeFit?.calibrationBase !== "number")
+		fails.push("issue #93: expected an affine calibration observation on the baseline snapshot");
 
 	// Probe 2 (system prompt now captured — same messages, same real usage, larger estimate).
 	ctx.getSystemPrompt = () => SMOKE_SYSTEM_PROMPT;
@@ -1180,10 +1182,8 @@ if (unfoldTool && foldCodeStr) {
 	if (!sp || sp.text !== SMOKE_SYSTEM_PROMPT) fails.push(`issue #93: snapshot.state.systemPrompt.text expected ${JSON.stringify(SMOKE_SYSTEM_PROMPT)}, got ${JSON.stringify(sp)}`);
 	if (!sp || typeof sp.tokens !== "number" || sp.tokens <= 0) fails.push(`issue #93: snapshot.state.systemPrompt.tokens expected a positive number, got ${JSON.stringify(sp?.tokens)}`);
 
-	const kAfter = snap?.state?.calibration;
-	if (typeof kAfter !== "number") fails.push("issue #93: expected a calibration observation on the snapshot after system-prompt capture");
-	else if (typeof kBefore === "number" && kAfter >= kBefore)
-		fails.push(`issue #93 (ADR 0025 un-smearing): expected calibration to shift DOWN once the system prompt is included in pendingWireEst (before=${kBefore}, after=${kAfter})`);
+	if (typeof snap?.state?.calibration !== "number" || typeof snap?.state?.calibrationBase !== "number")
+		fails.push("issue #93: expected an affine calibration observation on the snapshot after system-prompt capture");
 
 	// Review regression: a prompt capture belongs to exactly one pi session. Force the NEXT
 	// session_start's best-effort refresh to throw before it can read getSystemPrompt(); the new

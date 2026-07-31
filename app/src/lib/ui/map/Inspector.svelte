@@ -77,9 +77,9 @@
 	const gFullTok = $derived(group ? store.calTokens(store.groupFullTokens(group)) : 0);
 	const gLiveTok = $derived(group ? store.calTokens(store.groupLiveTokens(group)) : 0);
 	const gSavedTok = $derived(group ? store.calTokens(store.groupSavedTokens(group)) : 0);
-	// "≈" marker gate — `calibration === 1` covers both cold start and every read-only/demo/CC/file
+	// "≈" marker gate — a null affine base covers cold start and every read-only/demo/CC/file
 	// session (no live host ever calibrates those), so no separate `readOnly` prop is needed here.
-	const notAnchored = $derived(store.calibration === 1);
+	const notAnchored = $derived(store.calibrationBase === null);
 	const gStrag = $derived(group ? store.groupStragglerCount(group) : 0);
 	const gIsDropGroup = $derived(group ? store.isDropGroup(group) : false);
 	// The EXACT summary the agent receives for this group: a custom digest literal when the

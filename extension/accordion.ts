@@ -56,6 +56,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { Truth } from "../core/truth";
 import { estTokens } from "../core/tokens";
+import { fitCalibration, type TokenObservation } from "../core/calibration";
 import { linearize, messageInfo, contentFingerprint, wireToBlock, type PiMessage } from "../core/wire";
 import { serializeSnapshot, wireEventFromTruthEvent } from "../core/replica";
 import { resolveUnfold, resolveRecall } from "../core/agentView";
@@ -487,13 +488,15 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// there because that is the one place both "what we estimated" and "what actually got sent" are
 	// known together. `maybeObserveCalibration` (called from `ingestFinishedMessage`, so it covers
 	// both `message_end` and the `agent_end` backstop) pairs it against the resulting assistant
-	// message's REAL provider usage and raw-snaps `truth.calibration`. `lastRealTokens`/
+	// message's REAL provider usage and updates Truth's affine calibration. `lastRealTokens`/
 	// `lastEstWireTokens` are the raw ingredients of the most recent observation, surfaced on
 	// `telemetryMsg()` (protocol v18) so the GUI/smoke tests can audit calibration independently of
 	// the derived multiplier.
 	let pendingWireEst: number | null = null;
 	let lastRealTokens: number | null = null;
 	let lastEstWireTokens: number | null = null;
+	const calibrationObservations: TokenObservation[] = [];
+	const CALIBRATION_WINDOW = 8;
 
 	// Most recent ExtensionContext seen on any hook. Captured so the WS connection handler
 	// (which gets no ctx of its own) can read pi's CURRENT session history at attach time — the
@@ -2233,8 +2236,8 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	/**
 	 * Issue #11 stage 1 (ADR 0025): pair the wire estimate the most recent `context` hook recorded
 	 * (`pendingWireEst`) against THIS message's REAL provider usage (assistant messages only), and
-	 * raw-snap `truth.calibration = real / est` — no clamp, no smoothing (owner-approved v1 policy:
-	 * the dial always reflects the latest observation, never a running average). `pendingWireEst` is
+	 * update the rolling affine fit `real = base + scale * est`, re-anchored through the latest
+	 * observation so its provider receipt remains exact. `pendingWireEst` is
 	 * consumed (cleared) unconditionally on every call — including a non-assistant message, an
 	 * aborted/errored reply, or one with no usable `usage` — so a departing wire that never yields a
 	 * usable pairing can't accidentally pair with a LATER, unrelated response.
@@ -2253,11 +2256,10 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	 * SMEARING CAVEAT: `est` is Truth's own block-token accounting, which — by design — excludes
 	 * tool-call schemas (they belong to no block). `real` includes them. One multiplier therefore
 	 * distributes that fixed overhead PROPORTIONALLY across every block rather than carrying it as its
-	 * own line item — `real = base + k·est` would be the honest affine model; we ship the pure
-	 * multiplier knowingly (stage 1 scope; see ADR 0025 for the stage-2 plan). UPDATED (issue #93):
+	 * own line item. Issue #102 now fits that affine model over a short rolling window. UPDATED (issue #93):
 	 * `est` (`truth.liveTokens()`/`fullTokens()`) now ALSO includes the system prompt's own raw
-	 * estimate, so as of the un-smearing fix, the system prompt is no longer part of this caveat —
-	 * only tool-call-schema overhead remains smeared into `k`. See ADR 0025's issue-#93 addendum.
+	 * estimate, so as of the un-smearing fix, the system prompt is independently visible; the affine
+	 * base now learns the remaining tool-schema/provider framing overhead. See ADR 0025's addenda.
 	 */
 	function maybeObserveCalibration(msg: unknown): void {
 		if (!truth) return;
@@ -2275,7 +2277,10 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (real <= 0) return;
 		lastRealTokens = real;
 		lastEstWireTokens = est;
-		truth.setCalibration(real / est);
+		calibrationObservations.push({ est, real });
+		if (calibrationObservations.length > CALIBRATION_WINDOW) calibrationObservations.shift();
+		const fit = fitCalibration(calibrationObservations);
+		if (fit) truth.setCalibration(fit.scale, fit.base);
 	}
 
 	/**
@@ -2356,6 +2361,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		pendingWireEst = null;
 		lastRealTokens = null;
 		lastEstWireTokens = null;
+		calibrationObservations.length = 0;
 		// Issue #93 review fix: prompt capture is session-scoped. `refreshFromCtx` is deliberately
 		// best-effort and one optional API throwing can abort the rest of that refresh; without an
 		// eager reset here, `buildTruth` could apply the previous session's cached prompt to the new

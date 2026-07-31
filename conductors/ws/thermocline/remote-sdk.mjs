@@ -463,10 +463,9 @@ var Truth = class _Truth {
   systemPromptText = null;
   systemPromptTokensVal = 0;
   /**
-   * Provider-anchored calibration multiplier (issue #11, ADR 0025): `k = realTokens /
-   * estimatedTokens` for the same request, snapped by the HOST ONLY (`setCalibration`, called from
-   * the extension after pairing an assistant reply's real usage against the wire estimate that
-   * produced it). Default 1 — a session that never observes a real pairing (cold start; read-only /
+   * Provider-anchored affine calibration slope (issues #11/#102, ADR 0025), fitted by the HOST ONLY
+   * after pairing assistant replies with the estimates of their departing wires. The paired base
+   * term lives in `calibrationBaseVal`. Default slope 1 — a session that never observes a real pairing (cold start; read-only /
    * demo / CC / file sessions, which have no live host to ever call the setter) stays at 1 forever.
    * Stage 1 (display) shipped this dial as read-only plumbing; stage 2 (this) additionally feeds it
    * into the DECISION surface: `protectedFromIndex()` sizes the protected tail against a calibrated
@@ -477,6 +476,8 @@ var Truth = class _Truth {
    * transitively through `isProtected`/`protectedFromIndex`. See `calTokens`.
    */
   calibrationMul = 1;
+  /** Affine fixed-overhead term. `null` means no provider observation has landed yet. */
+  calibrationBaseVal = null;
   activeLocks = [];
   activeTailTok = 0;
   holderLabel = null;
@@ -572,6 +573,7 @@ var Truth = class _Truth {
     this.birthFolded = new Set(s.birthFolded);
     this.carriedSent = new Set(s.carriedSent);
     this.calibrationMul = Number.isFinite(s.calibration) && s.calibration > 0 ? s.calibration : 1;
+    this.calibrationBaseVal = s.calibrationBase === null || Number.isFinite(s.calibrationBase) ? s.calibrationBase : null;
     const sp = s.systemPrompt;
     this.systemPromptText = sp && typeof sp.text === "string" && Number.isFinite(sp.tokens) && sp.tokens >= 0 ? sp.text : null;
     this.systemPromptTokensVal = this.systemPromptText === null ? 0 : Math.round(sp.tokens);
@@ -608,6 +610,7 @@ var Truth = class _Truth {
     next.holderLabel = prev.holderLabel;
     next.activeTailTok = prev.activeTailTok;
     next.calibrationMul = prev.calibrationMul;
+    next.calibrationBaseVal = prev.calibrationBaseVal;
     next.systemPromptText = prev.systemPromptText;
     next.systemPromptTokensVal = prev.systemPromptTokensVal;
     for (const b of next.blockLog) {
@@ -679,6 +682,10 @@ var Truth = class _Truth {
   get calibration() {
     return this.calibrationMul;
   }
+  /** Fixed request overhead from the affine fit; `null` until the first real receipt. */
+  get calibrationBase() {
+    return this.calibrationBaseVal;
+  }
   /**
    * Calibrated value of a raw token estimate — `Math.round(n * calibration)`. A pure helper a
    * caller routes a number it ALREADY computed (`liveTokens()`, `effTokens(b)`, a per-kind sum, …)
@@ -691,13 +698,16 @@ var Truth = class _Truth {
    * helper — it converts the TARGET into raw-estimate space with one division instead (see that
    * method's doc for why). One multiplier necessarily SMEARS the fixed tool-schema overhead (which
    * belongs to no block) proportionally across every block rather than carrying it as its own line
-   * item — `real = base + k·est` would be the honest affine model; this ships the pure multiplier
-   * knowingly (ADR 0025's Deferred section). As of issue #93, the system prompt is no longer part of
-   * that smear: `liveTokens()`/`fullTokens()` include it directly, so only tool-call-schema overhead
-   * remains folded into `k` (see `liveTokens()`'s doc and ADR 0025's addendum).
+   * item. Issue #102 adds that term to whole-request totals through `calTotalTokens`; this helper
+   * remains slope-only because component and saving deltas must never receive the fixed base twice.
    */
   calTokens(n) {
     return Math.round(n * this.calibrationMul);
+  }
+  /** Calibrate a whole request total: fixed overhead once, plus the scaled estimated content. */
+  calTotalTokens(n) {
+    if (this.calibrationBaseVal === null) return this.calTokens(n);
+    return Math.max(0, Math.round(this.calibrationBaseVal + n * this.calibrationMul));
   }
   get locks() {
     return this.activeLocks;
@@ -796,8 +806,8 @@ var Truth = class _Truth {
   stats() {
     return {
       rev: this.revCounter,
-      liveTokens: this.calTokens(this.liveTokens()),
-      fullTokens: this.calTokens(this.fullTokens()),
+      liveTokens: this.calTotalTokens(this.liveTokens()),
+      fullTokens: this.calTotalTokens(this.fullTokens()),
       budget: this.budgetTok,
       contextWindow: this.contextWindowTok,
       protectTokens: this.protectTokensTarget,
@@ -1157,9 +1167,9 @@ var Truth = class _Truth {
     this.emit({ type: "config", protectTokens: this.protectTokensTarget, rev });
   }
   /**
-   * HOST-ONLY calibration snap (issue #11 stage 1, ADR 0025): `k = realTokens / estWireTokens` for
-   * the request that just completed. Raw snap, no clamp, no smoothing/EMA — owner-approved v1
-   * policy: the dial always reflects the MOST RECENT observation, not a running average. There is
+   * HOST-ONLY affine calibration update (issues #11/#102, ADR 0025). `k` is the rolling-fit slope
+   * and `base` is the fixed request overhead; the fit is always re-anchored through the MOST RECENT
+   * observation. There is
    * no `WireCommand` kind for this — a client can never call it; only the extension's own host code
    * does, after pairing an assistant message's real usage against the estimate of the wire that
    * produced it (see `extension/accordion.ts`'s `maybeObserveCalibration`). A non-finite or
@@ -1175,14 +1185,15 @@ var Truth = class _Truth {
    * the tail just grew over in the SAME rev it moved, instead of leaving it stale until the next
    * unrelated mutation happens to call `housekeep()`.
    */
-  setCalibration(k) {
-    if (!Number.isFinite(k) || k <= 0) return;
+  setCalibration(k, base = null) {
+    if (!Number.isFinite(k) || k <= 0 || base !== null && !Number.isFinite(base)) return;
     this.calibrationMul = k;
+    this.calibrationBaseVal = base;
     const touched = /* @__PURE__ */ new Set();
     this.housekeep(touched);
     const rev = ++this.revCounter;
     for (const id of touched) this.lastChangedRev.set(id, rev);
-    this.emit({ type: "config", calibration: this.calibrationMul, rev });
+    this.emit({ type: "config", calibration: this.calibrationMul, calibrationBase: this.calibrationBaseVal, rev });
   }
   markSent(order) {
     if (order <= this.sentThroughOrderValue) return;
@@ -1710,6 +1721,7 @@ function hydrateSnapshot(meta, state) {
     // Optional on the wire (v18, same treatment as v15's `carriedSent` above); default to the
     // cold-start value `1` for a peer/test literal that omits it — the host serializer always emits it.
     calibration: state.calibration ?? 1,
+    calibrationBase: state.calibrationBase ?? null,
     // Optional AND nullable on the wire (v19, issue #93); default `null` for a peer/test literal
     // that omits it — the host serializer always emits the field (as `null` before first capture).
     systemPrompt: state.systemPrompt ?? null,
@@ -1729,7 +1741,11 @@ function applyWireEvent(truth, ev) {
       if (ev.budget !== void 0) truth.setBudget(ev.budget);
       if (ev.contextWindow !== void 0 && ev.contextWindow !== null) truth.setContextWindow(ev.contextWindow);
       if (ev.protectTokens !== void 0) truth.setProtect(ev.protectTokens);
-      if (ev.calibration !== void 0) truth.setCalibration(ev.calibration);
+      if (ev.calibration !== void 0 || ev.calibrationBase !== void 0)
+        truth.setCalibration(
+          ev.calibration ?? truth.calibration,
+          ev.calibrationBase !== void 0 ? ev.calibrationBase : truth.calibrationBase
+        );
       if (ev.systemPrompt !== void 0) truth.setSystemPrompt(ev.systemPrompt.text, ev.systemPrompt.tokens);
       return;
     case "locks":
@@ -1826,7 +1842,7 @@ function recallHostEvent(ids, by, rev) {
 }
 
 // core/protocol.ts
-var PROTOCOL_VERSION = 19;
+var PROTOCOL_VERSION = 20;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
   "snapshot",

@@ -1060,6 +1060,16 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 		expect(t.rev).toBe(rev0 + 2);
 	});
 
+	it("applies the affine base once to aggregate totals while scaling component deltas only", () => {
+		const t = bulk(seq(2, 1000));
+		t.setCalibration(1.25, 12_000);
+		expect(t.calibration).toBe(1.25);
+		expect(t.calibrationBase).toBe(12_000);
+		expect(t.calTokens(1000)).toBe(1250);
+		expect(t.calTotalTokens(2000)).toBe(14_500);
+		expect(t.stats().liveTokens).toBe(14_500);
+	});
+
 	it("refuses non-finite / non-positive input — no poison, no rev bump, no event (same guard shape as setBudget/setProtect)", () => {
 		const t = bulk(seq(2, 1000));
 		const rev0 = t.rev;
@@ -1162,19 +1172,23 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 	it("round-trips through serializeSnapshot → hydrateSnapshot (replica replay parity)", () => {
 		const host = live();
 		host.append(seq(2, 1000));
-		host.setCalibration(2.25);
+		host.setCalibration(1.25, 12_000);
 
 		const state = serializeSnapshot(host, false);
-		expect(state.calibration).toBe(2.25);
+		expect(state.calibration).toBe(1.25);
+		expect(state.calibrationBase).toBe(12_000);
 
 		const replica = hydrateSnapshot(META, state);
-		expect(replica.calibration).toBe(2.25);
+		expect(replica.calibration).toBe(1.25);
+		expect(replica.calibrationBase).toBe(12_000);
+		expect(replica.stats().liveTokens).toBe(host.stats().liveTokens);
 		expect(replica.rev).toBe(host.rev);
 
 		// A stale-format peer that omits `calibration` (pre-v18) falls back to the safe cold-start
 		// default rather than forking on `undefined` — never a decision-affecting divergence.
-		const stale = hydrateSnapshot(META, { ...state, calibration: undefined });
+		const stale = hydrateSnapshot(META, { ...state, calibration: undefined, calibrationBase: undefined });
 		expect(stale.calibration).toBe(1);
+		expect(stale.calibrationBase).toBe(null);
 	});
 
 	it("a config event carrying ONLY calibration replays via applyWireEvent without touching the other dials", () => {
@@ -1188,10 +1202,10 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 			const w = wireEventFromTruthEvent(e);
 			if (w) events.push(w);
 		});
-		host.setCalibration(1.1);
+		host.setCalibration(1.1, 9000);
 		off();
 		const cfgEv = events.find((e) => e.kind === "config");
-		expect(cfgEv).toMatchObject({ kind: "config", calibration: 1.1 });
+		expect(cfgEv).toMatchObject({ kind: "config", calibration: 1.1, calibrationBase: 9000 });
 		expect((cfgEv as any).budget).toBeUndefined();
 		expect((cfgEv as any).protectTokens).toBeUndefined();
 
@@ -1199,6 +1213,7 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 		replica.append(seq(2, 1000));
 		applyWireEvent(replica, cfgEv!);
 		expect(replica.calibration).toBe(1.1);
+		expect(replica.calibrationBase).toBe(9000);
 		expect(replica.budget).toBe(budget0);
 		expect(replica.protectTokens).toBe(protect0);
 	});

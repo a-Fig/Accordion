@@ -60,6 +60,7 @@ export function serializeSnapshot(truth: Truth, foldingEnabled: boolean): Snapsh
 		birthFolded: [...truth.birthFoldedIds],
 		carriedSent: [...truth.carriedSentIds],
 		calibration: truth.calibration,
+		calibrationBase: truth.calibrationBase,
 		systemPrompt: truth.systemPrompt,
 		rev: truth.rev,
 	};
@@ -101,6 +102,7 @@ export function hydrateSnapshot(meta: SessionMeta, state: SnapshotState): Truth 
 		// Optional on the wire (v18, same treatment as v15's `carriedSent` above); default to the
 		// cold-start value `1` for a peer/test literal that omits it — the host serializer always emits it.
 		calibration: state.calibration ?? 1,
+		calibrationBase: state.calibrationBase ?? null,
 		// Optional AND nullable on the wire (v19, issue #93); default `null` for a peer/test literal
 		// that omits it — the host serializer always emits the field (as `null` before first capture).
 		systemPrompt: state.systemPrompt ?? null,
@@ -152,6 +154,7 @@ export function wireEventFromTruthEvent(e: TruthEvent): WireEvent | null {
 				contextWindow: e.contextWindow,
 				protectTokens: e.protectTokens,
 				calibration: e.calibration,
+				calibrationBase: e.calibrationBase,
 				systemPrompt: e.systemPrompt,
 				rev: e.rev,
 			};
@@ -178,7 +181,11 @@ export function applyWireEvent(truth: Truth, ev: WireEvent): void {
 			// A config event carries at most one dial; contextWindow is only ever emitted as a number.
 			if (ev.contextWindow !== undefined && ev.contextWindow !== null) truth.setContextWindow(ev.contextWindow);
 			if (ev.protectTokens !== undefined) truth.setProtect(ev.protectTokens);
-			if (ev.calibration !== undefined) truth.setCalibration(ev.calibration);
+			if (ev.calibration !== undefined || ev.calibrationBase !== undefined)
+				truth.setCalibration(
+					ev.calibration ?? truth.calibration,
+					ev.calibrationBase !== undefined ? ev.calibrationBase : truth.calibrationBase,
+				);
 			if (ev.systemPrompt !== undefined) truth.setSystemPrompt(ev.systemPrompt.text, ev.systemPrompt.tokens);
 			return;
 		case "locks":

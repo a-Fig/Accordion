@@ -1,9 +1,8 @@
 # ADR 0025 — Provider-anchored token calibration
 
-**Status:** accepted, stage 1 + stage 2 shipped (plumbing + display, then decision math; see the
-Stage 2 section below); system-prompt un-smearing addendum shipped alongside issue #93 (see the
-Addendum section below)
-**Date:** 2026-07-24 (stage 1) / 2026-07-24 (stage 2) / 2026-07-24 (issue #93 addendum)
+**Status:** accepted, stage 1 + stage 2 shipped; system-prompt un-smearing shipped with issue #93;
+the affine fit deferred by the original decision shipped for issue #102 (see the addenda below)
+**Date:** 2026-07-24 (stages 1/2 + issue #93 addendum) / 2026-07-31 (issue #102 affine addendum)
 **Builds on:** [ADR 0021](0021-truth-in-the-extension.md) (the Truth that owns every config dial in
 the pi extension process, and whose `context` hook is the one place the departing wire and pi's own
 `getContextUsage()` are both in scope), [ADR 0011](0011-conductor-involvement-locks.md) (the config-
@@ -226,11 +225,9 @@ itself untouched) so a tile's visual weight matches its calibrated readout.
 
 ## Deferred
 
-- **The affine fit (`real = base + k·est`).** Still needs ≥2 observations and a real regression (or a
-  two-parameter least-squares over a short rolling window) — out of scope for both stages shipped so
-  far; the pure multiplier remains a documented simplification, not a placeholder.
-- **Smoothing / outlier rejection.** Once there is an affine fit to smooth, raw-snap-per-observation
-  stops being the obviously-simplest option; revisit together with the affine work, not before.
+- **Outlier rejection.** The issue-#102 affine fit deliberately rejects only invalid/non-positive
+  fits. More elaborate provider-specific outlier handling remains deferred until real traces show it
+  is necessary.
 
 ## Addendum (issue #93) — the system prompt is un-smeared from `k`
 
@@ -259,3 +256,28 @@ a session with a tiny or empty system prompt sees essentially none.
 un-smoothed multiplier (the Update Rule section is unchanged). It is a partial, mechanical
 un-smearing of ONE known-named fixed-cost term, made tractable only because issue #93 needed the
 system prompt's own token estimate captured anyway — not a step toward `base` as a fitted parameter.
+
+## Addendum (issue #102) — affine calibration replaces the pure multiplier
+
+Issue #102 supplied the concrete failure case the original Deferred section anticipated. A provider
+receipt for a small pre-tool context produced a large pure multiplier because fixed prompt/schema
+overhead dominated the estimate. When an ~8.8k-token tool result was appended, Accordion multiplied
+that new content by the old overhead-heavy ratio and briefly projected ~71.5k tokens. The next
+provider receipt immediately corrected the same context to ~24.9k.
+
+The host now keeps the eight most recent `(est, real)` observations and fits
+`real = base + scale·est`. Ordinary least squares determines `scale`; `base` is then re-anchored so
+the fitted line passes exactly through the newest provider receipt. This preserves the latest real
+total without smoothing lag while history determines how quickly newly appended estimated content
+should grow. With fewer than two distinct observations, calibration uses an additive anchor
+(`scale = 1`, `base = real − est`), keeping the latest receipt exact without letting fixed overhead
+amplify newly appended content before the slope is identifiable.
+
+`Truth.calTokens(n)` applies only `scale` to a component or saving delta. New
+`Truth.calTotalTokens(n)` applies `base` once to a whole-request total. That split keeps conductor
+arithmetic coherent: aggregate baselines contain fixed overhead once, while per-block savings never
+subtract that overhead repeatedly. `SnapshotState` and config events carry nullable
+`calibrationBase` in protocol v20; `null` remains the cold-start/unanchored state.
+
+This addendum supersedes the original "pure multiplier anyway," raw-snap, and affine-Deferred policy
+sections above while retaining them as the history of stages 1 and 2.
