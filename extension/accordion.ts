@@ -487,11 +487,14 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// there because that is the one place both "what we estimated" and "what actually got sent" are
 	// known together. `maybeObserveCalibration` (called from `ingestFinishedMessage`, so it covers
 	// both `message_end` and the `agent_end` backstop) pairs it against the resulting assistant
-	// message's REAL provider usage and raw-snaps `truth.calibration`. `lastRealTokens`/
+	// message's REAL provider usage and raw-snaps `truth.calibration`. The captured block-order
+	// frontier makes that k apply only to blocks actually present on this departing wire (issue #102),
+	// never to assistant/tool blocks appended before the receipt arrives. `lastRealTokens`/
 	// `lastEstWireTokens` are the raw ingredients of the most recent observation, surfaced on
 	// `telemetryMsg()` (protocol v18) so the GUI/smoke tests can audit calibration independently of
 	// the derived multiplier.
 	let pendingWireEst: number | null = null;
+	let pendingCalibrationThroughOrder: number | null = null;
 	let lastRealTokens: number | null = null;
 	let lastEstWireTokens: number | null = null;
 
@@ -2138,6 +2141,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		const isDivergence = truth !== null;
 		buildTruth(messages);
 		if (isDivergence) {
+			// `Truth.rebuildFrom` intentionally drops the old receipt frontier: inserted/reordered blocks
+			// make it ambiguous. Drop its pending/audit ingredients too so telemetry cannot advertise an
+			// observation the rebuilt Truth no longer applies (issue #102).
+			pendingWireEst = null;
+			pendingCalibrationThroughOrder = null;
+			lastRealTokens = null;
+			lastEstWireTokens = null;
 			rebuilds++;
 			sendSnapshot();
 			// The Truth object was replaced — an in-process conductor rebuilds its tracked desired
@@ -2233,7 +2243,8 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	/**
 	 * Issue #11 stage 1 (ADR 0025): pair the wire estimate the most recent `context` hook recorded
 	 * (`pendingWireEst`) against THIS message's REAL provider usage (assistant messages only), and
-	 * raw-snap `truth.calibration = real / est` — no clamp, no smoothing (owner-approved v1 policy:
+	 * raw-snap `truth.calibration = real / est` through that wire's captured block frontier — no
+	 * clamp, no smoothing (owner-approved v1 policy:
 	 * the dial always reflects the latest observation, never a running average). `pendingWireEst` is
 	 * consumed (cleared) unconditionally on every call — including a non-assistant message, an
 	 * aborted/errored reply, or one with no usable `usage` — so a departing wire that never yields a
@@ -2262,8 +2273,10 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	function maybeObserveCalibration(msg: unknown): void {
 		if (!truth) return;
 		const est = pendingWireEst;
+		const throughOrder = pendingCalibrationThroughOrder;
 		pendingWireEst = null;
-		if (est === null || est <= 0) return;
+		pendingCalibrationThroughOrder = null;
+		if (est === null || est <= 0 || throughOrder === null) return;
 		const m = msg as { role?: string; stopReason?: string; usage?: RealUsage } | null | undefined;
 		if (!m || m.role !== "assistant" || !m.usage) return;
 		if (m.stopReason === "aborted" || m.stopReason === "error") return;
@@ -2275,7 +2288,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (real <= 0) return;
 		lastRealTokens = real;
 		lastEstWireTokens = est;
-		truth.setCalibration(real / est);
+		truth.setCalibration(real / est, throughOrder);
 	}
 
 	/**
@@ -2354,6 +2367,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// assistant reply against a stale estimate, or report a stale realTokens/estWireTokens in
 		// telemetry for a session that has not yet observed anything of its own.
 		pendingWireEst = null;
+		pendingCalibrationThroughOrder = null;
 		lastRealTokens = null;
 		lastEstWireTokens = null;
 		// Issue #93 review fix: prompt capture is session-scoped. `refreshFromCtx` is deliberately
@@ -2488,9 +2502,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				// folding is armed (never diverges from the wire, by the same invariant every other
 				// group/fold accounting relies on); `fullTokens()` is the raw unfolded size when folding
 				// is off (passthrough — `ret` stays undefined, `event.messages` departs verbatim).
+				// Capture the current last order alongside the estimate. `sentThroughOrder` cannot stand in
+				// for this: sent-ness advances in `finally` before the receipt, while this frontier must stay
+				// pinned to the exact wire being measured (issue #102).
 				// Recorded regardless of whether any client is connected, same as every other Truth
 				// bookkeeping on this hook — no disk I/O, CPU-only.
 				pendingWireEst = foldingEnabled ? truth.liveTokens() : truth.fullTokens();
+				pendingCalibrationThroughOrder = truth.blocks[truth.blocks.length - 1]?.order ?? -1;
 			}
 		} catch (err) {
 			hookErrors++;
@@ -2656,6 +2674,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// in-flight `context` hook's wire estimate — drop it rather than risk pairing the NEXT
 		// assistant reply's real usage against a now-stale pre-compaction estimate.
 		pendingWireEst = null;
+		pendingCalibrationThroughOrder = null;
 		if (!attached()) return;
 		const text = "pi compacted the session natively — Accordion's map has been rebuilt to match.";
 		try {
