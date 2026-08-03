@@ -29,9 +29,8 @@ export interface ViewBlock {
 	turn: number;
 	order: number;
 	/**
-	 * Full token cost, CALIBRATED (issue #11 stage 2, ADR 0025 — `Truth.calTokens`) — a real,
-	 * provider-anchored number, not the raw chars/4 estimate. See `TruthStats`'s doc comment
-	 * (`../truth`) for the "calibrate every conductor read surface" convention this is part of.
+	 * Full token cost, receipt-frontier CALIBRATED (issues #11/#102, ADR 0025): covered blocks use
+	 * `Truth.calibration`; blocks appended after that receipt stay raw. See `TruthStats` (`../truth`).
 	 */
 	tokens: number;
 	/**

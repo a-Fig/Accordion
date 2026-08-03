@@ -181,8 +181,8 @@ describe("Truth — birth-fold", () => {
 
 // F2 (issue #11 stage 2, ADR 0025): `setCalibration` used to only bump rev + emit, unlike
 // `setBudget`/`setProtect` which both run `housekeep()` since they can move `protectedFromIndex()`.
-// `calibration` is a THIRD boundary-moving dial (`computeProtectedFromIndex` divides the real-token
-// target by `calibrationMul`), so a `k` decrease that grows the raw threshold used to leave a fold
+// `calibration` is a THIRD boundary-moving dial (`computeProtectedFromIndex` weights covered blocks
+// by k), so a `k` decrease that grows the effective tail used to leave a fold
 // standing inside the newly-enlarged protected tail until some unrelated mutation happened to run
 // `housekeep()` next. These assert `setCalibration` now heals in the SAME rev it moves the boundary,
 // mirroring the existing `setProtect` heal test, and that the birth-fold exemption still holds.
@@ -1052,7 +1052,7 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 		expect(t.calibration).toBe(1.5);
 		expect(t.calTokens(1000)).toBe(1500);
 		expect(t.rev).toBe(rev0 + 1);
-		expect(events.at(-1)).toMatchObject({ type: "config", calibration: 1.5 });
+		expect(events.at(-1)).toMatchObject({ type: "config", calibration: 1.5, calibrationThroughOrder: 1 });
 
 		// A SECOND observation overwrites the first outright — no averaging/EMA toward it.
 		t.setCalibration(0.8);
@@ -1146,14 +1146,15 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 		expect(replica.protectedFromIndex()).toBe(hostPfi);
 	});
 
-	it("survives rebuildFrom (carried like budget/protectTokens), and a fresh build (prev === null) stays at the default", () => {
+	it("resets on a structural rebuild whose reordered block set invalidates the coverage frontier", () => {
 		const host = live();
 		host.append(seq(3, 1000));
 		host.setCalibration(1.42);
 
 		const fresh = seq(3, 1000);
 		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
-		expect(next.calibration).toBe(1.42);
+		expect(next.calibration).toBe(1);
+		expect(next.calibrationThroughOrder).toBeNull();
 
 		const firstBuild = Truth.rebuildFrom(null, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
 		expect(firstBuild.calibration).toBe(1); // not polluted by ANY prior state
@@ -1166,15 +1167,18 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 
 		const state = serializeSnapshot(host, false);
 		expect(state.calibration).toBe(2.25);
+		expect(state.calibrationThroughOrder).toBe(1);
 
 		const replica = hydrateSnapshot(META, state);
 		expect(replica.calibration).toBe(2.25);
+		expect(replica.calibrationThroughOrder).toBe(1);
 		expect(replica.rev).toBe(host.rev);
 
 		// A stale-format peer that omits `calibration` (pre-v18) falls back to the safe cold-start
 		// default rather than forking on `undefined` — never a decision-affecting divergence.
-		const stale = hydrateSnapshot(META, { ...state, calibration: undefined });
+		const stale = hydrateSnapshot(META, { ...state, calibrationThroughOrder: undefined });
 		expect(stale.calibration).toBe(1);
+		expect(stale.calibrationThroughOrder).toBeNull();
 	});
 
 	it("a config event carrying ONLY calibration replays via applyWireEvent without touching the other dials", () => {
@@ -1191,7 +1195,7 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 		host.setCalibration(1.1);
 		off();
 		const cfgEv = events.find((e) => e.kind === "config");
-		expect(cfgEv).toMatchObject({ kind: "config", calibration: 1.1 });
+		expect(cfgEv).toMatchObject({ kind: "config", calibration: 1.1, calibrationThroughOrder: 1 });
 		expect((cfgEv as any).budget).toBeUndefined();
 		expect((cfgEv as any).protectTokens).toBeUndefined();
 
@@ -1201,6 +1205,27 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 		expect(replica.calibration).toBe(1.1);
 		expect(replica.budget).toBe(budget0);
 		expect(replica.protectTokens).toBe(protect0);
+	});
+
+	it("does not apply a stale multiplier to blocks appended after the measured wire (issue #102)", () => {
+		const t = live();
+		t.append([blk("a:old:p0", "text", 0, 2539)]);
+
+		// The provider says the departing 2,539-token estimate actually cost 15,943. The old global
+		// multiplier was ~6.28× and would also multiply the next 8,851 raw tokens, flashing ~71.5k.
+		t.setCalibration(15_943 / 2_539, 0);
+		t.append([blk("r:new:p0", "tool_result", 1, 8_851)]);
+
+		const oldGlobalProjection = Math.round((2_539 + 8_851) * t.calibration);
+		expect(oldGlobalProjection).toBeGreaterThan(71_000);
+		expect(t.calBlockTokens(t.get("a:old:p0")!, 2_539)).toBe(15_943);
+		expect(t.calBlockTokens(t.get("r:new:p0")!, 8_851)).toBe(8_851);
+		expect(t.stats().liveTokens).toBe(24_794);
+		expect(t.stats().liveTokens).toBeLessThan(30_000);
+
+		// The next receipt covers the new block and atomically advances the frontier.
+		t.setCalibration(24_672 / 11_390, 1);
+		expect(t.stats().liveTokens).toBe(24_672);
 	});
 });
 
@@ -1278,7 +1303,7 @@ describe("Truth — systemPrompt (issue #93)", () => {
 		expect(withSp.protectedFromIndex()).toBe(pfiBefore); // the tail boundary did not move
 	});
 
-	it("survives rebuildFrom (carried like calibration/budget), and a fresh build (prev === null) stays null", () => {
+	it("survives rebuildFrom as a captured fact, while its calibration coverage resets", () => {
 		const host = live();
 		host.append(seq(3, 1000));
 		host.setSystemPrompt("captured prompt", 4);

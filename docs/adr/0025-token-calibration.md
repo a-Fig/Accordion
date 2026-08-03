@@ -2,13 +2,13 @@
 
 **Status:** accepted, stage 1 + stage 2 shipped (plumbing + display, then decision math; see the
 Stage 2 section below); system-prompt un-smearing addendum shipped alongside issue #93 (see the
-Addendum section below)
-**Date:** 2026-07-24 (stage 1) / 2026-07-24 (stage 2) / 2026-07-24 (issue #93 addendum)
+Addendum sections below); receipt-frontier fix shipped for issue #102
+**Date:** 2026-07-24 (stage 1 + stage 2 + issue #93) / 2026-08-03 (issue #102)
 **Builds on:** [ADR 0021](0021-truth-in-the-extension.md) (the Truth that owns every config dial in
 the pi extension process, and whose `context` hook is the one place the departing wire and pi's own
 `getContextUsage()` are both in scope), [ADR 0011](0011-conductor-involvement-locks.md) (the config-
 dial event shape `calibration` reuses verbatim).
-**Tracks:** issue #11.
+**Tracks:** issues #11, #93, and #102.
 
 ## Context
 
@@ -48,17 +48,19 @@ after exactly one real observation, and it composes cleanly with everything the 
 ### `k` lives on `Truth` as a rev-stamped scalar dial
 
 `core/truth.ts`'s `Truth` gets a `calibration` dial — default `1`, alongside `budget`/`protectTokens`
-in shape: a private field, a getter, and `setCalibration(k)` that goes through the same rev/event
+in shape: a private field, a getter, and `setCalibration(k, throughOrder)` that goes through the same rev/event
 machinery every other config dial uses (`this.revCounter++`, emit `{ type: "config", calibration, rev
 }`). It rides `SnapshotState` (optional, same "a stale/test literal without it still type-checks"
 treatment as v15's `carriedSent`) and the `config` `WireEvent`, so a replica hydrates and replays it
 exactly like `budget`/`protectTokens` — `core/replica.ts`'s `serializeSnapshot`/`hydrateSnapshot`/
-`wireEventFromTruthEvent`/`applyWireEvent` all round-trip it, and `Truth.rebuildFrom` carries it over a
-structural-divergence rebuild the same way it carries every other scalar dial.
+`wireEventFromTruthEvent`/`applyWireEvent` all round-trip it. Protocol v20 also carries the receipt's
+`calibrationThroughOrder` coverage frontier. A structural-divergence rebuild resets calibration to
+the cold state because reordered/inserted blocks make the old scalar frontier ambiguous.
 
-`Truth.calTokens(n) = Math.round(n * calibration)` is the one DISPLAY-only read helper: a component
-routes a number it already computed (`liveTokens()`, `effTokens(b)`, a per-kind sum) through it to opt
-into calibration. Protocol v18 (`core/protocol.ts`) bumps for the new wire vocabulary — `calibration`
+`Truth.calTokens(n) = Math.round(n * calibration)` remains the generic estimate helper for content
+that is not a session block. Block reads use `calBlockTokens(block, n)`, which applies k only when the
+block's order is at or below `calibrationThroughOrder`; later blocks remain raw. Protocol v18
+introduced `calibration`
 on `SnapshotState` and the `config` event, plus `realTokens`/`estWireTokens` on `TelemetryMessage` (the
 raw ingredients of the most recent observation, so the GUI/smoke tests can audit `k` independently of
 the derived multiplier).
@@ -100,7 +102,7 @@ response) and it isolates exactly the one request the estimate describes, rather
 
 ### Update rule: raw snap, no clamp, no smoothing
 
-`setCalibration(k)` always overwrites — no EMA, no bounding window, no outlier rejection beyond
+`setCalibration(k, throughOrder)` always overwrites — no EMA, no bounding window, no outlier rejection beyond
 refusing a non-finite/non-positive `k` (the same poison guard every other dial already has, since NaN/
 Infinity survive naive arithmetic and JSON-serialize as `null`, forking replicas). This is a deliberate
 v1 simplification: the dial always reflects the session's most recent observation. A single unusual
@@ -123,7 +125,7 @@ second axis (the affine `base` term) to smooth alongside, not before.
 ### Display: the "≈" marker
 
 A calibrated number renders bare when it is provider-anchored; a component shows a leading "≈" when
-`store.calibration === 1` (covers both cold start and every read-only/demo/CC/file session in one
+`store.calibrationThroughOrder === null` (covers both cold start and every read-only/demo/CC/file session in one
 check — the same failure mode either way) or, in `MapHeader` specifically, the existing `readOnly`
 prop. `MapHeader`'s hero line, composition-strip tooltips, and `ContextMap`/`Inspector`'s token
 readouts all route through `store.calTokens(n)`; tile canvas drawing (dice-face bins) stayed on raw
@@ -161,29 +163,20 @@ conductor needed a single code change to become calibration-aware: they already 
 are the one thing that stays UNCONVERTED: stage 2 treats the number already on the dial as meaning
 REAL tokens (that is the entire point of calibrating the numerator against it), never multiplying it.
 
-### `protectedFromIndex`: one division of the target, not a multiplication per block
+### `protectedFromIndex`: receipt-covered blocks and new blocks use different weights
 
-`computeProtectedFromIndex` (`core/truth.ts`) still walks the block log's RAW `Block.tokens` — it does
-not call `calTokens` inside the loop. Instead the REAL-token target (`protectTokens`, or a `tail-size`
-holder's `activeTailTokens`) is converted ONCE, before the walk, to the equivalent raw-estimate
-threshold: `target = targetReal / calibration`. `calibrated(rawSum) >= targetReal` iff `rawSum >=
-targetReal / calibration`, so the two forms decide identically — the division-first form was chosen
-purely for host/replica determinism: `calibration` is a rev-stamped scalar both sides carry
-byte-identical (JSON round-trips any finite double exactly), so one shared division from the same two
-operands is bit-identical on both sides (IEEE-754 basic ops are deterministic). Calibrating per block
-inside the walk instead would call `Math.round` (inside `calTokens`) once per iteration, whose
-cumulative rounding error is a function of iteration order/count — something a host and a replica have
-no contractual guarantee to reproduce identically walk-for-walk over a session's lifetime. A single
-division has no such accumulation to diverge on. `core/truth.test.ts` extends the stage-1 replica
-round-trip tests with a non-1-calibration case asserting the host and a JSON-round-tripped replica
-compute the IDENTICAL `protectedFromIndex()`.
+`computeProtectedFromIndex` (`core/truth.ts`) walks real-weighted block costs: `tokens * k` for a
+block covered by the latest receipt, otherwise raw `tokens`. It keeps those values unrounded during
+the walk, avoiding cumulative per-block rounding. Host and replica carry the same k, frontier, and
+block order, so they compute the same boundary. The old single `targetReal / k` division was valid
+only while one multiplier applied to the entire log; issue #102 deliberately removes that premise.
 
-### `Truth.stats()`: the aggregate is calibrated once per call, not per block
+### `Truth.stats()`: covered and newly appended totals are partitioned
 
-`stats().liveTokens`/`fullTokens` route the ALREADY-SUMMED raw total through one `calTokens` call
-each — never a per-block calibration inside `liveTokens()`/`fullTokens()` themselves, which stay the
-raw accessors every other internal caller (`effTokens`, group accounting, `serializeWire`) still needs
-untouched. `budget`/`protectTokens`/`contextWindow`/`protectedFromIndex`/`blockCount` are unconverted
+`stats().liveTokens`/`fullTokens` partition the current total into receipt-covered and uncovered raw
+sums, then report `round(covered * k + uncovered)`. `liveTokens()`/`fullTokens()` themselves stay the
+raw accessors every other internal caller (`effTokens`, group accounting, `serializeWire`) needs.
+`budget`/`protectTokens`/`contextWindow`/`protectedFromIndex`/`blockCount` are unconverted
 (the first three are literal dial values under the convention above; the last two are already
 calibration-aware or structural facts, not token sums). Issue #93's addendum (below) adds the system
 prompt's raw estimate into what `liveTokens()`/`fullTokens()` sum — the calibration mechanism here is
@@ -191,16 +184,16 @@ otherwise unchanged, it's just summing one more raw quantity before the single `
 
 ### The app: closing the hero/bar/flag disagreement stage 1 accepted
 
-`store.overBudget` now compares `calTokens(liveTokens)` against `budget` (previously a raw-vs-raw
+`store.overBudget` now compares the frontier-aware calibrated live total against `budget` (previously a raw-vs-raw
 comparison sitting next to an already-calibrated hero readout — exactly the disagreement stage 1's
 Consequences called out). `MapHeader`'s composition-bar axis (`denom`) and everything scaled against
 it (segment widths, the budget marker, headroom, the protected-tail handle/underline) now run on
-`calTokens(fullTokens)` instead of the raw total, so the bar's proportions agree with the calibrated
+the calibrated full total instead of the raw total, so the bar's proportions agree with the calibrated
 hero numbers and with `budget`/`protectTokens` (both already real-token dial values). `calBudget` —
 stage 1's `calTokens(budget)` — is now simply `budget` itself: under the new convention the dial is
 ALREADY real, so multiplying it again would double-calibrate it and reintroduce a hero/flag mismatch
 in the other direction. `ContextMap.svelte`'s `faceFor()` die-face binning now feeds on
-`store.calTokens(tokens)` (wrapped once at the call site, `tileDraw.ts`'s pure `faceFor` function
+`store.calBlockTokens(block, tokens)` (`tileDraw.ts`'s pure `faceFor` function
 itself untouched) so a tile's visual weight matches its calibrated readout.
 
 ## Consequences
@@ -259,3 +252,31 @@ a session with a tiny or empty system prompt sees essentially none.
 un-smoothed multiplier (the Update Rule section is unchanged). It is a partial, mechanical
 un-smearing of ONE known-named fixed-cost term, made tractable only because issue #93 needed the
 system prompt's own token estimate captured anyway — not a step toward `base` as a fitted parameter.
+
+## Addendum (issue #102) — a receipt calibrates only the wire it measured
+
+Issue #102 exposed a category error in the original global-multiplier design. In the reproduced tool
+loop, a 2,539-token block estimate paired with 15,943 real provider tokens, producing `k ≈ 6.28`.
+Before another provider receipt arrived, an 8,851-token tool result was appended. Applying the stale
+6.28 multiplier to that new block flashed roughly 71.5k; the next receipt immediately corrected the
+display back near 25k. Nothing actually entered and left the context at that scale — only the estimate
+spiked.
+
+The fix records `{ est, throughOrder }` together at the `context` hook. When the matching assistant
+usage lands, `setCalibration(real / est, throughOrder)` advances k and its coverage frontier
+atomically. Existing covered blocks use k; blocks appended after `throughOrder` stay raw until the
+next receipt covers them. In aggregate form this is `coveredRaw * k + newerRaw`, not
+`(coveredRaw + newerRaw) * k`.
+
+`sentThroughOrder` cannot substitute for this frontier. Sent-ness advances immediately when the wire
+departs, before provider usage exists; using it when the receipt arrives would include blocks that
+were appended after the measured request. The separately captured calibration frontier preserves the
+causal pairing.
+
+The current system prompt has equivalent coverage state: a prompt changed after the last receipt is
+raw until the next one. Structural rebuilds reset k/frontier to the cold state because an order-only
+frontier cannot prove coverage after blocks are inserted or reordered; the next request re-anchors it.
+
+This deliberately does not implement the deferred affine regression. The observed spike was not
+caused by the absence of a fitted base term; it was caused by applying any stale calibration to
+content that calibration had never measured.
