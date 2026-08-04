@@ -79,9 +79,11 @@ Replace marketing language with observable facts. If a claim can't be seen in th
 
 ## Color
 
-Monochrome base carries everything; the six **spectrum** colors are semantic — each names a block
-kind in the product (and together they form the brand gradient). Never set body text in a spectrum
-hue, and never pair two spectrum hues as foreground/background. Maintain 4.5:1 contrast for body copy.
+Monochrome base carries everything. Five **spectrum** colors name conversational block kinds; the
+bolted system prompt uses a separate pale fixed-context yellow so its permanent floor reads apart
+from the conversation. The spectrum hues still form the brand gradient, with indigo retained as its
+bridge between user blue and thinking purple. Never set body text in a semantic hue, and never pair
+two semantic hues as foreground/background. Maintain 4.5:1 contrast for body copy.
 
 | Token | Hex | RGB | CMYK (approx) | Role |
 |---|---|---|---|---|
@@ -92,7 +94,7 @@ hue, and never pair two spectrum hues as foreground/background. Maintain 4.5:1 c
 | Cloud | `#E8E8E8` | 232, 232, 232 | 0,0,0,9 | Borders, dividers |
 | Paper | `#F6F6F6` | 246, 246, 246 | 0,0,0,4 | Background surfaces |
 | White | `#FFFFFF` | 255, 255, 255 | 0,0,0,0 | Base canvas |
-| System | `#7D6EE6` | 125, 110, 230 | 46,52,0,10 | Block kind: bolted system prompt |
+| System | `#FFF6A4` | 255, 246, 164 | 0,4,36,0 | Block kind: bolted system prompt |
 | User | `#044EFF` | 4, 78, 255 | 98,69,0,0 | Block kind: user message |
 | Reply | `#1AA6E8` | 26, 166, 232 | 89,28,0,9 | Block kind: assistant reply |
 | Thinking | `#B480DF` | 180, 128, 223 | 19,43,0,13 | Block kind: thinking |

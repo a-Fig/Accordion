@@ -31,17 +31,15 @@
 	--ok: #5CB88A;             /* muted green */
 	--warn: #D6A24E;           /* muted amber — kept distinct from peach --k-tool_result */
 
-	/* block kinds — track the brand Spectrum identity (brand/accordion-brand-kit/brand.md).
-	   These VALUES intentionally override the former "DO NOT CHANGE" contract: the spectrum
-	   is now the canonical block-kind palette. Names are still load-bearing — do not rename. */
+	/* block kinds — track the semantic brand palette (brand/accordion-brand-kit/brand.md).
+	   Names are load-bearing — do not rename. */
 	--k-user: #044EFF;
 	--k-text: #1AA6E8;         /* brand spectrum azure — the assistant-reply spine
 	                              (a real gradient stop, distinct from the 4 kinds; not gray) */
 	--k-thinking: #B480DF;
 	--k-tool_call: #21D4C1;
 	--k-tool_result: #E19C7D;
-	--k-system: #7D6EE6;       /* brand spectrum indigo — the bolted `system` kind (v22);
-	                              the one gradient stop no other kind had claimed yet */
+	--k-system: #FFF6A4;       /* pale fixed-context yellow — the bolted `system` kind (v22) */
 	/* synthesized-summary tile (sliver fold mode) — dark neutral recessed tone; distinct
 	   from a folded group's brown so the summary never collides */
 	--k-summary: #2A2A2A;
