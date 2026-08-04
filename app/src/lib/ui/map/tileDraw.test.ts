@@ -1,5 +1,68 @@
 import { describe, it, expect } from "vitest";
-import { faceFor, computeGeometry, tileRectCss, hitTest, desaturate, resetSprites, getSprites, type TileSpec } from "./tileDraw";
+import {
+  faceFor,
+  computeGeometry,
+  tileRectCss,
+  hitTest,
+  desaturate,
+  resetSprites,
+  getSprites,
+  drawTile,
+  type Palette,
+  type TileSpec,
+} from "./tileDraw";
+
+type DrawCall = {
+  type: "drawImage" | "stroke" | "moveTo" | "lineTo";
+  image?: CanvasImageSource;
+  strokeStyle?: string | CanvasGradient | CanvasPattern;
+  lineWidth?: number;
+  x?: number;
+  y?: number;
+};
+
+function recordingContext(): { ctx: CanvasRenderingContext2D; calls: DrawCall[] } {
+  const calls: DrawCall[] = [];
+  const raw = {
+    fillStyle: "",
+    strokeStyle: "",
+    lineWidth: 1,
+    lineCap: "butt",
+    lineJoin: "miter",
+    globalAlpha: 1,
+    save() {},
+    restore() {},
+    beginPath() {},
+    closePath() {},
+    fill() {},
+    clip() {},
+    arc() {},
+    arcTo() {},
+    setLineDash() {},
+    moveTo(x: number, y: number) { calls.push({ type: "moveTo", x, y }); },
+    lineTo(x: number, y: number) { calls.push({ type: "lineTo", x, y }); },
+    stroke() {
+      calls.push({ type: "stroke", strokeStyle: raw.strokeStyle, lineWidth: raw.lineWidth });
+    },
+    drawImage(image: CanvasImageSource) { calls.push({ type: "drawImage", image }); },
+  };
+  return { ctx: raw as unknown as CanvasRenderingContext2D, calls };
+}
+
+const DRAW_PALETTE: Palette = {
+  kindColors: {
+    system: "#FFF6A4",
+    user: "#044EFF",
+    text: "#1AA6E8",
+    thinking: "#B480DF",
+    tool_call: "#21D4C1",
+    tool_result: "#E19C7D",
+  },
+  accent: "#E8E8E8",
+  accentDim: "#2C2C2C",
+  group: "#7C5230",
+  groupAccent: "#E8E8E8",
+};
 
 // ---------------------------------------------------------------------------
 // faceFor
@@ -48,6 +111,58 @@ describe("buildSprites — face 0 produces a blank sprite (no pips)", () => {
     // verify the exported faceFor thresholds don't collide with 0, and that
     // faceFor(0) still returns 1 (the caller must pass 0 explicitly for drop groups).
     expect(faceFor(0)).toBe(1); // faceFor never returns 0 — callers pass 0 directly
+  });
+});
+
+describe("drawTile — system block visual grammar", () => {
+  const spec: TileSpec = {
+    id: "sys:0",
+    kind: "system",
+    face: 5,
+    folded: false,
+    pinned: false,
+    selected: false,
+    inrange: false,
+  };
+
+  it("draws the calibrated dice-face sprite instead of replacing it with a glyph", () => {
+    const { ctx, calls } = recordingContext();
+    const face5 = {} as HTMLCanvasElement;
+
+    drawTile(ctx, { x: 10, y: 20, w: 40, h: 40 }, spec, DRAW_PALETTE, new Map([[5, face5]]));
+
+    expect(calls.find((call) => call.type === "drawImage")?.image).toBe(face5);
+  });
+
+  it("draws option J's heavy Smoke corners as the final layer above selection", () => {
+    const { ctx, calls } = recordingContext();
+    const face5 = {} as HTMLCanvasElement;
+
+    drawTile(
+      ctx,
+      { x: 10, y: 20, w: 40, h: 40 },
+      { ...spec, selected: true },
+      DRAW_PALETTE,
+      new Map([[5, face5]]),
+    );
+
+    const selectionStroke = calls.findIndex(
+      (call) => call.type === "stroke" && call.strokeStyle === DRAW_PALETTE.accent,
+    );
+    const cornerStroke = calls.findIndex(
+      (call) => call.type === "stroke" && call.strokeStyle === "#9A9A9A",
+    );
+    expect(selectionStroke).toBeGreaterThanOrEqual(0);
+    expect(cornerStroke).toBeGreaterThan(selectionStroke);
+    expect(calls[cornerStroke].lineWidth).toBeCloseTo(1.8);
+
+    const cornerMoves = calls.filter((call) => call.type === "moveTo").slice(-4);
+    const expectedMoves = [[13.2, 30.4], [39.6, 23.2], [46.8, 49.6], [20.4, 56.8]];
+    expect(cornerMoves).toHaveLength(expectedMoves.length);
+    cornerMoves.forEach((call, index) => {
+      expect(call.x).toBeCloseTo(expectedMoves[index][0]);
+      expect(call.y).toBeCloseTo(expectedMoves[index][1]);
+    });
   });
 });
 
