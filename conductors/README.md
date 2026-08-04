@@ -26,8 +26,9 @@ WebSocket client (`?role=conductor&token=<single-use>`).
   invariant. The extension spawns `node conductors/ws/thermocline/runner.mjs`, which imports the
   committed `remote-sdk.mjs` bundle (generated from `core/conductor/remote.ts` + `thermocline.ts` by
   `extension/build-remote-sdk.mjs`).
-- [`triptych/`](ws/triptych/) — pressure-gated thirds: raw recent band, tree-sitter-L2 code-skeleton
-  middle band (recoverable, tagged), lossy compaction-summary top band (compaction-naive's prompt
+- [`triptych/`](ws/triptych/) — pressure-gated thirds: raw recent band, content-detected
+  TypeScript/JavaScript/Python tree-sitter-L2 skeletons from assistant/thinking/tool-result blocks in
+  the middle band (recoverable, tagged), lossy compaction-summary top band (compaction-naive's prompt
   verbatim). Same spawn pattern (`runner.mjs` + the committed `triptych-sdk.mjs` bundle, emitted by the
   same build script); its tree-sitter wasm engine needs a one-time `npm install` in `ws/triptych/`.
 
