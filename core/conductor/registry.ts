@@ -6,9 +6,9 @@
  * hold window, and HOW it runs — `in-process` (instantiated inside the extension via `create()`) or
  * `spawn` (an out-of-process runner the extension launches, mirroring the live Truth over the wire).
  *
- * Framework-free and — deliberately — FILESYSTEM-free: `catalogMeta` takes a `runnerResolver`
- * callback so the extension (which CAN touch disk) decides whether a spawn conductor's runner file
- * actually exists on this install; the registry never reaches for `fs` itself.
+ * Framework-free and — deliberately — FILESYSTEM-free: `catalogMeta` takes a readiness callback so
+ * the extension (which CAN touch disk) resolves each spawn runner and its declared required modules;
+ * the registry never reaches for `fs` itself.
  *
  * The lock/tail/hold metadata for the in-process conductors is SOURCED FROM THE CONDUCTOR
  * DEFINITIONS THEMSELVES — each is instantiated once at module load and its declared `locks` /
@@ -21,7 +21,7 @@
  */
 import type { LockName } from "../locks";
 import type { Conductor } from "./contract";
-import type { ActiveConductorMeta } from "../protocol";
+import type { ActiveConductorMeta, ConductorReadiness } from "../protocol";
 import { NaiveCompactionConductor } from "../../conductors/in-process/compaction-naive/compaction-naive";
 import { HandoffConductor } from "../../conductors/in-process/handoff/handoff";
 import { DoormanConductor } from "../../conductors/in-process/doorman/doorman";
@@ -44,7 +44,15 @@ export interface RegistryEntry {
 	/** Spawn descriptor — the runner file the extension launches out of process. `entryFile` is
 	 *  relative to `conductors/ws/` (e.g. `"thermocline/runner.mjs"`) so one resolver serves every
 	 *  spawn conductor; the extension sanitizes it (no absolute paths, no `..`). */
-	spawn?: { entryFile: string };
+	spawn?: {
+		entryFile: string;
+		/** Node module specifiers that must resolve relative to the runner before it is selectable. */
+		requiredModules?: readonly string[];
+		/** Human explanation used when any required module cannot resolve. */
+		unavailableReason?: string;
+		/** Safe, explicit setup instruction. The host never performs it automatically. */
+		remediation?: string;
+	};
 }
 
 /** Build an in-process entry, sourcing its metadata from a sample instance of the conductor. */
@@ -103,7 +111,12 @@ const TRIPTYCH: RegistryEntry = {
 	tailTokens: 0,
 	holdWireUpToMs: 0,
 	kind: "spawn",
-	spawn: { entryFile: "triptych/runner.mjs" },
+	spawn: {
+		entryFile: "triptych/runner.mjs",
+		requiredModules: ["web-tree-sitter", "tree-sitter-wasms/package.json"],
+		unavailableReason: "Tree-sitter dependencies required for code skeletonization are not installed.",
+		remediation: "Run `npm install` in `conductors/ws/triptych/`, then reconnect Accordion.",
+	},
 };
 
 /** The full catalog, in picker order: detach first, then the shipped conductors. */
@@ -123,17 +136,17 @@ export function entryById(id: string | null): RegistryEntry | undefined {
 }
 
 /**
- * The available-conductor catalog for the `hello` message. A `spawn` entry is included ONLY if
- * `runnerResolver(entryFile)` reports its runner file resolves on this install (repo checkout vs.
- * npm package differ) — the extension supplies that check so the registry stays fs-free. In-process
- * and the `none` sentinel are always present.
+ * The conductor catalog for the `hello` message. Every entry remains visible. The extension
+ * computes spawn readiness because it owns filesystem/module resolution; this registry stays
+ * framework- and filesystem-free. In-process entries and the detach sentinel are always ready.
  */
-export function catalogMeta(runnerResolver?: (entryFile: string) => boolean): ActiveConductorMeta[] {
+export function catalogMeta(readinessOf?: (entry: RegistryEntry) => ConductorReadiness): ActiveConductorMeta[] {
 	const out: ActiveConductorMeta[] = [];
 	for (const e of ENTRIES) {
-		if (e.kind === "spawn") {
-			if (!runnerResolver || !e.spawn || !runnerResolver(e.spawn.entryFile)) continue;
-		}
+		const readiness: ConductorReadiness =
+			e.kind === "spawn"
+				? (readinessOf?.(e) ?? { state: "unavailable", reason: "This host did not verify the conductor runner." })
+				: { state: "ready" };
 		out.push({
 			id: e.id,
 			label: e.label,
@@ -142,6 +155,7 @@ export function catalogMeta(runnerResolver?: (entryFile: string) => boolean): Ac
 			tailTokens: e.tailTokens,
 			holdWireUpToMs: e.holdWireUpToMs,
 			remote: e.kind === "spawn",
+			readiness,
 		});
 	}
 	return out;

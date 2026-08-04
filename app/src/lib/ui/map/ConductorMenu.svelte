@@ -25,6 +25,7 @@
 	import type { ActiveConductorMeta } from "$core/protocol";
 	import { live, conductors, conductorState, selectConductor, anotherSurfaceControls } from "$lib/live/liveClient.svelte";
 	import { attemptSteer, readOnlyTip } from "$lib/live/controllerUi.svelte";
+	import { conductorReadinessText, isConductorSelectable } from "./conductorReadiness";
 
 	// READ-ONLY gate (v16, ADR 0024, spec Part 3): some OTHER surface holds the controller lease.
 	// This component is only ever mounted while `live.status === "connected"` (see its own gate at
@@ -68,6 +69,7 @@
 
 	/** `null` means the "None" row. */
 	function choose(meta: ActiveConductorMeta | null): void {
+		if (meta && !isConductorSelectable(meta)) return;
 		// Re-picking the active selection is a no-op — no re-handover prompt.
 		if ((meta?.id ?? null) === activeId) {
 			closeMenu();
@@ -170,16 +172,29 @@
 						type="button"
 						class="cond-item"
 						class:active={activeId === c.id}
+						class:unavailable={!isConductorSelectable(c)}
 						role="menuitemradio"
 						aria-checked={activeId === c.id}
-						title={c.description ?? c.label}
+						aria-disabled={!isConductorSelectable(c)}
+						disabled={!isConductorSelectable(c)}
+						title={conductorReadinessText(c) ?? c.description ?? c.label}
 						onclick={() => choose(c)}
 					>
 						<span class="cond-check">
 							{#if activeId === c.id}<Icon name="check" size={13} />{/if}
 						</span>
-						<span class="cond-item-label">{c.label}</span>
-						{#if isExclusive(c.locks)}
+						<span class="cond-item-copy">
+							<span class="cond-item-label">{c.label}</span>
+							{#if c.readiness.state === "unavailable"}
+								<span class="cond-unavailable-reason">{c.readiness.reason}</span>
+								{#if c.readiness.remediation}
+									<span class="cond-remediation mono">{c.readiness.remediation}</span>
+								{/if}
+							{/if}
+						</span>
+						{#if c.readiness.state === "unavailable"}
+							<span class="cond-unavailable-badge mono">UNAVAILABLE</span>
+						{:else if isExclusive(c.locks)}
 							<span class="cond-exclusive" title="Exclusive — takes over {c.locks.length} of 3 steering controls">
 								<Icon name="lock" size={10} />
 							</span>
@@ -272,8 +287,9 @@
 		top: calc(100% + 6px);
 		right: 0;
 		z-index: 50;
-		min-width: 200px;
-		max-width: 300px;
+		width: 380px;
+		min-width: 240px;
+		max-width: calc(100vw - 24px);
 		padding: 5px;
 		display: flex;
 		flex-direction: column;
@@ -303,6 +319,15 @@
 	.cond-item:hover {
 		background: var(--panel-3);
 	}
+	.cond-item.unavailable {
+		align-items: flex-start;
+		color: var(--faint);
+		cursor: not-allowed;
+		opacity: 0.78;
+	}
+	.cond-item.unavailable:hover {
+		background: transparent;
+	}
 	.cond-item:focus-visible {
 		outline: none;
 		box-shadow: var(--focus-ring);
@@ -326,11 +351,37 @@
 		flex: 0 0 auto;
 		color: var(--accent);
 	}
-	.cond-item-label {
+	.cond-item-copy {
 		flex: 1 1 auto;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.cond-item-label {
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+	.cond-unavailable-reason,
+	.cond-remediation {
+		font-size: var(--fs-2xs);
+		font-weight: 400;
+		line-height: 1.35;
+		white-space: normal;
+	}
+	.cond-unavailable-reason {
+		color: var(--muted);
+	}
+	.cond-remediation {
+		color: var(--faint);
+	}
+	.cond-unavailable-badge {
+		flex: 0 0 auto;
+		margin-top: 1px;
+		font-size: 8px;
+		letter-spacing: 0.08em;
+		color: var(--faint);
 	}
 	.cond-exclusive {
 		display: inline-flex;

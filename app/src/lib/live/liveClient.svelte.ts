@@ -92,8 +92,8 @@ export const live = $state<{
 
 /**
  * The host's advertised conductor catalog (Phase C, `hello.conductors`) — the SINGLE source of
- * truth the GUI's conductor picker (`ConductorMenu.svelte`) renders from. Empty until a `hello`
- * carrying a non-empty catalog arrives; cleared on disconnect (see `resetConductorState`).
+ * truth the GUI's conductor picker (`ConductorMenu.svelte`) renders from, including disabled
+ * unavailable entries. Empty until `hello`; cleared on disconnect (see `resetConductorState`).
  */
 export const conductors = $state<ActiveConductorMeta[]>([]);
 
@@ -169,13 +169,22 @@ function isControllerInfo(v: unknown): v is ControllerInfo {
 function isConductorMeta(v: unknown): v is ActiveConductorMeta {
 	if (!v || typeof v !== "object") return false;
 	const c = v as Record<string, unknown>;
+	const readiness = c.readiness as Record<string, unknown> | null;
+	const validReadiness =
+		!!readiness &&
+		typeof readiness === "object" &&
+		(readiness.state === "ready" ||
+			(readiness.state === "unavailable" &&
+				typeof readiness.reason === "string" &&
+				(readiness.remediation === undefined || typeof readiness.remediation === "string")));
 	return (
 		typeof c.id === "string" &&
 		typeof c.label === "string" &&
 		Array.isArray(c.locks) &&
 		typeof c.tailTokens === "number" &&
 		typeof c.holdWireUpToMs === "number" &&
-		typeof c.remote === "boolean"
+		typeof c.remote === "boolean" &&
+		validReadiness
 	);
 }
 

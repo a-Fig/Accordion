@@ -89,6 +89,7 @@ function makeDeps(truth: Truth | null, overrides: Partial<LiveHostDeps> = {}): H
 		sendToConductor: (m) => conductorLog.push(m),
 		sendToSocket: (socket, m) => socketLog.push({ socket, msg: m }),
 		mintToken: () => `tok-${++n}`,
+		readiness: () => ({ state: "ready" }),
 		spawnRunner: () => {
 			const c = mockChild();
 			spawned.push(c);
@@ -113,21 +114,48 @@ async function until(pred: () => boolean, ms = 2000): Promise<void> {
 
 // ── registry ──────────────────────────────────────────────────────────────────
 describe("registry", () => {
-	it("catalogMeta excludes a spawn conductor whose runner doesn't resolve, includes it when it does", () => {
+	it("keeps unavailable spawn conductors visible with host-computed readiness", () => {
 		const without = catalogMeta();
-		expect(without.some((e) => e.id === "thermocline")).toBe(false);
-		expect(without.some((e) => e.id === "doorman")).toBe(true);
-		const withRunner = catalogMeta(() => true);
-		expect(withRunner.find((e) => e.id === "thermocline")?.remote).toBe(true);
-		expect(withRunner.find((e) => e.id === "doorman")?.remote).toBe(false);
+		expect(without.find((e) => e.id === "thermocline")?.readiness.state).toBe("unavailable");
+		expect(without.find((e) => e.id === "doorman")?.readiness).toEqual({ state: "ready" });
+		const verified = catalogMeta(() => ({ state: "ready" }));
+		expect(verified.find((e) => e.id === "thermocline")).toMatchObject({ remote: true, readiness: { state: "ready" } });
+		expect(verified.find((e) => e.id === "doorman")).toMatchObject({ remote: false, readiness: { state: "ready" } });
 	});
 	it("sources lock/tail/hold metadata from the conductor definitions", () => {
 		expect(entryById("compaction-naive")?.locks).toEqual(["human-steering", "agent-unfold"]);
 		expect(entryById("handoff")?.locks).toContain("tail-size");
 		expect(entryById("handoff")?.tailTokens).toBe(0);
 		expect(entryById("doorman")?.holdWireUpToMs).toBe(150);
+		expect(entryById("thermocline")?.spawn?.requiredModules).toBeUndefined();
+		expect(entryById("triptych")?.spawn?.requiredModules).toEqual(["web-tree-sitter", "tree-sitter-wasms/package.json"]);
 		expect(entryById(null)?.id).toBe("none");
 		expect(entryById("nope")).toBeUndefined();
+	});
+});
+
+describe("select — required-capability readiness", () => {
+	it("refuses an unavailable spawn without detaching the current conductor", () => {
+		const t = bulk(textSeq(2));
+		const h = makeDeps(t, {
+			readiness: () => ({
+				state: "unavailable",
+				reason: "Tree-sitter dependencies are missing.",
+				remediation: "Run npm install.",
+			}),
+		});
+		const host = new LiveConductorHost(h.deps);
+		host.select("compaction-naive");
+		expect(host.activeMeta()?.id).toBe("compaction-naive");
+		expect(t.locks).toEqual(["human-steering", "agent-unfold"]);
+
+		host.select("triptych");
+
+		expect(host.activeMeta()?.id).toBe("compaction-naive");
+		expect(t.locks).toEqual(["human-steering", "agent-unfold"]);
+		expect(h.spawned).toHaveLength(0);
+		const status = h.broadcastLog.filter((m) => m.type === "conductorStatus").pop();
+		expect(status && status.type === "conductorStatus" && status.text).toContain("Tree-sitter dependencies are missing. Run npm install.");
 	});
 });
 
