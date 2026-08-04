@@ -26,7 +26,7 @@ export type { LockName, Op, TxnResult, TruthStats, Actor };
 export interface ViewBlock {
 	id: string;
 	/**
-	 * `"system"` (v21) is the agent's own system prompt — the FIRST block, and BOLTED: no proposal a
+	 * `"system"` (v22) is the agent's own system prompt — the FIRST block, and BOLTED: no proposal a
 	 * conductor can make will ever move it. Every op targeting it (`fold`/`unfold`/`pin`/`unpin`/
 	 * `auto`/`replace`, and any `group` whose SNAPPED range contains it) is clamped `"bolted"`
 	 * (`core/ops.ts`) — a PERMANENT refusal, unlike `not-foldable`/`noop`/`protected`, so a conductor
@@ -173,7 +173,7 @@ export interface ConductorHost {
 	 * The current effective system prompt, or `null` if none has been captured yet (issue #93).
 	 *
 	 * KEPT at its original shape — it is public contract surface, and a conductor that only wants the
-	 * prompt should not have to know where it lives. As of v21 it is no longer a scalar `Truth` fact
+	 * prompt should not have to know where it lives. As of v22 it is no longer a scalar `Truth` fact
 	 * but a projection of the BOLTED `system` block (`ViewBlock.kind === "system"`, always
 	 * `blocks()[0]` when present). Still READ-ONLY, now for a stronger reason than "there is no Op
 	 * kind for it": every op kind DOES apply to a block, and every one of them is refused on this one

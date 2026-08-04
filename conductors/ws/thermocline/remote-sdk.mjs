@@ -489,6 +489,9 @@ var Truth = class _Truth {
    * between is the issue #102 spike.
    */
   calibrationThroughOrderValue = null;
+  /** Whether the CURRENT system block was on the request covered by the latest receipt. Its stable
+   *  order (-1) cannot answer this after an in-place prompt replacement. */
+  systemPromptCalibratedValue = false;
   activeLocks = [];
   activeTailTok = 0;
   holderLabel = null;
@@ -586,6 +589,7 @@ var Truth = class _Truth {
     const maxOrder = this.blockLog.length ? this.blockLog[this.blockLog.length - 1].order : -1;
     this.calibrationThroughOrderValue = Number.isInteger(s.calibrationThroughOrder) && s.calibrationThroughOrder >= -1 ? Math.min(s.calibrationThroughOrder, maxOrder) : null;
     this.calibrationMul = this.calibrationThroughOrderValue !== null && Number.isFinite(s.calibration) && s.calibration > 0 ? s.calibration : 1;
+    this.systemPromptCalibratedValue = this.calibrationThroughOrderValue !== null && s.systemPromptCalibrated === true && this.systemBlock() !== void 0;
     this.lastChangedRev.clear();
     this.revCounter = s.rev;
     this.pfiCache = { rev: -1, value: 0 };
@@ -620,6 +624,7 @@ var Truth = class _Truth {
     next.activeTailTok = prev.activeTailTok;
     next.calibrationMul = 1;
     next.calibrationThroughOrderValue = null;
+    next.systemPromptCalibratedValue = false;
     const prevSys = prev.get(SYSTEM_BLOCK_ID);
     if (prevSys) next.insertSystemBlock(prevSys.text, prevSys.tokens);
     for (const b of next.blockLog) {
@@ -709,8 +714,13 @@ var Truth = class _Truth {
   get calibrationThroughOrder() {
     return this.calibrationThroughOrderValue;
   }
+  /** Whether the current system prompt was present on the latest calibrated request. */
+  get systemPromptCalibrated() {
+    return this.systemPromptCalibratedValue;
+  }
   /** True when this block existed on the departing wire covered by the latest receipt. */
   isCalibrated(b) {
+    if (b.id === SYSTEM_BLOCK_ID) return this.calibrationThroughOrderValue !== null && this.systemPromptCalibratedValue;
     return this.calibrationThroughOrderValue !== null && b.order <= this.calibrationThroughOrderValue;
   }
   /**
@@ -914,19 +924,21 @@ var Truth = class _Truth {
   computeProtectedFromIndex() {
     const blocks = this.blockLog;
     if (!blocks.length) return 0;
+    const floor = isBolted(blocks[0]) ? 1 : 0;
+    if (floor === blocks.length) return blocks.length;
     const targetReal = this.isLocked("tail-size") ? this.activeTailTok : this.protectTokensTarget;
     if (targetReal === 0) return blocks.length;
     const realCost = (b) => b.tokens * (this.isCalibrated(b) ? this.calibrationMul : 1);
     const cap = targetReal * PROTECT_OVERFLOW_CAP;
     let sum = realCost(blocks[blocks.length - 1]);
     if (sum >= targetReal) return blocks.length - 1;
-    for (let i = blocks.length - 2; i >= 0; i--) {
+    for (let i = blocks.length - 2; i >= floor; i--) {
       const next = sum + realCost(blocks[i]);
       if (next > cap) return i + 1;
       sum = next;
       if (sum >= targetReal) return i;
     }
-    return 0;
+    return floor;
   }
   isProtected(b) {
     return (this.index.get(b.id) ?? -1) >= this.protectedFromIndex();
@@ -1281,6 +1293,7 @@ var Truth = class _Truth {
   setSystemPrompt(text, tokens) {
     if (typeof text !== "string" || !Number.isFinite(tokens) || tokens < 0) return;
     if (!this.insertSystemBlock(text, tokens)) return;
+    this.systemPromptCalibratedValue = false;
     const touched = /* @__PURE__ */ new Set([SYSTEM_BLOCK_ID]);
     this.housekeep(touched);
     const rev = ++this.revCounter;
@@ -1322,6 +1335,7 @@ var Truth = class _Truth {
     this.calibrationMul = k;
     const maxOrder = this.blockLog.length ? this.blockLog[this.blockLog.length - 1].order : -1;
     this.calibrationThroughOrderValue = Math.min(throughOrder, maxOrder);
+    this.systemPromptCalibratedValue = this.systemBlock() !== void 0;
     const touched = /* @__PURE__ */ new Set();
     this.housekeep(touched);
     const rev = ++this.revCounter;
@@ -1330,6 +1344,7 @@ var Truth = class _Truth {
       type: "config",
       calibration: this.calibrationMul,
       calibrationThroughOrder: this.calibrationThroughOrderValue,
+      systemPromptCalibrated: this.systemPromptCalibratedValue,
       rev
     });
   }
@@ -1873,6 +1888,7 @@ function hydrateSnapshot(meta, state) {
     // hand-built/test literal (real peers are version-gated before hydration).
     calibration: calibrationThroughOrder === null ? 1 : state.calibration ?? 1,
     calibrationThroughOrder,
+    systemPromptCalibrated: calibrationThroughOrder === null ? false : state.systemPromptCalibrated ?? false,
     rev: state.rev
   });
   return truth;
@@ -1988,7 +2004,7 @@ function recallHostEvent(ids, by, rev) {
 }
 
 // core/protocol.ts
-var PROTOCOL_VERSION = 21;
+var PROTOCOL_VERSION = 22;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
   "snapshot",

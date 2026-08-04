@@ -1229,7 +1229,7 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 	});
 });
 
-// Issue #93, redesigned in v21: the system prompt is a real BOLTED `system` BLOCK — the first entry
+// Issue #93, redesigned in v22: the system prompt is a real BOLTED `system` BLOCK — the first entry
 // of the log (id `sys:0`, order -1) — not a scalar. Still captured/pushed through the same
 // `setSystemPrompt` + `config`-event shape as before (that seam is what keeps the extension capture
 // path, the wire, and replica replay unchanged), and still folded into `liveTokens()`/`fullTokens()`
@@ -1288,7 +1288,7 @@ describe("Truth — systemPrompt (issue #93)", () => {
 		const after = t.stats();
 		expect(after.fullTokens).toBe(4500);
 		expect(after.liveTokens).toBe(4500);
-		// v21: the prompt IS a block now, so `blockCount` counts it — the totals above are unchanged
+		// v22: the prompt IS a block now, so `blockCount` counts it — the totals above are unchanged
 		// because they always included its cost, just via a special-cased addend instead of the loop.
 		expect(after.blockCount).toBe(5);
 		expect(t.blocks[0].kind).toBe("system"); // first in the log
@@ -1393,6 +1393,41 @@ describe("Truth — systemPrompt (issue #93)", () => {
 		expect(withSp.isProtected(withSp.systemBlock()!)).toBe(false); // and it never joins the tail
 	});
 
+	it("stays in the foldable box even when a short conversation fits entirely inside the protected target", () => {
+		const t = bulk(seq(1, 1000));
+		t.setProtect(20_000);
+		expect(t.protectedFromIndex()).toBe(0); // the lone conversation block starts protected
+
+		t.setSystemPrompt("short-session prompt", 50);
+
+		expect(t.blocks.map((b) => b.kind)).toEqual(["system", "text"]);
+		expect(t.protectedFromIndex()).toBe(1); // older/foldable slice contains exactly the system tile
+		expect(t.isProtected(t.systemBlock()!)).toBe(false);
+		expect(t.isProtected(t.blocks[1])).toBe(true);
+	});
+
+	it("keeps a replaced prompt raw until a receipt covers the new text", () => {
+		const t = bulk(seq(2, 1000));
+		t.setSystemPrompt("first prompt", 100);
+		t.setCalibration(2, 1);
+		expect(t.systemPromptCalibrated).toBe(true);
+		expect(t.calBlockTokens(t.systemBlock()!, 100)).toBe(200);
+
+		// Same id/order, different content: the old receipt cannot calibrate the replacement.
+		t.setSystemPrompt("replacement prompt", 100);
+		expect(t.systemPromptCalibrated).toBe(false);
+		expect(t.calBlockTokens(t.systemBlock()!, 100)).toBe(100);
+
+		// The explicit coverage bit must survive a resnapshot; order -1 alone would incorrectly scale it.
+		const replica = hydrateSnapshot(META, serializeSnapshot(t, false));
+		expect(replica.systemPromptCalibrated).toBe(false);
+		expect(replica.calBlockTokens(replica.systemBlock()!, 100)).toBe(100);
+
+		t.setCalibration(2, 1);
+		expect(t.systemPromptCalibrated).toBe(true);
+		expect(t.calBlockTokens(t.systemBlock()!, 100)).toBe(200);
+	});
+
 	it("survives rebuildFrom as a captured fact, while its calibration coverage resets", () => {
 		const host = live();
 		host.append(seq(3, 1000));
@@ -1412,9 +1447,10 @@ describe("Truth — systemPrompt (issue #93)", () => {
 		host.setSystemPrompt("a prompt", 3);
 
 		const state = serializeSnapshot(host, false);
-		// v21: no `systemPrompt` scalar on the snapshot — it rides in `blocks` like everything else.
+		// v22: no `systemPrompt` scalar on the snapshot — it rides in `blocks` like everything else.
 		expect((state as Record<string, unknown>).systemPrompt).toBeUndefined();
 		expect(state.blocks[0]).toMatchObject({ id: "sys:0", kind: "system", order: -1, text: "a prompt", tokens: 3 });
+		expect(state.systemPromptCalibrated).toBe(false);
 
 		const replica = hydrateSnapshot(META, state);
 		expect(replica.systemPrompt).toEqual({ text: "a prompt", tokens: 3 });

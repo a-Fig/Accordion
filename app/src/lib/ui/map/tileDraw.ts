@@ -81,7 +81,7 @@ export function readPalette(): Palette {
   const v = (name: string) => s.getPropertyValue(name).trim();
   return {
     kindColors: {
-      // Brand Spectrum indigo — the bolted `system` kind (v21). Fill color for the bolt-head
+      // Brand Spectrum indigo — the bolted `system` kind (v22). Fill color for the bolt-head
       // tile drawn by `drawTile`/`drawBoltHead` below; see CLAUDE.md "Visual grammar".
       system: v("--k-system") || "#7D6EE6",
       user: v("--k-user") || "#044EFF",

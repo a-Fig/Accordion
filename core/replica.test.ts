@@ -105,13 +105,13 @@ describe("replica — carriedSent round trip (protocol v15)", () => {
 	});
 });
 
-// Issue #93, redesigned in v21: the system prompt is a BOLTED `system` BLOCK, captured host-side and
+// Issue #93, redesigned in v22: the system prompt is a BOLTED `system` BLOCK, captured host-side and
 // carried to every replica two ways — inside `SnapshotState.blocks` on a (re)snapshot, and as the
 // `config` WireEvent's `systemPrompt` create-or-replace payload on a live change. It rides `config`
 // rather than `appended` because `appended` can express neither a REPLACE (pi's effective prompt is
 // genuinely not static across a session) nor a HEAD insertion. Both paths must land the replica on
 // byte-identical state at a matching rev, or the displayed token total forks from the host's.
-describe("replica — system block round trip (protocol v21)", () => {
+describe("replica — system block round trip (protocol v22)", () => {
 	it("serializeSnapshot → hydrateSnapshot preserves the system prompt as the leading block", () => {
 		const host = live();
 		host.append(seq(2, 1000));

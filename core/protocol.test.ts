@@ -243,10 +243,10 @@ describe("v17 — notice message guard", () => {
 	});
 });
 
-// ── v21: the system prompt as a bolted `system` BLOCK (issue #93, redesigned) ──────────────────
+// ── v22: the system prompt as a bolted `system` BLOCK (issue #93, redesigned) ──────────────────
 // v19/v20 carried it as a `SnapshotState.systemPrompt` scalar; it now rides in `blocks` as an
 // ordinary WireBlock, so the element-level guard — not the snapshot shape — is what has to accept it.
-describe("v21 — the `system` wire block kind", () => {
+describe("v22 — the `system` wire block kind", () => {
 	const systemBlock = { id: "sys:0", kind: "system", turn: 0, order: -1, text: "You are helpful.", tokens: 4 };
 	const baseState = {
 		blocks: [systemBlock],
@@ -265,7 +265,7 @@ describe("v21 — the `system` wire block kind", () => {
 		rev: 0,
 	};
 
-	it("isWireBlock accepts kind:\"system\" (a pre-v21 peer would drop the prompt silently)", () => {
+	it("isWireBlock accepts kind:\"system\" (a pre-v22 peer would drop the prompt silently)", () => {
 		expect(isWireBlock(systemBlock)).toBe(true);
 	});
 

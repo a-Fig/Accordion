@@ -175,6 +175,9 @@ export class Truth {
 	 * between is the issue #102 spike.
 	 */
 	private calibrationThroughOrderValue: number | null = null;
+	/** Whether the CURRENT system block was on the request covered by the latest receipt. Its stable
+	 *  order (-1) cannot answer this after an in-place prompt replacement. */
+	private systemPromptCalibratedValue = false;
 
 	private activeLocks: readonly LockName[] = [];
 	private activeTailTok = 0;
@@ -282,6 +285,7 @@ export class Truth {
 		carriedSent: readonly string[];
 		calibration: number;
 		calibrationThroughOrder: number | null;
+		systemPromptCalibrated: boolean;
 		rev: number;
 	}): void {
 		this.blockLog = s.blocks.slice();
@@ -304,13 +308,12 @@ export class Truth {
 		this.calibrationMul = this.calibrationThroughOrderValue !== null && Number.isFinite(s.calibration) && s.calibration > 0
 			? s.calibration
 			: 1;
-		// NOTE: the system prompt is no longer a scalar to adopt separately — it rides in `blocks` as
-		// the ONE `system` block (`SYSTEM_BLOCK_ID`, order `SYSTEM_BLOCK_ORDER`), so it is hydrated by
-		// the `this.blockLog = s.blocks.slice()` above like any other block, and its token cost enters
-		// `liveTokens()`/`fullTokens()` through the same per-block loop. Its calibration coverage is
-		// likewise the ordinary `isCalibrated(b)` test (`order <= calibrationThroughOrder`), which its
-		// `-1` order satisfies for any non-null frontier — correct, since every wire a receipt ever
-		// measured carried the system prompt.
+		// The system prompt rides in `blocks`, but its content can be replaced while its stable order
+		// remains -1. Preserve the explicit coverage bit so a newly replaced prompt stays raw until the
+		// next provider receipt instead of inheriting the previous prompt's multiplier.
+		this.systemPromptCalibratedValue = this.calibrationThroughOrderValue !== null
+			&& s.systemPromptCalibrated === true
+			&& this.systemBlock() !== undefined;
 		this.lastChangedRev.clear();
 		this.revCounter = s.rev;
 		// Rev-keyed read caches are stamped stale so they recompute against the adopted rev.
@@ -351,6 +354,7 @@ export class Truth {
 		// Carrying k here would recreate issue #102 for a newly inserted block below the old frontier.
 		next.calibrationMul = 1;
 		next.calibrationThroughOrderValue = null;
+		next.systemPromptCalibratedValue = false;
 		// Issue #93: carried, unlike `contextWindow` — the system prompt IS a preserved captured fact,
 		// not a live re-derived one. `refreshFromCtx` runs before a rebuild can be triggered (it's called
 		// at the top of the `context` hook, before `ingestMessages`), so without this carry `next` would
@@ -482,8 +486,13 @@ export class Truth {
 	get calibrationThroughOrder(): number | null {
 		return this.calibrationThroughOrderValue;
 	}
+	/** Whether the current system prompt was present on the latest calibrated request. */
+	get systemPromptCalibrated(): boolean {
+		return this.systemPromptCalibratedValue;
+	}
 	/** True when this block existed on the departing wire covered by the latest receipt. */
 	isCalibrated(b: Block): boolean {
+		if (b.id === SYSTEM_BLOCK_ID) return this.calibrationThroughOrderValue !== null && this.systemPromptCalibratedValue;
 		return this.calibrationThroughOrderValue !== null && b.order <= this.calibrationThroughOrderValue;
 	}
 	/**
@@ -704,6 +713,11 @@ export class Truth {
 	private computeProtectedFromIndex(): number {
 		const blocks = this.blockLog;
 		if (!blocks.length) return 0;
+		// Bolted context is a fixed floor, not part of the MOVING working tail. Keeping the leading
+		// system block outside this suffix also guarantees it always renders in the first/foldable box,
+		// including a brand-new session whose conversation is shorter than the protection target.
+		const floor = isBolted(blocks[0]) ? 1 : 0;
+		if (floor === blocks.length) return blocks.length;
 		const targetReal = this.isLocked("tail-size") ? this.activeTailTok : this.protectTokensTarget;
 		if (targetReal === 0) return blocks.length;
 		// Covered blocks use k; blocks newer than the receipt frontier stay raw. Use unrounded float
@@ -713,13 +727,13 @@ export class Truth {
 		const cap = targetReal * PROTECT_OVERFLOW_CAP;
 		let sum = realCost(blocks[blocks.length - 1]);
 		if (sum >= targetReal) return blocks.length - 1;
-		for (let i = blocks.length - 2; i >= 0; i--) {
+		for (let i = blocks.length - 2; i >= floor; i--) {
 			const next = sum + realCost(blocks[i]);
 			if (next > cap) return i + 1;
 			sum = next;
 			if (sum >= targetReal) return i;
 		}
-		return 0;
+		return floor;
 	}
 	isProtected(b: Block): boolean {
 		return (this.index.get(b.id) ?? -1) >= this.protectedFromIndex();
@@ -1097,6 +1111,9 @@ export class Truth {
 	setSystemPrompt(text: string, tokens: number): void {
 		if (typeof text !== "string" || !Number.isFinite(tokens) || tokens < 0) return;
 		if (!this.insertSystemBlock(text, tokens)) return; // unchanged — not a state change
+		// A stable order cannot prove content coverage: a replaced prompt did not ride the request that
+		// produced the current k. The next receipt will cover this exact text and restore the flag.
+		this.systemPromptCalibratedValue = false;
 		const touched = new Set<string>([SYSTEM_BLOCK_ID]);
 		this.housekeep(touched);
 		const rev = ++this.revCounter;
@@ -1139,6 +1156,7 @@ export class Truth {
 		this.calibrationMul = k;
 		const maxOrder = this.blockLog.length ? this.blockLog[this.blockLog.length - 1].order : -1;
 		this.calibrationThroughOrderValue = Math.min(throughOrder, maxOrder);
+		this.systemPromptCalibratedValue = this.systemBlock() !== undefined;
 		const touched = new Set<string>();
 		this.housekeep(touched);
 		const rev = ++this.revCounter;
@@ -1147,6 +1165,7 @@ export class Truth {
 			type: "config",
 			calibration: this.calibrationMul,
 			calibrationThroughOrder: this.calibrationThroughOrderValue,
+			systemPromptCalibrated: this.systemPromptCalibratedValue,
 			rev,
 		});
 	}
