@@ -9,11 +9,29 @@
  */
 
 export type BlockKind =
+	| "system" // the harness's standing instructions — structural, bolted, never foldable
 	| "user" // the human's instruction/intent — highest durable value
 	| "text" // an assistant reply / conclusion
 	| "thinking" // ephemeral assistant reasoning
 	| "tool_call" // WHAT the agent did (tiny, durable record of an action)
 	| "tool_result"; // WHAT the agent saw (often huge, decays fast)
+
+/**
+ * The id of the BOLTED system-prompt block (issue #106). A CONSTANT, not derived from message
+ * content, because there is exactly one system prompt per session and it always sits at
+ * position 0 — so a stable id is what lets a REPLACED prompt (pi's `before_agent_start` can
+ * swap one mid-session) land on the same block instead of appending a second one.
+ *
+ * Deliberately NOT a durable id under `live/mapping.ts → isDurableId` (which recognises only
+ * `u:` / `a:` / `r:` / `s:`). That is load-bearing, not an oversight: a non-durable id makes the
+ * message carrying it `hasNonDurable`, which `applyPlan` already treats as never group-removable.
+ * So the wire-side refusal to collapse the system prompt falls out of machinery that predates
+ * this feature, underneath the explicit guards in `computeFoldOps` / `foldOne` / `createGroup`.
+ *
+ * Lives in the engine (not `live/protocol.ts`) for layering: `parse.ts` and `mapping.ts` both
+ * need it, and `protocol.ts` is deliberately import-free at runtime.
+ */
+export const SYSTEM_BLOCK_ID = "sys:0";
 
 /** Who last changed a block's fold state. */
 export type Actor = "you" | "agent" | "auto" | "conductor";

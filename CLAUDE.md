@@ -10,7 +10,8 @@ Guidance for AI coding sessions. [VISION.md](VISION.md) = product north star · 
 ## Terminology
 
 - **pi** — the CLI AI coding harness whose context window Accordion visualizes. Not an Accordion product; it's the tool the user runs. `extension/accordion.ts` is a pi plugin that hooks into pi's `context` hook (fires before each model call).
-- **block** — atomic unit of context: one chunk of a single kind (`user`, `text`, `thinking`, `tool_call`, or `tool_result`). See `engine/types.ts → Block`.
+- **block** — atomic unit of context: one chunk of a single kind (`system`, `user`, `text`, `thinking`, `tool_call`, or `tool_result`). See `engine/types.ts → Block`.
+- **bolted** — a block no actor may fold, group, or pin: not the human, not a conductor, not the agent. Today exactly the `system` kind (the harness's prompt). Predicate: `engine/digest.ts → isBolted`. Distinct from *held* (a human override, which the human can release) and from *protected* (the working tail, which moves as the tail resizes) — bolted is a property of the kind and never lifts. Its tokens ARE counted in `liveTokens`: a fixed floor, not reclaimable headroom.
 - **turn** — one user message plus all assistant content (thinking, text, tool calls, tool results) that follows it before the next user message.
 - **fold / folding** — replacing a block's content in-place with something shorter, like a summary; the block stays on the wire to the LLM in compressed form. Always reversible.
 - **held** — a block carrying a human override (manual pin, fold, or unfold). `ViewBlock.held = true`; the host refuses conductor commands on held blocks unless the conductor holds a `human-steering` involvement lock.
@@ -39,7 +40,7 @@ Guidance for AI coding sessions. [VISION.md](VISION.md) = product north star · 
 
 `app/src/lib/engine/` owns the model. **The UI only renders and calls its actions — never reach around it.**
 
-- `types.ts` — `Block { id, kind, turn, order, text, tokens, toolName?, callId?, override, autoFolded, by }`. Kinds: `user · text · thinking · tool_call · tool_result`
+- `types.ts` — `Block { id, kind, turn, order, text, tokens, toolName?, callId?, override, autoFolded, by }`. Kinds: `system · user · text · thinking · tool_call · tool_result`. `system` is **bolted** (see Terminology) and always block 0 with id `SYSTEM_BLOCK_ID` (`sys:0`); it is emitted only when a system prompt can actually be sourced — otherwise no block appears at all (silent absence), which is why Claude Code transcripts and `sample-session.jsonl` are unchanged
 - `parse.ts` — pi / Claude Code JSONL → typed blocks. `tool_call` and `tool_result` are separate blocks sharing a `callId`. An assistant message's thinking/text/call blocks share an `id` prefix before `:`
 - `store.svelte.ts` — `AccordionStore` (Svelte runes); exposed as `window.__store`. `appendBlocks(blocks)` is the streaming seam used by the live link to add new blocks. **Protected working tail** (`protectTokens`, default `20_000`): `protectedFromIndex` marks the first block in the tail; both auto- and manual-`fold()` are refused inside it; a block that was auto-folded before entering the tail heals back to live; `pin()` remains allowed. `setProtect(n)` resizes and re-folds, wired to an on-bar draggable handle. Under the `tail-size` involvement lock (ADR 0011), the tail floor is lifted — the conductor may fold any block
 - `tokens.ts` — chars/4 estimate · `digest.ts` — what a kind collapses to when folded
@@ -135,6 +136,7 @@ Colors are brand **Spectrum** identity colors — defined in [brand/accordion-br
 
 | kind | hex |
 |------|-----|
+| `system` | `#7D6EE6` |
 | `user` | `#044EFF` |
 | `text` | `#1AA6E8` |
 | `thinking` | `#B480DF` |
@@ -142,6 +144,8 @@ Colors are brand **Spectrum** identity colors — defined in [brand/accordion-br
 | `tool_result` | `#E19C7D` |
 
 **`#044EFF` blue is reserved for the user block kind — never a button, never UI chrome.** UI accent is always monochrome/neutral.
+
+- **Bolted tile:** the `system` block draws a hex **bolt head** in place of dice pips (`tileDraw.ts`), and the same `bolt` icon marks it in the transcript row and the Inspector pill. The tile never says "immutable" — the constraint is implied by the mark and spelled out in words only in the Inspector.
 
 - **live = solid / folded = recessed** (dim + faint hatch, never a heavy dark hatch)
 - Group tiles use the current chestnut group palette from `app/src/app.css`: `--group #7C5230 · --group-edge #0A0A0A · --group-accent #E8E8E8`. Summary/sliver tiles stay dark neutral via `--k-summary`.

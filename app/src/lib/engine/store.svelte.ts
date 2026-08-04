@@ -12,7 +12,7 @@
  * intent. Deterministic and explainable; the smarts come later.
  */
 import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
-import { digest, digestTokens, foldTag, groupDigest, groupDigestTokens, substTokens, wireFoldable } from "./digest";
+import { digest, digestTokens, foldTag, groupDigest, groupDigestTokens, isBolted, substTokens, wireFoldable } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { isDurableId } from "../live/mapping";
 import type { Conductor, ConductorView, Command, ClampReport, ClampReason, LockName, ConductorHost, CompletionRequest, CompletionResult, JSONValue } from "$conductors/contract";
@@ -1121,6 +1121,12 @@ export class AccordionStore {
 	private substOne(id: string, content: string | undefined, by: Actor, kind: "fold" | "replace", reports: ClampReport[], recoverable = false): void {
 		const b = this.get(id);
 		if (!b) return void reports.push(clamp(kind, [id], "unknown-id", `no block ${id}`));
+		// BOLTED first: checked ahead of every other clamp so the conductor always learns the
+		// REAL, permanent reason. A system block is never held, grouped, or protected, so without
+		// this it would fall through to `not-foldable` — technically true but misleading, since it
+		// reads as "wrong kind, try another block" rather than "this is structural and no command
+		// will ever move it".
+		if (isBolted(b)) return void reports.push(clamp(kind, [id], "bolted", `${label(b)} is bolted; the system prompt is never foldable by any actor`));
 		if (b.override !== null) return void reports.push(clamp(kind, [id], "human-override", `${label(b)} is held by the human`));
 		if (this.groupWire.has(id)) return void reports.push(clamp(kind, [id], "grouped", `${label(b)} is inside a folded group`));
 		// Protection is ABSOLUTE: a block inside the protected working tail is never folded, by a
@@ -1159,6 +1165,10 @@ export class AccordionStore {
 	private liveOne(id: string, by: Actor, kind: "restore" | "pin", reports: ClampReport[]): void {
 		const b = this.get(id);
 		if (!b) return void reports.push(clamp(kind, [id], "unknown-id", `no block ${id}`));
+		// A bolted block is permanently live, so `restore`/`pin` can never have an effect on it.
+		// `noop` ("already live") would also be true, but it invites the conductor to retry later
+		// as if the state were incidental; `bolted` says it is permanent.
+		if (isBolted(b)) return void reports.push(clamp(kind, [id], "bolted", `${label(b)} is bolted; it is permanently live`));
 		if (b.override !== null) return void reports.push(clamp(kind, [id], "human-override", `${label(b)} is held by the human`));
 		if (this.groupWire.has(id)) return void reports.push(clamp(kind, [id], "grouped", `${label(b)} is inside a folded group`));
 		// Already live: the documented contract is to REPORT the no-op, not silently swallow it.
@@ -1179,6 +1189,15 @@ export class AccordionStore {
 		if (ids.length < 1) return void reports.push(clamp("group", ids, "invalid-group", "a group needs ≥1 block"));
 		const range = this.snappedRange(ids[0], ids[ids.length - 1]);
 		if (range) {
+			// Report a bolted member as `bolted`, not as the generic `invalid-group` that
+			// `createGroup`'s null return would otherwise produce — the conductor should learn that
+			// this specific range can never be grouped, rather than that it got the bounds wrong.
+			const bolted = range.filter((id) => {
+				const b = this.get(id);
+				return !!b && isBolted(b);
+			});
+			if (bolted.length)
+				return void reports.push(clamp("group", ids, "bolted", `would collapse the bolted system prompt`));
 			const held = range.filter((id) => this.get(id)?.override != null);
 			if (held.length)
 				return void reports.push(clamp("group", ids, "human-override", `would collapse ${held.length} human-held block(s)`));
@@ -1438,6 +1457,10 @@ export class AccordionStore {
 		if (this.humanLocked("you")) return;
 		const b = this.get(id);
 		if (!b || this.inFoldedGroup(id)) return;
+		// A bolted block (system prompt) is already permanently live — it can never fold, so a
+		// pin protects nothing. Refuse rather than write a meaningless override that would then
+		// render as a human-held pin in the view and in `ViewBlock.held`.
+		if (isBolted(b)) return;
 		b.override = "pinned";
 		b.by = "you";
 		b.subst = undefined; // human override clears conductor-owned content
@@ -1588,6 +1611,16 @@ export class AccordionStore {
 		if (!memberIds) return null;
 		// Never reach into the protected tail (ADR 0006 §1).
 		if ((this.index.get(memberIds[memberIds.length - 1]) ?? Infinity) >= this.protectedFromIndex) return null;
+		// Never swallow a BOLTED block. Group collapse is a separate mechanism from per-block
+		// folding — it removes whole messages from the wire and may legitimately include kinds
+		// `wireFoldable` refuses (`user`, `tool_call`) — so the kind gate that protects the system
+		// prompt everywhere else does NOT cover this path. Without this check a group spanning
+		// block 0 would collapse the system prompt off the agent's wire entirely. Refuse the whole
+		// group rather than silently trimming it: a partial range is not what the caller asked for.
+		for (const id of memberIds) {
+			const m = this.get(id);
+			if (m && isBolted(m)) return null;
+		}
 		for (const id of memberIds) {
 			if (this.groupAt.get(id)) return null; // overlap with an existing group
 		}

@@ -29,6 +29,11 @@ export const FOLD_RANK: Record<ConductorBlockKind, number> = {
 	text: 2, // conclusions, medium durable value
 	tool_call: 3, // tiny + durable record of an action → fold last
 	user: 4, // the instruction/intent → fold last of all
+	// BOLTED (issue #106) — ranked last for totality, but unreachable in practice: the host
+	// reports `foldedTokens === tokens` for a system block, so `conduct`'s
+	// `b.foldedTokens < b.tokens` candidate filter drops it before rank is ever consulted.
+	// Were a conductor to target it anyway, the host clamps with reason `bolted`.
+	system: 5,
 };
 
 export class BuiltinConductor implements Conductor {

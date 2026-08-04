@@ -62,7 +62,7 @@ import { buildCommands, planSignature } from "./commands.ts";
 
 // Mirrors CONDUCTOR_PROTOCOL_VERSION in conductors/contract/protocol.ts — keep in lockstep
 // (v6 dropped RecallCommand and ViewBlock.fresh for simplification; the app's hello gate is a strict !==).
-const CONDUCTOR_PROTOCOL_VERSION = 6;
+const CONDUCTOR_PROTOCOL_VERSION = 7;
 
 const ID = "the-conductor";
 const LABEL = "The Conductor";

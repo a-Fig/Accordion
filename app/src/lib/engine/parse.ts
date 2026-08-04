@@ -7,6 +7,7 @@
  * stay grouped by the human exchange they belong to.
  */
 import type { Block, BlockKind, ParsedSession, SessionMeta } from "./types";
+import { SYSTEM_BLOCK_ID } from "./types";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 
 function parseLines(raw: string): any[] {
@@ -88,7 +89,12 @@ function parsePi(entries: any[]): ParsedSession {
 				break;
 			case "message": {
 				const m = e.message || {};
-				if (m.role === "user") {
+				if (m.role === "system" || m.role === "developer") {
+					// Bolted system prompt (issue #106) — mirrors `linearize`'s handling of the same
+					// roles on the live wire, so a session read from disk and the same session watched
+					// live produce the same first block. Constant id, turn 0 (preamble).
+					sink.push(SYSTEM_BLOCK_ID, "system", asText(m.content));
+				} else if (m.role === "user") {
 					sink.turn += 1;
 					sink.push(`${eid}:u`, "user", asText(m.content));
 				} else if (m.role === "assistant") {

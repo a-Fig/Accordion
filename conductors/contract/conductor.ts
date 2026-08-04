@@ -28,8 +28,16 @@
  * out-of-process conductor. Keep it that way: no Svelte, no `$state`, no Node/Tauri APIs.
  */
 
-/** The block kinds, mirrored from the engine so this contract has zero engine dependency. */
-export type ConductorBlockKind = "user" | "text" | "thinking" | "tool_call" | "tool_result";
+/**
+ * The block kinds, mirrored from the engine so this contract has zero engine dependency.
+ *
+ * `system` is the harness's standing instructions — BOLTED context. It appears in the view (a
+ * conductor should be able to see and budget against it; it is real, permanent window spend)
+ * but NO command will ever move it: `fold` / `replace` / `restore` / `pin` targeting it, and any
+ * `group` whose range contains it, are clamped with reason `bolted`. Treat its tokens as a fixed
+ * floor to fold down TOWARD, never as reclaimable headroom.
+ */
+export type ConductorBlockKind = "system" | "user" | "text" | "thinking" | "tool_call" | "tool_result";
 
 /** The three steering controls a conductor may take exclusive control of (ADR 0011). */
 export type LockName = "human-steering" | "agent-unfold" | "tail-size";
@@ -231,6 +239,15 @@ export type ClampReason =
 	 * (which would let the view show a fold the agent never actually receives).
 	 */
 	| "not-foldable"
+	/**
+	 * The block is BOLTED — structural context Accordion does not own (today: the `system`
+	 * prompt). No command of any kind will ever move it: not `fold`/`replace` (it can never be
+	 * restated), not `restore`/`pin` (it is permanently live), and not `group` (a range
+	 * containing it is refused whole). Distinct from `not-foldable`, which says "wrong kind for
+	 * THIS command" and invites trying another; `bolted` says the block is permanently out of
+	 * reach, so a conductor should stop targeting it and budget around its tokens instead.
+	 */
+	| "bolted"
 	/** The op was a no-op (e.g. restoring an already-live block). */
 	| "noop";
 

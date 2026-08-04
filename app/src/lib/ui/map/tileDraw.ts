@@ -81,6 +81,7 @@ export function readPalette(): Palette {
   const v = (name: string) => s.getPropertyValue(name).trim();
   return {
     kindColors: {
+      system: v("--k-system") || "#7D6EE6",
       user: v("--k-user") || "#044EFF",
       text: v("--k-text") || "#1AA6E8",
       thinking: v("--k-thinking") || "#B480DF",
@@ -512,22 +513,68 @@ export function drawTile(
     ctx.stroke();
   }
 
-  // ---- dice pips (blitted from sprite) ----
-  // Folded tiles KEEP their dice face (the old DOM showed pips at the cell's
-  // .36 opacity). Drawing them dimmed-but-visible keeps a folded block reading
-  // as "a recessed version of the colored tile," not a blank square.
-  const spriteCanvas = sprites.get(spec.face);
-  if (spriteCanvas) {
-    if (spec.folded) {
-      // Drained tiles read as near-black recessed squares — keep the pips a faint
-      // ghost (the weight is still legible up close) so the tile doesn't sprout
-      // loud white dots that fight the drain. Hover relights toward full.
+  // ---- BOLTED: the system prompt wears a bolt head instead of dice pips (issue #106) ----
+  // Drawn INSTEAD of the face, not on top of it: faces 4/5/6 put pips in the corners, so any
+  // corner-rivet motif would collide, and overlaying a glyph on center pips just reads as
+  // noise. The token weight the face would have carried is not lost — the Inspector shows the
+  // exact count, and the tile's whole point is "this is structural", not "this is heavy".
+  //
+  // Per-tile path work (rather than a cached sprite like the pips) is deliberate and safe: the
+  // "no live gradients / no per-tile filters" rule in CLAUDE.md exists because those costs are
+  // paid ~982 times per repaint. There is exactly ONE system tile in a session, so this hexagon
+  // is drawn once per frame at most. Below ~9px the hex degrades into a smudge, so it is simply
+  // skipped — the indigo fill still distinguishes the tile at that size.
+  if (spec.kind === "system") {
+    const cx = x + w / 2;
+    const cy = y + h / 2;
+    const rad = Math.min(w, h) * 0.26;
+    if (w >= 9) {
       ctx.save();
-      ctx.globalAlpha = opts.hovered ? 0.7 : 0.22;
-      ctx.drawImage(spriteCanvas, x, y, w, h);
+      // Hex outline = bolt head. Stroked, not filled, so the indigo reads through and the mark
+      // stays legible against both the vivid tile and a selection ring.
+      ctx.beginPath();
+      for (let k = 0; k < 6; k++) {
+        // -90° start puts a flat edge top/bottom — the orientation a bolt head reads as.
+        const a = (Math.PI / 3) * k - Math.PI / 2;
+        const px = cx + rad * Math.cos(a);
+        const py = cy + rad * Math.sin(a);
+        k === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.strokeStyle = "rgba(255,255,255,0.85)";
+      ctx.lineWidth = Math.max(1, Math.round(w / 16));
+      ctx.stroke();
+      // Center dot — the driven fastener. Only at sizes where it won't blur into the outline.
+      if (w >= 14) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, Math.max(0.75, rad * 0.28), 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(255,255,255,0.85)";
+        ctx.fill();
+      }
       ctx.restore();
-    } else {
-      ctx.drawImage(spriteCanvas, x, y, w, h);
+    }
+    // NO early return. Selection and range rings below still apply: a bolted block is fully
+    // observable — clickable, arrow-key traversable, inspectable — and observation is never
+    // lockable (ADR 0011). Only the FOLD-state decorations are moot, and those are unreachable
+    // anyway (`folded`/`pinned` can never be true for a bolted block).
+  } else {
+    // ---- dice pips (blitted from sprite) ----
+    // Folded tiles KEEP their dice face (the old DOM showed pips at the cell's
+    // .36 opacity). Drawing them dimmed-but-visible keeps a folded block reading
+    // as "a recessed version of the colored tile," not a blank square.
+    const spriteCanvas = sprites.get(spec.face);
+    if (spriteCanvas) {
+      if (spec.folded) {
+        // Drained tiles read as near-black recessed squares — keep the pips a faint
+        // ghost (the weight is still legible up close) so the tile doesn't sprout
+        // loud white dots that fight the drain. Hover relights toward full.
+        ctx.save();
+        ctx.globalAlpha = opts.hovered ? 0.7 : 0.22;
+        ctx.drawImage(spriteCanvas, x, y, w, h);
+        ctx.restore();
+      } else {
+        ctx.drawImage(spriteCanvas, x, y, w, h);
+      }
     }
   }
 

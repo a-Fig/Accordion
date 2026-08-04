@@ -34,6 +34,10 @@
 	/* block kinds — track the brand Spectrum identity (brand/accordion-brand-kit/brand.md).
 	   These VALUES intentionally override the former "DO NOT CHANGE" contract: the spectrum
 	   is now the canonical block-kind palette. Names are still load-bearing — do not rename. */
+	--k-system: #7D6EE6;       /* brand spectrum indigo — the BOLTED system prompt. The one
+	                              gradient stop not previously claimed by a kind; sits between
+	                              user blue and thinking violet, so it reads as structural
+	                              without competing with the reserved #044EFF user blue. */
 	--k-user: #044EFF;
 	--k-text: #1AA6E8;         /* brand spectrum azure — the assistant-reply spine
 	                              (a real gradient stop, distinct from the 4 kinds; not gray) */

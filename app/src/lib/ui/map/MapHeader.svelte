@@ -18,6 +18,11 @@
 		{ kind: "text", label: "replies" },
 		{ kind: "tool_call", label: "tool calls" },
 		{ kind: "user", label: "your messages" },
+		// Last rung: BOLTED, the one kind that never folds at all (issue #106). Required here,
+		// not optional — `liveByKind` only tallies kinds present in this ladder, so omitting it
+		// would leave the composition strip short of `liveTokens` by the system prompt's full
+		// size, and the strip would visibly fail to account for the budget it sits next to.
+		{ kind: "system", label: "system prompt (bolted)" },
 	];
 
 	const liveByKind = $derived.by(() => {
@@ -862,6 +867,7 @@
 	.seg:first-child  { border-radius: var(--radius-pill) 0 0 var(--radius-pill); }
 	.seg:last-of-type { border-radius: 0 var(--radius-pill) var(--radius-pill) 0; }
 
+	.seg.k-system     { background: var(--k-system); }
 	.seg.k-user       { background: var(--k-user); }
 	.seg.k-text       { background: var(--k-text); }
 	.seg.k-thinking   { background: var(--k-thinking); }

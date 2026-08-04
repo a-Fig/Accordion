@@ -18,6 +18,7 @@
  */
 import type { WireBlock, FoldOp, GroupOp } from "./protocol";
 import type { Block } from "../engine/types";
+import { SYSTEM_BLOCK_ID } from "../engine/types";
 import { estTokens, BLOCK_OVERHEAD } from "../engine/tokens";
 
 // ── Minimal structural types for pi's in-memory AgentMessage ─────────────────
@@ -63,6 +64,14 @@ export interface PiMessage {
  */
 export function blockId(m: PiMessage, i: number, partIndex?: number): string {
 	switch (m.role) {
+		// Bolted system prompt: a CONSTANT id, never anchored to a timestamp. Without this case
+		// these roles would fall through to `default:` and get a durable `s:<timestamp>` id —
+		// which `applyPlan` would then consider a legitimate group-removal candidate. Keeping the
+		// id here (rather than only inline in `linearize`) preserves this function's contract as
+		// the single place the formula lives, so `linearize` and `messageInfo` cannot drift.
+		case "system":
+		case "developer":
+			return SYSTEM_BLOCK_ID;
 		case "user":
 			return m.timestamp != null ? `u:${m.timestamp}` : `m${i}:u`;
 		case "assistant": {
@@ -131,6 +140,17 @@ export function linearize(messages: PiMessage[]): WireBlock[] {
 
 	messages.forEach((m, i) => {
 		switch (m.role) {
+			case "system":
+			case "developer": {
+				// The harness's standing instructions, if pi carries them inline in the message
+				// array. Emitted as a BOLTED block (issue #106): counted, inspectable, immovable.
+				// Before this branch existed these roles fell through to `default:` and were
+				// silently dropped, so the map understated real window usage by the prompt's
+				// full size. `turn` stays 0 (preamble) and it takes order 0, since a system
+				// message can only appear ahead of the first user turn.
+				push(SYSTEM_BLOCK_ID, "system", textOf(m.content));
+				break;
+			}
 			case "user": {
 				turn += 1;
 				push(blockId(m, i), "user", textOf(m.content));
@@ -217,6 +237,13 @@ function messageInfo(m: PiMessage, i: number): MsgInfo {
 		if (!isDurableId(id)) hasNonDurable = true;
 	};
 	switch (m.role) {
+		case "system":
+		case "developer":
+			// Mirrors `linearize`. `blockId` returns the non-durable `SYSTEM_BLOCK_ID`, so `push`
+			// sets `hasNonDurable` and the message becomes un-group-removable via the existing
+			// durability rule — belt to the explicit `isBolted` braces elsewhere.
+			push(blockId(m, i));
+			break;
 		case "user":
 			push(blockId(m, i));
 			break;
@@ -256,6 +283,12 @@ function messageInfo(m: PiMessage, i: number): MsgInfo {
  *  folds a protected block, so no separate wire-side position protection is needed here.
  *  The durable-id + structural guards (kind checks, non-empty digest) remain the safety floor. */
 function foldOne(m: PiMessage, i: number, byId: Map<string, FoldOp>, mark: () => void, onApplied: (id: string) => void): PiMessage {
+	// BOLTED: the system prompt is never substituted, by anyone, on any path (issue #106). The
+	// role branches below would already skip it (only `assistant`/`toolResult` fold), so this is
+	// deliberately redundant — it makes the refusal explicit at the wire's last gate rather than
+	// leaving it as an emergent property of which roles happen to have branches. `computeFoldOps`
+	// never emits such an op in the first place; this is the independent second wall.
+	if (m.role === "system" || m.role === "developer") return m;
 	if (m.role === "assistant" && Array.isArray(m.content)) {
 		let parts: PiPart[] | null = null; // lazily cloned only if we actually fold
 		(m.content as PiPart[]).forEach((b, j) => {

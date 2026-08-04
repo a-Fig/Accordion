@@ -27,6 +27,7 @@
 	let view = $state<"map" | "transcript">("map");
 	// Human-readable role label for a transcript message header.
 	const ROLE: Record<Block["kind"], string> = {
+		system: "System",
 		user: "You",
 		text: "Assistant",
 		thinking: "Thinking",
@@ -63,6 +64,7 @@
 	// this names them so the grid's colours are self-explaining. Order follows the
 	// conversation grammar: you → reply → thinking → tool call → tool result.
 	const KINDS: { kind: BlockKind; lbl: string }[] = [
+		{ kind: "system", lbl: "system" },
 		{ kind: "user", lbl: "user" },
 		{ kind: "text", lbl: "reply" },
 		{ kind: "thinking", lbl: "thinking" },
@@ -1174,7 +1176,9 @@
 							<span class="tr-tok mono tnum">
 								{k(store.effTokens(b))}{#if folded}<span class="dim">/{k(b.tokens)}</span>{/if} tok
 							</span>
-							{#if prot}
+							{#if b.kind === "system"}
+								<span class="tr-flag bolted" title="bolted — the harness owns the system prompt; it is never folded, grouped, or pinned by anyone"><Icon name="bolt" size={10} /></span>
+							{:else if prot}
 								<span class="tr-flag" title="protected working tail — never folds"><Icon name="lock" size={10} /></span>
 							{:else if b.override === "pinned"}
 								<span class="tr-flag" title="pinned — held full"><Icon name="pin" size={10} /></span>
@@ -1300,6 +1304,7 @@
 		flex: 0 0 auto;
 		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
 	}
+	.ksw.k-system { background: var(--k-system); }
 	.ksw.k-user { background: var(--k-user); }
 	.ksw.k-text { background: var(--k-text); }
 	.ksw.k-thinking { background: var(--k-thinking); }
@@ -1615,6 +1620,9 @@
 		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3);
 		z-index: 2;
 	}
+	/* A bolted block can never be a band member (a group containing it is refused at
+	   creation), so this DOM cell path is defensive parity with the canvas only. */
+	.cell.k-system { background: var(--k-system); }
 	.cell.k-user { background: var(--k-user); }
 	.cell.k-text { background: var(--k-text); }
 	.cell.k-thinking { background: var(--k-thinking); }
@@ -1951,6 +1959,7 @@
 		border-left-color: var(--kc);
 		box-shadow: 0 0 0 1px var(--accent-soft);
 	}
+	.tr-msg.k-system { --kc: var(--k-system); }
 	.tr-msg.k-user { --kc: var(--k-user); }
 	.tr-msg.k-text { --kc: var(--k-text); }
 	.tr-msg.k-thinking { --kc: var(--k-thinking); }
@@ -1993,6 +2002,12 @@
 		display: inline-flex;
 		align-items: center;
 		color: var(--faint);
+	}
+	/* The bolted flag carries the kind's own indigo rather than the faint neutral the other
+	   flags use: it states an identity ("this is the system prompt"), not a transient state
+	   the way lock/pin do, so it should read at the same weight as the spine beside it. */
+	.tr-flag.bolted {
+		color: var(--k-system);
 	}
 	.tr-btn {
 		display: inline-flex;

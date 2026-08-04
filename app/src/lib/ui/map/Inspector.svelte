@@ -3,6 +3,7 @@
 	import { cubicOut } from "svelte/easing";
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block, Group } from "../../engine/types";
+	import { isBolted } from "../../engine/digest";
 	import Icon from "$lib/ui/Icon.svelte";
 
 	let {
@@ -20,6 +21,7 @@
 	} = $props();
 
 	const KIND_LABEL: Record<Block["kind"], string> = {
+		system: "System prompt",
 		user: "User",
 		text: "Reply",
 		thinking: "Thinking",
@@ -32,6 +34,11 @@
 
 	const folded = $derived(block ? store.isFolded(block) : false);
 	const pinned = $derived(block?.override === "pinned");
+	// BOLTED (issue #106) — the system prompt. This is the ONE surface that spells the
+	// constraint out in words: the tile and the transcript flag only imply it through the bolt
+	// mark, by design. Uses the engine predicate rather than `kind === "system"` so the panel
+	// can never disagree with the gates that actually refuse the mutations.
+	const bolted = $derived(block ? isBolted(block) : false);
 	// Protected working tail — never folded (the safety pillar). The Fold control is
 	// disabled here so the guarantee is visible, not just enforced silently.
 	const protect = $derived(block ? store.isProtected(block) : false);
@@ -259,6 +266,12 @@
 							<span class="pill-dot"></span>live
 						</span>
 					{/if}
+					{#if bolted}
+						<span class="pill pill-bolted" title="Structural context — Accordion does not manage the system prompt">
+							<Icon name="bolt" size={10} stroke={2} />
+							bolted
+						</span>
+					{/if}
 					{#if protect}
 						<span class="pill pill-accent" title="In the protected working tail — never folded">
 							<Icon name="lock" size={10} stroke={2} />
@@ -288,6 +301,22 @@
 			</div>
 
 			<!-- Actions -->
+			{#if bolted}
+				<!-- A bolted block gets PROSE instead of controls. Rendering the Fold/Pin buttons
+				     disabled would be the lesser option: `fold` is already refused by kind, but
+				     `pin` would look live while `store.pin` silently no-ops on it — the exact
+				     "UI shows a state the engine would refuse" divergence the codebase forbids.
+				     This is also the one place the constraint is stated in words (the tile and
+				     the transcript flag only imply it), which is what the design calls for. -->
+				<p class="bolted-note">
+					<Icon name="bolt" size={12} stroke={2} />
+					<span>
+						The system prompt is <strong>bolted</strong>. It sits at the head of every model call and
+						Accordion does not manage it — it can't be folded, grouped, or pinned by you, the
+						conductor, or the agent. Its tokens are counted in the budget as a fixed floor.
+					</span>
+				</p>
+			{:else}
 			<div class="action-row">
 				<button
 					class="action-btn"
@@ -326,6 +355,7 @@
 					{pinned ? "Unpin" : "Pin"}
 				</button>
 			</div>
+			{/if}
 		</div>
 
 		<!-- ── Body ───────────────────────────────────────────────── -->
@@ -504,6 +534,7 @@
 	}
 
 	/* kind color variables */
+	.k-system      { --kc: var(--k-system); }
 	.k-user       { --kc: var(--k-user); }
 	.k-text        { --kc: var(--k-text); }
 	.k-thinking    { --kc: var(--k-thinking); }
@@ -566,6 +597,38 @@
 		color: var(--accent);
 		background: var(--accent-soft);
 		gap: 5px;
+	}
+
+	/* Bolted pill — carries the system kind's own indigo, unlike the neutral `pill-accent`
+	   used for transient states. Bolted is an identity, not a state that can change. */
+	.pill-bolted {
+		color: var(--k-system);
+		background: color-mix(in srgb, var(--k-system) 14%, transparent);
+		gap: 5px;
+	}
+
+	/* Prose shown in place of the Fold/Pin controls for a bolted block. */
+	.bolted-note {
+		display: flex;
+		align-items: flex-start;
+		gap: var(--sp-2);
+		margin: 0;
+		padding: var(--sp-2) var(--sp-3);
+		border-radius: 6px;
+		border: 1px solid color-mix(in srgb, var(--k-system) 30%, transparent);
+		background: color-mix(in srgb, var(--k-system) 8%, transparent);
+		font-size: var(--fs-xs);
+		line-height: 1.5;
+		color: var(--muted);
+	}
+	.bolted-note :global(svg) {
+		flex: 0 0 auto;
+		margin-top: 2px;
+		color: var(--k-system);
+	}
+	.bolted-note strong {
+		color: var(--text);
+		font-weight: 600;
 	}
 
 	/* Token table: tabular mono data display */

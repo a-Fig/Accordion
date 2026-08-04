@@ -627,6 +627,10 @@ export function sumTokens(blocks: ViewBlock[]): number {
  */
 export function blockLabel(b: ViewBlock): string {
 	switch (b.kind) {
+		// Bolted system prompt (issue #106). Unreachable via a group/handoff range — the host
+		// refuses any group containing it — but the switch must stay total.
+		case "system":
+			return "system";
 		case "user":
 			return "user";
 		case "text":

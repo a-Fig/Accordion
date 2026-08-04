@@ -26,7 +26,7 @@ import type { AccordionStore } from "../engine/store.svelte";
 import type { Block } from "../engine/types";
 import type { FoldOp, GroupOp, UnfoldRestored, RecallContent } from "./protocol";
 import { isDurableId } from "./mapping";
-import { foldCode, wireFoldable } from "../engine/digest";
+import { foldCode, isBolted, wireFoldable } from "../engine/digest";
 
 /**
  * Compute the fold plan for the current store state: one `FoldOp` per block that
@@ -42,6 +42,11 @@ export function computeFoldOps(store: AccordionStore): FoldOp[] {
 		// wire (applyPlan removes the message before any in-place fold runs) AND a trap — the op
 		// would carry the block's own digest, divergent from the group summary. Skip them.
 		if (store.groupOf(b)?.folded) continue;
+		// BOLTED (issue #106): the system prompt never rides the wire folded. `wireFoldable`
+		// already refuses it (`system` is not in FOLDABLE_KINDS), so this is the deliberate
+		// belt-and-braces the hard floor calls for — stated explicitly here because this is the
+		// function that decides what the agent actually receives.
+		if (isBolted(b)) continue;
 		if (!wireFoldable(b)) continue; // never user / tool_call — the ONE shared foldability gate
 		if (!isDurableId(b.id)) continue; // durable-id safety guard
 		const digestText = store.digestOf(b);

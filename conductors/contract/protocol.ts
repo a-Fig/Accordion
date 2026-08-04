@@ -35,8 +35,14 @@ import type { Command, ClampReport, ViewBlock, LockName, JSONValue } from "./con
  *        A field drops from every `context/update` block; the command vocabulary is unchanged.
  *  - v6: `RecallCommand` removed from the `Command` union — conductor recall (ADR 0019) was
  *        ripped out for simplification, along with the `not-recallable` clamp reason.
+ *  - v7: `system` added to `ConductorBlockKind` — the harness's system prompt now appears in
+ *        the view as a BOLTED block (issue #106). Two visible changes: a `context/update` may
+ *        carry a block of a kind a v6 conductor does not recognise, and a new `bolted`
+ *        `ClampReason` may come back in `host/commandResult`. Its tokens ARE counted in
+ *        `liveTokens`, so a conductor that budgets against that number sees a higher, honest
+ *        baseline it cannot fold away.
  */
-export const CONDUCTOR_PROTOCOL_VERSION = 6;
+export const CONDUCTOR_PROTOCOL_VERSION = 7;
 
 /**
  * How much of each block's content a conductor wants to receive (declared in

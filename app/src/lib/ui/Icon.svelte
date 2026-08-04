@@ -36,6 +36,7 @@
 		| 'play'
 		| 'square'
 		| 'fold'
+		| 'bolt'
 		| 'accordion';
 
 	// Raw inner SVG markup for each icon (Lucide 24×24 path geometry).
@@ -85,6 +86,11 @@
 		'square': `<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>`,
 		// Brand 'fold' glyph — the signature action icon (stroke-width 2).
 		'fold': `<path stroke-width="2" d="M8 5l4 3 4-3"/><path stroke-width="2" d="M4 12h16"/><path stroke-width="2" d="M8 19l4-3 4 3"/>`,
+		// Bolt head — the BOLTED marker for the system-prompt block (issue #106). Deliberately
+		// the same hexagon-plus-center geometry the canvas tile draws in `tileDraw.ts`, so the
+		// map tile and the transcript/Inspector flag read as one metaphor rather than two
+		// unrelated marks. Flat-top hexagon (vertices at ±30°, ±90°) on the 24×24 Lucide grid.
+		'bolt': `<path d="M12 3l7.79 4.5v9L12 21l-7.79-4.5v-9z"/><circle cx="12" cy="12" r="2.5"/>`,
 		// Generic bellows glyph fallback. The real brand mark is raster art
 		// (brand.md: "not vector"), rendered from the PNG via Logo.svelte — the
 		// chrome uses <Logo>, not this icon. Kept only as a named fallback.

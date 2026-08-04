@@ -87,7 +87,7 @@ wire:
 |----------------|----------|----------------------------------------------------------------------------------|
 | `id`           | string   | durable block id — what every command references                                 |
 | `messageKey`   | string?  | provider-message grouping key; blocks with the same key snap together in groups  |
-| `kind`         | string   | `user` · `text` · `thinking` · `tool_call` · `tool_result`                       |
+| `kind`         | string   | `system` · `user` · `text` · `thinking` · `tool_call` · `tool_result`. `system` is the harness's prompt and is **bolted** — see below |
 | `turn`         | number   | 1-based user turn                                                                 |
 | `order`        | number   | global 0-based position in the conversation                                      |
 | `tokens`       | number   | full token cost at full fidelity                                                 |
@@ -165,6 +165,7 @@ A **`ClampReport`** is `{ command, ids, reason, detail }`. `reason` is one of:
 | `invalid-group`  | a `group`'s ids were not a valid contiguous, ungrouped, ≥1-member run entirely outside the protected tail |
 | `protected`      | the block is inside the active protected working tail; the host refuses to fold it. Without `tail-size` this is the human's `protectTokens` tail; with `tail-size` it is the conductor's declared `tailTokens` tail (`tailTokens = 0` ⇒ no tail, no `protected` clamps). See ADR 0011 |
 | `not-foldable`   | the command targeted a kind the engine never folds/replaces (`user` or `tool_call`) |
+| `bolted`         | the block is **bolted** — structural context Accordion does not own (today: the `system` prompt). No command of any kind moves it: not `fold`/`replace`, not `restore`/`pin`, and not `group` (a range containing it is refused whole). Distinct from `not-foldable`, which means "wrong kind for this command"; `bolted` means permanently out of reach, so stop targeting it and budget around its tokens |
 | `noop`           | the command was a no-op (e.g. restoring an already-live block)                 |
 
 In-process, `conduct()` returns and the host applies synchronously; the clamp reports are
@@ -315,7 +316,7 @@ reverted by host healing). Each `block` is a `ViewBlock` — its `text` is prese
 ```
 
 `reason` is one of the `ClampReason`s tabled in Part 1 (`unknown-id`, `human-override`,
-`grouped`, `invalid-group`, `protected`, `not-foldable`, `noop`). Commands are never silently
+`grouped`, `invalid-group`, `protected`, `not-foldable`, `bolted`, `noop`). Commands are never silently
 dropped — every clamp is reported.
 
 **`cap/result`** — answer to a `cap/request` you sent (same `reqId`).
@@ -419,7 +420,7 @@ wants full content, and on each `context/update` folds the oldest non-`protected
 // recency-folder.js — run: node recency-folder.js   (npm i ws)
 // Advertise it for auto-discovery by writing this JSON to
 // ~/.accordion/conductors/recency-folder.json (refresh heartbeatAt every few seconds):
-//   { "registryProtocol":1, "conductorProtocol":6, "id":"recency-folder",
+//   { "registryProtocol":1, "conductorProtocol":7, "id":"recency-folder",
 //     "label":"Recency folder", "url":"ws://127.0.0.1:7700",
 //     "pid":<pid>, "startedAt":<ms>, "heartbeatAt":<ms> }
 import { WebSocketServer } from "ws";

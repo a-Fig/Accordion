@@ -56,6 +56,28 @@ export function wireFoldable(b: Block): boolean {
 }
 
 /**
+ * Is this block BOLTED — structurally fixed context that no actor may fold, pin, group, or
+ * otherwise restate? Today that is exactly the `system` kind: the harness's standing
+ * instructions, which sit at the head of every model call and which Accordion does not own.
+ *
+ * `wireFoldable` already refuses a `system` block for PER-BLOCK folding (`system` is not in
+ * `FOLDABLE_KINDS`), so this predicate is not what stops a fold — it is the named gate for
+ * the OTHER mutation paths that per-block foldability does not cover:
+ *   • group collapse (ADR 0006), which may legitimately sweep in `user` / `tool_call`;
+ *   • `pin`, which is meaningless on a block that can never fold in the first place;
+ *   • the conductor host, which reports a distinct `bolted` clamp so a strategy learns
+ *     "this is structural" rather than the misleading "wrong kind".
+ *
+ * Deliberately a PREDICATE rather than scattered `kind === "system"` checks: one definition
+ * to change if a second bolted kind ever appears (tool definitions are the obvious candidate).
+ * Kind-only, like `wireFoldable` — content- and id-independent, so it holds identically in
+ * live, preview, and read-only modes (CLAUDE.md: preview is not a more permissive mode).
+ */
+export function isBolted(b: Block): boolean {
+	return b.kind === "system";
+}
+
+/**
  * Short, stable handle for a block, derived purely from its durable id (FNV-1a → base36,
  * 6 chars). Stateless and deterministic so the engine, the live link, and the
  * `accordion-context-folding` skill never drift. Not collision-free by construction, but
@@ -113,6 +135,12 @@ export function digest(b: Block): string {
 /** The per-kind essence kept when a block is folded (without the tag). */
 function digestBody(b: Block): string {
 	switch (b.kind) {
+		case "system":
+			// Defensive only. A bolted block never folds (`isBolted` / `wireFoldable` both refuse
+			// it on every path), so this string should never reach a wire or a tile. It exists so
+			// the switch stays total and a future bolted kind degrades to something sane rather
+			// than falling through to the generic clip.
+			return "system prompt · " + clip(b.text, 80);
 		case "user":
 			return "“" + clip(b.text, 100) + "”";
 		case "text":
@@ -166,6 +194,9 @@ export function substTokens(content: string): number {
 
 /** Order kinds appear in a group recap, with singular/plural nouns. */
 const GROUP_KIND_NOUN: Record<BlockKind, [string, string]> = {
+	// Unreachable in practice — a group containing a bolted block is refused at creation
+	// (`createGroup`). Present so the Record stays total over `BlockKind`.
+	system: ["system prompt", "system prompts"],
 	user: ["ask", "asks"],
 	text: ["reply", "replies"],
 	thinking: ["thought", "thoughts"],

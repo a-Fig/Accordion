@@ -78,6 +78,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { linearize, applyPlan, type PiMessage, type AppliedCounts } from "../app/src/lib/live/mapping";
+import { SYSTEM_BLOCK_ID } from "../app/src/lib/engine/types";
 import { DEFAULT_PORT, PROTOCOL_VERSION, type FoldOp, type GroupOp, type ServerMessage, type StreamMessage, type UnfoldRequestMessage, type UnfoldResultMessage, type RecallRequestMessage, type RecallContent, type CompleteRequestMessage, type CompleteResultMessage } from "../app/src/lib/live/protocol";
 
 /** The GUI's reply to a sync: in-place fold ops + group-collapse ops (ADR 0006). */
@@ -470,6 +471,71 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// `message_end` committed-streaming path to build a full array for linearize
 	// without losing global turn/order numbering (see Phase 3 in ADR 0003).
 	let lastMessages: PiMessage[] = [];
+	// ── BOLTED system prompt (issue #106) ───────────────────────────────────────
+	// The harness's standing instructions, once we manage to source them. Held in memory only
+	// (never persisted — the `context` hook must stay disk-I/O-free).
+	//
+	// Sourcing is BEST-EFFORT and deliberately defensive: pi's exposure of the system prompt is
+	// not part of any contract we control, so `sniffSystemPrompt` probes several plausible
+	// carriers rather than betting on one field name. When nothing yields a prompt this stays
+	// null and NO system block is ever emitted — the documented "silent absence" behavior, which
+	// is also exactly what Claude Code transcripts and older pi versions get.
+	//
+	// Note this is only needed when pi does NOT already carry a `system` role inside the message
+	// array. If it does, `linearize` picks it up on its own and `withSystem` steps aside.
+	let systemPromptText: string | null = null;
+
+	/**
+	 * Best-effort probe for the system prompt across the shapes pi might expose it in. Reads
+	 * only; never throws (a malformed/exotic ctx must never be able to break a model call).
+	 */
+	function sniffSystemPrompt(src: unknown): string | null {
+		if (!src || typeof src !== "object") return null;
+		const o = src as Record<string, unknown>;
+		for (const key of ["systemPrompt", "system"]) {
+			const v = o[key];
+			if (typeof v === "string" && v.trim()) return v;
+			// Some providers model the system prompt as an array of content parts.
+			if (Array.isArray(v)) {
+				const joined = v
+					.filter((p): p is { text: string } => !!p && typeof (p as { text?: unknown }).text === "string")
+					.map((p) => p.text)
+					.join("\n");
+				if (joined.trim()) return joined;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Adopt a freshly sniffed system prompt. Returns true when the text actually CHANGED, which
+	 * the caller uses to force a full resync: the GUI is fed by the `sentCount` delta cursor, so
+	 * a prompt REPLACED mid-session (pi's `before_agent_start` can do exactly that) would
+	 * otherwise never be re-sent — the block sits at index 0, long behind the cursor, and the
+	 * GUI would keep rendering the stale text indefinitely.
+	 */
+	function adoptSystemPrompt(text: string | null): boolean {
+		if (!text || text === systemPromptText) return false;
+		systemPromptText = text;
+		return true;
+	}
+
+	/**
+	 * The message array to LINEARIZE FOR THE VIEW — pi's real messages, plus a synthetic
+	 * `system` message at the head when we sourced a prompt that isn't already in the array.
+	 *
+	 * The synthetic message exists ONLY to be linearized. It is never written to `lastMessages`,
+	 * never handed to `applyPlan`, and never returned to pi — so it cannot alter a model call.
+	 * Prepending a MESSAGE (rather than post-hoc splicing a WireBlock into the block list) is
+	 * what keeps `turn`/`order` numbering and the `SYSTEM_BLOCK_ID` derivation in `linearize`'s
+	 * hands, so the view's block sequence stays exactly what a single code path produced.
+	 */
+	function withSystem(msgs: PiMessage[]): PiMessage[] {
+		if (!systemPromptText) return msgs;
+		// pi already carries it inline → `linearize` emits the block itself; don't double it.
+		if (msgs.some((m) => m.role === "system" || m.role === "developer")) return msgs;
+		return [{ role: "system", content: systemPromptText } as PiMessage, ...msgs];
+	}
 	// Messages that have FINISHED since the last `context`/`agent_end` snapshot, in
 	// finish order. In a tool loop the assistant message and its tool result both end
 	// before the next `context` fires; we must accumulate ALL of them (not just the
@@ -1131,7 +1197,9 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			if (live.length) lastMessages = live;
 			// VIEW-ONLY full sync: folding may legally happen only at `context`, so (like the
 			// agent_end/message_end paths) we do NOT await or apply a plan here.
-			const backlog = linearize(lastMessages);
+			// Carries the bolted system block too, when one has been sourced — a GUI attaching
+			// mid-session must see the same first block a GUI present from the start does.
+			const backlog = linearize(withSystem(lastMessages));
 			if (backlog.length) {
 				send(ws, { type: "sync", reqId: ++reqSeq, full: true, blocks: backlog, contextWindow });
 				sentCount = backlog.length; // cursor now matches what the GUI holds
@@ -1417,6 +1485,11 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// (i.e. the user's next message) — the bug. Reading here means an attach that lands
 		// before any turn still has a correct baseline to flush.
 		lastMessages = readSessionMessages(ctx);
+		// A new session may carry a different system prompt (different project, different
+		// harness config), so drop the old one rather than letting it bleed across the switch.
+		// It is re-sniffed on this session's first `before_agent_start` / `context`.
+		systemPromptText = null;
+		adoptSystemPrompt(sniffSystemPrompt(ctx));
 		startedAt = Date.now();
 		try {
 			meta = { title: "pi session", cwd: process?.cwd?.() ?? "", model: "", contextWindow: null, format: "pi" };
@@ -1429,6 +1502,26 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			ctx.ui.setStatus("accordion", ctx.ui.theme.fg("accent", "\u{1FA97} accordion"));
 		} catch {
 			/* status API optional */
+		}
+	});
+
+	// ── bolted system prompt: catch a per-turn replacement (issue #106) ─────────
+	// `before_agent_start` is the hook that can REPLACE the system prompt for a turn, so it is
+	// the one place a swap is guaranteed to be visible — and on many pi versions it is also the
+	// earliest carrier of the prompt at all (the `context` event may only ever hand us messages).
+	// Probing here as well as at `context` is why sourcing degrades gracefully instead of
+	// depending on one field of one hook.
+	//
+	// Notification-only: we read, we never return a value, so this cannot alter what pi sends.
+	// Wrapped defensively — a throw here must never be able to break the agent's turn.
+	pi.on("before_agent_start", (event, ctx: ExtensionContext) => {
+		try {
+			latestCtx = ctx;
+			// A changed prompt rewinds the delta cursor so the next sync re-sends the new text
+			// (same reasoning as the `context` hook — the block sits at index 0, behind the cursor).
+			if (adoptSystemPrompt(sniffSystemPrompt(event) ?? sniffSystemPrompt(ctx))) sentCount = 0;
+		} catch {
+			/* best-effort: never let prompt sniffing disturb a turn */
 		}
 	});
 
@@ -1509,7 +1602,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// one are now subsumed by it — drop them.
 		lastMessages = event.messages as unknown as PiMessage[];
 		pendingSince = [];
-		const all = linearize(lastMessages);
+		// Sniff the bolted system prompt (issue #106) from this call's event/ctx. In-memory only
+		// — no disk I/O on this hook. A CHANGED prompt rewinds the delta cursor so the GUI gets a
+		// full resync carrying the new text; without that the block at index 0 would sit forever
+		// behind `sentCount` and keep showing the superseded prompt.
+		if (adoptSystemPrompt(sniffSystemPrompt(event) ?? sniffSystemPrompt(ctx))) sentCount = 0;
+		const all = linearize(withSystem(lastMessages));
 		if (!attached()) {
 			recordPlanOutcome("no-gui", null, { ops: 0, groups: 0 }, null);
 			return; // no GUI → pass through untouched
@@ -1700,13 +1798,17 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// Either escape would double-count and over-advance `sentCount`. Durable ids are
 		// position-independent, so linearizing each set in isolation is sound (we read
 		// only `.id`, never the locally-numbered turn/order).
+		// `[msg]` / `pendingSince` are probed for their OWN ids only — never wrapped in
+		// `withSystem`, which would inject a phantom system id into a dedup set and make an
+		// unrelated message look already-seen. Only the two views of the FULL array below carry
+		// the bolted block, so `baseIds` matches what was actually synced.
 		const msgIds = new Set(linearize([msg]).map((b) => b.id));
-		const baseIds = new Set(linearize(lastMessages).map((b) => b.id));
+		const baseIds = new Set(linearize(withSystem(lastMessages)).map((b) => b.id));
 		const pendIds = new Set(linearize(pendingSince).map((b) => b.id));
 		const alreadySeen = [...msgIds].some((id) => baseIds.has(id) || pendIds.has(id));
 		if (msgIds.size > 0 && !alreadySeen) pendingSince.push(msg);
 
-		const all = linearize([...lastMessages, ...pendingSince]);
+		const all = linearize(withSystem([...lastMessages, ...pendingSince]));
 		if (all.length <= sentCount) return finish(); // nothing new to push (RTT stamp still returned)
 		const reqId = ++reqSeq;
 		const full = sentCount === 0;
@@ -1746,7 +1848,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// cleared here so no ghost can survive the agent loop.
 		sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
 
-		const all = linearize(lastMessages);
+		const all = linearize(withSystem(lastMessages));
 		if (all.length <= sentCount) return; // nothing new since the last sync
 		const reqId = ++reqSeq;
 		const full = sentCount === 0;

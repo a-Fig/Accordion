@@ -61,8 +61,14 @@
  *        `PassthroughMessage.recalls` are gone. The plan-applied ack (`passthrough`) and its
  *        cause taxonomy STAY — only their birth-fold/recall-specific fields and roles are
  *        removed. Bumped (never renumbered downward) so a stale client can't pair silently.
+ *  - v10: `system` added to `WireBlock.kind` (issue #106). The extension now emits a BOLTED
+ *        first block carrying the harness's system prompt when it can source one. Breaking for
+ *        the usual reason both peers check `protocolVersion !== PROTOCOL_VERSION` strictly: a v9
+ *        GUI would receive a `kind` it has no color, digest, or tile treatment for. The block is
+ *        never folded, never grouped, and never carries a `{#code FOLDED}` tag, so no `FoldOp` or
+ *        `GroupOp` ever references it — the op shapes are unchanged.
  */
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi
@@ -82,12 +88,13 @@ export const DEFAULT_PORT = 4317;
  *     (kind: thinking | text | tool_call); prefers responseId, falls back to timestamp
  *   • `r:<toolCallId>`                     — a tool_result message
  *   • `s:<timestamp>`                      — a summary/other message
+ *   • `sys:0`                              — the bolted system prompt (see SYSTEM_BLOCK_ID)
  * Fallback (anchor field absent): positional `m<i>:u`, `m<i>:p<j>`, `m<i>:r`,
  * `m<i>:s` — ensures nothing crashes on malformed messages.
  */
 export interface WireBlock {
 	id: string;
-	kind: "user" | "text" | "thinking" | "tool_call" | "tool_result";
+	kind: "system" | "user" | "text" | "thinking" | "tool_call" | "tool_result";
 	turn: number;
 	order: number;
 	text: string;
