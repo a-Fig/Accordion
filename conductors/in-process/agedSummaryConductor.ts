@@ -29,6 +29,7 @@
 import { ViewConductor, type Command, type ConductorView } from "../../core/conductor/view";
 import type { ConductorHost, LockName, ViewBlock } from "../../core/conductor/contract";
 import { collapsibleMessageKeys, messageKey } from "../../core/groupShape";
+import { isBolted } from "../../core/digest";
 import { roleFloorRecap } from "../../core/wire";
 import { estTokens, BLOCK_OVERHEAD } from "../../core/tokens";
 
@@ -145,6 +146,11 @@ export function sumTokens(blocks: readonly ViewBlock[]): number {
  *  the role labeling convention in the Transcript view. */
 export function blockLabel(b: ViewBlock): string {
 	switch (b.kind) {
+		case "system":
+			// Unreachable via `agedRegion` (which filters bolted blocks out — nothing here may ever be
+			// summarized away), but the exhaustive check below demands a case, and a label is the right
+			// thing to have if a future prompt-builder legitimately wants to NAME the system prompt.
+			return "system prompt";
 		case "user":
 			return "user";
 		case "text":
@@ -444,9 +450,23 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	}
 
 	/**
-	 * The aged region: every block older than the protected working tail that is not human-held and
-	 * not already inside a FOREIGN group. All kinds included (per-kind group-eligibility is decided
-	 * separately by `includeInGroup`, applied only where a block would be folded away).
+	 * The aged region: every block older than the protected working tail that is not human-held,
+	 * not BOLTED, and not already inside a FOREIGN group. All other kinds included (per-kind
+	 * group-eligibility is decided separately by `includeInGroup`, applied only where a block would be
+	 * folded away).
+	 *
+	 * BOLTED (`isBolted` — today the `system` prompt block, which sits at index 0 and is therefore in
+	 * EVERY aged prefix) is excluded here, at the source, for two independent reasons. First, its text
+	 * must never be fed to the summarizing completion: the model already receives the system prompt
+	 * verbatim on every request, so summarizing it is pure waste and invites the summary to
+	 * paraphrase the harness's own instructions back at it. Second — and this is the one that would
+	 * lose data — `coveredIds` is built from exactly this set, and `emitCoverageGroup` walks the aged
+	 * prefix turning covered blocks into contiguous runs. A run that started at index 0 would include
+	 * the system block, and `Truth.opGroup` refuses such a range WHOLE with the `bolted` clamp: the
+	 * summary-bearing carrier would be rejected while a sibling DROP run still commits, which is
+	 * precisely the "content removed with nothing standing in for it" failure the run-level exclusions
+	 * exist to prevent. Filtering here makes the bolted block a run SPLITTER (like a held block)
+	 * instead — the run simply starts at index 1, and nothing else changes.
 	 */
 	private agedRegion(view: ConductorView): ViewBlock[] {
 		const foreign = this.foreignGroupedIds();
@@ -454,7 +474,7 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		const boundary = Math.min(this.agedBoundaryIndex(view), view.protectedFromIndex);
 		for (let i = 0; i < boundary && i < view.blocks.length; i++) {
 			const b = view.blocks[i];
-			if (!b.held && !foreign.has(b.id)) aged.push(b);
+			if (!b.held && !isBolted(b) && !foreign.has(b.id)) aged.push(b);
 		}
 		return aged;
 	}

@@ -52,7 +52,7 @@ import type { ViewBlock } from "../../../core/conductor/contract";
 import type { BlockKind } from "../../../core/types";
 import type { ConductorView } from "../../../core/conductor/view";
 // The SINGLE remaining tag-authoring site imports the canonical tag builder — never a copy.
-import { foldTag } from "../../../core/digest";
+import { foldTag, isBolted } from "../../../core/digest";
 // The run-boundary snapper mirrors Truth's group snapping EXACTLY by importing the SAME messageKey
 // function the engine's `snappedRange` walks (core/truth.ts → opGroup), never a re-implementation —
 // so a run's member set is a provable fixed point of what Truth actually groups. See `safeRunFromUnits`.
@@ -201,6 +201,13 @@ export function buildUnits(blocks: readonly ViewBlock[]): Unit[] {
 
 	const units: Unit[] = [];
 	for (const b of blocks) {
+		// A BOLTED block (`isBolted` — today the `system` prompt, which is always blocks[0]) never
+		// becomes a unit, so it can never join a stratum run nor carry a per-block fold. Every op
+		// targeting it would be clamped `bolted` anyway, but a GROUP is refused WHOLE on that clamp:
+		// a run that spanned index 0 would take the whole stratum down with it. Excluding it here makes
+		// it a run boundary instead. Its tokens still count — `project()` builds from `stats()`, which
+		// includes the block — it simply offers no savings, which is exactly right for a fixed floor.
+		if (isBolted(b)) continue;
 		// A tool_result already swallowed by its call's unit is skipped (it was emitted with the call).
 		if (b.kind === "tool_result" && pairedResultIds.has(b.id)) continue;
 

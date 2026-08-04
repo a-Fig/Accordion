@@ -18,7 +18,12 @@ export type TruthEvent =
 	| { type: "ops-applied"; by: Actor; results: OpResult[]; rev: number }
 	/** A config dial moved (budget / contextWindow / protectTokens / calibration / systemPrompt). Only
 	 *  the changed field(s). `calibration` (v18) is HOST-set only — see `Truth.setCalibration`.
-	 *  `systemPrompt` (v19, issue #93) is HOST-set only — see `Truth.setSystemPrompt`. */
+	 *  `systemPrompt` (v19, issue #93) is HOST-set only — see `Truth.setSystemPrompt`. Since v21 the
+	 *  prompt is a real BOLTED `system` BLOCK rather than a scalar, but the event stays on `config`:
+	 *  it is the replayable INPUT a replica turns into a create-or-replace of its own system block
+	 *  (an `appended` event can express neither a replace nor a head insertion). The v20
+	 *  `systemPromptCalibrated` companion is gone — the block's calibration coverage is now the
+	 *  ordinary `order <= calibrationThroughOrder` test. */
 	| {
 			type: "config";
 			budget?: number;
@@ -26,7 +31,6 @@ export type TruthEvent =
 			protectTokens?: number;
 			calibration?: number;
 			calibrationThroughOrder?: number;
-			systemPromptCalibrated?: boolean;
 			systemPrompt?: { text: string; tokens: number };
 			rev: number;
 	  }
