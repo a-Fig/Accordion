@@ -35,8 +35,8 @@ import type {
 } from "./protocol";
 
 describe("PROTOCOL_VERSION", () => {
-	it("is bumped to 20 for calibration coverage frontiers (issue #102)", () => {
-		expect(PROTOCOL_VERSION).toBe(20);
+	it("is bumped to 21 for conductor readiness (issue #105)", () => {
+		expect(PROTOCOL_VERSION).toBe(21);
 	});
 });
 
@@ -48,6 +48,7 @@ describe("isServerMessage — v13 additions", () => {
 		tailTokens: 5000,
 		holdWireUpToMs: 200,
 		remote: false,
+		readiness: { state: "ready" },
 	};
 
 	it("accepts a hello WITHOUT `conductors` (backward-compatible shape)", () => {

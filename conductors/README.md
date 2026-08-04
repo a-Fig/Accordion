@@ -33,3 +33,19 @@ WebSocket client (`?role=conductor&token=<single-use>`).
 
 Each conductor's own README covers its design in detail — start there for anything beyond a
 one-line orientation.
+
+## Readiness versus degradation
+
+The extension advertises every conductor with host-computed readiness for its **required** startup
+capabilities. Unavailable entries stay visible but disabled in the picker, with a reason and a safe
+manual remediation; selection rechecks the same readiness host-side before disturbing the current
+conductor.
+
+Thermocline is the reference boundary: its Node runner is dependency-free, and a missing Python
+attention probe still leaves its tested age-based policy fallback operational. Probe failure is
+therefore runtime degradation reported through conductor status, not catalog unavailability.
+Triptych's tree-sitter packages enable its defining skeletonization behavior, so failure to resolve
+either package makes Triptych unavailable until its nested `npm install` has been run. Resolution is
+the generic catalog gate; Triptych adds a runner-side preflight that initializes its parser and every
+grammar before connecting, catching corrupt or incompatible installs without weakening the generic
+registry contract.

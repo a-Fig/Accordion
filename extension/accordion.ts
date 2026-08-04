@@ -3,7 +3,7 @@
  *
  * The truth moved into the extension: it hosts an in-process `Truth` per session (core/truth.ts —
  * the same class the app once ran). pi's `context` hook is a LOCAL operation against that Truth —
- * NO 250ms GUI plan round trip. A client (the GUI) is a REPLICA + remote control over protocol v12.
+ * NO 250ms GUI plan round trip. A client (the GUI) is a REPLICA + remote control over protocol v21.
  *
  * Per-hook loop (all local, no disk I/O, no await on any client):
  *   1. reconcile pi's `event.messages` against the Truth by a cheap durable-id walk. If it is our
@@ -74,8 +74,9 @@ import {
 	type ControllerInfo,
 } from "../core/protocol";
 import { LiveConductorHost, type SpawnedRunner } from "../core/conductor/liveHost";
-import { catalogMeta } from "../core/conductor/registry";
+import { catalogMeta, type RegistryEntry } from "../core/conductor/registry";
 import type { CompletionRequest, CompletionResult } from "../core/conductor/contract";
+import { conductorReadiness, resolveRunnerPath as resolveConductorRunnerPath } from "./conductorReadiness";
 import {
 	REGISTRY_PROTOCOL,
 	REGISTRY_DIR,
@@ -574,33 +575,31 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			if (ws && ws.readyState === 1) send(ws, m);
 		},
 		mintToken: () => crypto.randomBytes(16).toString("hex"),
+		readiness: readinessOf,
 		spawnRunner,
 		runCompletion,
 		spawnEnv: () => ({ port, sessionKey: sessionId, home: HOME }),
 		now: () => Date.now(),
 	});
 
-	/** Resolve a spawn conductor's runner file on disk (repo checkout only this phase), or null.
-	 *  `entryFile` is relative to `conductors/ws/` (registry contract) — sanitized here so a
-	 *  malformed catalog entry can never resolve outside that directory. */
+	const conductorsWsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "conductors", "ws");
+
+	/** Required-capability readiness shared by hello metadata and host-side selection enforcement. */
+	function readinessOf(entry: RegistryEntry) {
+		return conductorReadiness(entry, conductorsWsDir);
+	}
+
+	/** Resolve a sanitized spawn runner path. Module requirements are checked separately above. */
 	function resolveRunnerPath(entryFile: string): string | null {
-		try {
-			if (typeof entryFile !== "string" || entryFile.length === 0) return null;
-			if (path.isAbsolute(entryFile) || entryFile.split(/[\\/]/).includes("..")) return null;
-			const here = path.dirname(fileURLToPath(import.meta.url));
-			const p = path.resolve(here, "..", "conductors", "ws", entryFile);
-			return fs.existsSync(p) ? p : null;
-		} catch {
-			return null;
-		}
+		return resolveConductorRunnerPath(conductorsWsDir, entryFile);
 	}
 
 	/**
 	 * Launch a spawn conductor's runner in its own Node process (NOT detached, so it dies with pi),
 	 * piping stderr into a bounded buffer surfaced via `conductorStatus` on an unexpected exit. The
 	 * returned handle's `kill()` sends SIGTERM first, SIGKILL on a second call — the grace loop lives
-	 * in `LiveConductorHost`. Returns null when the runner file is absent (thermocline then simply
-	 * doesn't appear in the catalog, and a defensive `select` of it undoes cleanly).
+	 * in `LiveConductorHost`. Returns null when the runner disappears after readiness was checked;
+	 * selection then fails transactionally without acquiring locks.
 	 */
 	function spawnRunner(entryFile: string, env: Record<string, string>): SpawnedRunner | null {
 		const runnerPath = resolveRunnerPath(entryFile);
@@ -1899,9 +1898,9 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// v16: re-read the controller lease from disk so this client's hello carries the current lease
 		// (and any external change it reveals is broadcast to already-connected clients).
 		refreshControllerNow();
-		// hello advertises the conductor catalog (thermocline only if its runner resolves on disk) plus
-		// the current controller lease (v16).
-		send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta, conductors: catalogMeta((entryFile) => resolveRunnerPath(entryFile) !== null), controller: controllerInfo() });
+		// hello advertises every conductor with host-computed required-capability readiness, plus the
+		// current controller lease (v16). Optional degradation remains a runtime status concern.
+		send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta, conductors: catalogMeta(readinessOf), controller: controllerInfo() });
 		sendSnapshot(ws);
 		// P1-6: a freshly attached REMOTE conductor gets an initial turn-committed right AFTER its
 		// snapshot — by now the spawned SDK has hydrated its replica and run `conductor.attach`, so its
