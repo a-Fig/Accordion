@@ -1229,10 +1229,12 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 	});
 });
 
-// Issue #93: the system prompt as a scalar Truth fact — never a Block (no id, so no fold/pin/group
-// affordance can ever target it), captured/pushed via the same config-dial shape as `calibration`/
-// `contextWindow`, and folded into `liveTokens()`/`fullTokens()` (un-smearing it out of ADR 0025's
-// calibration pairing — see that ADR's issue-#93 addendum).
+// Issue #93, redesigned in v22: the system prompt is a real BOLTED `system` BLOCK — the first entry
+// of the log (id `sys:0`, order -1) — not a scalar. Still captured/pushed through the same
+// `setSystemPrompt` + `config`-event shape as before (that seam is what keeps the extension capture
+// path, the wire, and replica replay unchanged), and still folded into `liveTokens()`/`fullTokens()`
+// — now naturally, as one more term in the block loop, which is what un-smears it out of ADR 0025's
+// calibration pairing (see that ADR's issue-#93 addendum).
 describe("Truth — systemPrompt (issue #93)", () => {
 	it("defaults to null", () => {
 		const t = bulk(seq(2, 1000));
@@ -1274,18 +1276,98 @@ describe("Truth — systemPrompt (issue #93)", () => {
 		expect(t.systemPrompt).toEqual({ text: "a real one", tokens: 4 });
 	});
 
-	it("liveTokens()/fullTokens() include the raw system-prompt estimate (un-smearing); blockCount is unaffected", () => {
+	it("liveTokens()/fullTokens() include the system-prompt estimate (un-smearing); it now counts as a block", () => {
 		const t = bulk(seq(4, 1000));
 		t.setProtect(0);
 		const before = t.stats();
 		expect(before.fullTokens).toBe(4000);
 		expect(before.liveTokens).toBe(4000);
+		expect(before.blockCount).toBe(4);
 
 		t.setSystemPrompt("x".repeat(2000), 500);
 		const after = t.stats();
 		expect(after.fullTokens).toBe(4500);
 		expect(after.liveTokens).toBe(4500);
-		expect(after.blockCount).toBe(4); // block-only — untouched
+		// v22: the prompt IS a block now, so `blockCount` counts it — the totals above are unchanged
+		// because they always included its cost, just via a special-cased addend instead of the loop.
+		expect(after.blockCount).toBe(5);
+		expect(t.blocks[0].kind).toBe("system"); // first in the log
+		expect(t.blocks[0].order).toBe(-1); // sorts first without renumbering anything else
+		expect(t.blocks.slice(1).map((b) => b.order)).toEqual([0, 1, 2, 3]);
+	});
+
+	it("its tokens are a FIXED FLOOR — nothing folds it, so liveTokens can never drop below its cost", () => {
+		const t = bulk(seq(4, 1000));
+		t.setProtect(0);
+		t.setSystemPrompt("x".repeat(2000), 500);
+		// Fold every foldable block: the prompt's 500 tokens survive whole.
+		t.apply([{ kind: "fold", ids: t.blocks.filter((b) => b.kind === "text").map((b) => b.id) }], "you");
+		expect(t.liveTokens()).toBeGreaterThanOrEqual(500);
+		expect(t.effTokens(t.systemBlock()!)).toBe(500);
+		expect(t.isFolded(t.systemBlock()!)).toBe(false);
+	});
+
+	it("a CHANGED prompt REPLACES the block in place (append is idempotent by id — a second one would be dropped)", () => {
+		const t = bulk(seq(2, 1000));
+		t.setSystemPrompt("first prompt", 100);
+		expect(t.blocks.length).toBe(3);
+		const rev1 = t.rev;
+
+		t.setSystemPrompt("second, longer prompt", 250);
+		expect(t.blocks.length).toBe(3); // replaced, not appended
+		expect(t.systemBlock()!.text).toBe("second, longer prompt");
+		expect(t.systemBlock()!.tokens).toBe(250); // BOTH text and tokens updated
+		expect(t.blocks[0].id).toBe("sys:0"); // same id, same position
+		expect(t.rev).toBe(rev1 + 1);
+		expect(t.fullTokens()).toBe(2250);
+
+		// A same-value re-capture is a genuine no-op: no rev bump, no event for a replica to replay.
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+		t.setSystemPrompt("second, longer prompt", 250);
+		expect(t.rev).toBe(rev1 + 1);
+		expect(events.length).toBe(0);
+	});
+
+	it("is BOLTED — every op targeting it is clamped `bolted`, and a group spanning it is refused WHOLE", () => {
+		// A minimal guard-rail check only; the exhaustive bolted suite is a separate piece of work.
+		const t = bulk(seq(3, 1000));
+		t.setProtect(0);
+		t.setSystemPrompt("the prompt", 50);
+		const sys = "sys:0";
+
+		for (const by of ["you", "auto", "agent"] as const) {
+			expect(t.apply([{ kind: "fold", ids: [sys] }], by).results[0].clamped).toBe("bolted");
+			expect(t.apply([{ kind: "unfold", ids: [sys] }], by).results[0].clamped).toBe("bolted");
+			expect(t.apply([{ kind: "pin", ids: [sys] }], by).results[0].clamped).toBe("bolted");
+			expect(t.apply([{ kind: "unpin", ids: [sys] }], by).results[0].clamped).toBe("bolted");
+			expect(t.apply([{ kind: "auto", ids: [sys] }], by).results[0].clamped).toBe("bolted");
+		}
+		expect(t.apply([{ kind: "replace", id: sys, content: "gotcha" }], "auto").results[0].clamped).toBe("bolted");
+
+		// A group whose SNAPPED range contains it is refused whole with `bolted` — never trimmed to
+		// exclude it, and never mislabelled `invalid-group` (which would invite a retry).
+		const grouped = t.apply([{ kind: "group", ids: [sys, "a:b1:p0"] }], "auto");
+		expect(grouped.results[0].applied).toBe(false);
+		expect(grouped.results[0].clamped).toBe("bolted");
+		expect(t.groups.length).toBe(0);
+
+		// Nothing moved: still live, still un-held, still full cost.
+		expect(t.isFolded(t.systemBlock()!)).toBe(false);
+		expect(t.held(t.systemBlock()!)).toBe(false);
+		expect(t.canFold(t.systemBlock()!, "you")).toBe(false);
+	});
+
+	it("carries no `{#code FOLDED}` tag and is unreachable from the agent's unfold/recall", () => {
+		const t = bulk(seq(2, 1000));
+		t.setSystemPrompt("the prompt", 50);
+		const sys = t.systemBlock()!;
+		expect(t.digestOf(sys)).not.toContain("FOLDED"); // only foldable kinds are tagged
+		// `resolveUnfold`/`resolveRecall` both match on `isFolded && wireFoldable && isDurableId`; the
+		// system block fails all three, so its code can never resolve to anything.
+		const code = foldCode(sys.id);
+		expect(t.computeFoldOps().some((o) => o.id === sys.id)).toBe(false);
+		expect(t.blocks.filter((b) => foldCode(b.id) === code && t.isFolded(b)).length).toBe(0);
 	});
 
 	it("is a no-op contribution when uncaptured (every CC/demo/file session)", () => {
@@ -1295,12 +1377,55 @@ describe("Truth — systemPrompt (issue #93)", () => {
 		expect(t.stats().fullTokens).toBe(3000);
 	});
 
-	it("computeProtectedFromIndex is unaffected — it walks raw block tokens directly, never through liveTokens()/fullTokens()", () => {
+	it("the protected SET is unaffected — a head insertion shifts the boundary INDEX by one and nothing else", () => {
 		const withSp = bulk(seq(5, 1000));
 		withSp.setProtect(2500);
 		const pfiBefore = withSp.protectedFromIndex();
+		const protectedBefore = withSp.blocks.slice(pfiBefore).map((b) => b.id);
+
 		withSp.setSystemPrompt("x".repeat(40_000), 10_000); // a huge system prompt
-		expect(withSp.protectedFromIndex()).toBe(pfiBefore); // the tail boundary did not move
+
+		// `protectedFromIndex` is an ARRAY INDEX and the prompt occupies index 0, so it necessarily
+		// moves by exactly one. What must not change — and does not, because the tail walk runs from
+		// the END — is WHICH blocks are protected.
+		expect(withSp.protectedFromIndex()).toBe(pfiBefore + 1);
+		expect(withSp.blocks.slice(withSp.protectedFromIndex()).map((b) => b.id)).toEqual(protectedBefore);
+		expect(withSp.isProtected(withSp.systemBlock()!)).toBe(false); // and it never joins the tail
+	});
+
+	it("stays in the foldable box even when a short conversation fits entirely inside the protected target", () => {
+		const t = bulk(seq(1, 1000));
+		t.setProtect(20_000);
+		expect(t.protectedFromIndex()).toBe(0); // the lone conversation block starts protected
+
+		t.setSystemPrompt("short-session prompt", 50);
+
+		expect(t.blocks.map((b) => b.kind)).toEqual(["system", "text"]);
+		expect(t.protectedFromIndex()).toBe(1); // older/foldable slice contains exactly the system tile
+		expect(t.isProtected(t.systemBlock()!)).toBe(false);
+		expect(t.isProtected(t.blocks[1])).toBe(true);
+	});
+
+	it("keeps a replaced prompt raw until a receipt covers the new text", () => {
+		const t = bulk(seq(2, 1000));
+		t.setSystemPrompt("first prompt", 100);
+		t.setCalibration(2, 1);
+		expect(t.systemPromptCalibrated).toBe(true);
+		expect(t.calBlockTokens(t.systemBlock()!, 100)).toBe(200);
+
+		// Same id/order, different content: the old receipt cannot calibrate the replacement.
+		t.setSystemPrompt("replacement prompt", 100);
+		expect(t.systemPromptCalibrated).toBe(false);
+		expect(t.calBlockTokens(t.systemBlock()!, 100)).toBe(100);
+
+		// The explicit coverage bit must survive a resnapshot; order -1 alone would incorrectly scale it.
+		const replica = hydrateSnapshot(META, serializeSnapshot(t, false));
+		expect(replica.systemPromptCalibrated).toBe(false);
+		expect(replica.calBlockTokens(replica.systemBlock()!, 100)).toBe(100);
+
+		t.setCalibration(2, 1);
+		expect(t.systemPromptCalibrated).toBe(true);
+		expect(t.calBlockTokens(t.systemBlock()!, 100)).toBe(200);
 	});
 
 	it("survives rebuildFrom as a captured fact, while its calibration coverage resets", () => {
@@ -1316,37 +1441,48 @@ describe("Truth — systemPrompt (issue #93)", () => {
 		expect(firstBuild.systemPrompt).toBe(null); // not polluted by ANY prior state
 	});
 
-	it("round-trips through serializeSnapshot → hydrateSnapshot (replica replay parity)", () => {
+	it("round-trips through serializeSnapshot → hydrateSnapshot as an ordinary block (replica replay parity)", () => {
 		const host = live();
 		host.append(seq(2, 1000));
 		host.setSystemPrompt("a prompt", 3);
 
 		const state = serializeSnapshot(host, false);
-		expect(state.systemPrompt).toEqual({ text: "a prompt", tokens: 3 });
+		// v22: no `systemPrompt` scalar on the snapshot — it rides in `blocks` like everything else.
+		expect((state as Record<string, unknown>).systemPrompt).toBeUndefined();
+		expect(state.blocks[0]).toMatchObject({ id: "sys:0", kind: "system", order: -1, text: "a prompt", tokens: 3 });
+		expect(state.systemPromptCalibrated).toBe(false);
 
 		const replica = hydrateSnapshot(META, state);
 		expect(replica.systemPrompt).toEqual({ text: "a prompt", tokens: 3 });
 		expect(replica.rev).toBe(host.rev);
-
-		// A stale-format peer that omits `systemPrompt` (pre-v19) falls back to null rather than
-		// forking on `undefined` — never a decision-affecting divergence.
-		const stale = hydrateSnapshot(META, { ...state, systemPrompt: undefined });
-		expect(stale.systemPrompt).toBe(null);
+		expect(replica.fullTokens()).toBe(host.fullTokens());
 	});
 
-	it("adoptSnapshot self-validates a malformed shape (bad text/tokens type) to null, same guard shape as calibration", () => {
+	it("a snapshot with NO system block hydrates to a silent absence, not a placeholder", () => {
 		const host = live();
 		host.append(seq(2, 1000));
 		const state = serializeSnapshot(host, false);
+		expect(state.blocks.some((b) => b.kind === "system")).toBe(false);
 
-		const badTokens = hydrateSnapshot(META, { ...state, systemPrompt: { text: "ok", tokens: NaN } });
-		expect(badTokens.systemPrompt).toBe(null);
+		const replica = hydrateSnapshot(META, state);
+		expect(replica.systemPrompt).toBe(null);
+		expect(replica.systemBlock()).toBeUndefined();
+		expect(replica.stats().blockCount).toBe(2);
+	});
 
-		const badText = hydrateSnapshot(META, { ...state, systemPrompt: { text: 5 as unknown as string, tokens: 3 } });
-		expect(badText.systemPrompt).toBe(null);
-
-		const negativeTokens = hydrateSnapshot(META, { ...state, systemPrompt: { text: "ok", tokens: -1 } });
-		expect(negativeTokens.systemPrompt).toBe(null);
+	it("setSystemPrompt is the sole validation seam — a malformed shape never reaches the block log", () => {
+		// The v19/v20 `adoptSnapshot` self-validation of a `systemPrompt` scalar is gone with the
+		// scalar. Its coverage moves here: the ONLY way a system block is ever created (host capture or
+		// a replica replaying a `config` event) runs through `setSystemPrompt`, which refuses a
+		// malformed shape outright rather than poisoning `liveTokens()`/`fullTokens()` with NaN.
+		const t = live();
+		t.append(seq(2, 1000));
+		t.setSystemPrompt("ok", NaN);
+		t.setSystemPrompt("ok", -1);
+		t.setSystemPrompt(5 as unknown as string, 3);
+		expect(t.systemBlock()).toBeUndefined();
+		expect(t.blocks.length).toBe(2);
+		expect(Number.isFinite(t.fullTokens())).toBe(true);
 	});
 
 	it("a config event carrying ONLY systemPrompt replays via applyWireEvent without touching the other dials", () => {

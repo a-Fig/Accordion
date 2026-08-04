@@ -119,13 +119,30 @@
  *  - v21: every advertised conductor carries required-capability readiness. Unavailable
  *    conductors remain visible with a reason/remediation, while hosts reject stale or forged
  *    selection commands for them before disturbing the current conductor (issue #105).
+ *  - v22: the system prompt becomes a BLOCK, replacing v19's scalar. `WireBlock.kind` (and
+ *    `WIRE_KINDS`, and `ViewBlock.kind` in `core/conductor/contract.ts`) gains a sixth kind,
+ *    `"system"` — the agent's effective prompt, carried as the FIRST block in the log
+ *    (`SYSTEM_BLOCK_ID` = `"sys:0"`, `order` -1) and BOLTED: no actor — human, conductor, or agent —
+ *    may fold, group, pin, or replace it, and `ClampReason` gains `"bolted"` to say so permanently
+ *    rather than through a misleading incidental clamp. Its tokens are counted in `liveTokens`/
+ *    `fullTokens` as a fixed floor, now naturally (it is in the block log) rather than as a special
+ *    addend. Consequently `SnapshotState.systemPrompt` is REMOVED — the prompt rides in `blocks`
+ *    like every other block. `systemPromptCalibrated` remains because a prompt can be replaced in
+ *    place at order -1 after the latest receipt; order alone cannot prove the receipt covered the
+ *    current text. The `config` event's `systemPrompt` field STAYS: it is the replayable
+ *    input a replica turns into a create-or-replace of its own `system` block (an `appended` event
+ *    could not express a REPLACE, and would land the block at the end of the log besides). A session
+ *    with no sourceable prompt emits no block at all — silent absence, never a placeholder. Bumped
+ *    because a pre-v22 peer would reject every `system` WireBlock at `isWireBlock` and drop the
+ *    prompt (and its tokens) silently, while a pre-v22 HOST would send a scalar a v22 client no
+ *    longer reads.
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import { sanitizeOps, type Op, type OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 21;
+export const PROTOCOL_VERSION = 22;
 
 /**
  * The DOOR: a fixed, well-known loopback port that exactly ONE extension binds at a time as an
@@ -153,10 +170,17 @@ export const DEFAULT_PORT = DOOR_PORT;
  *   • `r:<toolCallId>`                     — a tool_result message
  *   • `s:<timestamp>`                      — a summary/other message
  * Fallback (anchor absent): positional `m<i>:u|p<j>|r|s`.
+ *
+ * The one exception is the `system` block (v22): its id is the constant `SYSTEM_BLOCK_ID`
+ * (`"sys:0"`, `core/types.ts`) and its `order` is -1, because the agent's system prompt is not a
+ * member of pi's `messages` array at all — it rides the provider request's own `system` field, so
+ * there is no message to anchor an id to and nothing positional to re-identify. It is deliberately
+ * NOT a durable id (`isDurableId` rejects `"sys:"`), which is a free extra wall keeping it off every
+ * fold/group wire path.
  */
 export interface WireBlock {
 	id: string;
-	kind: "user" | "text" | "thinking" | "tool_call" | "tool_result";
+	kind: "system" | "user" | "text" | "thinking" | "tool_call" | "tool_result";
 	turn: number;
 	order: number;
 	text: string;
@@ -296,16 +320,12 @@ export interface SnapshotState {
 	calibration?: number;
 	/** Last block order covered by `calibration`, or `null` before the first usable receipt (v20). */
 	calibrationThroughOrder?: number | null;
-	/** Whether the current system prompt was covered by that same receipt (v20). */
+	/** Whether the current system block was present on the request covered by `calibration`. A prompt
+	 *  replacement invalidates this even though the stable block keeps order -1 (v20, retained in v22). */
 	systemPromptCalibrated?: boolean;
-	/**
-	 * The current effective system prompt (`Truth.systemPrompt`, v19, issue #93) — see the protocol
-	 * History note above. Optional AND nullable: a peer/test literal without the field still
-	 * type-checks (the v19 bump is the real cross-version gate, same treatment as `calibration`), and
-	 * a live session legitimately has `null` before its first `context` hook captures a value. A
-	 * hydrating replica defaults an absent field to `null` (same as an explicit `null`).
-	 */
-	systemPrompt?: { text: string; tokens: number } | null;
+	// NOTE (v22): the v19/v20 `systemPrompt` scalar is GONE. The agent's system prompt is now the first
+	// entry of `blocks` (a `system` WireBlock, id `"sys:0"`, order -1). A session that never captured a
+	// prompt simply has no such block — silent absence.
 	rev: number;
 }
 
@@ -334,6 +354,13 @@ export type WireEvent =
 			calibration?: number;
 			calibrationThroughOrder?: number;
 			systemPromptCalibrated?: boolean;
+			/**
+			 * A create-or-replace of the `system` block (v22; v19's field, kept while its scalar sibling
+			 * in `SnapshotState` was dropped). A replica replays it through `Truth.setSystemPrompt`,
+			 * which reconstructs the block deterministically at the head of its own log. It rides
+			 * `config` rather than `appended` because `appended` can express neither a REPLACE (pi's
+			 * effective prompt genuinely changes mid-session) nor a head insertion.
+			 */
 			systemPrompt?: { text: string; tokens: number };
 			rev: number;
 	  }
@@ -703,7 +730,7 @@ export function isClientMessage(v: unknown): v is ClientMessage {
 	return CLIENT_TYPES.has((v as { type: unknown }).type as string);
 }
 
-const WIRE_KINDS = new Set(["user", "text", "thinking", "tool_call", "tool_result"]);
+const WIRE_KINDS = new Set(["system", "user", "text", "thinking", "tool_call", "tool_result"]);
 
 /**
  * Element-level guard for a `WireBlock`. `isServerMessage` vets only the `type` tag, and an

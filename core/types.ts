@@ -14,11 +14,44 @@
  */
 
 export type BlockKind =
+	| "system" // the harness's own system prompt — BOLTED (see `SYSTEM_BLOCK_ID` / `isBolted`)
 	| "user" // the human's instruction/intent — highest durable value
 	| "text" // an assistant reply / conclusion
 	| "thinking" // ephemeral assistant reasoning
 	| "tool_call" // WHAT the agent did (tiny, durable record of an action)
 	| "tool_result"; // WHAT the agent saw (often huge, decays fast)
+
+/**
+ * The id of the ONE `system` block a Truth may hold — the agent's current effective system prompt.
+ *
+ * Singular and constant by construction: pi has exactly one effective prompt at a time, and a
+ * CHANGED prompt REPLACES this block in place (`Truth.setSystemPrompt`) rather than appending a
+ * second one. A stable id is what makes that replacement expressible at all — `Truth.append` is
+ * idempotent by id, so a "new" system block under a fresh id every capture would either pile up or
+ * be silently dropped.
+ *
+ * It is deliberately NOT a durable, content-anchored wire id (`core/wire.ts`'s `isDurableId` rejects
+ * it — `"sys:"` is not the `"s:"` prefix): the system prompt is not a member of pi's `messages`
+ * array at all (it rides the provider request's own `system` field), so nothing on the wire can ever
+ * re-identify it positionally. Non-durability is a free extra wall — `Truth.canFold`, `opFold`'s
+ * `non-durable` clamp, `computeFoldOps`, `collapsibleMessageKeys` and `computeGroupOps` all refuse a
+ * non-durable id with a live wire attached, so even if a future bolted-guard regressed, the block
+ * still could not reach the wire as a fold or a group member. See `isBolted` in `core/digest.ts`.
+ */
+export const SYSTEM_BLOCK_ID = "sys:0";
+
+/**
+ * The `order` every `system` block carries. Conversation blocks are numbered from 0 by
+ * `linearize`, so `-1` sorts the system prompt FIRST without renumbering a single existing block —
+ * and, critically, without shifting `Truth.calibrationThroughOrder`'s meaning (a receipt frontier of
+ * `n` still covers exactly the same conversation blocks it did before, and now also covers the
+ * system prompt, which every wire that receipt measured genuinely carried).
+ *
+ * It also lands the block on the right side of `Truth.sent`: a live session starts at
+ * `sentThroughOrder === -1`, so `-1 <= -1` makes the system prompt "already sent" from birth — true
+ * (it rides every request) and the reason it is never birth-fold-eligible nor listed in `freshIds`.
+ */
+export const SYSTEM_BLOCK_ORDER = -1;
 
 /**
  * Who last changed a block's fold state.

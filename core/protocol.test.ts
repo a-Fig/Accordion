@@ -10,7 +10,7 @@
  * `holdRelease`/`cancelComplete` messages and a `holdId` on `wireDeparting`.
  */
 import { describe, it, expect } from "vitest";
-import { isServerMessage, isClientMessage, sanitizeCommand, sanitizeSurfaceId, sanitizeSurfaceLabel, PROTOCOL_VERSION } from "./protocol";
+import { isServerMessage, isClientMessage, isWireBlock, sanitizeCommand, sanitizeSurfaceId, sanitizeSurfaceLabel, PROTOCOL_VERSION } from "./protocol";
 import type {
 	HelloMessage,
 	ControllerMessage,
@@ -35,8 +35,8 @@ import type {
 } from "./protocol";
 
 describe("PROTOCOL_VERSION", () => {
-	it("is bumped to 21 for conductor readiness (issue #105)", () => {
-		expect(PROTOCOL_VERSION).toBe(21);
+	it("is bumped to 22 for the bolted `system` block kind (issue #93 redesign)", () => {
+		expect(PROTOCOL_VERSION).toBe(22);
 	});
 });
 
@@ -243,10 +243,13 @@ describe("v17 — notice message guard", () => {
 	});
 });
 
-// ── v19: system prompt visibility (issue #93) ─────────────────────────────────
-describe("v19 — systemPrompt on SnapshotState / config WireEvent", () => {
+// ── v22: the system prompt as a bolted `system` BLOCK (issue #93, redesigned) ──────────────────
+// v19/v20 carried it as a `SnapshotState.systemPrompt` scalar; it now rides in `blocks` as an
+// ordinary WireBlock, so the element-level guard — not the snapshot shape — is what has to accept it.
+describe("v22 — the `system` wire block kind", () => {
+	const systemBlock = { id: "sys:0", kind: "system", turn: 0, order: -1, text: "You are helpful.", tokens: 4 };
 	const baseState = {
-		blocks: [],
+		blocks: [systemBlock],
 		overlay: [],
 		groups: [],
 		budget: 70_000,
@@ -262,18 +265,27 @@ describe("v19 — systemPrompt on SnapshotState / config WireEvent", () => {
 		rev: 0,
 	};
 
-	it("accepts a snapshot whose state carries a captured systemPrompt", () => {
-		const msg = { type: "snapshot" as const, state: { ...baseState, systemPrompt: { text: "You are helpful.", tokens: 4 } } };
-		expect(isServerMessage(msg)).toBe(true);
+	it("isWireBlock accepts kind:\"system\" (a pre-v22 peer would drop the prompt silently)", () => {
+		expect(isWireBlock(systemBlock)).toBe(true);
 	});
 
-	it("accepts a snapshot whose state carries systemPrompt: null (not yet captured)", () => {
-		const msg = { type: "snapshot" as const, state: { ...baseState, systemPrompt: null } };
-		expect(isServerMessage(msg)).toBe(true);
+	it("isWireBlock still rejects an unmodelled kind — the set is enumerated, not open", () => {
+		expect(isWireBlock({ ...systemBlock, kind: "sys" })).toBe(false);
+		expect(isWireBlock({ ...systemBlock, kind: "prompt" })).toBe(false);
 	});
 
-	it("accepts a snapshot whose state OMITS systemPrompt entirely (pre-v19 literal, backward-compatible shape)", () => {
+	it("accepts a snapshot whose blocks lead with the system block", () => {
 		const msg = { type: "snapshot" as const, state: baseState };
+		expect(isServerMessage(msg)).toBe(true);
+	});
+
+	it("accepts a snapshot with NO system block (silent absence — never captured)", () => {
+		const msg = { type: "snapshot" as const, state: { ...baseState, blocks: [] } };
+		expect(isServerMessage(msg)).toBe(true);
+	});
+
+	it("accepts a config event carrying the create-or-replace systemPrompt payload", () => {
+		const msg = { type: "event" as const, event: { kind: "config" as const, systemPrompt: { text: "You are helpful.", tokens: 4 }, rev: 3 } };
 		expect(isServerMessage(msg)).toBe(true);
 	});
 });

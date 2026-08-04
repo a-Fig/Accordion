@@ -62,7 +62,9 @@ export function serializeSnapshot(truth: Truth, foldingEnabled: boolean): Snapsh
 		calibration: truth.calibration,
 		calibrationThroughOrder: truth.calibrationThroughOrder,
 		systemPromptCalibrated: truth.systemPromptCalibrated,
-		systemPrompt: truth.systemPrompt,
+		// v22: no `systemPrompt` scalar. The agent's prompt is the first entry of `blocks` above (a
+		// `system` WireBlock), so it serializes and hydrates like any other block — and a session that
+		// never captured one simply has no such block (silent absence, never a placeholder).
 		rev: truth.rev,
 	};
 }
@@ -109,9 +111,6 @@ export function hydrateSnapshot(meta: SessionMeta, state: SnapshotState): Truth 
 		calibration: calibrationThroughOrder === null ? 1 : (state.calibration ?? 1),
 		calibrationThroughOrder,
 		systemPromptCalibrated: calibrationThroughOrder === null ? false : (state.systemPromptCalibrated ?? false),
-		// Optional AND nullable on the wire (v19, issue #93); default `null` for a peer/test literal
-		// that omits it — the host serializer always emits the field (as `null` before first capture).
-		systemPrompt: state.systemPrompt ?? null,
 		rev: state.rev,
 	});
 	return truth;
@@ -191,6 +190,10 @@ export function applyWireEvent(truth: Truth, ev: WireEvent): void {
 			if (ev.calibration !== undefined && ev.calibrationThroughOrder !== undefined) {
 				truth.setCalibration(ev.calibration, ev.calibrationThroughOrder);
 			}
+			// v22: this create-or-replaces the replica's own BOLTED `system` block at the head of its log
+			// (`Truth.setSystemPrompt` → `insertSystemBlock`), reconstructing it deterministically from
+			// the event rather than receiving it as an `appended` block. Host and replica therefore bump
+			// `rev` by exactly one on the same input, keeping the replay assertion meaningful.
 			if (ev.systemPrompt !== undefined) truth.setSystemPrompt(ev.systemPrompt.text, ev.systemPrompt.tokens);
 			return;
 		case "locks":

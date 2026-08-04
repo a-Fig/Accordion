@@ -36,6 +36,7 @@
 		| 'play'
 		| 'square'
 		| 'fold'
+		| 'bolt'
 		| 'accordion';
 
 	// Raw inner SVG markup for each icon (Lucide 24×24 path geometry).
@@ -85,6 +86,11 @@
 		'square': `<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>`,
 		// Brand 'fold' glyph — the signature action icon (stroke-width 2).
 		'fold': `<path stroke-width="2" d="M8 5l4 3 4-3"/><path stroke-width="2" d="M4 12h16"/><path stroke-width="2" d="M8 19l4-3 4 3"/>`,
+		// 'bolt' — the BOLTED mark (system prompt / `isBolted`, see CLAUDE.md "Visual grammar").
+		// A flat-top/bottom hex "bolt head" + centre dot, the SAME geometry as the canvas glyph
+		// `tileDraw.ts`'s `drawBoltHead` draws on the map tile, so the tile, the transcript row
+		// flag, and this Inspector-pill icon all read as one metaphor.
+		'bolt': `<polygon points="21 12 16.5 4.2 7.5 4.2 3 12 7.5 19.8 16.5 19.8"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/>`,
 		// Generic bellows glyph fallback. The real brand mark is raster art
 		// (brand.md: "not vector"), rendered from the PNG via Logo.svelte — the
 		// chrome uses <Logo>, not this icon. Kept only as a named fallback.
