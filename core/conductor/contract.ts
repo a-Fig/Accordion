@@ -66,7 +66,7 @@ export interface ViewBlock {
 export interface StateChange {
 	id?: string;
 	groupId?: string;
-	what: "fold" | "unfold" | "pin" | "unpin" | "group" | "ungroup" | "replace" | "protect" | "budget" | "recall";
+	what: "fold" | "unfold" | "pin" | "unpin" | "group" | "ungroup" | "replace" | "protect" | "budget" | "systemPrompt" | "recall";
 	by: Actor;
 }
 

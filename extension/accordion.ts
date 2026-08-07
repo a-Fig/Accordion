@@ -2356,6 +2356,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		pendingWireEst = null;
 		lastRealTokens = null;
 		lastEstWireTokens = null;
+		// Issue #93 review fix: prompt capture is session-scoped. `refreshFromCtx` is deliberately
+		// best-effort and one optional API throwing can abort the rest of that refresh; without an
+		// eager reset here, `buildTruth` could apply the previous session's cached prompt to the new
+		// Truth, leaking its text and corrupting token totals until a later successful hook refresh.
+		systemPromptText = null;
+		systemPromptTokens = 0;
 		setLastMessages([]); // clears lastMessages + lastFps together (invariant: never one without the other)
 		// E2 (external review round): folding is OPT-IN and OFF by default PER SESSION — reset the
 		// arm on every `session_start`, regardless of `_event.reason` ("startup"/"reload"/"new"/

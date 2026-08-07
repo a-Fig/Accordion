@@ -1799,6 +1799,9 @@ function hostEventsFromTruthEvent(truth, e) {
     return changes.length ? [{ type: "state-changed", changes, rev: e.rev }] : [];
   }
   if (e.type === "config") {
+    if (e.systemPrompt !== void 0) {
+      return [{ type: "state-changed", changes: [{ what: "systemPrompt", by: "you" }], rev: e.rev }];
+    }
     if (e.budget === void 0 && e.protectTokens === void 0 && e.contextWindow === void 0) return [];
     const what = e.budget !== void 0 ? "budget" : "protect";
     return [{ type: "state-changed", changes: [{ what, by: "you" }], rev: e.rev }];
