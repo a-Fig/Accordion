@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "./store.svelte";
 import type { Block, ParsedSession } from "./types";
+import { Truth } from "$core/truth";
 
 // A protected block is NEVER folded — by the auto-folder OR the user. This is the
 // safety pillar; these tests lock it so it can't silently regress.
@@ -181,5 +182,33 @@ describe("local-only mutators refuse to run while a command sink is installed", 
 		expect(() => {
 			s.wireAttached = true;
 		}).not.toThrow();
+	});
+});
+
+// Issue #93: like `calibration`, `systemPrompt` is HOST-SET ONLY — there is no store-side setter a
+// UI action can call. It arrives purely as a mirrored read: seeded from the wrapped Truth at
+// construction, then kept in sync via the "config" case of `applyTruthEvent` whenever the Truth
+// underneath (a replica in live mode, replaying a wire event) emits one.
+describe("systemPrompt mirrors the wrapped Truth's config dial", () => {
+	it("seeds null when the Truth has no captured system prompt yet", () => {
+		const s = makeStore(2);
+		expect(s.systemPrompt).toBe(null);
+	});
+
+	it("seeds from an existingTruth that already has one captured (replica hydration path)", () => {
+		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks: [], lineCount: 0, skipped: 0 };
+		const truth = new Truth(parsed);
+		truth.setSystemPrompt("You are a helpful assistant.", 8);
+		const s = new AccordionStore(parsed, truth);
+		expect(s.systemPrompt).toEqual({ text: "You are a helpful assistant.", tokens: 8 });
+	});
+
+	it("updates reactively when the underlying Truth emits a systemPrompt config event", () => {
+		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks: [], lineCount: 0, skipped: 0 };
+		const truth = new Truth(parsed);
+		const s = new AccordionStore(parsed, truth);
+		expect(s.systemPrompt).toBe(null);
+		truth.setSystemPrompt("captured mid-session", 3); // mirrors a replica replaying an `applyWireEvent` config case
+		expect(s.systemPrompt).toEqual({ text: "captured mid-session", tokens: 3 });
 	});
 });

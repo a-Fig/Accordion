@@ -66,7 +66,7 @@ export interface ViewBlock {
 export interface StateChange {
 	id?: string;
 	groupId?: string;
-	what: "fold" | "unfold" | "pin" | "unpin" | "group" | "ungroup" | "replace" | "protect" | "budget" | "recall";
+	what: "fold" | "unfold" | "pin" | "unpin" | "group" | "ungroup" | "replace" | "protect" | "budget" | "systemPrompt" | "recall";
 	by: Actor;
 }
 
@@ -152,6 +152,12 @@ export interface ConductorHost {
 	textOf(id: string): string | null;
 	/** Aggregate readout of the current state. CALIBRATED — see `TruthStats`'s doc comment. */
 	stats(): TruthStats;
+	/**
+	 * The current effective system prompt, or `null` if none has been captured yet (issue #93).
+	 * Read-only — there is no `Op` kind for it, so it can never be a legal `propose()` target; it is a
+	 * scalar `Truth` fact, not a `Block`.
+	 */
+	systemPrompt(): { text: string; tokens: number } | null;
 	/**
 	 * Synchronous token estimate using the host's tokenizer, CALIBRATED (issue #11 stage 2, ADR 0025)
 	 * against the session's current `Truth.calibration` — same convention as `ViewBlock.tokens` /
