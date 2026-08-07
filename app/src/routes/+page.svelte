@@ -9,12 +9,15 @@
 	import { foldAlarm, runFoldCheck } from "$lib/live/foldAlarm.svelte";
 	import { servedToken } from "$lib/live/servedToken";
 	import { takeoverPopup, demotionToast, dismissTakeoverPopup, dismissDemotionToast } from "$lib/live/controllerUi.svelte";
+	import { notice, dismissNotice } from "$lib/live/notice.svelte";
 	import { DEFAULT_PORT } from "$core/protocol";
 	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
 	import SessionsSidebar from "$lib/ui/live/SessionsSidebar.svelte";
 	import TakeoverPopup from "$lib/ui/live/TakeoverPopup.svelte";
 	import DemotionToast from "$lib/ui/live/DemotionToast.svelte";
+	import NoticeToast from "$lib/ui/live/NoticeToast.svelte";
+	import ToastRegion from "$lib/ui/live/ToastRegion.svelte";
 	import ReadOnlyHint from "$lib/ui/live/ReadOnlyHint.svelte";
 	import MapHeader from "$lib/ui/map/MapHeader.svelte";
 	import ContextMap from "$lib/ui/map/ContextMap.svelte";
@@ -349,7 +352,10 @@
 <!-- Single-controller UX (v16, ADR 0024, spec Part 3) — global overlays, independent of which
      session view is on screen. At most one of popup/toast is ever relevant at a time (the popup
      only fires on a fresh hello; the toast only fires when we're demoted from an already-held
-     lease), but both read their own `$state` so there's nothing to coordinate here. -->
+     lease), but both read their own `$state` so there's nothing to coordinate here. All transient
+     toasts mount inside ToastRegion (the app's single notification corner): it owns the fixed
+     position and vertical stacking, so simultaneous toasts stack instead of overlapping. DOM
+     order = stacking order — controller toasts above informational notices. -->
 {#if takeoverPopup.show}
 	<TakeoverPopup
 		label={takeoverPopup.label}
@@ -360,16 +366,21 @@
 		ondecline={dismissTakeoverPopup}
 	/>
 {/if}
-{#if demotionToast.show}
-	<DemotionToast
-		label={demotionToast.label}
-		onclose={dismissDemotionToast}
-		ontakeback={() => {
-			claimController();
-			dismissDemotionToast();
-		}}
-	/>
-{/if}
+<ToastRegion>
+	{#if demotionToast.show}
+		<DemotionToast
+			label={demotionToast.label}
+			onclose={dismissDemotionToast}
+			ontakeback={() => {
+				claimController();
+				dismissDemotionToast();
+			}}
+		/>
+	{/if}
+	{#if notice.show}
+		<NoticeToast text={notice.text} onclose={dismissNotice} />
+	{/if}
+</ToastRegion>
 <ReadOnlyHint />
 
 <style>

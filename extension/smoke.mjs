@@ -52,6 +52,9 @@ const accordionLive = mod.default;
 if (typeof accordionLive !== "function") throw new Error("default export is not a function");
 // Compute fold codes exactly as the engine does (to correlate a folded digest to its unfold code).
 const { foldCode } = await jiti.import("../core/digest.ts");
+// The LIVE protocol version, not a hardcoded literal — so a version bump doesn't silently desync
+// this smoke test from `core/protocol.ts` (the same rationale as smoke-mock.mjs's import).
+const { PROTOCOL_VERSION } = await jiti.import("../core/protocol.ts");
 
 const fails = [];
 
@@ -103,7 +106,7 @@ const entry = readOnlyEntry();
 if (!(entry.port > 0)) fails.push(`registry port not assigned (got ${entry.port})`);
 if (entry.registryProtocol !== 1) fails.push(`registry protocol mismatch (${entry.registryProtocol})`);
 if (entry.model !== "test/model") fails.push(`model not captured (${entry.model})`);
-if (entry.protocolVersion !== 16) fails.push(`protocol version expected 16, got ${entry.protocolVersion}`);
+if (entry.protocolVersion !== PROTOCOL_VERSION) fails.push(`protocol version expected ${PROTOCOL_VERSION}, got ${entry.protocolVersion}`);
 const PORT = entry.port;
 
 // Durable-id messages (a:/u: prefixes) the whole protocol flow builds on.
@@ -273,7 +276,7 @@ await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2
 );
 {
 	const hello = a.inbox.hello[0];
-	if (hello && hello.protocolVersion !== 16) fails.push(`hello.protocolVersion expected 16, got ${hello?.protocolVersion}`);
+	if (hello && hello.protocolVersion !== PROTOCOL_VERSION) fails.push(`hello.protocolVersion expected ${PROTOCOL_VERSION}, got ${hello?.protocolVersion}`);
 	if (hello && hello.role !== "gui") fails.push(`hello.role expected "gui", got ${hello?.role}`);
 	// Phase C: hello advertises the available-conductor catalog (the GUI picker renders from this).
 	if (hello && (!Array.isArray(hello.conductors) || !hello.conductors.some((c) => c.id === "doorman")))
@@ -691,6 +694,56 @@ if (unfoldTool && foldCodeStr) {
 		if (typeof stillFolded !== "string" || stillFolded.length >= GIANT.length)
 			fails.push("after detach the freeze did not preserve doorman's fold as a human fold");
 	}
+}
+
+// ── native-compaction suppression is gated on foldingEnabled, NOT attached() ────
+// Folding is ARMED (true) here (Phase C step (0) restored it). A connected client (`a`) is attached
+// throughout this block — the whole point of the policy is that attachment alone must NOT suppress.
+{
+	// (1) folding ON + client attached → suppressed, with the "armed" notify.
+	notifications.length = 0;
+	const armedRet = await Promise.resolve(handlers.session_before_compact({ reason: "threshold" }, ctx));
+	if (!armedRet || armedRet.cancel !== true) fails.push("folding ON did not suppress native compaction (expected {cancel:true})");
+	if (!notifications.some((n) => n.message.includes("suppressed"))) fails.push("folding-ON suppression did not notify");
+
+	// (2) folding OFF + client attached → NOT suppressed (owner policy: a viewer with folding off
+	//     leaves pi's own safety net intact) — pi runs its native compaction unhindered.
+	a.inbox.folding.length = 0;
+	a.sendCmd({ kind: "setFolding", value: false });
+	await waitFor(() => a.inbox.folding.some((f) => f.enabled === false), 1500, "folding off (compaction section)").catch(
+		() => fails.push("setFolding(false) was not echoed (compaction section)"),
+	);
+	notifications.length = 0;
+	const offRet = await Promise.resolve(handlers.session_before_compact({ reason: "overflow" }, ctx));
+	if (offRet !== undefined) fails.push("folding OFF still suppressed native compaction (attached() regression)");
+	if (notifications.some((n) => n.message.includes("suppressed"))) fails.push("folding-OFF path unexpectedly emitted the suppression notify");
+
+	// (3) session_compact (post-compaction) fires while a client IS attached → a quiet status notify,
+	//     no cancellation possible (there's nothing to cancel — pi already saved the compaction).
+	// (`session_compact` gating on `attached()` reuses the same primitive already exercised
+	// extensively elsewhere in this file — e.g. the /accordion command's wasAttached branch above and
+	// the READ-ONLY/controller sections below all depend on `attached()` being accurate — so a
+	// dedicated "zero clients" rerun here is not repeated; it would require tearing down both `a` and
+	// `b`, which every later section in this file depends on staying open.)
+	notifications.length = 0;
+	a.inbox.notice = [];
+	b.inbox.notice = [];
+	await Promise.resolve(handlers.session_compact({ reason: "overflow", fromExtension: false, willRetry: false }, ctx));
+	if (!notifications.some((n) => n.message.includes("compacted"))) fails.push("session_compact (attached) did not notify about the native compaction");
+	// v17: the SAME event also broadcasts a `notice` to every connected GUI client (not just whoever
+	// is watching pi's own CLI) — assert both already-connected clients (`a`/`b`) receive it.
+	await waitFor(() => (a.inbox.notice || []).length > 0 && (b.inbox.notice || []).length > 0, 2000, "notice broadcast on native compaction").catch(
+		() => fails.push("session_compact did not broadcast a `notice` message to connected clients"),
+	);
+	if ((a.inbox.notice || []).some((n) => typeof n.text !== "string" || !n.text.includes("compacted")))
+		fails.push("notice broadcast text did not mention the native compaction");
+
+	// Restore folding ON for the sections that follow, which assume it.
+	a.inbox.folding.length = 0;
+	a.sendCmd({ kind: "setFolding", value: true });
+	await waitFor(() => a.inbox.folding.some((f) => f.enabled === true), 1500, "folding on (compaction section restore)").catch(
+		() => fails.push("setFolding(true) restore (compaction section) was not echoed"),
+	);
 }
 
 // ── E2 (external review round): folding must reset to OFF on every session_start ──

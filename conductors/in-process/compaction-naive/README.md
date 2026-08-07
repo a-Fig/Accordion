@@ -14,31 +14,26 @@ then factored the machinery this conductor shared near-verbatim with the sibling
 conductor into `../agedSummaryConductor.ts`'s `AgedSummaryConductor` base class — see that file's
 own doc comment and "Shared base (PR #82)" below.
 
-## User messages: preserved by staying live, not by the summary
+## User messages: swallowed into the summary, preserved by the prompt's promise (main parity)
 
-Pre-#82, this conductor's system prompt PROMISED user messages were reproduced verbatim inside the
-summary, while mechanically folding them into the SAME non-recoverable group as everything else —
-capped at 8000 output tokens, with any nonempty result accepted and nothing checking the promise
-actually held. A single user message larger than the cap made "verbatim" mathematically impossible;
-a smaller one could be silently paraphrased and nothing would notice.
+An earlier revision of this port (PR #82) briefly excluded `user`-kind blocks from the group
+entirely, via a `NaiveCompactionConductor.includeInGroup` override, on the theory that main's
+"reproduce verbatim" promise was mechanically unenforceable for an oversized user message. That
+override has since been REMOVED — this conductor is restored to match origin/main byte-for-byte:
+ALL kinds, including `user`, are swallowed into the single summary group. `COMPACTION_SYSTEM` carries
+main's original instruction verbatim: "USER MESSAGES ARE SACRED. Reproduce EVERY user message
+VERBATIM, in order, exactly as originally written, in the '## User messages' section" — a dedicated
+section the model is expected to fill in completely, while every other kind (assistant text,
+thinking, tool calls, tool results) is genuinely summarized/lossy.
 
-Fixed mechanically, not by prompt-tweaking: `NaiveCompactionConductor.includeInGroup` excludes every
-`user`-kind block from ever becoming a group member. The shared base's run-walk
-(`emitCoverageGroup`) treats an excluded block exactly like a held or foreign-grouped one — it
-forces the run to split around it — so a user block always sits live, at full token cost, either
-between two summary groups or beside one. It is still fed to the completion prompt as CONTEXT (via
-`newlyAged`), so the summary can accurately describe what was asked; it is just never a candidate to
-be folded away.
-
-**The honest cost of this fix: aged user messages stay live, at full token cost, forever.** They are
-never grouped, never folded, never counted as "saved" by the trigger math (see
-`AgedSummaryConductor.conduct`'s `survivors` filter). In a session with a large volume of user text,
-this conductor's real compaction ratio is worse than the pre-#82 numbers implied, because those
-numbers were crediting savings from content that was never safely removable in the first place. This
-is the same rule the UI's own fold gate applies elsewhere in Accordion: user words are sacred, and
-"the conductor collapsed my instructions into a lossy AI paraphrase, silently" is not a trade this
-codebase is willing to make just to hit a better ratio. `handoff` (the sibling conductor) does NOT
-apply this exclusion — see its own README for why that is a deliberate difference, not the same bug.
+**This is a deliberate, unenforced trust, not an oversight.** There is no mechanical check that the
+model actually reproduced every user message intact — the same trust every mainstream `/compact`-
+style tool (Cursor's composer, Claude Code's own `/compact`) places in its summarizer. An oversized or
+silently-paraphrased user message is exactly the kind of quality loss this conductor exists to
+demonstrate as a foil, not something Accordion's own conductor should quietly engineer around —
+engineering around it would make the foil less faithful to what it is imitating, not more useful.
+`handoff` (the sibling conductor) makes the identical choice for the identical reason — see its own
+README.
 
 ## Prompt injection defense
 
@@ -56,7 +51,8 @@ untrusted data, never instructions.
 
 - `compaction-naive.ts` — the `NaiveCompactionConductor` (`AgedSummaryConductor` subclass): the
   `COMPACTION_SYSTEM` prompt, the two `buildPrompt` instruction strings, the count-preamble format,
-  the three status messages, and the `includeInGroup` override that excludes `user` blocks.
+  and the four status messages (empty-output / window-too-tight / reject / unavailable).
+  `includeInGroup` is NOT overridden — every kind, including `user`, is swallowed into the group.
 - `compaction-naive.test.ts` — golden tests against `core/conductor/testhost.ts`'s `TestHost`.
 - `../agedSummaryConductor.ts` — the shared base class (see "Shared base (PR #82)" below).
 
@@ -67,10 +63,10 @@ derivation, foreign-grouped-id exclusion, group-emission run-walk, completion la
 attempt-key/sticky-status lifecycle, and output-token reservation math (`MAX_OUTPUT_TOKENS`(8000) /
 `MIN_OUTPUT_TOKENS`(1000) / `OUTPUT_SAFETY_MARGIN`(512) — this conductor's own copies were literally
 commented "copied verbatim from handoff"). That duplication had already drifted: this conductor was
-missing `handoff`'s prompt-injection neutralizer, and this conductor alone had the user-verbatim bug
-above. `../agedSummaryConductor.ts`'s `AgedSummaryConductor` now owns all of that; this file owns
-only what is genuinely different (documented in its own top-of-file PORT FIDELITY notes) — mainly
-the prompt text and the `includeInGroup` override.
+missing `handoff`'s prompt-injection neutralizer. `../agedSummaryConductor.ts`'s `AgedSummaryConductor`
+now owns all of that (including link-unavailability classification — see "Port fidelity" §1 below);
+this file owns only what is genuinely different (documented in its own top-of-file PORT FIDELITY
+notes) — mainly the prompt text and the four status messages.
 
 ## Port fidelity — real adaptations (not cosmetic)
 
@@ -80,7 +76,14 @@ class's own doc comment for the full detail.
 
 1. **No `host.can()`.** The old contract's `ConductorHost.can("complete"/"countTokens")`
    pre-flight checks are gone from the new contract. `countTokens` is now unconditionally
-   available; a **rejected** `complete()` promise IS the "model unavailable" signal.
+   available; a **rejected** `complete()` promise IS the "model unavailable" signal —
+   `AgedSummaryConductor`'s `isUnavailableError` classifies that rejection (keyed on the exact
+   `"no model available"` message `extension/accordion.ts`'s `runCompletion` throws when the
+   session has no live model) and, on a match, shows the calm main-parity status ("Naive
+   compaction unavailable — waiting for live model link") AND clears the retry gate so the very
+   next pass retries automatically — mirroring main's pre-check exactly, without ever recording a
+   failed attempt for this case. A genuine rejection (a real provider error, a timeout, …) still
+   shows the sticky reject message and still waits for genuinely new content before retrying.
 
 2. **`this.rerun()` replaces `host.requestRerun()`.** `ViewConductor.rerun()` is the adapter's
    local successor: a protected method the subclass calls directly once its async completion
@@ -96,12 +99,12 @@ class's own doc comment for the full detail.
    sets a status that survives subsequent `conduct()` passes until a genuine retry launches or a
    result commits — every idle path calls `surfaceIdleStatus()` instead of bare-clearing the bar.
 
-Everything else — `agedRegion`, the group-emission run-walk (a held/grouped/excluded block splits
-the region into multiple groups, each carrying the same digest), `COMPACTION_SYSTEM`, both
-`buildPrompt` instruction strings, the output-token reservation constants, `lastAttemptKey` retry
-gating, and the stale-completion guard (comparing `AbortController` identity) — is ported/kept
-unchanged in behavior, just relocated to the shared base (or, for the prompt text and
-`includeInGroup`, kept here since they are genuinely this conductor's own).
+Everything else — `agedRegion`, the group-emission run-walk (a held block splits the region into
+multiple groups, each carrying the same digest), `COMPACTION_SYSTEM`, both `buildPrompt` instruction
+strings, the output-token reservation constants, `lastAttemptKey` retry gating, and the
+stale-completion guard (comparing `AbortController` identity) — is ported/kept unchanged in behavior,
+just relocated to the shared base (or, for the prompt text and status messages, kept here since they
+are genuinely this conductor's own).
 
 ## Locks
 

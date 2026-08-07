@@ -1,5 +1,5 @@
 /*
- * core/conductors/doorman/doorman.ts — the birth-fold demonstration conductor.
+ * conductors/in-process/doorman/doorman.ts — the birth-fold demonstration conductor.
  *
  * Doorman stands at the door: it intercepts GIANT fresh `tool_result` blocks on their way
  * OUT to the model, before they ever ride the wire. Code files get skeletonized in place
@@ -46,8 +46,8 @@
  *     digest applies. That digest still carries the `{#code FOLDED}` tag (recallable,
  *     unfoldable) exactly like a human fold would.
  */
-import type { Conductor, ConductorHost, HostEvent, ViewBlock } from "../../conductor/contract";
-import type { Op } from "../../ops";
+import type { Conductor, ConductorHost, HostEvent, ViewBlock } from "../../../core/conductor/contract";
+import type { Op } from "../../../core/ops";
 import { classifyCodeRead, type CodeReadInfo } from "./classify";
 import { detectLang, skeletonize } from "./skeletonize";
 

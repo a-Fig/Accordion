@@ -1,5 +1,5 @@
 // remote-sdk.mjs — GENERATED ARTIFACT, DO NOT EDIT BY HAND.
-// Bundled from core/conductor/remote.ts + conductors/thermocline/thermocline.ts (and their core/
+// Bundled from core/conductor/remote.ts + conductors/ws/thermocline/thermocline.ts (and their core/
 // graph) by extension/build-remote-sdk.mjs. Regenerate with:
 //     node extension/build-remote-sdk.mjs      (or: npm --prefix extension run build:remote-sdk)
 // Flat ESM, runnable under plain `node` (Node 22+ ships the global WebSocket the SDK dials with).
@@ -1673,7 +1673,7 @@ function recallHostEvent(ids, by, rev) {
 }
 
 // core/protocol.ts
-var PROTOCOL_VERSION = 16;
+var PROTOCOL_VERSION = 17;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
   "snapshot",
@@ -1689,7 +1689,8 @@ var SERVER_TYPES = /* @__PURE__ */ new Set([
   "turnCommitted",
   "proposeResult",
   "completeResult",
-  "controller"
+  "controller",
+  "notice"
 ]);
 function isServerMessage(v) {
   if (!v || typeof v !== "object" || !("type" in v)) return false;
@@ -1985,12 +1986,12 @@ function runRemoteConductor(conductor, opts) {
   });
 }
 
-// conductors/thermocline/thermocline.ts
+// conductors/ws/thermocline/thermocline.ts
 import { mkdirSync, writeFileSync as writeFileSync2, renameSync, readFileSync as readFileSync2 } from "node:fs";
 import { homedir } from "node:os";
 import { join as join2 } from "node:path";
 
-// conductors/thermocline/policy.ts
+// conductors/ws/thermocline/policy.ts
 var FOLDABLE_KINDS2 = /* @__PURE__ */ new Set(["text", "thinking", "tool_result"]);
 var DEFAULT_CFG = {
   highWater: 0.9,
@@ -2553,7 +2554,7 @@ function blockLabel(b) {
   }
 }
 
-// conductors/thermocline/scorer.ts
+// conductors/ws/thermocline/scorer.ts
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -2688,7 +2689,7 @@ function tailTextFromView(blocks) {
   return text;
 }
 
-// conductors/thermocline/thermocline.ts
+// conductors/ws/thermocline/thermocline.ts
 var ID = "thermocline";
 var LABEL = "Thermocline";
 function persistPath(dir, key) {

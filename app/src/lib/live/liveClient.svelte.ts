@@ -31,6 +31,7 @@ import {
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 import { evaluateHelloController, noteControllerBroadcast, flashBlockedHintCenter, resetControllerUi, someoneElseControls } from "./controllerUi.svelte";
 import { mySurfaceId, surfaceIdIfSettled, surfaceIdReady } from "./surfaceId";
+import { showNotice, dismissNotice } from "./notice.svelte";
 
 // Re-export so existing importers keep a stable path (`mySurfaceId` moved to surfaceId.ts to add the
 // sessionStorage + BroadcastChannel-dedupe machinery without bloating this module — ADR 0024 §5).
@@ -183,6 +184,7 @@ function resetConductorState(): void {
 	conductorStatus.metrics = undefined;
 	controllerState.info = null;
 	resetControllerUi(); // drop any popup/toast/hint left over from a prior connection (Part 3)
+	dismissNotice(); // drop any generic notice toast left over from a prior connection (v17)
 }
 
 /** Send a remote-control command to the host (guarded on socket state). */
@@ -414,6 +416,8 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 				noteControllerBroadcast(controllerState.info, { surfaceId: msg.surfaceId, label: msg.label }, mySurfaceId());
 				controllerState.info = { surfaceId: msg.surfaceId, label: msg.label, fresh: true };
 			}
+		} else if (msg.type === "notice") {
+			if (typeof msg.text === "string" && msg.text) showNotice(msg.text);
 		} else if (msg.type === "recall") {
 			// The live agent read folded content (a pure host-side read, no state change). Surfaced
 			// for conductors (Phase C); the GUI has nothing to mutate, so this is observational only.

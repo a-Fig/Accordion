@@ -2,7 +2,7 @@
  * hostAdapter.test.ts — the shared TruthEvent → HostEvent derivation (`./hostAdapter`), extracted
  * from `TestHost` in Phase C so the in-extension live host and the remote SDK host can reuse it
  * verbatim. `testhost.test.ts`-equivalent coverage lives in the conductor suites that exercise
- * `TestHost` end to end (`core/conductors/**`, `conductors/thermocline/**`, `./view.test.ts`); this
+ * `TestHost` end to end (`conductors/in-process/**`, `conductors/ws/thermocline/**`, `./view.test.ts`); this
  * file targets the extracted functions directly, in isolation from any host lifecycle.
  */
 import { describe, it, expect } from "vitest";

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { connectLive, disconnectLive, setArmed, live, conductors, conductorState, conductorStatus, selectConductor, mySurfaceId } from "./liveClient.svelte";
 import { _resetSurfaceIdForTests } from "./surfaceId";
+import { notice } from "./notice.svelte";
 import { folding } from "./folding.svelte";
 import { session } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
@@ -324,6 +325,33 @@ describe("liveClient — conductor catalog + state (Phase C, v13)", () => {
 		expect(conductorState.active).toBeNull();
 		expect(conductorStatus.text).toBeNull();
 		expect(conductorStatus.metrics).toBeUndefined();
+	});
+});
+
+describe("liveClient — generic notice broadcast (v17)", () => {
+	it("shows the notice toast with the broadcast text", () => {
+		const ws = connectHelloSnapshot();
+		notice.show = false;
+		ws.emit({ type: "notice", text: "pi compacted the session natively — Accordion's map has been rebuilt to match." });
+		expect(notice.show).toBe(true);
+		expect(notice.text).toBe("pi compacted the session natively — Accordion's map has been rebuilt to match.");
+	});
+
+	it("ignores a malformed notice (non-string/empty text) instead of throwing", () => {
+		const ws = connectHelloSnapshot();
+		notice.show = false;
+		expect(() => ws.emit({ type: "notice", text: 42 as unknown as string })).not.toThrow();
+		expect(notice.show).toBe(false);
+		expect(() => ws.emit({ type: "notice", text: "" })).not.toThrow();
+		expect(notice.show).toBe(false);
+	});
+
+	it("resets the notice toast on disconnect", () => {
+		const ws = connectHelloSnapshot();
+		ws.emit({ type: "notice", text: "something happened" });
+		expect(notice.show).toBe(true);
+		disconnectLive();
+		expect(notice.show).toBe(false);
 	});
 });
 

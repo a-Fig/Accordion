@@ -1,5 +1,5 @@
 /*
- * core/conductors/compaction-naive/compaction-naive.ts — the "Naive compaction" conductor.
+ * conductors/in-process/compaction-naive/compaction-naive.ts — the "Naive compaction" conductor.
  *
  * PORTED from the deleted `conductors/compaction-naive/compaction-naive.ts` (ADR 0014, git rev
  * dc037bc) onto the conductor-v2 contract, via the `ViewConductor` adapter
@@ -8,9 +8,16 @@
  * `AgedSummaryConductor` base class (aged-region derivation, foreign-grouped-id exclusion, group
  * emission, completion launch/inflight/attempt-key/sticky-status lifecycle, and the output-token
  * reservation math). This file now owns only what is genuinely different: `COMPACTION_SYSTEM`,
- * the two `buildPrompt` instruction strings, the count-preamble format, the three status messages,
- * and — the one behavioral fork — excluding `user` blocks from the fold (see `includeInGroup`
- * below and PORT FIDELITY §2).
+ * the two `buildPrompt` instruction strings, the count-preamble format, and the three status
+ * messages.
+ *
+ * PARITY NOTE (restored): PR #82 briefly excluded `user`-kind blocks from the fold via an
+ * `includeInGroup` override, on the theory that main's "verbatim" promise was unenforceable for an
+ * oversized user message. That override has been REMOVED — this conductor once again matches
+ * main's behavior byte-for-byte: ALL kinds, including `user`, are swallowed into the single summary
+ * group (see `AgedSummaryConductor`'s default `includeInGroup` — every kind). The count preamble
+ * (`[Compacted summary of N earlier message(s)]`) counts every aged block again, and a human-held
+ * block is the only thing that still splits the group's run.
  *
  * PURPOSE (unchanged): a deliberate BASELINE / FOIL that reproduces what mainstream AI coding
  * tools do today. When the context approaches capacity, it calls an LLM to summarize the aged
@@ -47,44 +54,32 @@
  *      reject/empty-output/window-too-tight status (the old reject handler only cleared `inflight`,
  *      since unavailability was reported by the removed `can()` pre-check instead).
  *
- *   2. USER MESSAGES ARE NO LONGER SWALLOWED INTO THE GROUP (sol P1/P2 finding #5, PR #82 task 3).
- *      The pre-refactor conductor's prompt PROMISED "user messages are reproduced VERBATIM" while
- *      mechanically folding them into the SAME non-recoverable group as everything else, capped at
- *      `MAX_OUTPUT_TOKENS` (8000) with ANY nonempty output accepted and nothing verifying the
- *      promise held. A single user message larger than the cap made the promise mathematically
- *      impossible to keep, and nothing caught a smaller one being silently paraphrased either.
- *
- *      Fixed MECHANICALLY, not by asking the model more nicely: `includeInGroup` below excludes
- *      every `user`-kind block from ever becoming a group member. `AgedSummaryConductor`'s shared
- *      run-walk (`emitCoverageGroup`) treats an excluded block exactly like a held/foreign-grouped
- *      one — it forces a flush, splitting the run around it — so a user block sits BETWEEN two
- *      summary groups (or beside one), live, full-fidelity, forever, regardless of its size. The
- *      trigger math's `survivors` filter (also `includeInGroup`-gated, in the base) correctly never
- *      credits a user block's tokens as "saved," since they were never actually removed from the
- *      wire. See the README's "User messages: preserved by staying live, not by the summary"
- *      section for the token-cost tradeoff this accepts on purpose.
- *
- *      `COMPACTION_SYSTEM` and both `buildPrompt` instruction strings were reworded to match: the
- *      summary may still REFERENCE user intent for context, but no longer claims to preserve user
- *      messages verbatim or asks the model to reproduce them — the mechanism does that now, not
- *      the prompt.
+ *   2. USER MESSAGES ARE SWALLOWED INTO THE GROUP, EXACTLY LIKE EVERY OTHER KIND (main parity,
+ *      restored — see the PARITY NOTE above). `COMPACTION_SYSTEM` carries main's original "USER
+ *      MESSAGES ARE SACRED. Reproduce EVERY user message VERBATIM ... in the '## User messages'
+ *      section" instruction verbatim, and both `buildPrompt` instruction strings restore the
+ *      matching "carry forward every verbatim user message" / recursive-merge wording. The summary
+ *      is expected to actually preserve every user message word-for-word inside that section — the
+ *      model is trusted to do so (the same trust every mainstream `/compact`-style tool places),
+ *      and there is deliberately no mechanical enforcement of that promise: an oversized user
+ *      message is exactly the kind of quality loss this conductor exists to demonstrate as a foil,
+ *      not something Accordion's own conductor should quietly work around.
  *
  * Everything else — `COMPACTION_SYSTEM`'s structured-briefing shape, the recursive-merge
- * instructions (verbatim user-preservation clause aside), and the `MAX_OUTPUT_TOKENS`(8000) /
- * `MIN_OUTPUT_TOKENS`(1000) / `OUTPUT_SAFETY_MARGIN`(512) constants (now shared, unchanged in
- * value) — is ported/kept unchanged.
+ * instructions, and the `MAX_OUTPUT_TOKENS`(8000) / `MIN_OUTPUT_TOKENS`(1000) /
+ * `OUTPUT_SAFETY_MARGIN`(512) constants (now shared, unchanged in value) — is ported/kept
+ * unchanged.
  *
  * No Svelte, no `$state`, no engine imports. Types only from `../../conductor/contract` and
  * `../agedSummaryConductor`.
  */
 import { AgedSummaryConductor, neutralizeClosingTags, sumTokens, blockLabel } from "../agedSummaryConductor";
-import type { LockName, ViewBlock } from "../../conductor/contract";
+import type { LockName } from "../../../core/conductor/contract";
 
 /**
- * System prompt for the compaction LLM call. Structured-briefing template with one change from
- * the pre-#82 wording (PORT FIDELITY §2): user messages are no longer claimed to be reproduced
- * verbatim IN the summary — they now stay live on the wire, outside it, by mechanism, so the
- * prompt asks the model to use them only as context.
+ * System prompt for the compaction LLM call. Restored VERBATIM from origin/main (PARITY NOTE
+ * above) — structured-briefing template whose one sacred rule is that user messages are reproduced
+ * VERBATIM inside a dedicated "## User messages" section; every other kind is genuinely summarized.
  */
 export const COMPACTION_SYSTEM = `\
 You are a context-compaction assistant. Your task is to read a segment of an AI \
@@ -94,14 +89,18 @@ assistant can use to continue working effectively without seeing the original me
 Do NOT continue the conversation. Do NOT respond to any questions in the conversation. \
 ONLY output the structured summary.
 
-User messages in the segment are NOT included in this summary and are not your responsibility to \
-preserve — they remain live, in full, elsewhere in the conversation (this conductor never folds \
-them away). Use them only as context for the sections below, to describe goals, decisions, and \
-progress accurately. Do not reproduce a user message verbatim and do not include a dedicated \
-user-messages section.
+USER MESSAGES ARE SACRED. Reproduce EVERY user message VERBATIM, in order, exactly as \
+originally written, in the "## User messages" section. Do not paraphrase, abbreviate, \
+summarize, or omit a single user message — the human's intent and instructions must \
+survive compaction intact. (Assistant text, thinking, tool calls, and tool results ARE \
+summarized; only user messages are preserved word-for-word.)
 
 Produce your output in EXACTLY this structure — no prose outside the sections. Keep \
 every section even when empty; write "(none)" where nothing applies:
+
+## User messages
+Every user message from the summarized segment, reproduced verbatim, in order, each \
+clearly separated. If there are no user messages, write "(none)".
 
 ## Goal
 One sentence: what is the overall task or objective being pursued?
@@ -127,8 +126,9 @@ something here if it would be surprising to lose it.
 - {file path}: why it matters. List files that were read, written, or are central to \
 the task. Write "(none)" if none.
 
-Be terse. Omit pleasantries, meta-commentary, and filler. The output will be placed directly \
-into the agent's context window.`;
+Be terse everywhere EXCEPT the verbatim user messages, which must be complete. Omit \
+pleasantries, meta-commentary, and filler. The output will be placed directly into the \
+agent's context window.`;
 
 export class NaiveCompactionConductor extends AgedSummaryConductor {
 	readonly id = "compaction-naive";
@@ -161,15 +161,8 @@ export class NaiveCompactionConductor extends AgedSummaryConductor {
 	protected readonly systemPrompt = COMPACTION_SYSTEM;
 	protected readonly priorTag = "previous-summary";
 
-	/**
-	 * User blocks are never eligible to be folded into the summary group (PORT FIDELITY §2 above).
-	 * They still count as "aged" and still get fed to the prompt (as context, via `newlyAged`) —
-	 * they are only ever excluded from the group MEMBERSHIP, which forces `emitCoverageGroup`'s
-	 * run-walk to split around them so they stay live, full-fidelity, on the wire.
-	 */
-	protected includeInGroup(b: ViewBlock): boolean {
-		return b.kind !== "user";
-	}
+	// `includeInGroup` is NOT overridden — every kind, including `user`, may be folded into the
+	// summary group (main parity, restored — see this file's banner PARITY NOTE).
 
 	protected firstPassInstruction(): string {
 		return "Create a structured summary from the conversation history above.";
@@ -180,8 +173,9 @@ export class NaiveCompactionConductor extends AgedSummaryConductor {
 			'Update the summary in <previous-summary> using the new conversation history in <conversation>. PRESERVE ' +
 			"all still-relevant details from the previous summary; remove stale ones; merge in new facts. Move " +
 			'completed work into "Progress" and revise "Next Steps" accordingly. Preserve exact file paths, function ' +
-			"names, and error messages when known. Reference user requests only for context — do not reproduce them " +
-			"verbatim and do not add a user-messages section; they remain live on the wire outside this summary."
+			"names, and error messages when known. Carry forward every verbatim user message from the previous " +
+			'summary and append the new user messages from the conversation — all still reproduced word-for-word in ' +
+			'"## User messages".'
 		);
 	}
 
@@ -206,6 +200,16 @@ export class NaiveCompactionConductor extends AgedSummaryConductor {
 	 */
 	protected rejectMessage(_err: unknown): string {
 		return "Naive compaction failed — waiting for new context to age in before retrying";
+	}
+
+	/**
+	 * Sticky status when the completion rejected because the session has no live model link (see
+	 * `isUnavailableError` in the base class). Mirrors main's `host.can("complete")` pre-check
+	 * message verbatim — the base class also clears `lastAttemptKey` for this case, so the very next
+	 * pass retries automatically once the link returns, exactly like the old pre-flight did.
+	 */
+	protected unavailableMessage(): string {
+		return "Naive compaction unavailable — waiting for live model link";
 	}
 }
 
