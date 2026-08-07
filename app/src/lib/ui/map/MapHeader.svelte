@@ -5,7 +5,7 @@
 	import EditableNumber from "$lib/ui/EditableNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import { folding } from "$lib/live/folding.svelte";
-	import { live, setArmed, conductorState, conductorStatus, controllerState, isController, claimController } from "$lib/live/liveClient.svelte";
+	import { live, setArmed, conductorState, conductorStatus, controllerState, anotherSurfaceControls, claimController } from "$lib/live/liveClient.svelte";
 	import { attemptSteer, flashBlockedHint, readOnlyTip } from "$lib/live/controllerUi.svelte";
 	import ConductorMenu from "./ConductorMenu.svelte";
 
@@ -16,7 +16,11 @@
 	// untouched by this feature). This is "live and steerable in principle, but SOME OTHER surface
 	// currently holds the lease" — the "whisper" treatment: steering controls dim, a chip names the
 	// actual controller, and TAKE CONTROL is always one click away.
-	const notController = $derived(live.status === "connected" && !isController());
+	// U1: gated on `anotherSurfaceControls()` (a NON-null FRESH foreign lease), NOT `!isController()`.
+	// A null/stale lease is uncontested — this surface auto-claims it silently — so an everyday
+	// uncontested connect must render ZERO read-only chrome at any point (no false READ-ONLY flash
+	// while the silent auto-claim round-trips).
+	const notController = $derived(live.status === "connected" && anotherSurfaceControls());
 	const controllerLabel = $derived(controllerState.info?.label ?? "");
 	// Exactly the two spec-approved chip strings — "another tab" disambiguates when THIS surface is
 	// also a browser tab (saying "browser tab steers" would be ambiguous about which one).
@@ -389,9 +393,10 @@
 
 			<button
 				class="btn-secondary reset-btn"
-				onclick={() => store.resetAll()}
-				disabled={editCount === 0 || steerLocked || notController}
-				aria-disabled={steerLocked || notController}
+				class:ro-dim={notController}
+				onclick={(e) => attemptSteer({ live: true, isController: !notController, verb: "steer", x: e.clientX, y: e.clientY }, () => store.resetAll())}
+				disabled={editCount === 0 || steerLocked}
+				aria-disabled={editCount === 0 || steerLocked || notController}
 				title={notController
 					? readOnlyTip("steer")
 					: steerLocked
