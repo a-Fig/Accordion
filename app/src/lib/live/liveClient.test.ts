@@ -229,6 +229,8 @@ describe("liveClient — telemetry + protocol guard", () => {
 			hookCount: 42,
 			lastHoldMs: 2,
 			holdTimeouts: 0,
+			realTokens: 5150,
+			estWireTokens: 5000,
 		});
 		expect(live.telemetry).toEqual({
 			lastHookMs: 3,
@@ -238,6 +240,8 @@ describe("liveClient — telemetry + protocol guard", () => {
 			hookCount: 42,
 			lastHoldMs: 2,
 			holdTimeouts: 0,
+			realTokens: 5150,
+			estWireTokens: 5000,
 		});
 	});
 

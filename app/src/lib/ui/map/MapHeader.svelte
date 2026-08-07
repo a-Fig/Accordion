@@ -54,6 +54,20 @@
 		return m;
 	});
 
+	// ── provider-anchored calibration (issue #11 stage 1, ADR 0025) ──────────
+	// DISPLAY only — every decision-math read above (denom, budget bar math, protect math, over-
+	// budget color) stays on the raw chars/4 estimate untouched. `calLiveTokens`/`calBudget` are the
+	// hero line's own calibrated readout, kept in the SAME basis (both routed through `calTokens`) so
+	// their ratio on screen still reads sensibly even though `store.overBudget`'s color decision is
+	// computed separately, on the raw numbers. `notAnchored` is the "≈" marker gate: `readOnly`
+	// (CC/demo/file — no live host ever calibrates those) or `calibration === 1` (cold start; the
+	// session's own default before any observation has landed) both mean "this number is a bare
+	// estimate, not provider-anchored."
+	const calLiveTokens = $derived(store.calTokens(store.liveTokens));
+	const calBudget = $derived(store.calTokens(store.budget));
+	const calOverBy = $derived(calLiveTokens - calBudget);
+	const notAnchored = $derived(readOnly || store.calibration === 1);
+
 	const denom = $derived(Math.max(store.fullTokens, store.budget, 1));
 	// fmt/k formatters must round their input because AnimatedNumber passes a float mid-tween
 	const fmt = (n: number) => Math.round(n).toLocaleString();
@@ -220,12 +234,13 @@
 		<div class="nums">
 			<div class="hero-line">
 				<span class="hero-stat mono tnum" class:over={store.overBudget}>
-					<AnimatedNumber value={store.liveTokens} format={fmt} />
+					{#if notAnchored}<span class="approx" title="estimated — not yet anchored to a real provider response" aria-hidden="true">≈</span>{/if}
+					<AnimatedNumber value={calLiveTokens} format={fmt} />
 				</span>
-				<span class="budget-denom mono tnum">/ <AnimatedNumber value={store.budget} format={fmt} /></span>
+				<span class="budget-denom mono tnum">/ {#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}<AnimatedNumber value={calBudget} format={fmt} /></span>
 				{#if store.overBudget}
 					<span class="over-flag mono tnum">
-						over by <AnimatedNumber value={store.liveTokens - store.budget} format={fmtOverBy} />
+						over by <AnimatedNumber value={calOverBy} format={fmtOverBy} />
 					</span>
 				{/if}
 			</div>
@@ -429,11 +444,11 @@
 			{#each LADDER as seg (seg.kind)}
 				{@const v = liveByKind[seg.kind]}
 				{#if v > 0}
-					<span class="seg k-{seg.kind}" style:width="{(v / denom) * 100}%" title="{seg.label}: {fmt(v)} live"></span>
+					<span class="seg k-{seg.kind}" style:width="{(v / denom) * 100}%" title="{seg.label}: {fmt(store.calTokens(v))} live"></span>
 				{/if}
 			{/each}
 			{#if store.savedTokens > 0}
-				<span class="seg saved-seg" style:width="{(store.savedTokens / denom) * 100}%" title="folded away: {fmt(store.savedTokens)}"></span>
+				<span class="seg saved-seg" style:width="{(store.savedTokens / denom) * 100}%" title="folded away: {fmt(store.calTokens(store.savedTokens))}"></span>
 			{/if}
 			{#if headroomPct > 0.5}
 				<span class="headroom" style:left="{100 - headroomPct}%" style:width="{headroomPct}%" title="headroom: {fmt(store.budget - store.fullTokens)} under budget"></span>
@@ -533,6 +548,12 @@
 		font-size: var(--fs-sm);
 		color: var(--faint);
 		align-self: baseline;
+	}
+
+	/* "≈" marker — a bare (not provider-anchored) estimate. Monochrome, no new color (issue #11). */
+	.approx {
+		color: var(--muted);
+		margin-right: 0.1em;
 	}
 
 	/* Over-budget flag — danger, no pill chrome */

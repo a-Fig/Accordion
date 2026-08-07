@@ -481,6 +481,19 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	const hookDurations: number[] = []; // bounded ring for the p95 readout
 	const HOOK_RING = 256;
 
+	// ── token calibration (issue #11 stage 1, ADR 0025) ──────────────────────────
+	// `pendingWireEst` is the estimate of the wire the MOST RECENT `context` hook let depart — set
+	// there because that is the one place both "what we estimated" and "what actually got sent" are
+	// known together. `maybeObserveCalibration` (called from `ingestFinishedMessage`, so it covers
+	// both `message_end` and the `agent_end` backstop) pairs it against the resulting assistant
+	// message's REAL provider usage and raw-snaps `truth.calibration`. `lastRealTokens`/
+	// `lastEstWireTokens` are the raw ingredients of the most recent observation, surfaced on
+	// `telemetryMsg()` (protocol v18) so the GUI/smoke tests can audit calibration independently of
+	// the derived multiplier.
+	let pendingWireEst: number | null = null;
+	let lastRealTokens: number | null = null;
+	let lastEstWireTokens: number | null = null;
+
 	// Most recent ExtensionContext seen on any hook. Captured so the WS connection handler
 	// (which gets no ctx of its own) can read pi's CURRENT session history at attach time — the
 	// authoritative way to populate a session that already has turns (especially a RESUMED one).
@@ -699,7 +712,20 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// long the host held the departing wire for the attached conductor's last-moment proposal on
 		// the most recent hook, and how many holds have timed out over the session. Both stay 0 while
 		// no conductor is attached (no hold is ever fired), so a no-conductor session is unchanged.
-		return { type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: liveHost.lastHoldMs, holdTimeouts: liveHost.holdTimeouts };
+		// realTokens/estWireTokens (protocol v18, issue #11 stage 1) are the raw ingredients of the most
+		// recent calibration observation — null until the first one lands this session (cold start).
+		return {
+			type: "telemetry",
+			lastHookMs,
+			maxHookMs,
+			p95HookMs: p95HookMs(),
+			rebuilds,
+			hookCount,
+			lastHoldMs: liveHost.lastHoldMs,
+			holdTimeouts: liveHost.holdTimeouts,
+			realTokens: lastRealTokens,
+			estWireTokens: lastEstWireTokens,
+		};
 	}
 	function broadcastTelemetry(): void {
 		broadcast(telemetryMsg());
@@ -2154,12 +2180,71 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	}
 
 	/**
+	 * Real provider usage fields (issue #11 stage 1) — NOT part of `core/wire.ts`'s `PiMessage` (a
+	 * lowest-common-denominator projection used across both the extension and `core/`), so read them
+	 * off the raw pi message object instead of the narrowed type.
+	 */
+	interface RealUsage {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		totalTokens?: number;
+	}
+
+	/**
+	 * Issue #11 stage 1 (ADR 0025): pair the wire estimate the most recent `context` hook recorded
+	 * (`pendingWireEst`) against THIS message's REAL provider usage (assistant messages only), and
+	 * raw-snap `truth.calibration = real / est` — no clamp, no smoothing (owner-approved v1 policy:
+	 * the dial always reflects the latest observation, never a running average). `pendingWireEst` is
+	 * consumed (cleared) unconditionally on every call — including a non-assistant message, an
+	 * aborted/errored reply, or one with no usable `usage` — so a departing wire that never yields a
+	 * usable pairing can't accidentally pair with a LATER, unrelated response.
+	 *
+	 * PAIRING CHOICE: `usage.input + usage.cacheRead + usage.cacheWrite` is exactly what the provider
+	 * billed as INPUT for the request that carried the departing wire `pendingWireEst` estimated.
+	 * `usage.output` is that SAME call's own reply and was never part of what was sent, so it is
+	 * deliberately EXCLUDED here — unlike pi's own `calculateContextTokens` (input+output+cacheRead+
+	 * cacheWrite, `@earendil-works/pi-coding-agent`'s compaction module), which sums output back IN
+	 * because it estimates the NEXT call's forward-looking context size, a different quantity than
+	 * "what did THIS request actually cost." This is the chosen "rigorous" pairing over the
+	 * `ctx.getContextUsage()`-based v1 fallback the design allows: it is never null (no post-
+	 * compaction gap) and isolates exactly the one request `pendingWireEst` describes, rather than
+	 * blending in `ctx.getContextUsage()`'s own trailing-message estimate.
+	 *
+	 * SMEARING CAVEAT: `est` is Truth's own block-token accounting, which — by design — excludes the
+	 * system prompt and tool-call schemas (neither belongs to any block). `real` includes them. One
+	 * multiplier therefore distributes that fixed overhead PROPORTIONALLY across every block rather
+	 * than carrying it as its own line item — `real = base + k·est` would be the honest affine model;
+	 * we ship the pure multiplier knowingly (stage 1 scope; see ADR 0025 for the stage-2 plan).
+	 */
+	function maybeObserveCalibration(msg: unknown): void {
+		if (!truth) return;
+		const est = pendingWireEst;
+		pendingWireEst = null;
+		if (est === null || est <= 0) return;
+		const m = msg as { role?: string; stopReason?: string; usage?: RealUsage } | null | undefined;
+		if (!m || m.role !== "assistant" || !m.usage) return;
+		if (m.stopReason === "aborted" || m.stopReason === "error") return;
+		const u = m.usage;
+		const input = typeof u.input === "number" ? u.input : 0;
+		const cacheRead = typeof u.cacheRead === "number" ? u.cacheRead : 0;
+		const cacheWrite = typeof u.cacheWrite === "number" ? u.cacheWrite : 0;
+		const real = input + cacheRead + cacheWrite;
+		if (real <= 0) return;
+		lastRealTokens = real;
+		lastEstWireTokens = est;
+		truth.setCalibration(real / est);
+	}
+
+	/**
 	 * Append ONE just-finished message (message_end) to the Truth immediately — this is what kills
 	 * the one-turn lag. Deduped on the message's durable ids so a re-fire or an already-appended
 	 * message is skipped (and `lastMessages` is extended so the next context prefix still matches).
 	 */
 	function ingestFinishedMessage(msg: PiMessage): void {
 		if (!truth) return;
+		maybeObserveCalibration(msg);
 		const ids = messageInfo(msg, 0).ids;
 		if (!ids.length) return;
 		if (ids.every((id) => truth!.get(id))) return; // already represented → nothing to do
@@ -2211,6 +2296,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			unsubTruth = null;
 		}
 		truth = null;
+		// issue #11 stage 1: a pending/observed calibration pairing belongs to the OLD session's Truth
+		// (which just went away) — carrying it over would either mispair the new session's first
+		// assistant reply against a stale estimate, or report a stale realTokens/estWireTokens in
+		// telemetry for a session that has not yet observed anything of its own.
+		pendingWireEst = null;
+		lastRealTokens = null;
+		lastEstWireTokens = null;
 		setLastMessages([]); // clears lastMessages + lastFps together (invariant: never one without the other)
 		// E2 (external review round): folding is OPT-IN and OFF by default PER SESSION — reset the
 		// arm on every `session_start`, regardless of `_event.reason` ("startup"/"reload"/"new"/
@@ -2331,6 +2423,15 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				if (foldingEnabled) {
 					ret = { messages: truth.serializeWire(messages) as unknown as AgentMessage[] };
 				}
+				// (c.1) issue #11 stage 1: record what THIS departing wire is estimated to cost, so the
+				// NEXT assistant reply's real usage can be paired against it (`maybeObserveCalibration`).
+				// `liveTokens()` is Truth's own accounting of what `serializeWire` just produced when
+				// folding is armed (never diverges from the wire, by the same invariant every other
+				// group/fold accounting relies on); `fullTokens()` is the raw unfolded size when folding
+				// is off (passthrough — `ret` stays undefined, `event.messages` departs verbatim).
+				// Recorded regardless of whether any client is connected, same as every other Truth
+				// bookkeeping on this hook — no disk I/O, CPU-only.
+				pendingWireEst = foldingEnabled ? truth.liveTokens() : truth.fullTokens();
 			}
 		} catch (err) {
 			hookErrors++;
@@ -2469,6 +2570,10 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		latestCtx = ctx;
 		const msgs = readSessionMessages(ctx);
 		if (msgs.length > 0) ingestMessages(msgs);
+		// issue #11 stage 1: native compaction rewrites the session's block set out from under any
+		// in-flight `context` hook's wire estimate — drop it rather than risk pairing the NEXT
+		// assistant reply's real usage against a now-stale pre-compaction estimate.
+		pendingWireEst = null;
 		if (!attached()) return;
 		const text = "pi compacted the session natively — Accordion's map has been rebuilt to match.";
 		try {
