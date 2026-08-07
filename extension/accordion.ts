@@ -2428,9 +2428,9 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// suppression stays unconditional (no hard-overflow escape valve) — Accordion's own budget/fold
 	// state is the only thing standing between the session and overflow at that point, so pi's native
 	// compaction must not race it. When a native compaction DOES run because folding was off, the
-	// paired `session_compact` handler below notifies and the existing structural-divergence rebuild
-	// (`ingestMessages` → `rebuildTruth`, next `agent_end`/`message_end`/`context`) picks up the
-	// compacted history — including for an attached-but-collaborative conductor via `liveHost.dispatchResync()`.
+	// paired `session_compact` handler below immediately reconciles the Truth against the compacted
+	// history (the same `ingestMessages` → `rebuildTruth` structural-divergence path the hooks use —
+	// including conductor resync via `liveHost.dispatchResync()`) and then notifies.
 	pi.on("session_before_compact", (_event, ctx: ExtensionContext) => {
 		if (foldingEnabled) {
 			try {
@@ -2443,18 +2443,32 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// folding off (whether or not a client is attached) → let pi protect itself natively
 	});
 
-	// ── native compaction ran while folding was off: quietly rebuild + notify ──
+	// ── native compaction ran while folding was off: rebuild NOW + notify ──────
 	// Fires AFTER pi has actually saved a compaction (the one above did not cancel it, since folding
-	// was off). The Truth itself catches up via the normal structural-divergence path the next time
-	// `agent_end`/`message_end`/`context` reconciles pi's rewritten history (`ingestMessages` detects
-	// the mismatch and calls `rebuildTruth`, which forces every connected client to resnapshot and
-	// resyncs an attached conductor) — nothing to force here. This handler surfaces the human-facing
-	// note two ways: `ctx.ui.notify` for whoever is watching pi's own CLI/log, and — v17 — a `notice`
-	// broadcast (`core/protocol.ts`) to every connected GUI client, so a browser-served tab or a
-	// desktop window that isn't looking at pi's terminal still sees why the map just changed shape.
-	// If a client is connected, the map itself already visibly changes on the forced resnapshot; the
-	// notice is the accompanying explanation of why.
+	// was off). Reconcile the Truth HERE rather than waiting for the next `agent_end`/`message_end`/
+	// `context` pass: pi's MANUAL `/compact` path saves the compaction, emits this event, and returns
+	// with NO follow-up model call, so an attached map would otherwise show pre-compaction history
+	// until the human's next prompt — while the toast below claims it was rebuilt. `readSessionMessages`
+	// resolves the post-compaction history via pi's own `buildSessionContext()` (collapses the
+	// compaction to exactly what the next model call will see); `ingestMessages` detects the
+	// structural divergence and rebuilds (forced client resnapshot + conductor resync). For the
+	// AUTOMATIC (threshold/overflow) trigger a retry's `context` hook follows immediately and would
+	// reconcile anyway — this same-path ingest just lands moments earlier and the retry's ingest
+	// becomes a cheap no-divergence walk. Best-effort like all discovery I/O: an EMPTY read means the
+	// session state could not be resolved — keep the current Truth and let the normal reconciliation
+	// catch up, rather than rebuilding an empty map (a real post-compaction branch is never empty:
+	// it always contains at least the compaction summary entry). Not the `context` hook path, so the
+	// no-disk-I/O-on-hook invariant is untouched.
+	//
+	// The human-facing note then goes out two ways: `ctx.ui.notify` for whoever is watching pi's own
+	// CLI/log, and — v17 — a `notice` broadcast (`core/protocol.ts`) to every connected GUI client,
+	// so a browser-served tab or a desktop window that isn't looking at pi's terminal still sees why
+	// the map just changed shape. The map itself already visibly changed on the forced resnapshot;
+	// the notice is the accompanying explanation of why.
 	pi.on("session_compact", (_event, ctx: ExtensionContext) => {
+		latestCtx = ctx;
+		const msgs = readSessionMessages(ctx);
+		if (msgs.length > 0) ingestMessages(msgs);
 		if (!attached()) return;
 		const text = "pi compacted the session natively — Accordion's map has been rebuilt to match.";
 		try {
