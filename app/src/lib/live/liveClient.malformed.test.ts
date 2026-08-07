@@ -10,7 +10,7 @@ import { PROTOCOL_VERSION } from "./protocol";
  * a sync without a real `blocks` array are absorbed gracefully instead of throwing
  * mid-pump and stranding the client half-connected.
  *
- * Same FakeWebSocket pattern as liveClient.test.ts / conductorClient.test.ts.
+ * Same FakeWebSocket pattern as liveClient.test.ts.
  */
 
 class FakeWebSocket {

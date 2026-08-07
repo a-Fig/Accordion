@@ -18,7 +18,7 @@ import { PROTOCOL_VERSION } from "./protocol";
  *
  * We stub `window`/`fetch` (vitest's environment here is plain node — see vitest.config.ts) and
  * drive the real, exported `poll()` against the real `discovery`/`live` reactive state, the same
- * pattern conductorDiscovery.test.ts and liveClient.test.ts use for their modules.
+ * pattern liveClient.test.ts uses for its module.
  */
 
 import { poll, __resetPollFailureStreakForTest } from "./browserDiscovery.svelte";
