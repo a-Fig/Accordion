@@ -22,7 +22,7 @@
 	import Icon from "$lib/ui/Icon.svelte";
 	import ConsentDialog from "./ConsentDialog.svelte";
 	import { isExclusive } from "$core/locks";
-	import type { ActiveConductorMeta } from "$lib/live/protocol";
+	import type { ActiveConductorMeta } from "$core/protocol";
 	import { live, conductors, conductorState, selectConductor } from "$lib/live/liveClient.svelte";
 
 	let open = $state(false);

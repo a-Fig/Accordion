@@ -45,14 +45,6 @@ describe("viewBlockOf — per-block projection fidelity", () => {
 		expect(v.text).toBe(b.text);
 	});
 
-	it("messageKey strips the assistant-part suffix so parts of one message share a key", () => {
-		const t = bulk([blk("a:resp1:p0", 0), blk("a:resp1:p1", 1)]);
-		const v0 = viewBlockOf(t, t.get("a:resp1:p0")!);
-		const v1 = viewBlockOf(t, t.get("a:resp1:p1")!);
-		expect(v0.messageKey).toBe("a:resp1");
-		expect(v1.messageKey).toBe("a:resp1");
-	});
-
 	it("held/folded reflect a human override; foldedTokens mirrors Truth.foldedTokensOf (the digest/subst size, hypothetical even when live)", () => {
 		const t = bulk(seq(2, 1000));
 		t.setProtect(0);

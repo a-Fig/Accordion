@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "../engine/store.svelte";
 import type { Block, BlockKind, ParsedSession } from "../engine/types";
-import { isDurableId, applyPlan, type PiMessage } from "./mapping";
-import { foldCode } from "../engine/digest";
+import { isDurableId, applyPlan, type PiMessage } from "$core/wire";
+import { foldCode } from "$core/digest";
 
 // computeFoldOps mirrors the engine's LOCAL fold decisions into provider-safe wire
 // ops. These tests lock the kind filter, the durable-id guard, and the empty-digest

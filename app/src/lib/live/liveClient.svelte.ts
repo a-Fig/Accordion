@@ -26,7 +26,7 @@ import {
 	type SnapshotState,
 	type WireCommand,
 	type ActiveConductorMeta,
-} from "./protocol";
+} from "$core/protocol";
 import { ghostStart, ghostEnd, ghostClearAll } from "./ghostState.svelte";
 
 let socket: WebSocket | null = null;
@@ -178,6 +178,7 @@ function adoptSnapshot(state: SnapshotState): void {
 		groups: Array.isArray(state.groups) ? state.groups : [],
 		locks: Array.isArray(state.locks) ? state.locks : [],
 		birthFolded: Array.isArray(state.birthFolded) ? state.birthFolded : [],
+		carriedSent: Array.isArray(state.carriedSent) ? state.carriedSent : [],
 	};
 	const truth = hydrateSnapshot(pendingMeta, clean);
 	const store = new AccordionStore({ meta: pendingMeta, blocks: [], lineCount: 0, skipped: 0 }, truth);
@@ -185,6 +186,20 @@ function adoptSnapshot(state: SnapshotState): void {
 	session.store = store;
 	folding.enabled = !!state.foldingEnabled;
 	awaitingSnapshot = false;
+}
+
+/**
+ * Tear down the wire side of a live replica (both the socket-death path and manual disconnect
+ * share this). A replica that just lost its wire must not go on looking steerable: null the
+ * command sink AND badge the session read-only — the same affordance a Claude Code transcript
+ * uses — so a fold gesture against the now-orphaned local Truth reads as a personal lens, not as
+ * still steering a live agent that's gone. Checked BEFORE nulling the sink (wireControlled would
+ * otherwise always read false); a store that was never live (demo/file/CC — never wire-controlled)
+ * is left alone so an unrelated session displayed during a failed connect attempt isn't mislabeled.
+ */
+function orphanReplica(): void {
+	if (session.store && session.store.wireControlled) session.readOnly = true;
+	if (session.store) session.store.setCommandSink(null);
 }
 
 export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; token?: string } = {}): void {
@@ -276,10 +291,8 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 				p95HookMs: msg.p95HookMs,
 				rebuilds: msg.rebuilds,
 				hookCount: msg.hookCount,
-				// v13: a pre-v13 host would omit these — default to 0 rather than NaN-poisoning the
-				// latency badge's re-keyed (lastHookMs - lastHoldMs) threshold math.
-				lastHoldMs: typeof msg.lastHoldMs === "number" ? msg.lastHoldMs : 0,
-				holdTimeouts: typeof msg.holdTimeouts === "number" ? msg.holdTimeouts : 0,
+				lastHoldMs: msg.lastHoldMs,
+				holdTimeouts: msg.holdTimeouts,
 			};
 		} else if (msg.type === "conductorState") {
 			// Broadcast to EVERY client — the honest, shared "who (if anyone) is driving" state.
@@ -325,7 +338,7 @@ export function connectLive(port: number = DEFAULT_PORT, opts: { host?: string; 
 			live.sessionId = null;
 			live.port = null;
 			resetConductorState(); // wire down → no host to advertise/attach a conductor
-			if (session.store) session.store.setCommandSink(null); // wire down → no remote control
+			orphanReplica(); // wire down → no remote control; badge read-only if it was actually live
 			if (!manualClose && live.status !== "error") {
 				live.status = "idle";
 				live.detail = "disconnected";
@@ -339,7 +352,7 @@ export function disconnectLive(): void {
 	awaitingSnapshot = false;
 	ghostClearAll();
 	resetConductorState();
-	if (session.store) session.store.setCommandSink(null);
+	orphanReplica();
 	if (socket) {
 		try {
 			socket.close();

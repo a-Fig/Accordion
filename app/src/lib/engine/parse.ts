@@ -7,7 +7,7 @@
  * stay grouped by the human exchange they belong to.
  */
 import type { Block, BlockKind, ParsedSession, SessionMeta } from "./types";
-import { estTokens, BLOCK_OVERHEAD } from "./tokens";
+import { estTokens, BLOCK_OVERHEAD } from "$core/tokens";
 
 function parseLines(raw: string): any[] {
 	const out: any[] = [];

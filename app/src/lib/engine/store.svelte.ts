@@ -422,9 +422,4 @@ export class AccordionStore {
 	unfoldGroup(id: string, by: Actor = "you"): void {
 		this.applyOps([{ kind: "unfoldGroup", groupId: id }], by);
 	}
-	toggleGroup(id: string, by: Actor = "you"): void {
-		const g = this.groupById(id);
-		if (!g) return;
-		g.folded ? this.unfoldGroup(id, by) : this.foldGroup(id, by);
-	}
 }

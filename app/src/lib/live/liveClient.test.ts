@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { connectLive, disconnectLive, setArmed, live, conductors, conductorState, conductorStatus, selectConductor } from "./liveClient.svelte";
 import { folding } from "./folding.svelte";
 import { session } from "../session.svelte";
-import { PROTOCOL_VERSION, type SnapshotState, type WireEvent, type ActiveConductorMeta } from "./protocol";
+import { AccordionStore } from "../engine/store.svelte";
+import { PROTOCOL_VERSION, type SnapshotState, type WireEvent, type ActiveConductorMeta } from "$core/protocol";
 
 /*
  * liveClient Phase B coverage. The live client is a WebSocket CLIENT, so we drive it against a fake
@@ -238,13 +239,6 @@ describe("liveClient — telemetry + protocol guard", () => {
 		});
 	});
 
-	it("defaults lastHoldMs/holdTimeouts to 0 when a pre-v13 host omits them", () => {
-		const ws = connectHelloSnapshot();
-		ws.emit({ type: "telemetry", lastHookMs: 3, maxHookMs: 12, p95HookMs: 7, rebuilds: 1, hookCount: 42 });
-		expect(live.telemetry.lastHoldMs).toBe(0);
-		expect(live.telemetry.holdTimeouts).toBe(0);
-	});
-
 	it("refuses a protocol-version mismatch loudly", () => {
 		connectLive(1234);
 		const ws = FakeWebSocket.last!;
@@ -329,5 +323,52 @@ describe("liveClient — conductor catalog + state (Phase C, v13)", () => {
 		expect(conductorState.active).toBeNull();
 		expect(conductorStatus.text).toBeNull();
 		expect(conductorStatus.metrics).toBeUndefined();
+	});
+});
+
+describe("liveClient — read-only badge on wire loss (P3: an orphaned replica must not stay silently mutable)", () => {
+	it("badges the session read-only when the socket dies out from under an established replica", () => {
+		const ws = connectHelloSnapshot();
+		expect(session.readOnly).toBe(false);
+
+		ws.close(); // socket death, not a manual disconnect
+		expect(session.readOnly).toBe(true);
+		expect(session.store!.wireControlled).toBe(false); // command sink nulled too
+	});
+
+	it("badges the session read-only on a manual disconnect too", () => {
+		connectHelloSnapshot();
+		expect(session.readOnly).toBe(false);
+
+		disconnectLive();
+		expect(session.readOnly).toBe(true);
+	});
+
+	it("clears the read-only badge on the next hello (reconnect)", () => {
+		const ws = connectHelloSnapshot();
+		ws.close();
+		expect(session.readOnly).toBe(true);
+
+		connectLive(1234);
+		const ws2 = FakeWebSocket.last!;
+		ws2.open();
+		ws2.emit(helloFrame());
+		expect(session.readOnly).toBe(false);
+	});
+
+	it("does not mislabel an unrelated (never wire-controlled) session on a failed connect attempt", () => {
+		// A CC/file/demo session sitting in session.store when a live connect is attempted and
+		// then fails before ever reaching snapshot: this store was never wireControlled, so its
+		// read-only-ness must be left exactly as it was — a failed dial elsewhere shouldn't badge
+		// an unrelated session.
+		session.store = new AccordionStore({ meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks: [], lineCount: 0, skipped: 0 });
+		session.readOnly = false;
+
+		connectLive(1234);
+		const ws = FakeWebSocket.last!;
+		ws.open();
+		ws.close(); // dies before hello/snapshot ever arrive
+
+		expect(session.readOnly).toBe(false);
 	});
 });

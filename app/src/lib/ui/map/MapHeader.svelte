@@ -36,7 +36,7 @@
 		}
 		return r >= 1000 ? `${(r / 1000).toFixed(r >= 10000 ? 0 : 1)}k` : `${r}`;
 	};
-	const fmtOverBy = (n: number) => k(Math.round(n));
+	const fmtOverBy = (n: number) => k(n);
 
 	// ── Involvement locks (ADR 0011) — the honest mirror of the engine's gating. A locked
 	// control LOOKS locked in every mode (preview/demo/read-only included), driven purely off

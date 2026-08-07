@@ -52,7 +52,7 @@
 import { discovery, publishSessions, DEMO_ID } from "./discovery.svelte";
 import { REGISTRY_PROTOCOL, type SessionEntry } from "./registry";
 import { live as liveConn } from "./liveClient.svelte";
-import { PROTOCOL_VERSION } from "./protocol";
+import { PROTOCOL_VERSION } from "$core/protocol";
 import { session } from "../session.svelte";
 
 const POLL_MS = 1000;
@@ -60,6 +60,13 @@ const POLL_MS = 1000;
 // After this many consecutive failed polls (~10s at POLL_MS=1000), stop holding the last list
 // and treat the server as gone — see "Threshold death" in the banner comment above.
 const MAX_CONSECUTIVE_FAILURES = 10;
+
+// A hung `fetch` (half-open connection, dead extension process that never resets the socket)
+// would otherwise leave `_polling` true forever — freezing the session list without ever
+// tripping MAX_CONSECUTIVE_FAILURES, since a promise that never settles never counts as a
+// failure. Derived from POLL_MS (4x it) rather than a bare literal so the two can't drift out
+// of proportion to each other; an abort here counts as an ordinary failed poll (see `poll()`).
+const FETCH_TIMEOUT_MS = POLL_MS * 4;
 
 let _timer: ReturnType<typeof setInterval> | null = null;
 let _polling = false;
@@ -143,7 +150,14 @@ export async function poll(): Promise<void> {
 		try {
 			const token = urlToken();
 			const url = token ? `/__accordion/sessions?token=${encodeURIComponent(token)}` : "/__accordion/sessions";
-			const res = await fetch(url);
+			const controller = new AbortController();
+			const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+			let res: Response;
+			try {
+				res = await fetch(url, { signal: controller.signal });
+			} finally {
+				clearTimeout(timer);
+			}
 			if (res.ok) {
 				const ct = res.headers.get("content-type") ?? "";
 				if (ct.includes("application/json")) {

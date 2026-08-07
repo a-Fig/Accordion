@@ -1,6 +1,6 @@
 # ADR 0022 — Conductor contract v2: evented, transactional, write-once portable
 
-**Status:** accepted (Phase A — contract + validation suite; Phase C host not yet built)
+**Status:** accepted — Phase A (contract + validation suite) and Phase C (`LiveConductorHost`) both shipped on this branch
 **Date:** 2026-07-17
 **Builds on:** [ADR 0007](0007-conductor-protocol.md) (the original `conduct(view) → Command[]`
 contract this ADR replaces the transport/lifecycle of, while keeping its authoring ergonomics

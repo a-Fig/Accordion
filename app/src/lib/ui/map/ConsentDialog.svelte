@@ -24,7 +24,7 @@
 	 * onconfirm / oncancel. The caller (ConductorMenu) owns the selection flow and the wire send.
 	 */
 	import { LOCK_NAMES, LOCK_LABELS, hasLock, type LockName } from "$core/locks";
-	import type { ActiveConductorMeta } from "$lib/live/protocol";
+	import type { ActiveConductorMeta } from "$core/protocol";
 	import Icon from "$lib/ui/Icon.svelte";
 
 	let {
@@ -53,7 +53,6 @@
 
 	// Under `tail-size`, `tailTokens` is what the conductor DECLARES it will enforce — 0 means it
 	// claims the whole context (no protected tail); >0 protects the newest ~N tokens (core/locks.ts).
-	const tailTaken = $derived(hasLock(conductor.locks, "tail-size"));
 	const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : `${n}`);
 	const tailNote = $derived(
 		conductor.tailTokens > 0
@@ -145,7 +144,7 @@
 						<span class="lock-name">{LOCK_LABEL[row.name]}</span>
 						<span class="lock-detail">
 							{LOCK_LABELS[row.name]}
-							{#if row.name === "tail-size" && tailTaken}
+							{#if row.name === "tail-size" && row.taken}
 								— {tailNote}
 							{/if}
 						</span>

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { applyPlan, type PiMessage } from "./mapping";
-import type { GroupOp, FoldOp } from "./protocol";
+import { applyPlan, type PiMessage } from "$core/wire";
+import type { GroupOp, FoldOp } from "$core/protocol";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // applyPlan GROUP COLLAPSE (ADR 0006) — the provider-safety heart.

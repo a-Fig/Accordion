@@ -36,7 +36,6 @@ export type Lang =
   | "java"
   | "c"
   | "css"
-  | "json"
   | "generic";
 
 export interface SkeletonResult {
@@ -80,7 +79,6 @@ const EXT_LANG: Record<string, Lang> = {
   css: "css",
   scss: "css",
   less: "css",
-  json: "json",
 };
 
 /** Lower-case file extension (without the dot), or "" if none. */
@@ -156,7 +154,6 @@ export const MASK_OPTS: Record<Lang, MaskOpts> = {
   java: { slash: true },
   c: { slash: true },
   css: { slash: true },
-  json: {},
   python: { hash: true, triple: true },
   generic: { slash: true, hash: true, backtick: true },
 };
@@ -339,9 +336,6 @@ export function skeletonize(src: string, lang: Lang): SkeletonResult {
     case "css":
       result = skeletonizeCss(src);
       break;
-    case "json":
-      result = skeletonizeJson(src);
-      break;
     case "generic":
     default:
       result = skeletonizeGeneric(src);
@@ -415,20 +409,6 @@ function looksContainer(maskLine: string): boolean {
 function isTopLevelTypeDecl(maskLine: string): boolean {
   const t = maskLine.trim();
   return /^(export\s+)?(declare\s+)?(interface|type)\b/.test(t);
-}
-
-function isDecorator(maskLine: string): boolean {
-  return /^\s*@[\w.]/.test(maskLine);
-}
-
-function isCommentLine(maskLine: string): boolean {
-  const t = maskLine.trim();
-  return t.startsWith("//") || t.startsWith("/*") || t.startsWith("*") || t.endsWith("*/");
-}
-
-function isImportExportLine(maskLine: string): boolean {
-  const t = maskLine.trim();
-  return /^(import|export)\b/.test(t) || /^(use|package|mod|pub\s+use|pub\s+mod)\b/.test(t);
 }
 
 function skeletonizeBrace(src: string, lang: Lang): SkeletonResult {
@@ -632,9 +612,6 @@ function skeletonizeBrace(src: string, lang: Lang): SkeletonResult {
     kept += 1;
     depth += delta;
     reconcileStack(stack, depth);
-    void isImportExportLine;
-    void isDecorator;
-    void isCommentLine;
   }
 
   // Truncated / unbalanced source: a callable body opened (`{`) but its closing `}` never
@@ -674,9 +651,6 @@ function ELL_MARK(n: number): string {
 /** Is this (masked) line an assignment that opens a `{`/`[` literal? */
 function isAssignmentOpening(maskLine: string): boolean {
   const t = maskLine.trim();
-  if (!/^(export\s+)?(default\s+)?(const|let|var|static|public|private|readonly|pub)?\b/.test(t)) {
-    // still allow `Foo.bar = {` style
-  }
   return /=\s*[{[]\s*$/.test(t) || /[:=]\s*[{[]\s*$/.test(t);
 }
 
@@ -743,7 +717,6 @@ function skeletonizePython(src: string): SkeletonResult {
       // with `:` at this paren depth. Track parens on the mask to find the real end.
       let j = i;
       let parens = 0;
-      let sawColonEnd = false;
       for (; j < orig.length; j++) {
         out.push(orig[j]);
         kept += 1;
@@ -753,16 +726,13 @@ function skeletonizePython(src: string): SkeletonResult {
         }
         const mj = mask[j].replace(/\s+$/, "");
         if (parens <= 0 && mj.endsWith(":")) {
-          sawColonEnd = true;
           break;
         }
         if (parens <= 0 && /:\s*\S/.test(mask[j]) && j === i) {
           // single-line `def f(): body` — handled by body scan below
-          sawColonEnd = true;
           break;
         }
       }
-      void sawColonEnd;
 
       // Body starts at j+1. Find the first non-blank line and confirm it's more-indented.
       let b = j + 1;
@@ -988,19 +958,13 @@ function skeletonizeCss(src: string): SkeletonResult {
       // shallowly: we just collapse its whole body to `{ … }` for simplicity & determinism.
       let j = i;
       let d = startDepth + delta;
-      let firstBraceMoreContent = m.slice(openCol + 1);
-      void firstBraceMoreContent;
       while (d > startDepth && j + 1 < orig.length) {
         j++;
         d += braceDelta(mask[j]);
       }
       const interior = countNonBlank(orig, i + 1, j); // lines strictly inside (excl. close)
       const sameLine = i === j;
-      if (sameLine) {
-        out.push(`${header} { ${ELL} }`);
-      } else {
-        out.push(`${header} { ${ELL} }`);
-      }
+      out.push(`${header} { ${ELL} }`);
       kept += 1;
       elided += interior + (sameLine ? 0 : 1);
       depth = startDepth;
@@ -1016,51 +980,6 @@ function skeletonizeCss(src: string): SkeletonResult {
   }
 
   return { skeleton: out.join("\n"), totalLines: orig.length, keptLines: kept, elidedLines: elided };
-}
-
-// ----------------------------------------------------------------------------------------
-// JSON — keep the shape one level deep; elide deeper objects/arrays.
-// ----------------------------------------------------------------------------------------
-
-function skeletonizeJson(src: string): SkeletonResult {
-  const orig = splitLines(src);
-  // Best-effort: parse and re-emit one level deep. If parsing fails, fall through to generic.
-  try {
-    const value = JSON.parse(src);
-    const skeleton = jsonShape(value);
-    const keptLines = splitLines(skeleton).length;
-    return {
-      skeleton,
-      totalLines: orig.length,
-      keptLines,
-      elidedLines: Math.max(0, orig.length - keptLines),
-    };
-  } catch {
-    return skeletonizeGeneric(src);
-  }
-}
-
-function jsonShape(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) {
-    if (value.length === 0) return "[]";
-    return `[ ${ELL} ${value.length} ${value.length === 1 ? "item" : "items"} ]`;
-  }
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj);
-  if (keys.length === 0) return "{}";
-  const parts = keys.map((k) => `  ${JSON.stringify(k)}: ${jsonShapeChild(obj[k])}`);
-  return `{\n${parts.join(",\n")}\n}`;
-}
-
-/** One level down: scalars verbatim; nested object/array → a typed elision placeholder. */
-function jsonShapeChild(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) {
-    return value.length === 0 ? "[]" : `[ ${ELL} ${value.length} ${value.length === 1 ? "item" : "items"} ]`;
-  }
-  const keys = Object.keys(value as Record<string, unknown>);
-  return keys.length === 0 ? "{}" : `{ ${ELL} ${keys.length} ${keys.length === 1 ? "key" : "keys"} }`;
 }
 
 // ----------------------------------------------------------------------------------------

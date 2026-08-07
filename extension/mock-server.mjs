@@ -56,7 +56,10 @@ import * as http from "node:http";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const jiti = createJiti(import.meta.url);
+// The app's source imports core via the `$core` alias (svelte/vite/vitest all resolve it); jiti
+// knows nothing about kit aliases, so mirror it here — otherwise loading any app module that
+// touches `$core/*` (parse.ts → $core/tokens) dies with MODULE_NOT_FOUND.
+const jiti = createJiti(import.meta.url, { alias: { $core: path.join(__dirname, "../core") } });
 
 // Load the REAL protocol/Truth modules so this mock can never silently desync from a version bump
 // (the rot that killed the previous mock: it spoke a hard-coded pre-v13 shape). Straight from
