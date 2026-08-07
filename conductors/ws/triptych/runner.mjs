@@ -12,8 +12,10 @@
 //
 //     cd conductors/ws/triptych && npm install     # one-time, repo checkouts only
 //
-// A missing install fails the spawn loudly (nonzero exit + a clear stderr line the extension
-// surfaces via conductorStatus) rather than silently degrading.
+// The extension normally catches a missing install before selection through catalog readiness.
+// This runner also initializes every grammar BEFORE dialing Accordion. Dependencies that disappear
+// after the host check, corrupt WASM, and incompatible package versions therefore fail loudly
+// (nonzero exit + clear stderr) rather than attaching a summaries-only Triptych.
 //
 // Spawn env (set by the extension): ACCORDION_PORT (required), ACCORDION_TOKEN (required).
 
@@ -38,6 +40,15 @@ async function main() {
 	} catch (err) {
 		log(`cannot load the tree-sitter skeleton engine: ${err?.message ?? err}`);
 		log("run `npm install` in conductors/ws/triptych/ (web-tree-sitter + tree-sitter-wasms), then re-select Triptych.");
+		process.exit(1);
+	}
+
+	try {
+		const { initializeSkeletonizer } = await import("./preflight.mjs");
+		await initializeSkeletonizer(skeletonizer);
+	} catch (err) {
+		log(`cannot initialize the tree-sitter skeleton engine: ${err?.message ?? err}`);
+		log("reinstall dependencies with `npm install` in conductors/ws/triptych/, then re-select Triptych.");
 		process.exit(1);
 	}
 

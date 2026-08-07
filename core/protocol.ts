@@ -116,13 +116,16 @@
  *    events carry `calibrationThroughOrder`; snapshots also carry `systemPromptCalibrated` so a
  *    prompt changed after the last receipt remains raw. Bumped because older peers would apply k to
  *    every newly appended block and recreate the transient context spike.
+ *  - v21: every advertised conductor carries required-capability readiness. Unavailable
+ *    conductors remain visible with a reason/remediation, while hosts reject stale or forged
+ *    selection commands for them before disturbing the current conductor (issue #105).
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import { sanitizeOps, type Op, type OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 20;
+export const PROTOCOL_VERSION = 21;
 
 /**
  * The DOOR: a fixed, well-known loopback port that exactly ONE extension binds at a time as an
@@ -199,9 +202,18 @@ export interface SessionMetaWire {
 }
 
 /**
- * One entry in the available-conductor catalog the host advertises (Phase C). This is the SINGLE
- * source of truth for the GUI's conductor picker — the host, not the GUI, knows what conductors
- * exist (in-process built-ins, an attached remote SDK) and what each one claims.
+ * Whether a conductor's REQUIRED capabilities can start on this host. Optional capabilities that
+ * have a contract-preserving fallback (Thermocline's attention probe is the reference case) do not
+ * make a conductor unavailable; their degradation is surfaced after attach via conductorStatus.
+ */
+export type ConductorReadiness =
+	| { state: "ready" }
+	| { state: "unavailable"; reason: string; remediation?: string };
+
+/**
+ * One entry in the conductor catalog the host advertises (Phase C). This is the SINGLE source of
+ * truth for the GUI's conductor picker — including entries that exist but are unavailable on this
+ * install, so the picker can explain the prerequisite before selection.
  */
 export interface ActiveConductorMeta {
 	id: string;
@@ -212,6 +224,8 @@ export interface ActiveConductorMeta {
 	holdWireUpToMs: number;
 	/** True iff this conductor runs out-of-process over the wire (a remote SDK), not in-extension. */
 	remote: boolean;
+	/** Host-computed readiness of the conductor's required startup capabilities. */
+	readiness: ConductorReadiness;
 }
 
 /**
@@ -336,8 +350,8 @@ export interface HelloMessage {
 	sessionId?: string;
 	role: Role;
 	meta: SessionMetaWire;
-	/** The available-conductor catalog (Phase C) — omitted/undefined on a host with none attached
-	 *  or not yet advertising one; the GUI picker renders from this, never from local knowledge. */
+	/** The conductor catalog (Phase C), including unavailable entries with setup guidance. Optional
+	 *  for compatibility with hand-built test peers; the GUI renders only from host knowledge. */
 	conductors?: ActiveConductorMeta[];
 	/** The current global controller lease (v16, ADR 0024), or `null` when no lease exists. Optional
 	 *  so a pre-v16-shaped literal still type-checks (the version bump is the real cross-version gate);
