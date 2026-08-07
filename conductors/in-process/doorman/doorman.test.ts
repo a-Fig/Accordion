@@ -7,10 +7,10 @@
  */
 import { describe, it, expect } from "vitest";
 import { DoormanConductor } from "./doorman";
-import { TestHost } from "../../conductor/testhost";
-import type { Block, ParsedSession } from "../../types";
-import type { ConductorHost, HostEvent, ViewBlock } from "../../conductor/contract";
-import type { Op } from "../../ops";
+import { TestHost } from "../../../core/conductor/testhost";
+import type { Block, ParsedSession } from "../../../core/types";
+import type { ConductorHost, HostEvent, ViewBlock } from "../../../core/conductor/contract";
+import type { Op } from "../../../core/ops";
 
 // ── block builders ───────────────────────────────────────────────────────────────────────
 

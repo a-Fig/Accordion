@@ -1,5 +1,5 @@
 /*
- * core/conductors/doorman/classify.ts
+ * conductors/in-process/doorman/classify.ts
  *
  * Ported VERBATIM (every reject gate byte-identical, only this banner comment and the
  * `ViewBlock` import path rewritten) from the deleted `conductors/code-skeleton/classify.ts`
@@ -38,7 +38,7 @@
  * Pure & deterministic: no Date / Math.random / global state. No `$lib`, no app imports.
  */
 
-import type { ViewBlock } from "../../conductor/contract";
+import type { ViewBlock } from "../../../core/conductor/contract";
 
 export interface CodeReadInfo {
 	/** Recovered file path (or undefined if only inferable from content). */

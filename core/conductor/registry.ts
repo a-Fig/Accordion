@@ -15,15 +15,15 @@
  * `tailTokens` / `holdWireUpToMs` read off the instance — so the catalog can never drift from what
  * the conductor actually claims. Thermocline is the exception: it runs out of process, and its
  * class cannot be imported here without pulling its `child_process` attention-probe into the
- * extension bundle, so its metadata is mirrored verbatim from `conductors/thermocline/thermocline.ts`
- * (kept in lockstep by the comment on `THERMOCLINE`).
+ * extension bundle, so its metadata is mirrored verbatim from
+ * `conductors/ws/thermocline/thermocline.ts` (kept in lockstep by the comment on `THERMOCLINE`).
  */
 import type { LockName } from "../locks";
 import type { Conductor } from "./contract";
 import type { ActiveConductorMeta } from "../protocol";
-import { NaiveCompactionConductor } from "../conductors/compaction-naive/compaction-naive";
-import { HandoffConductor } from "../conductors/handoff/handoff";
-import { DoormanConductor } from "../conductors/doorman/doorman";
+import { NaiveCompactionConductor } from "../../conductors/in-process/compaction-naive/compaction-naive";
+import { HandoffConductor } from "../../conductors/in-process/handoff/handoff";
+import { DoormanConductor } from "../../conductors/in-process/doorman/doorman";
 
 /** One catalog entry: everything the host needs to attach (or detach to) this conductor. */
 export interface RegistryEntry {
@@ -71,7 +71,7 @@ const NONE: RegistryEntry = {
 };
 
 /*
- * Thermocline (spawn). Metadata MIRRORED from `conductors/thermocline/thermocline.ts`:
+ * Thermocline (spawn). Metadata MIRRORED from `conductors/ws/thermocline/thermocline.ts`:
  *   readonly locks = ["human-steering"];  readonly holdWireUpToMs = 200;  (no tailTokens ⇒ 0)
  * Keep in lockstep with that class — it cannot be imported here (its scorer spawns a probe).
  */

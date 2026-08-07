@@ -41,8 +41,8 @@ import type {
 	ViewBlock,
 	LockName,
 	Op,
-} from "../../core/conductor/contract";
-import type { ConductorView } from "../../core/conductor/view";
+} from "../../../core/conductor/contract";
+import type { ConductorView } from "../../../core/conductor/view";
 import type { Config, Plan, ThermoState, Applied, Unit } from "./policy";
 import {
 	DEFAULT_CFG,

@@ -1,10 +1,10 @@
 /*
  * build-remote-sdk.mjs — bundle the out-of-process conductor SDK into a single flat, runnable ESM
- * file at conductors/thermocline/remote-sdk.mjs, so the thermocline runner can actually import it.
+ * file at conductors/ws/thermocline/remote-sdk.mjs, so the thermocline runner can actually import it.
  *
- * WHY A BUNDLE: `conductors/thermocline/runner.mjs` is a plain `.mjs` the extension spawns with
+ * WHY A BUNDLE: `conductors/ws/thermocline/runner.mjs` is a plain `.mjs` the extension spawns with
  * `node runner.mjs`. Node 22 can type-strip a single `.ts` file, but `core/conductor/remote.ts`
- * (and `conductors/thermocline/thermocline.ts`) reach the rest of `core/` through EXTENSIONLESS
+ * (and `conductors/ws/thermocline/thermocline.ts`) reach the rest of `core/` through EXTENSIONLESS
  * relative imports (the `moduleResolution: "bundler"` convention the app/tsconfig relies on), which
  * Node's own ESM resolver never infers — so a bare `import("../../core/conductor/remote.ts")` fails
  * several frames deep in core/'s graph. esbuild's bundler resolution DOES infer those extensions, so
@@ -13,7 +13,7 @@
  *
  * The output re-exports exactly what the runner needs:
  *   • runRemoteConductor  (core/conductor/remote.ts — the WS-client SDK)
- *   • ThermoclineConductor (conductors/thermocline/thermocline.ts — the strategy the runner drives)
+ *   • ThermoclineConductor (conductors/ws/thermocline/thermocline.ts — the strategy the runner drives)
  *
  * What stays EXTERNAL (never bundled):
  *   • ws — the SDK dials with Node 22+'s global `WebSocket`, never the `ws` package; `ws` must not be
@@ -25,7 +25,7 @@
  * Run: node ./build-remote-sdk.mjs   (or `npm run build:remote-sdk`)
  * Prereq: `npm install` in this directory so esbuild is available.
  *
- * The generated conductors/thermocline/remote-sdk.mjs is a COMMITTED artifact (repo precedent:
+ * The generated conductors/ws/thermocline/remote-sdk.mjs is a COMMITTED artifact (repo precedent:
  * extension/accordion.js). It is repo-checkout-only this phase — NOT part of the npm tarball.
  */
 import * as esbuild from "esbuild";
@@ -34,10 +34,10 @@ import * as path from "node:path";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
-const outfile = path.resolve(repoRoot, "conductors", "thermocline", "remote-sdk.mjs");
+const outfile = path.resolve(repoRoot, "conductors", "ws", "thermocline", "remote-sdk.mjs");
 
 const banner = `// remote-sdk.mjs — GENERATED ARTIFACT, DO NOT EDIT BY HAND.
-// Bundled from core/conductor/remote.ts + conductors/thermocline/thermocline.ts (and their core/
+// Bundled from core/conductor/remote.ts + conductors/ws/thermocline/thermocline.ts (and their core/
 // graph) by extension/build-remote-sdk.mjs. Regenerate with:
 //     node extension/build-remote-sdk.mjs      (or: npm --prefix extension run build:remote-sdk)
 // Flat ESM, runnable under plain \`node\` (Node 22+ ships the global WebSocket the SDK dials with).
@@ -51,7 +51,7 @@ const result = await esbuild.build({
 	stdin: {
 		contents:
 			'export { runRemoteConductor } from "./core/conductor/remote";\n' +
-			'export { ThermoclineConductor } from "./conductors/thermocline/thermocline";\n',
+			'export { ThermoclineConductor } from "./conductors/ws/thermocline/thermocline";\n',
 		resolveDir: repoRoot,
 		sourcefile: "remote-sdk-entry.ts",
 		loader: "ts",

@@ -1,5 +1,5 @@
 /*
- * core/conductors/compaction-naive/compaction-naive.ts — the "Naive compaction" conductor.
+ * conductors/in-process/compaction-naive/compaction-naive.ts — the "Naive compaction" conductor.
  *
  * PORTED from the deleted `conductors/compaction-naive/compaction-naive.ts` (ADR 0014, git rev
  * dc037bc) onto the conductor-v2 contract, via the `ViewConductor` adapter
@@ -74,7 +74,7 @@
  * `../agedSummaryConductor`.
  */
 import { AgedSummaryConductor, neutralizeClosingTags, sumTokens, blockLabel } from "../agedSummaryConductor";
-import type { LockName } from "../../conductor/contract";
+import type { LockName } from "../../../core/conductor/contract";
 
 /**
  * System prompt for the compaction LLM call. Restored VERBATIM from origin/main (PARITY NOTE

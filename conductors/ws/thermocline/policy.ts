@@ -47,16 +47,16 @@
 //   APPLIED-STATE — the explicit { foldedIds, strata } sets the plan renders. project() reads
 //           ONLY these sets (never the view's per-block flags) so token accounting never
 //           double-counts an already-folded block or infers a fold the conductor didn't make.
-import type { Op } from "../../core/ops";
-import type { ViewBlock } from "../../core/conductor/contract";
-import type { BlockKind } from "../../core/types";
-import type { ConductorView } from "../../core/conductor/view";
+import type { Op } from "../../../core/ops";
+import type { ViewBlock } from "../../../core/conductor/contract";
+import type { BlockKind } from "../../../core/types";
+import type { ConductorView } from "../../../core/conductor/view";
 // The SINGLE remaining tag-authoring site imports the canonical tag builder — never a copy.
-import { foldTag } from "../../core/digest";
+import { foldTag } from "../../../core/digest";
 // The run-boundary snapper mirrors Truth's group snapping EXACTLY by importing the SAME messageKey
 // function the engine's `snappedRange` walks (core/truth.ts → opGroup), never a re-implementation —
 // so a run's member set is a provable fixed point of what Truth actually groups. See `safeRunFromUnits`.
-import { messageKey } from "../../core/truth";
+import { messageKey } from "../../../core/truth";
 
 export type { ConductorView, ViewBlock };
 

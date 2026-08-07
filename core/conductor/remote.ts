@@ -7,7 +7,7 @@
  * `../replica`'s `hydrateSnapshot` / `applyWireEvent` — REUSED VERBATIM, never reimplemented, so a
  * conductor golden-tested against `TestHost` sees an identical read surface here.
  *
- * `conductors/thermocline/runner.mjs` is the intended consumer: it spawns as its own Node process
+ * `conductors/ws/thermocline/runner.mjs` is the intended consumer: it spawns as its own Node process
  * (the extension owns the spawn), reads `ACCORDION_PORT`/`ACCORDION_TOKEN` from its environment,
  * and calls `runRemoteConductor(new ThermoclineConductor(...), { port, token, signal })`.
  *
@@ -17,7 +17,7 @@
  * Node process with `ws` as a runtime dependency) and the app (a browser bundle, where `ws` cannot
  * resolve at all). Importing the `ws` package directly here would tie this shared layer to a
  * Node-only runtime dependency the browser side can never satisfy. Node 22 (the runtime this SDK
- * actually runs under, per `conductors/thermocline/runner.mjs`) ships a spec-compliant global
+ * actually runs under, per `conductors/ws/thermocline/runner.mjs`) ships a spec-compliant global
  * `WebSocket` client, so the default `wsFactory` uses that; a caller embedding this SDK elsewhere
  * (or a test) may inject any constructor-shaped factory that produces the same minimal surface
  * (`onopen`/`onmessage`/`onerror`/`onclose`, `send`, `close`, `readyState`) — exactly the subset
@@ -33,8 +33,8 @@
  * `ConductorHost.propose(txn): Promise<TxnResult>` (`./contract`) is async by contract — precisely
  * so an out-of-process host like this one can honor it directly. `propose` here crosses the wire
  * (send `propose`, await the matching `proposeResult`) and resolves the host's actual `proposeResult`
- * verbatim; every conductor `await`s it (`./view.ts`, `core/conductors/doorman/doorman.ts`,
- * `conductors/thermocline/thermocline.ts`). No cast is needed — the host built below IS a
+ * verbatim; every conductor `await`s it (`./view.ts`, `conductors/in-process/doorman/doorman.ts`,
+ * `conductors/ws/thermocline/thermocline.ts`). No cast is needed — the host built below IS a
  * `ConductorHost`. (An in-process host resolves the same Promise on a microtask after applying the
  * ops synchronously; a conductor cannot tell the two hosts apart, which is the whole portability point.)
  */

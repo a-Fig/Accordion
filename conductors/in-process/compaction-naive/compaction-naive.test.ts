@@ -26,8 +26,8 @@
  * and "a user block in the middle" describe blocks below exercise mixed-kind fixtures directly.
  */
 import { describe, expect, it } from "vitest";
-import { TestHost } from "../../conductor/testhost";
-import type { Block, BlockKind } from "../../types";
+import { TestHost } from "../../../core/conductor/testhost";
+import type { Block, BlockKind } from "../../../core/types";
 import { COMPACTION_SYSTEM, NaiveCompactionConductor } from "./compaction-naive";
 
 const BUDGET = 1000; // TRIGGER (0.9) high-water mark = 900 tokens
@@ -408,7 +408,7 @@ describe("NaiveCompactionConductor — all block kinds are swallowed (main parit
 
 describe("NaiveCompactionConductor — output-token reservation (external review round, P1-7)", () => {
 	// PORT FIDELITY §6 (see compaction-naive.ts banner): `launchCompletion` now reserves output room
-	// against `view.contextWindow`, mirroring `core/conductors/handoff/handoff.ts`'s identical fix
+	// against `view.contextWindow`, mirroring `conductors/in-process/handoff/handoff.ts`'s identical fix
 	// (and its `handoff.test.ts` "middle branch"/"decline path" tests below, adapted to this
 	// conductor's own system prompt/prompt shape and constants — MAX_SUMMARY_TOKENS(8000),
 	// MIN_SUMMARY_TOKENS(1000), OUTPUT_SAFETY_MARGIN(512)).

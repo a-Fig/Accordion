@@ -16,8 +16,8 @@ import { serializeSnapshot, hydrateSnapshot, applyWireEvent, wireEventFromTruthE
 import { LiveConductorHost, type LiveHostDeps, type SpawnedRunner } from "./liveHost";
 import { catalogMeta, entryById } from "./registry";
 import type { ConductorHost } from "./contract";
-import { DoormanConductor } from "../conductors/doorman/doorman";
-import { NaiveCompactionConductor } from "../conductors/compaction-naive/compaction-naive";
+import { DoormanConductor } from "../../conductors/in-process/doorman/doorman";
+import { NaiveCompactionConductor } from "../../conductors/in-process/compaction-naive/compaction-naive";
 
 const META = { format: "pi" as const, title: "t", cwd: "", model: "" };
 
