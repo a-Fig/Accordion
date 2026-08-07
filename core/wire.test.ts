@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { linearize, applyPlan, blockId, isDurableId, messageInfo, contentFingerprint, wireToBlock, type PiMessage } from "./wire";
+import type { GroupOp } from "./protocol";
 
 /*
  * core/wire.ts is the moved live/mapping.ts. Its provider-safety behavior is exhaustively covered
@@ -117,8 +118,77 @@ describe("core/wire — applyPlan", () => {
 	});
 	it("never folds a tool_call, even if named", () => {
 		const ms = session();
-		const applied = { ops: 0, groups: 0 };
-		applyPlan(ms, [{ id: "a:r1:p2", digestText: "nope" }], [], applied);
-		expect(applied.ops).toBe(0);
+		const out = applyPlan(ms, [{ id: "a:r1:p2", digestText: "nope" }]);
+		const call = (out[1].content as any[]).find((p: any) => p.type === "toolCall");
+		expect(call.id).toBe("c1"); // untouched — never substituted
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// applyPlan — role-validity floor (P3, review-confirmed; ADR 0006's open watch item).
+//
+// A DROP GroupOp (summaryText: null) removes its whole run and pushes NOTHING onto the wire.
+// If that hole sits at the very front of the surviving wire, or between two survivors of the
+// SAME role, the result is a provider-invalid message array: a non-"user" leading message, or
+// two adjacent same-role messages some providers reject/mis-merge. The floor degrades ONLY the
+// offending run to a one-message `{#code FOLDED}` recap (same shape a REPLACE run already
+// produces) instead of removing it outright — every OTHER drop in the same call, and every drop
+// that isn't actually unsafe, still removes verbatim (see the "no-repair-needed" case below).
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("core/wire — applyPlan role-validity floor", () => {
+	/** Build a drop GroupOp (summaryText: null). */
+	const drop = (memberIds: string[]): GroupOp => ({ id: "g:" + memberIds[0], memberIds, summaryText: null });
+
+	it("leading-drop: dropping the run at the front would leave a non-\"user\" leading message — degraded to a recap", () => {
+		const ms: PiMessage[] = [
+			{ role: "user", content: "hi", timestamp: 1 }, // m0 u:1 — inside the dropped run
+			{ role: "assistant", responseId: "r1", timestamp: 2, content: [{ type: "text", text: "first reply" }] as any }, // m1 a:r1:p0 — inside the dropped run
+			{ role: "assistant", responseId: "r2", timestamp: 3, content: [{ type: "text", text: "second reply, no user in between" }] as any }, // m2 — NOT in the group
+		];
+		const out = applyPlan(ms, [], [drop(["u:1", "a:r1:p0"])]);
+		// Without the floor this would collapse to just m2 (role "assistant") — an invalid
+		// leading message. The floor must keep the wire starting with "user".
+		expect(out[0].role).toBe("user");
+		expect(out.length).toBe(2); // [recap, m2] — the run degrades to ONE synthetic message
+		const recapText = (out[0].content as any[])[0].text as string;
+		expect(recapText).toMatch(/^\{#[0-9a-z]{6} FOLDED\}/); // carries the recovery tag
+		expect(recapText).not.toContain("hi");
+		expect(recapText).not.toContain("first reply"); // the original content never rides the wire
+		expect((out[1].content as any[])[0].text).toBe("second reply, no user in between"); // m2 untouched
+	});
+
+	it('interior same-role adjacency: dropping the run would leave "user" directly followed by "user" — degraded to a recap', () => {
+		const ms: PiMessage[] = [
+			{ role: "user", content: "turn1", timestamp: 1 }, // m0 u:1 — stays live (not a member)
+			{ role: "assistant", responseId: "r1", timestamp: 2, content: [{ type: "text", text: "reply1" }] as any }, // m1 a:r1:p0 — the whole dropped run
+			{ role: "user", content: "turn2", timestamp: 3 }, // m2 u:3 — stays live (not a member)
+		];
+		const out = applyPlan(ms, [], [drop(["a:r1:p0"])]);
+		// Without the floor: [u:1, u:3] — two adjacent "user" messages. The floor must insert
+		// something non-"user" between them instead of letting them weld together.
+		expect(out.length).toBe(3);
+		expect(out[0].role).toBe("user");
+		expect(out[2].role).toBe("user");
+		expect(out[1].role).not.toBe("user"); // the recap breaks the adjacency
+		const recapText = (out[1].content as any[])[0].text as string;
+		expect(recapText).toMatch(/^\{#[0-9a-z]{6} FOLDED\}/);
+		expect(recapText).not.toContain("reply1");
+	});
+
+	it("no-repair-needed: a drop whose surrounding roles are already safe still removes the run verbatim", () => {
+		const ms: PiMessage[] = [
+			{ role: "user", content: "hi", timestamp: 1 }, // m0 u:1 — dropped
+			{ role: "assistant", responseId: "r1", timestamp: 2, content: [{ type: "text", text: "reply" }] as any }, // m1 a:r1:p0 — dropped
+			{ role: "user", content: "next question", timestamp: 3 }, // m2 u:3 — survives; ALSO "user" at the front, so leading is already safe
+		];
+		const out = applyPlan(ms, [], [drop(["u:1", "a:r1:p0"])]);
+		// The surviving leading message (m2) is already "user" — no adjacency/leading problem,
+		// so the run must drop verbatim: no synthetic recap message inserted anywhere.
+		expect(out.length).toBe(1);
+		expect(out[0].role).toBe("user");
+		expect((out[0].content as string)).toBe("next question");
+		const flat = JSON.stringify(out);
+		expect(flat).not.toContain("FOLDED");
 	});
 });

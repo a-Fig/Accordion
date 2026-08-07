@@ -18,8 +18,8 @@ import type { LockName } from "./locks";
 import { hasLock } from "./locks";
 import { digest, digestTokens, substTokens, groupDigest, groupDigestTokens, wireFoldable, foldTag } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
-import { isDurableId, messageInfo, applyPlan, type PiMessage } from "./wire";
-import type { WireBlock, FoldOp, GroupOp } from "./protocol";
+import { isDurableId, applyPlan, computeDegradedDropRuns, roleFloorRecap, type PiMessage, type WireMsgShape } from "./wire";
+import type { FoldOp, GroupOp } from "./protocol";
 import type { Op, OpResult, TxnResult, ClampReason } from "./ops";
 import type { TruthEvent } from "./events";
 
@@ -64,6 +64,53 @@ export function messageKey(id: string): string {
 	const parsed = id.match(/^(.+):\d+$/);
 	if (parsed && !/^[a-z]:\d+$/.test(id)) return parsed[1];
 	return id;
+}
+
+/**
+ * Recover a block id's WIRE role class — the inverse of `blockId()`'s own `u:`/`a:`/`r:`/`s:`
+ * prefix scheme (plus the `m<i>:…` positional fallback). Used ONLY to reconstruct
+ * `WireMsgShape.role` for `Truth.degradedRunKeys` (see its doc comment): a live session's block
+ * ids already encode which wire-role class produced them, so no real `PiMessage` is needed to
+ * tell a user message from an assistant one.
+ *
+ * Exact for `user` / `assistant` / `toolResult` (each has its own unambiguous prefix). The rare
+ * pi "default" message kinds (bash / custom / branchSummary / compactionSummary) all surface as
+ * a bare `text` block under an `s:`/`m<i>:s` id (see `linearize`'s `default` branch) — a `Block`
+ * alone cannot tell those sub-kinds apart, so they collapse to one `"other"` placeholder. This
+ * only under-distinguishes two DIFFERENT non-conversational kinds landing adjacent to each other
+ * around a degraded run's boundary — a vanishingly rare shape with no conversational content —
+ * never a user/assistant misclassification, which is the case that actually matters for the
+ * role-validity floor. A loaded (non-live) session's ids never match ANY of these prefixes (parse.ts
+ * uses `<eid>:u` / `<eid>:<i>` / `<eid>:r`), which is fine: `Truth.degradedRunKeys` only builds
+ * `WireMsgShape`s when `computeGroupOps()` yields at least one group, and a loaded session's ids
+ * are never durable (`isDurableId`), so `computeGroupOps()` already strips them to nothing first.
+ */
+function wireRoleOfId(id: string): string {
+	if (id.startsWith("u:") || /^m\d+:u$/.test(id)) return "user";
+	if (id.startsWith("a:") || /^m\d+:p/.test(id)) return "assistant";
+	if (id.startsWith("r:") || /^m\d+:r$/.test(id)) return "toolResult";
+	return "other"; // "s:" / `m<i>:s`
+}
+
+/**
+ * How many LOGICAL messages a collapsed run's blocks came from — needed because `roleFloorRecap`'s
+ * text is parameterized by MESSAGE count (`applyPlan`'s Phase B counts `messages[]` array
+ * positions), while a `GroupShape` run is a `Block[]` and one message can contribute several
+ * blocks (e.g. an assistant turn's thinking + text + tool_call). Blocks from the same message are
+ * always contiguous (both `linearize` and `parse.ts` emit one message's parts back to back), so a
+ * single forward scan counting `messageKey` transitions gives the exact message count.
+ */
+function messageCountOfRun(run: readonly Block[]): number {
+	let n = 0;
+	let prevKey: string | null = null;
+	for (const b of run) {
+		const k = messageKey(b.id);
+		if (k !== prevKey) {
+			n++;
+			prevKey = k;
+		}
+	}
+	return n;
 }
 
 export class Truth {
@@ -128,6 +175,8 @@ export class Truth {
 	// ── rev-keyed read caches (recomputed lazily when rev changes) ───────────
 	private pfiCache = { rev: -1, value: 0 };
 	private groupWireCache = { rev: -1, map: new Map<string, { tokens: number; collapsed: boolean }>() };
+	/** `degradedRunKeys()`'s memo — see that method's doc comment. */
+	private degradeCache = { rev: -1, keys: new Set<string>() };
 
 	constructor(parsed: ParsedSession) {
 		this.meta = parsed.meta;
@@ -191,6 +240,7 @@ export class Truth {
 		// Rev-keyed read caches are stamped stale so they recompute against the adopted rev.
 		this.pfiCache = { rev: -1, value: 0 };
 		this.groupWireCache = { rev: -1, map: new Map<string, { tokens: number; collapsed: boolean }>() };
+		this.degradeCache = { rev: -1, keys: new Set<string>() };
 	}
 
 	/**
@@ -514,7 +564,8 @@ export class Truth {
 			return n;
 		}
 		const c = this.classifyGroup(g);
-		let n = c.collapsedRuns.length * this.groupSummaryTok(g, c);
+		let n = 0;
+		for (const run of c.collapsedRuns) n += this.runWireTok(g, c, run);
 		for (const id of c.stragglers) n += this.get(id)?.tokens ?? 0;
 		return n;
 	}
@@ -531,21 +582,121 @@ export class Truth {
 		for (const g of this.groupList) {
 			if (!g.folded) continue;
 			const c = this.classifyGroup(g);
-			const summaryTok = this.groupSummaryTok(g, c);
-			const runFirsts = new Set(c.collapsedRuns.map((r) => r[0].id));
+			const runTok = new Map<string, number>(); // carrier (run[0]) id → THIS run's own wire cost
+			for (const run of c.collapsedRuns) runTok.set(run[0].id, this.runWireTok(g, c, run));
 			for (const b of c.members) {
-				if (c.collapsed.has(b.id)) m.set(b.id, { tokens: runFirsts.has(b.id) ? summaryTok : 0, collapsed: true });
+				if (c.collapsed.has(b.id)) m.set(b.id, { tokens: runTok.get(b.id) ?? 0, collapsed: true });
 				else m.set(b.id, { tokens: b.tokens, collapsed: false });
 			}
 		}
 		this.groupWireCache = { rev: this.revCounter, map: m };
 		return m;
 	}
-	private groupSummaryTok(g: Group, c: GroupShape): number {
+	/**
+	 * The wire cost of ONE collapsed run within a folded group. A REPLACE group (`g.digest` a
+	 * string, or `undefined` → auto-recap) inserts the SAME summary text for every run of that
+	 * group (`applyPlan`'s Phase B reuses `g.summaryText`/the auto-digest verbatim per run — see
+	 * the "INTERIOR straggler (TWO runs)" cross-validation test), so charging every run the same
+	 * scalar is correct and unchanged from before.
+	 *
+	 * A DROP group (`isDropGroup`) is NOT uniform across runs: `applyPlan`'s role-validity floor
+	 * (ADR 0006's open watch item, closed by `computeDegradedDropRuns`) can independently degrade
+	 * ONE run of a drop group to a one-message recap while its siblings still vanish for free — a
+	 * single "0 for every run" shortcut would under-count a degraded run's real cost and make the
+	 * GUI's savings readout LIE about what the model actually receives (the one thing this repo
+	 * promises never happens). `degradedRunKeys()` re-derives the EXACT same verdict `applyPlan`
+	 * would reach for this run — via the SAME exported `computeDegradedDropRuns` function, not a
+	 * parallel re-implementation of the role-adjacency check — so this can never silently drift
+	 * from the wire. A degraded run's cost is the recap's OWN token estimate, built from the exact
+	 * SAME text `applyPlan` synthesizes (`roleFloorRecap`, exported from `wire.ts` for this reason)
+	 * so the number matches token-for-token, not just in shape.
+	 */
+	private runWireTok(g: Group, c: GroupShape, run: Block[]): number {
 		if (!c.carrier) return 0;
-		if (this.isDropGroup(g)) return 0;
+		if (this.isDropGroup(g)) {
+			if (!this.degradedRunKeys().has(messageKey(run[0].id))) return 0;
+			return estTokens(roleFloorRecap(g.id, messageCountOfRun(run))) + BLOCK_OVERHEAD;
+		}
 		if (typeof g.digest === "string" && g.digest) return estTokens(g.digest) + BLOCK_OVERHEAD;
 		return groupDigestTokens(g, c.collapsedMembers);
+	}
+
+	/**
+	 * Which collapsed runs (identified by their carrier block's `messageKey`) `applyPlan`'s
+	 * role-validity floor would degrade to a recap RIGHT NOW, across every folded group at once —
+	 * memoized per `rev` (like `groupWire`/`protectedFromIndex`) since every group's accounting
+	 * reads it.
+	 *
+	 * WHY this must call the wire's OWN function and never a re-derived approximation: the floor's
+	 * verdict for one run depends on global context — which OTHER runs (this group's or another
+	 * group's) survive, degrade, or vanish right next to it — exactly the cross-run cascade
+	 * `computeDegradedDropRuns` already implements for `applyPlan`. Re-deriving an "equivalent"
+	 * check here would inevitably diverge on some edge case (a second folded group nearby, a
+	 * cascaded chain of drops), and drift between the wire and the accounting is precisely the bug
+	 * this method exists to close — the UI's claimed savings would once again lie about what the
+	 * model actually received. Calling the SAME function makes drift structurally impossible: same
+	 * inputs in, same verdict out, whether that function runs inside `applyPlan` (host, real
+	 * `PiMessage[]`) or here (host OR replica, reconstructed from `Block`s).
+	 *
+	 * `Truth` never holds pi's real messages (only the extension does, and only transiently, as
+	 * `serializeWire`'s parameter) — but a live `Block`'s own id already encodes which wire-role
+	 * class produced it (`wireRoleOfId`, the inverse of `blockId`'s prefix scheme), so the needed
+	 * `WireMsgShape[]` is reconstructed from `blockLog` alone (`buildWireShapes`), same for the
+	 * host and a replica that only ever adopted a snapshot.
+	 *
+	 * PERFORMANCE: one O(blockCount) pass to reconstruct `WireMsgShape[]` plus `computeGroupOps()`
+	 * (O(foldedGroups), already paid by `serializeWire` on the host) — no worse an order than the
+	 * O(blockCount) `liveTokens()`/`fullTokens()` passes this same rev change already triggers, and
+	 * skipped entirely (no reconstruction at all) when no group is folded.
+	 */
+	private degradedRunKeys(): Set<string> {
+		if (this.degradeCache.rev === this.revCounter) return this.degradeCache.keys;
+		const groups = this.computeGroupOps();
+		const keys = new Set<string>();
+		if (groups.length) {
+			const { shapes, keys: msgKeys } = this.buildWireShapes();
+			const { degradeStart } = computeDegradedDropRuns(shapes, groups);
+			for (const idx of degradeStart) keys.add(msgKeys[idx]);
+		}
+		this.degradeCache = { rev: this.revCounter, keys };
+		return keys;
+	}
+	/** Reconstruct one `WireMsgShape` per logical message in `blockLog`, grouped by `messageKey`
+	 *  (blocks sharing a key are always contiguous — see `messageCountOfRun`) — the `Block`-only
+	 *  equivalent of `messages.map((m,i) => ({...messageInfo(m,i), role: m.role}))`, which is all
+	 *  `applyPlan` itself builds from real `PiMessage[]` before calling `computeDegradedDropRuns`. */
+	private buildWireShapes(): { shapes: WireMsgShape[]; keys: string[] } {
+		const shapes: WireMsgShape[] = [];
+		const keys: string[] = [];
+		let curKey: string | null = null;
+		let ids: string[] = [];
+		let calls: string[] = [];
+		let results: string[] = [];
+		let hasNonDurable = false;
+		const flush = () => {
+			if (curKey === null) return;
+			shapes.push({ role: wireRoleOfId(ids[0]), ids, calls, results, hasNonDurable });
+			keys.push(curKey);
+		};
+		for (const b of this.blockLog) {
+			const k = messageKey(b.id);
+			if (k !== curKey) {
+				flush();
+				curKey = k;
+				ids = [];
+				calls = [];
+				results = [];
+				hasNonDurable = false;
+			}
+			ids.push(b.id);
+			if (!isDurableId(b.id)) hasNonDurable = true;
+			if (b.callId) {
+				if (b.kind === "tool_call") calls.push(b.callId);
+				else if (b.kind === "tool_result") results.push(b.callId);
+			}
+		}
+		flush();
+		return { shapes, keys };
 	}
 	private classifyGroup(g: Group): GroupShape {
 		const members: Block[] = [];
@@ -1224,5 +1375,3 @@ export class Truth {
 		return out;
 	}
 }
-
-export type { WireBlock, PiMessage };

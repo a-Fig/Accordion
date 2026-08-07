@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "../engine/store.svelte";
-import { estTokens, BLOCK_OVERHEAD } from "../engine/tokens";
-import { groupDigestTokens } from "../engine/digest";
+import { estTokens, BLOCK_OVERHEAD } from "$core/tokens";
+import { groupDigestTokens } from "$core/digest";
+import { roleFloorRecap } from "$core/wire";
 import type { Block, Group, ParsedSession } from "../engine/types";
 
 function b(id: string, kind: Block["kind"], turn: number, order: number, tokens: number, callId?: string): Block {
@@ -51,14 +52,18 @@ describe("isDropGroup", () => {
 	});
 });
 
-describe("groupLiveTokens — drop group has 0 carrier cost", () => {
-	it("a drop group (digest:null) folds to 0 carrier tokens (plus any stragglers)", () => {
+describe("groupLiveTokens — drop group carrier cost", () => {
+	it("a drop group whose removal breaks role validity charges the degraded recap, not 0", () => {
 		const s = makeStore();
-		// Inject a drop group over a balanced range (a:r1:p0..r:c1); no stragglers.
+		// Inject a drop group over a balanced range (a:r1:p0..r:c1); no stragglers. Removing this
+		// entire turn would leave u:1 directly adjacent to u:2 (same-role) — the wire's role-validity
+		// floor degrades the drop to a one-message recap, and accounting must charge exactly that
+		// recap (the UI must not claim 100% savings the wire doesn't deliver). The run spans two
+		// messages: the a:r1 assistant message and the r:c1 tool_result message.
 		s.groups = [{ id: "g:a:r1:p0", memberIds: ["a:r1:p0", "a:r1:p1", "a:r1:p2", "r:c1"], folded: true, by: "auto", digest: null }];
 		const g = s.groups[0];
 		expect(s.isDropGroup(g)).toBe(true);
-		expect(s.groupLiveTokens(g)).toBe(0); // carrier = 0; no stragglers
+		expect(s.groupLiveTokens(g)).toBe(estTokens(roleFloorRecap(g.id, 2)) + BLOCK_OVERHEAD);
 	});
 
 	it("a drop group with a straggler — straggler stays live at full tokens", () => {

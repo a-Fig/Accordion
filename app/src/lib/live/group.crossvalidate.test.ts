@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { applyPlan, linearize, wireToBlock, type PiMessage } from "./mapping";
+import { applyPlan, linearize, wireToBlock, type PiMessage } from "$core/wire";
 import { AccordionStore } from "../engine/store.svelte";
 import type { ParsedSession } from "../engine/types";
 
