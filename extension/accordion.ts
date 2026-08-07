@@ -3,7 +3,7 @@
  *
  * The truth moved into the extension: it hosts an in-process `Truth` per session (core/truth.ts —
  * the same class the app once ran). pi's `context` hook is a LOCAL operation against that Truth —
- * NO 250ms GUI plan round trip. A client (the GUI) is a REPLICA + remote control over protocol v11.
+ * NO 250ms GUI plan round trip. A client (the GUI) is a REPLICA + remote control over protocol v12.
  *
  * Per-hook loop (all local, no disk I/O, no await on any client):
  *   1. reconcile pi's `event.messages` against the Truth by a cheap durable-id walk. If it is our
@@ -307,6 +307,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	let lastHookMs = 0; // most recent hook duration (ms)
 	let maxHookMs = 0; // worst hook duration
 	let rebuilds = 0; // structural-divergence Truth rebuilds
+	let hookErrors = 0; // `context` hook throws caught by the passthrough guard (should stay 0)
 	const hookDurations: number[] = []; // bounded ring for the p95 readout
 	const HOOK_RING = 256;
 
@@ -420,10 +421,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 * any one session's HTTP server can list every session on the machine. Best-effort:
 	 * an unreadable directory or a partially-written/corrupt file is skipped, never thrown.
 	 *
-	 * ASYNC (fs.promises), not fs.*Sync: this runs on the same event loop as the `context`
-	 * hook's `requestPlan`, which only allows REQUEST_TIMEOUT_MS (250ms) before falling back
-	 * to passthrough. A browser tab polls this every second — synchronous directory/file I/O
-	 * here would add avoidable jitter to that budget; the async form yields between files.
+	 * ASYNC (fs.promises), not fs.*Sync: this runs on the same event loop as the `context` hook,
+	 * which is now a LOCAL, synchronous reconcile against the in-process Truth (no plan round
+	 * trip) that must stay fast — disk I/O on that path is a documented invariant violation. A
+	 * browser tab polls this endpoint every second; synchronous directory/file I/O here would
+	 * still share that event loop and add avoidable jitter ahead of the next model call. The
+	 * async form yields between files instead.
 	 *
 	 * Opportunistically REAPS dead entries it encounters (unlike a bare read): a browser-only
 	 * user has no desktop app ever running to clean up `~/.accordion/sessions/` after a
@@ -655,7 +658,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 						served: true,
 						sessionId,
 						protocolVersion: PROTOCOL_VERSION,
-						telemetry: { hookCount, lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, foldingEnabled },
+						telemetry: { hookCount, lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookErrors, foldingEnabled },
 					}),
 				);
 				return;
@@ -951,6 +954,19 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// On a resumed/loaded session no hook has fired yet, so read straight from the session
 			// manager. This runs before `ws` joins `clients`, so any resulting append events reach
 			// only the ALREADY-connected clients — the new client gets the up-to-date snapshot next.
+			//
+			// This intentionally still runs even when `truth` already exists (not gated behind
+			// `!truth`, i.e. NOT bootstrap-only): `readSessionMessages` reads pi's CURRENT
+			// `sessionManager` state, which reflects tree-nav (`session_before_tree`/`session_tree`,
+			// which this extension does not hook) the instant it happens — the only other way a
+			// tree-nav jump surfaces is the next `context`/`agent_end` hook. Gating this to
+			// bootstrap-only would leave a client that attaches right after a tree-nav (before the
+			// next model call) looking at the stale pre-nav branch. A second client attaching mid-
+			// session can still spuriously trip `ingestMessages`' divergence check against
+			// `lastMessages` here, forcing a rebuild — but `buildTruth`/`Truth.rebuildFrom` now
+			// preserves every surviving block's overlay and the host's dials across that rebuild, so
+			// the rebuild this triggers no longer wipes the first client's folds/pins/groups/dials
+			// (review finding).
 			const history = readSessionMessages(latestCtx);
 			if (history.length) ingestMessages(history);
 
@@ -996,12 +1012,6 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		});
 	}
 
-	/**
-	 * Send a sync and await the GUI's plan. Resolves a discriminated PlanResult:
-	 *   • "unsent"  — no GUI attached at call time (nothing sent).
-	 *   • "timeout" — sent, but no reply within the governing wait (the caller falls back to
-	 *                 the last known plan). `waitedMs` is that wait: PLAN_DEADLINE_MS when the
-	 *                 caller passes `armedNow`, PLAN_TIMEOUT_MS otherwise. Snapshotted by the
 	// ── Phase B host helpers (the truth lives here now) ─────────────────────────
 
 	/** Parse the client role from the connect URL (`?role=conductor`); default "gui". */
@@ -1028,8 +1038,13 @@ export default function accordionLive(pi: ExtensionAPI): void {
 
 	/**
 	 * (Re)build the authoritative Truth from a full messages array. Subscribes the event forwarder
-	 * so every subsequent Truth mutation streams to clients as a replayable `event`. The Truth
-	 * constructor marks all loaded history as sent (born sent). Sets `wireAttached` + the known
+	 * so every subsequent Truth mutation streams to clients as a replayable `event`. Uses
+	 * `Truth.rebuildFrom` so a structural-divergence rebuild (the CURRENT `truth`, captured as
+	 * `prev` below, is non-null) carries over every surviving block's overlay, `birthFolded`
+	 * membership, scalar dials, and fully-surviving groups from the truth being replaced — a
+	 * rebuild must reconcile pi's messages, not silently wipe every human/host fold, pin, group,
+	 * and dial (review finding). `prev === null` (session_start already nulled `truth`) skips
+	 * carryover: a brand-new session has nothing to preserve. Sets `wireAttached` + the known
 	 * context window BEFORE subscribing so those internal bumps ride the snapshot, not a stray event.
 	 */
 	function buildTruth(messages: PiMessage[]): void {
@@ -1037,12 +1052,17 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			unsubTruth();
 			unsubTruth = null;
 		}
+		const prev = truth;
 		const blocks = linearize(messages).map(wireToBlock);
-		const t = new Truth({ meta: metaForTruth(), blocks, lineCount: 0, skipped: 0 });
+		const t = Truth.rebuildFrom(prev, { meta: metaForTruth(), blocks, lineCount: 0, skipped: 0 });
 		t.wireAttached = true; // a live pi session is always a live wire (durability-aware accounting)
 		if (contextWindow != null) {
 			t.setContextWindow(contextWindow);
-			t.setBudget(contextWindow); // snap the budget to the model window (was the GUI's connect-time behavior)
+			// Snap the budget to the model window only on the FIRST build (no prior human dial to
+			// respect). A rebuild already carried `prev`'s budget via `rebuildFrom` — re-snapping it
+			// here on every divergence would silently undo a human's custom budget (part of the same
+			// finding: a rebuild must preserve the human's dials, not just per-block overlay).
+			if (!prev) t.setBudget(contextWindow);
 		}
 		unsubTruth = t.onEvent(forwardTruthEvent);
 		truth = t;
@@ -1233,25 +1253,36 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// unchanged (the default when folding is disabled); an explicit `{ messages }` replaces them.
 	pi.on("context", (event, ctx: ExtensionContext) => {
 		const t0 = Date.now();
-		latestCtx = ctx;
-		// Refresh model/usage in memory only — NO disk I/O on the model-call critical path.
-		refreshFromCtx(ctx);
-		const messages = event.messages as unknown as PiMessage[];
-		// (a) Reconcile pi's messages against the Truth: append a new suffix, or rebuild on
-		//     structural divergence (both broadcast to clients via the Truth subscription).
-		ingestMessages(messages);
-		// (b) PHASE C: wire-departing hold — a conductor's last-moment fold plugs in here (no-op today).
+		// Invariant: this hook must NEVER break a model call. Everything that can throw (a bad
+		// parse, an unexpected message shape, a Truth bug) is guarded — on any throw we fall back to
+		// passthrough (`ret` stays undefined) so pi proceeds with its own original messages,
+		// unmodified. Timing (below) still covers the whole guarded body, error or not.
 		let ret: { messages: AgentMessage[] } | undefined;
-		if (truth) {
-			// (c) If folding is armed, serialize the wire from the Truth and replace; else passthrough.
-			if (foldingEnabled) {
-				ret = { messages: truth.serializeWire(messages) as unknown as AgentMessage[] };
+		try {
+			latestCtx = ctx;
+			// Refresh model/usage in memory only — NO disk I/O on the model-call critical path.
+			refreshFromCtx(ctx);
+			const messages = event.messages as unknown as PiMessage[];
+			// (a) Reconcile pi's messages against the Truth: append a new suffix, or rebuild on
+			//     structural divergence (both broadcast to clients via the Truth subscription).
+			ingestMessages(messages);
+			// (b) PHASE C: wire-departing hold — a conductor's last-moment fold plugs in here (no-op today).
+			if (truth) {
+				// (c) If folding is armed, serialize the wire from the Truth and replace; else passthrough.
+				if (foldingEnabled) {
+					ret = { messages: truth.serializeWire(messages) as unknown as AgentMessage[] };
+				}
+				// (d) markSent through the last block — everything present has now reached the model.
+				const last = truth.blocks[truth.blocks.length - 1];
+				if (last) truth.markSent(last.order);
 			}
-			// (d) markSent through the last block — everything present has now reached the model.
-			const last = truth.blocks[truth.blocks.length - 1];
-			if (last) truth.markSent(last.order);
+		} catch (err) {
+			hookErrors++;
+			console.error("[accordion] context hook failed; passing messages through unmodified:", err);
+			ret = undefined;
 		}
-		// (e) Measure the whole hook and stream it as telemetry (proves the local path is fast).
+		// (e) Measure the whole hook (guarded body included) and stream it as telemetry (proves the
+		// local path is fast, and that a caught failure doesn't leave telemetry stale either).
 		recordHook(Date.now() - t0);
 		broadcastTelemetry();
 		return ret;

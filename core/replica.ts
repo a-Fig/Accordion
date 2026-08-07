@@ -56,6 +56,7 @@ export function serializeSnapshot(truth: Truth, foldingEnabled: boolean): Snapsh
 		sentThroughOrder: truth.sentThroughOrder,
 		wireAttached: truth.wireAttached,
 		foldingEnabled,
+		birthFolded: [...truth.birthFoldedIds],
 		rev: truth.rev,
 	};
 }
@@ -88,6 +89,7 @@ export function hydrateSnapshot(meta: SessionMeta, state: SnapshotState): Truth 
 		tailTokens: state.tailTokens,
 		sentThroughOrder: state.sentThroughOrder,
 		wireAttached: state.wireAttached,
+		birthFolded: state.birthFolded,
 		rev: state.rev,
 	});
 	return truth;

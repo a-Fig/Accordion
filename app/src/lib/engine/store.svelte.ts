@@ -64,6 +64,7 @@ export class AccordionStore {
 		return this._groups;
 	}
 	set groups(v: Group[]) {
+		this.assertLocalMode("groups");
 		this.truth.setGroups(v);
 		this._groups = this.truth.groups.map(cloneGroup);
 		this.version++;
@@ -185,6 +186,22 @@ export class AccordionStore {
 	get wireControlled(): boolean {
 		return this.commandSink !== null;
 	}
+	/**
+	 * Guard for the six mutators (`setContextWindow`, `appendBlocks`, `setLocks`, `clearLocks`, the
+	 * `groups` setter, the `wireAttached` setter) that write wire FACTS straight to the local Truth
+	 * instead of routing through `commandSink` like fold/pin/setBudget/setProtect do. In live replica
+	 * mode that wire input arrives ONLY via `replayEvent` (called by `liveClient.svelte.ts`), which
+	 * mutates the underlying Truth directly through `applyWireEvent` — it never calls these methods.
+	 * So calling one of these WHILE a command sink is installed is never correct: it would locally
+	 * fork the replica away from the host instead of waiting for the echoed event. Throws
+	 * unconditionally (no local-mode/live-mode split) — there is no live-mode caller these could ever
+	 * legitimately serve.
+	 */
+	private assertLocalMode(name: string): void {
+		if (this.commandSink) {
+			throw new Error(`AccordionStore.${name}() is local-only — it must not be called in live replica mode (state arrives via replayEvent)`);
+		}
+	}
 	/** The Truth's monotonic rev — the replica gap-check anchor. */
 	get rev(): number {
 		return this.truth.rev;
@@ -288,11 +305,16 @@ export class AccordionStore {
 		return this._activeTail;
 	}
 
-	// ── the wire-attached flag (set by the live client) ─────────────────────
+	// ── the wire-attached flag (local-mode / test seam) ─────────────────────
+	// In live mode the replica's `wireAttached` arrives baked into the snapshot/`adoptSnapshot`
+	// (hydrateSnapshot sets it on the Truth directly) — this setter is for local/demo sessions that
+	// want to simulate a live wire (e.g. group-accounting cross-validation tests), so it is guarded
+	// the same as the other five wire-fact mutators below.
 	get wireAttached(): boolean {
 		return this.truth.wireAttached;
 	}
 	set wireAttached(v: boolean) {
+		this.assertLocalMode("wireAttached");
 		if (this.truth.wireAttached === v) return;
 		this.truth.wireAttached = v; // bumps the truth rev → group accounting recomputes
 		this.version++;
@@ -300,8 +322,10 @@ export class AccordionStore {
 
 	// ── config dials ────────────────────────────────────────────────────────
 	// Budget + protect are human dials → route to the wire in live mode. contextWindow, append,
-	// and locks are wire FACTS (set from snapshot/events by the live client), never human actions,
-	// so they always apply to the local (replica) Truth directly.
+	// and locks are wire FACTS — in live mode they arrive over the wire as `event`s and are applied
+	// by `replayEvent` (→ `applyWireEvent`) DIRECTLY against the Truth, bypassing these methods
+	// entirely. So these methods are local-mode-only (demo / CC / file / tests); `assertLocalMode`
+	// refuses a live-mode call rather than let it silently fork the replica from the host.
 	setBudget(n: number): void {
 		if (this.commandSink) {
 			this.commandSink({ kind: "setBudget", value: n });
@@ -310,6 +334,7 @@ export class AccordionStore {
 		this.truth.setBudget(n);
 	}
 	setContextWindow(n: number): void {
+		this.assertLocalMode("setContextWindow");
 		this.truth.setContextWindow(n);
 	}
 	setProtect(n: number): void {
@@ -320,12 +345,15 @@ export class AccordionStore {
 		this.truth.setProtect(n);
 	}
 	appendBlocks(blocks: Block[]): void {
+		this.assertLocalMode("appendBlocks");
 		this.truth.append(blocks);
 	}
 	setLocks(locks: readonly LockName[], holder: string, tailTokens = 0): void {
+		this.assertLocalMode("setLocks");
 		this.truth.setLocks(locks, holder, tailTokens);
 	}
 	clearLocks(): void {
+		this.assertLocalMode("clearLocks");
 		this.truth.clearLocks();
 	}
 

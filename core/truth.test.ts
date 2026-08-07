@@ -336,3 +336,93 @@ describe("Truth — stats", () => {
 		expect(t.stats().liveTokens).toBeLessThan(before.liveTokens);
 	});
 });
+
+// A structural-divergence rebuild (tree-nav / compaction / another extension rewriting messages)
+// used to construct a bare `new Truth(...)`, silently dropping every human/host fold, pin, group,
+// and dial — even for block ids that survived the rebuild untouched. `Truth.rebuildFrom` is the
+// fix: it carries per-block overlay + `birthFolded` membership for surviving ids, scalar dials,
+// and any group whose members ALL survive, onto a freshly-built Truth.
+describe("Truth — rebuildFrom (rebuild-preserving overlay)", () => {
+	it("a fold + pin + group + custom protectTokens/budget + birth-folded block all survive a rebuild when every id survives", () => {
+		const host = live();
+		host.append(seq(6, 1000));
+		host.setProtect(2000); // protects the newest ~2 (indices 4, 5)
+		host.apply([{ kind: "pin", ids: ["a:b0:p0"] }], "you");
+		host.apply([{ kind: "fold", ids: ["a:b1:p0"] }], "you");
+		const groupRes = host.apply([{ kind: "group", ids: ["a:b2:p0", "a:b3:p0"] }], "you");
+		expect(groupRes.results[0].applied).toBe(true);
+		host.apply([{ kind: "fold", ids: ["a:b5:p0"] }], "auto"); // birth-fold: protected + unsent
+		host.setBudget(55_000);
+
+		// Sanity on the host itself before rebuilding.
+		expect(host.get("a:b5:p0")!.autoFolded).toBe(true);
+		expect(host.birthFoldedIds).toContain("a:b5:p0");
+		expect(host.isFolded(host.get("a:b5:p0")!)).toBe(true);
+
+		// Simulate pi re-linearizing the SAME messages into a fresh block list (no overlay) — every
+		// id survives, in the same order.
+		const fresh = seq(6, 1000);
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+
+		expect(next.get("a:b0:p0")!.override).toBe("pinned");
+		expect(next.get("a:b0:p0")!.by).toBe("you");
+		expect(next.get("a:b1:p0")!.override).toBe("folded");
+		expect(next.get("a:b1:p0")!.by).toBe("you");
+
+		expect(next.groups.length).toBe(1);
+		expect(next.groups[0].memberIds).toEqual(["a:b2:p0", "a:b3:p0"]);
+		expect(next.groups[0].folded).toBe(true);
+
+		expect(next.protectTokens).toBe(2000);
+		expect(next.budget).toBe(55_000);
+
+		// The birth-fold survives — carried into `next`'s OWN birthFolded set — even though
+		// `rebuildFrom` runs a housekeep pass at the end (which would otherwise heal any OTHER
+		// autoFolded block still sitting in the protected tail).
+		expect(next.birthFoldedIds).toContain("a:b5:p0");
+		expect(next.isFolded(next.get("a:b5:p0")!)).toBe(true);
+	});
+
+	it("drops a group when any member id disappears, but keeps the overlay of ids that DO survive", () => {
+		const host = live();
+		host.append(seq(5, 1000));
+		host.setProtect(0);
+		host.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "you");
+		const groupRes = host.apply([{ kind: "group", ids: ["a:b2:p0", "a:b3:p0"] }], "you");
+		expect(groupRes.results[0].applied).toBe(true);
+		expect(host.groups.length).toBe(1);
+
+		// "a:b3:p0" (a group member) does NOT survive the rebuild; everything else does.
+		const fresh = [blk("a:b0:p0", "text", 0, 1000), blk("a:b1:p0", "text", 1, 1000), blk("a:b2:p0", "text", 2, 1000), blk("a:b4:p0", "text", 3, 1000)];
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+
+		expect(next.blocks.length).toBe(4);
+		expect(next.get("a:b3:p0")).toBeUndefined(); // gone — nothing to carry
+		expect(next.groups.length).toBe(0); // dropped — not every member survived
+		expect(next.get("a:b0:p0")!.override).toBe("folded"); // surviving overlay still carried
+		expect(next.get("a:b0:p0")!.by).toBe("you");
+	});
+
+	it("carries over lock state (locks + holder + enforced tail tokens)", () => {
+		const host = live();
+		host.append(seq(3, 1000));
+		host.setProtect(0);
+		host.setLocks(["tail-size"], "conductor-x", 5000);
+
+		const fresh = seq(3, 1000);
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+
+		expect(next.locks).toEqual(["tail-size"]);
+		expect(next.lockHolder).toBe("conductor-x");
+		expect(next.activeTailTokens).toBe(5000);
+	});
+
+	it("prev === null (the very first build) skips carryover entirely — a fresh Truth, not polluted by ANY prior state", () => {
+		const fresh = seq(3, 1000);
+		const next = Truth.rebuildFrom(null, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(next.budget).toBe(70_000); // the class default, not some leaked value
+		expect(next.protectTokens).toBe(20_000);
+		expect(next.groups.length).toBe(0);
+		expect(next.get("a:b0:p0")!.override).toBe(null);
+	});
+});

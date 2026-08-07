@@ -6,8 +6,10 @@
  *
  * INVARIANTS (enforced below):
  *   1. Ghosts NEVER enter store.blocks or the engine model.
- *      Committed blocks arrive solely via the Phase-3 appendBlocks path in
- *      liveClient.svelte.ts. A ghost is only ever removed, never converted.
+ *      Committed blocks arrive via the wire `appended` event: liveClient.svelte.ts's
+ *      `replayEvent` → `applyWireEvent` appends them straight onto the replica Truth
+ *      (the store's own `appendBlocks` is a local-mode-only seam liveClient never calls —
+ *      see store.svelte.ts's `assertLocalMode`). A ghost is only ever removed, never converted.
  *   2. Every ghost spawned on a "start" frame is cleared on:
  *        a. its own "end" frame       (clean single-part resolution)
  *        b. an "abort" sweep          (error/abort or message_end/agent_end backstop)
