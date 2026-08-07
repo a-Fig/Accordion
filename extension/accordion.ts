@@ -118,6 +118,19 @@ const DOOR_RETRY_MS = 4_000;
 // both to classify an EADDRINUSE occupant (live Accordion vs. foreign software) and to decide the
 // /accordion URL. Never blocks a model call.
 const DOOR_PROBE_MS = 750;
+/**
+ * Three-way classification of whatever holds the door port (C2/S3):
+ *   • "accordion"  — a completed 200 from a loopback peer that is a MATCHING-version live Accordion
+ *                    (served:true AND protocolVersion===PROTOCOL_VERSION AND its sessionId is in the
+ *                    registry). Trust it: stand down this cycle, and /accordion may print the door URL.
+ *   • "foreign"    — a COMPLETED HTTP response that fails the served/shape check (definitive evidence
+ *                    of non-Accordion software). Permanent stand-down for this run.
+ *   • "transient"  — probe timeout, connection error/refused, or an Accordion of a DIFFERENT protocol
+ *                    version (served:true but protocolVersion mismatched), or a matching Accordion whose
+ *                    sessionId we could not confirm in the registry (likely a startup race). Ambiguous:
+ *                    keep retrying, NEVER permanent, and NEVER trust it with the secret door URL.
+ */
+type DoorProbe = "accordion" | "foreign" | "transient";
 // ── the controller lease (ADR 0024) ──────────────────────────────────────────
 // The lease-holder's extension refreshes controller.json's heartbeat this often while a matching
 // socket is connected; other extensions observe changes by polling the file's mtime this often.
@@ -188,6 +201,25 @@ function currentDoorRetryMs(): number {
 	if (raw === undefined) return DOOR_RETRY_MS;
 	const n = Number(raw);
 	return Number.isInteger(n) && n > 0 ? n : DOOR_RETRY_MS;
+}
+
+/** Controller heartbeat cadence, overridable via ACCORDION_CONTROLLER_HEARTBEAT_MS for fast tests
+ *  (default CONTROLLER_HEARTBEAT_MS). Test-only seam mirroring ACCORDION_DOOR_RETRY_MS; production
+ *  never sets the env, so it is always CONTROLLER_HEARTBEAT_MS. */
+function currentControllerHeartbeatMs(): number {
+	const raw = process.env.ACCORDION_CONTROLLER_HEARTBEAT_MS;
+	if (raw === undefined) return CONTROLLER_HEARTBEAT_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : CONTROLLER_HEARTBEAT_MS;
+}
+
+/** Controller poll cadence, overridable via ACCORDION_CONTROLLER_POLL_MS for fast tests
+ *  (default CONTROLLER_POLL_MS). Test-only seam; production always uses CONTROLLER_POLL_MS. */
+function currentControllerPollMs(): number {
+	const raw = process.env.ACCORDION_CONTROLLER_POLL_MS;
+	if (raw === undefined) return CONTROLLER_POLL_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : CONTROLLER_POLL_MS;
 }
 
 const ACCORDION_APP_FLAG = "accordion-app";
@@ -381,9 +413,9 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 
 	// -- the controller lease (ADR 0024) --
 	// In-memory view of the GLOBAL controller.json lease, kept current by our own claim writes and a
-	// ~1s mtime poll. null => no lease exists. Enforcement reads this; hello re-reads fresh from disk.
+	// ~1s poll. null => no lease exists. Enforcement reads this; the poll, the heartbeat, and a claim
+	// all re-read the file fresh (content-level, not mtime-gated — see reloadControllerLease / C4).
 	let controllerLease: ControllerLease | null = null;
-	let controllerFileMtimeMs = 0;              // last-seen controller.json mtime (skip unchanged reads)
 	let lastBroadcastHolder: string | null = null; // last surfaceId we broadcast (dedupe `controller` frames)
 	let controllerPollTimer: ReturnType<typeof setInterval> | null = null;
 	let controllerHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -1263,41 +1295,65 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 
 	// -- the door: an ADDITIONAL fixed-port listener, one extension at a time (ADR 0024) --
 	/**
-	 * Probe the door port's /__accordion/meta and resolve true iff a LIVE Accordion server answers
-	 * (served:true from a loopback peer). Bounded (DOOR_PROBE_MS). Used to classify an EADDRINUSE
-	 * occupant (Accordion vs. foreign software) and to decide the /accordion URL. Never on the hook path.
+	 * Probe the door port's /__accordion/meta and CLASSIFY the occupant (C2/S3, DoorProbe above). This
+	 * is deliberately STRICTER than the old served:true-only trust: a completed response that only sets
+	 * served:true is not enough to print the secret door URL at it — it must also match this protocol
+	 * version and name a session in the registry. And, critically, a timeout / connection error / a
+	 * mismatched-version Accordion is "transient", NOT foreign: a busy or momentarily-unavailable peer
+	 * must never trigger a PERMANENT door stand-down. Bounded (DOOR_PROBE_MS); never on the hook path.
 	 */
-	function probeDoorIsAccordion(): Promise<boolean> {
+	function probeDoor(): Promise<DoorProbe> {
 		const dp = currentDoorPort();
-		if (dp === null) return Promise.resolve(false);
+		if (dp === null) return Promise.resolve("transient");
 		return new Promise((resolve) => {
 			let settled = false;
 			let request: http.ClientRequest | null = null;
-			const finish = (ok: boolean): void => {
+			const finish = (result: DoorProbe): void => {
 				if (settled) return;
 				settled = true;
 				clearTimeout(deadline);
-				resolve(ok);
+				resolve(result);
 			};
-			const deadline = setTimeout(() => { request?.destroy(); finish(false); }, DOOR_PROBE_MS);
+			// A timeout means we never got a completed response — AMBIGUOUS (a busy/slow peer), not foreign.
+			const deadline = setTimeout(() => { request?.destroy(); finish("transient"); }, DOOR_PROBE_MS);
 			request = http.get({ hostname: "127.0.0.1", port: dp, path: "/__accordion/meta" }, (response) => {
-				if (response.statusCode !== 200 || !isLoopbackPeer(response.socket.remoteAddress)) { response.destroy(); finish(false); return; }
+				if (!isLoopbackPeer(response.socket.remoteAddress)) { response.destroy(); finish("transient"); return; }
+				// A COMPLETED non-200 HTTP response is a live server that isn't our (ungated, always-200)
+				// /meta contract — definitive foreign software.
+				if (response.statusCode !== 200) { response.destroy(); finish("foreign"); return; }
 				const chunks: Buffer[] = [];
 				let bodyBytes = 0;
 				response.on("data", (chunk: Buffer) => {
 					bodyBytes += chunk.length;
-					if (bodyBytes > SIBLING_ORIGIN_META_MAX_BYTES) { response.destroy(); finish(false); return; }
+					if (bodyBytes > SIBLING_ORIGIN_META_MAX_BYTES) { response.destroy(); finish("foreign"); return; }
 					chunks.push(chunk);
 				});
 				response.on("end", () => {
+					if (settled) return;
+					let meta: { served?: unknown; sessionId?: unknown; protocolVersion?: unknown };
 					try {
-						const metaBody = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { served?: unknown };
-						finish(metaBody.served === true);
-					} catch { finish(false); }
+						meta = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+					} catch { finish("foreign"); return; } // completed response, unparseable body → foreign
+					// Fails the served/shape check → foreign (a completed response from non-Accordion software).
+					if (meta.served !== true || typeof meta.sessionId !== "string") { finish("foreign"); return; }
+					// An Accordion of a DIFFERENT protocol version — do NOT trust it with the secret URL, but
+					// do NOT permanently stand down either (it's still Accordion). Keep retrying.
+					if (meta.protocolVersion !== PROTOCOL_VERSION) { finish("transient"); return; }
+					// Best-effort registry confirmation: a matching sessionId in the live registry proves this
+					// really is our peer. If we can't confirm it (registry read fails, or the session isn't
+					// listed yet — a startup race), treat it as ambiguous rather than trusting the secret URL.
+					const sid = meta.sessionId;
+					void listLiveSessions().then(
+						(sessions) => finish(sessions.some((s) => s.sessionId === sid) ? "accordion" : "transient"),
+						() => finish("transient"),
+					);
 				});
-				response.on("error", () => finish(false));
+				response.on("aborted", () => finish("transient"));
+				response.on("error", () => finish("transient"));
 			});
-			request.on("error", () => finish(false));
+			// A connection error (ECONNREFUSED, ECONNRESET from a peer that exited mid-probe, …) is
+			// AMBIGUOUS — never a permanent foreign stand-down.
+			request.on("error", () => finish("transient"));
 		});
 	}
 
@@ -1311,9 +1367,11 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	/**
 	 * Try to become the door holder: bind the fixed door port as an ADDITIONAL listener serving the
 	 * SAME handlers (static UI, /__accordion/*, WS upgrade) as this session's ephemeral server. On
-	 * EADDRINUSE, probe the occupant: a live Accordion door -> stand by and re-check on a slow timer;
-	 * foreign software -> log once and stand down PERMANENTLY. Idempotent (no-op once held / stood down
-	 * / a bind is already in flight). NEVER on the context hook.
+	 * EADDRINUSE, probe + classify the occupant (probeDoor): a matching live Accordion door -> stand by
+	 * and re-check on a slow timer; definitive foreign software -> log once and stand down PERMANENTLY;
+	 * anything ambiguous (timeout / connection error / other-version Accordion) -> keep retrying, never
+	 * permanent. Idempotent (no-op once held / stood down / a bind is already in flight). NEVER on the
+	 * context hook.
 	 */
 	function tryBindDoor(): void {
 		if (doorHeld || doorForeign || doorBinding) return;
@@ -1337,18 +1395,28 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			try { dwss.close(); } catch { /* ignore */ }
 			try { server.close(); } catch { /* ignore */ }
 			if (err?.code === "EADDRINUSE") {
-				void probeDoorIsAccordion().then((accordion) => {
-					if (accordion) {
-						scheduleDoorRetry(); // a live Accordion door holds it -> stand by, re-check
-					} else if (!doorForeign) {
-						doorForeign = true; // foreign software -> permanent stand-down (log once)
-						console.warn(`[accordion] door port ${dp} is held by non-Accordion software; the stable door URL is unavailable this run`);
+				void probeDoor().then((result) => {
+					if (result === "accordion") {
+						scheduleDoorRetry(); // a matching live Accordion door holds it -> stand by, re-check
+					} else if (result === "foreign") {
+						if (!doorForeign) {
+							doorForeign = true; // definitive non-Accordion software -> permanent stand-down (log once)
+							console.warn(`[accordion] door port ${dp} is held by non-Accordion software; the stable door URL is unavailable this run`);
+						}
+					} else {
+						// transient/ambiguous (timeout / connection error / other-version Accordion / unconfirmed
+						// session) -> NEVER a permanent stand-down; keep retrying so a busy or momentarily-gone
+						// Accordion peer, or one still mid-startup, doesn't disable the door for this whole run.
+						scheduleDoorRetry();
 					}
 				});
 			} else {
 				scheduleDoorRetry(); // transient -> try again later
 			}
 		});
+		// C3: verified on Windows 11 (2026-07-23) that two SEPARATE node processes racing this exact
+		// listen(PORT, "127.0.0.1") do NOT both bind — the loser cleanly gets EADDRINUSE (no SO_REUSEADDR
+		// hijack). So the EADDRINUSE probe path above is the sole arbitration; no lockfile is needed.
 		server.listen(dp, "127.0.0.1", () => {
 			doorBinding = false;
 			doorServer = server;
@@ -1373,18 +1441,47 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	}
 
 	// -- the controller lease: the GLOBAL single-controller blackboard (ADR 0024) --
-	/** Read + parse controller.json (best-effort). Returns the lease or null (absent/corrupt/old-proto). */
+	/** Read + parse controller.json (best-effort). Returns the lease or null (absent/corrupt/old-proto).
+	 *  S2: controller.json is a shared, ANY-extension-writable (or hand-editable) blackboard, so the
+	 *  fields read off it are re-validated through the SAME ingress sanitizers a live `?surface`/`?label`
+	 *  dial goes through — a corrupt/hostile file must not ride a malformed id or an unbounded label into
+	 *  the lease cache or a `controller` broadcast. A field that fails sanitization ⇒ treat as no lease. */
 	function readControllerLease(): ControllerLease | null {
 		try {
 			const raw = JSON.parse(fs.readFileSync(CONTROLLER_PATH, "utf8"));
-			return isControllerLease(raw) ? raw : null;
+			if (!isControllerLease(raw)) return null;
+			const surfaceId = sanitizeSurfaceId(raw.surfaceId);
+			const label = sanitizeSurfaceLabel(raw.label);
+			if (!surfaceId || !label) return null; // reject: same charset/length gate as the dial ingress
+			return { ...raw, surfaceId, label };
 		} catch {
 			return null;
 		}
 	}
 
+	/** Structural equality on the fields that decide "did the lease change" — content-level so a
+	 *  same-mtime foreign rewrite is caught (C4). Compares holder + timestamps, not the file's mtime. */
+	function leaseEq(a: ControllerLease | null, b: ControllerLease | null): boolean {
+		if (a === b) return true;               // both null (or the same object)
+		if (!a || !b) return false;
+		return a.surfaceId === b.surfaceId
+			&& a.label === b.label
+			&& a.claimedAt === b.claimedAt
+			&& a.heartbeatAt === b.heartbeatAt;
+	}
+
+	/** Read controller.json FRESH into the in-memory cache (content-level, NOT mtime-gated — C4/C1) and
+	 *  report whether the lease changed since our cached copy. Never broadcasts (each caller decides). */
+	function reloadControllerLease(): { lease: ControllerLease | null; changed: boolean } {
+		const next = readControllerLease();
+		const changed = !leaseEq(controllerLease, next);
+		controllerLease = next;
+		return { lease: next, changed };
+	}
+
 	/** Atomic write-rename of controller.json (same pattern as a registry entry). Updates the in-memory
-	 *  cache + our recorded mtime so the poll does not re-read our own write as an external change. */
+	 *  cache so a following poll does not re-read our own write as an external change (the content compare
+	 *  in reloadControllerLease sees it as unchanged). */
 	function writeControllerLease(lease: ControllerLease): void {
 		try {
 			fs.mkdirSync(REGISTRY_ROOT, { recursive: true });
@@ -1392,7 +1489,6 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			fs.writeFileSync(tmp, JSON.stringify(lease));
 			fs.renameSync(tmp, CONTROLLER_PATH);
 			controllerLease = lease;
-			try { controllerFileMtimeMs = fs.statSync(CONTROLLER_PATH).mtimeMs; } catch { /* ignore */ }
 		} catch {
 			/* best-effort: a lease write never breaks a session */
 		}
@@ -1417,29 +1513,33 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 
 	/** Read controller.json fresh into the cache + broadcast any change (used at connect time). */
 	function refreshControllerNow(): void {
-		controllerLease = readControllerLease();
-		try { controllerFileMtimeMs = fs.statSync(CONTROLLER_PATH).mtimeMs; } catch { controllerFileMtimeMs = 0; }
+		reloadControllerLease();
 		maybeBroadcastController();
 	}
 
-	/** ~1s mtime poll: adopt an EXTERNAL controller.json change (another extension's claim) + broadcast it. */
+	/** ~1s poll: adopt an EXTERNAL controller.json change (another extension's claim) + broadcast it.
+	 *  C4: a CONTENT compare (not the old mtime early-return) so a same-mtime foreign rewrite is never
+	 *  missed. The file read is tiny, so reading it every tick is cheap. */
 	function pollControllerFile(): void {
-		try {
-			const st = fs.statSync(CONTROLLER_PATH);
-			if (st.mtimeMs === controllerFileMtimeMs) return; // unchanged since our last read/write
-			controllerFileMtimeMs = st.mtimeMs;
-			controllerLease = readControllerLease();
-			maybeBroadcastController();
-		} catch {
-			// File absent (only the pre-first-claim state) -> no lease. Never broadcast a clear.
-			if (controllerLease !== null) { controllerLease = null; controllerFileMtimeMs = 0; }
-		}
+		const { changed } = reloadControllerLease();
+		// maybeBroadcastController dedupes on holder, so a pure heartbeat bump (holder unchanged) is a
+		// no-op; an absent file resolves to null and is never broadcast as a "cleared" frame.
+		if (changed) maybeBroadcastController();
 	}
 
-	/** ~2s heartbeat: refresh the lease's heartbeatAt IFF a connected socket IS the current holder. */
+	/** ~2s heartbeat: refresh the lease's heartbeatAt IFF a connected socket IS the current holder.
+	 *  C1: re-read the lease FRESH FROM DISK first (not the possibly-stale in-memory cache). At a
+	 *  coincident tick the heartbeat can fire before the poll, so writing from the cache would let this
+	 *  extension re-assert an OLD holder and clobber another extension's just-written fresh claim. By
+	 *  reading fresh and only ever writing back the SAME surfaceId that is on disk, we can never write a
+	 *  surfaceId that differs from the current file, and we adopt+broadcast a foreign change as the poll
+	 *  would. */
 	function heartbeatController(): void {
-		const lease = controllerLease;
+		const { lease, changed } = reloadControllerLease();
+		if (changed) maybeBroadcastController(); // a foreign claim we observed this tick — adopt + broadcast it
 		if (!lease) return;
+		// Only refresh the heartbeat if the FRESH on-disk holder is a surface connected to THIS
+		// extension; we write back that exact holder (never a different surfaceId than the file's).
 		let holderConnected = false;
 		for (const info of clients.values()) if (info.surfaceId && info.surfaceId === lease.surfaceId) { holderConnected = true; break; }
 		if (!holderConnected) return;
@@ -1449,11 +1549,11 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	/** Start the controller poll + heartbeat timers once (idempotent). Both are unref'd, best-effort. */
 	function startControllerTimers(): void {
 		if (!controllerPollTimer) {
-			controllerPollTimer = setInterval(pollControllerFile, CONTROLLER_POLL_MS);
+			controllerPollTimer = setInterval(pollControllerFile, currentControllerPollMs());
 			controllerPollTimer.unref?.();
 		}
 		if (!controllerHeartbeatTimer) {
-			controllerHeartbeatTimer = setInterval(heartbeatController, CONTROLLER_HEARTBEAT_MS);
+			controllerHeartbeatTimer = setInterval(heartbeatController, currentControllerHeartbeatMs());
 			controllerHeartbeatTimer.unref?.();
 		}
 	}
@@ -1503,7 +1603,14 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		const info = clients.get(ws);
 		if (!info || !info.surfaceId) return; // a surface with no identity can never hold the lease
 		const now = Date.now();
-		const prior = controllerLease && controllerLease.surfaceId === info.surfaceId ? controllerLease : null;
+		// S4: read the current lease fresh, then skip the write-rename entirely when this surface ALREADY
+		// holds a fresh lease — the heartbeat timer keeps heartbeatAt current, so a redundant claim (claim
+		// spam) shouldn't amplify disk churn. A stale-but-ours or someone-else's lease still rewrites.
+		const { lease: current } = reloadControllerLease();
+		if (current && current.surfaceId === info.surfaceId && isFreshLease(current, now)) {
+			return; // already the fresh holder — nothing to write, no change to broadcast
+		}
+		const prior = current && current.surfaceId === info.surfaceId ? current : null;
 		writeControllerLease({
 			registryProtocol: REGISTRY_PROTOCOL,
 			surfaceId: info.surfaceId,
@@ -2211,7 +2318,11 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			// (a single well-known link that survives any one session's death). Otherwise fall back to
 			// this session's own ephemeral token URL as before (the door-occupied-by-foreign case).
 			const dp = currentDoorPort();
-			const doorUp = dp !== null && doorSecret !== "" && (doorHeld || (await probeDoorIsAccordion()));
+			// Only print the secret-bearing door URL when WE hold the door, or a probe confirms a MATCHING
+			// live Accordion door holds it ("accordion"). A "transient" (busy/other-version peer) or
+			// "foreign" occupant falls back to this session's own ephemeral URL — never leak the secret
+			// URL at software we could not positively identify as a compatible Accordion (C2/S3).
+			const doorUp = dp !== null && doorSecret !== "" && (doorHeld || (await probeDoor()) === "accordion");
 			if (doorUp) {
 				lines.push(`Browser: http://127.0.0.1:${dp}/?token=${doorSecret}`);
 			} else if (port && webToken) {
