@@ -1,8 +1,10 @@
 # Thermocline
 
 An **out-of-process** context-management conductor for Accordion: attention-gated, LLM-quality
-compression staged in deliberate double-buffered epochs, under a **hard budget invariant** — the
-agent is *never* over budget.
+compression staged in deliberate double-buffered epochs, holding the agent **at or under budget**
+whenever the configuration is winnable. When the protected tail and/or human-pinned content alone
+already exceed the cap, no ladder can close that gap — Thermocline surfaces it explicitly as
+**OVERFLOW** rather than silently blowing the budget.
 
 Thermocline is the synthesis of two earlier conductors:
 
@@ -13,7 +15,8 @@ Thermocline is the synthesis of two earlier conductors:
   verbatim. This gives compression *depth* and a way to always free tokens.
 
 …combined under a deterministic budget ladder whose last rung is a hard delete, so the planner
-provably terminates at "protected tail + one minimal stratum" and can never outgrow the budget.
+provably terminates at "protected tail + held content + one minimal stratum" — under cap whenever
+that floor itself fits, and surfaced as **OVERFLOW** (never silent) when it doesn't.
 
 ## Layout
 
@@ -59,7 +62,8 @@ GPU is ideal; CPU works, slower).
 If the probe binary, `python3`, or `torch`/`transformers` is absent — or the spawn fails, or it
 times out — the scoring promise **rejects**, the conductor catches it, and the score map simply
 stays empty. The policy's **age-based rung 3.5** and the **hard-cap floor** are probe-independent,
-so the hard budget invariant still holds; the strategy just compacts by age instead of by attention.
+so the budget invariant still holds over reducible content; the strategy just compacts by age
+instead of by attention (irreducible overflow is surfaced the same way either way).
 This is a first-class path, unit-tested, not an afterthought.
 
 ## The epoch lifecycle
@@ -78,6 +82,12 @@ This is a first-class path, unit-tested, not an afterthought.
 `locks: ["human-steering"]` only. `agent-unfold` is deliberately **unlocked** — the agent's `unfold`
 IS graduation gate ②: a folded block the agent chose *not* to pull back is a signal it is safe to
 compress. `recall` is never lockable.
+
+A human can still raise `setProtect` mid-session — it isn't gated by `human-steering`. If that heals
+an already-applied fold or prunes an already-applied stratum's group, the conductor reconciles its
+`appliedFolds`/`appliedStrata` bookkeeping against the live view (both on the `state-changed{what:
+"protect"}` event, which also kicks an immediate re-evaluation tick, and on every tick thereafter) so
+`project()`/fill never keeps crediting a saving that no longer exists.
 
 ## Double-gate graduation
 

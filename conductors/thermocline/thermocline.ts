@@ -118,7 +118,9 @@ function persistPath(dir: string, key: string): string {
 export class ThermoclineConductor implements Conductor {
 	readonly id = ID;
 	readonly label = LABEL;
-	readonly description = "Attention-gated LLM compression in deliberate epochs, under a hard budget invariant.";
+	readonly description =
+		"Attention-gated LLM compression in deliberate epochs; live tokens stay at or under budget whenever " +
+		"protected/held content leaves room to compress, else the shortfall is surfaced as OVERFLOW — never silent.";
 	// human-steering ONLY — agent-unfold stays open (the agent's unfold is graduation gate ②).
 	readonly locks: readonly LockName[] = ["human-steering"];
 	// Small hold: the pre-model-call wire-departing hook runs a strictly deterministic emergency.
@@ -192,6 +194,7 @@ export class ThermoclineConductor implements Conductor {
 	private overflowTokens = 0;
 	private overflowCapTokens = 0;
 	private overflowProtectedTokens = 0;
+	private overflowHeldTokens = 0;
 
 	constructor(opts: ThermoclineOptions = {}) {
 		this.cfg = { ...DEFAULT_CFG, ...(opts.cfg ?? {}) };
@@ -231,8 +234,7 @@ export class ThermoclineConductor implements Conductor {
 				// proposes are async by contract v2) — e.g. a test driver, or an awaiting host.
 				return this.enqueueTick();
 			case "state-changed":
-				this.onStateChanged(e.changes);
-				return;
+				return this.onStateChanged(e.changes);
 			case "wire-departing":
 				return this.onWireDeparting();
 			case "resync":
@@ -241,9 +243,23 @@ export class ThermoclineConductor implements Conductor {
 		}
 	}
 
-	/** Agent recall/unfold is graduation gate ②; a human edit resets graduation via `held` next tick. */
-	private onStateChanged(changes: readonly StateChange[]): void {
+	/**
+	 * Agent recall/unfold is graduation gate ②; a human edit resets graduation via `held` next tick.
+	 *
+	 * P2 FIX — a human raising `setProtect` (a `what:"protect"` change) can HEAL an already-applied
+	 * fold, or PRUNE an already-applied stratum's group, UNDERNEATH the conductor: Truth's
+	 * `healProtected`/`pruneProtectedGroups` run synchronously inside `setProtect`, BEFORE this
+	 * event even fires — and the event itself carries NO block ids (see `StateChange`), so nothing
+	 * else would ever surface which id(s) healed. Because thermocline locks `human-steering` (the
+	 * ONLY other channel through which a human could directly fold/unfold/pin a block), a `protect`
+	 * heal is the ONE remaining way `appliedFolds`/`appliedStrata` can silently drift from reality.
+	 * React to it the same tick: reconcile our applied-state bookkeeping against the live view (see
+	 * `reconcileAppliedAgainstView`) and kick a tick so `project()`/fill catches up PROMPTLY, rather
+	 * than sitting stale until the next natural blocks-appended/turn-committed event.
+	 */
+	private onStateChanged(changes: readonly StateChange[]): void | Promise<void> {
 		let sawAgentTouch = false;
+		let sawProtectChange = false;
 		for (const c of changes) {
 			// gate ②: consume by:"agent" edits — the "recall" what-variant AND agent "unfold".
 			if (c.by === "agent" && (c.what === "recall" || c.what === "unfold") && c.id) {
@@ -257,6 +273,7 @@ export class ThermoclineConductor implements Conductor {
 			// humanOverride ids are NOT added here: the view's per-block `held` flag already reflects
 			// them next tick and policy's graduation resets on `held`. Adding them would permanently
 			// poison an id a human merely folded-then-unfolded.
+			if (c.what === "protect") sawProtectChange = true;
 		}
 		// On ANY agent touch, UNCONDITIONALLY discard an in-flight prepare so the veto can't be missed:
 		// the in-flight prepare's plan is local and may fold the touched unit. Agent unfolds are rare;
@@ -264,6 +281,11 @@ export class ThermoclineConductor implements Conductor {
 		if (sawAgentTouch && this.preparing) {
 			++this.prepareToken;
 			this.preparing = false;
+		}
+		if (sawProtectChange && this.reconcileAppliedAgainstView()) {
+			// Something was ACTUALLY healed/pruned underneath us — re-evaluate promptly instead of
+			// waiting for the next natural blocks-appended/turn-committed event.
+			return this.enqueueTick();
 		}
 	}
 
@@ -297,6 +319,9 @@ export class ThermoclineConductor implements Conductor {
 	private async onWireDeparting(): Promise<void> {
 		const view = this.materialize();
 		this.lastView = view;
+		// Defense in depth — see `reconcileAppliedAgainstView`: this is another project()-computing
+		// site, and the wire may depart before a protect-triggered tick has had a chance to settle.
+		this.reconcileAppliedAgainstView();
 		if (project(view, this.appliedForProject()) > capOf(view)) {
 			await this.runEmergency(view);
 		}
@@ -338,6 +363,62 @@ export class ThermoclineConductor implements Conductor {
 		};
 	}
 
+	/**
+	 * VIEW-DERIVED RECONCILIATION (P2 fix) — a human raising `setProtect` mid-session can HEAL an
+	 * already-applied fold (Truth's `healProtected`) or PRUNE an already-applied stratum's group
+	 * (`pruneProtectedGroups`) UNDERNEATH the conductor: both run synchronously inside `setProtect`,
+	 * BEFORE the `state-changed{what:"protect"}` event even fires, and that event carries NO block
+	 * ids — so nothing tells us WHICH id(s) healed. `project()` doesn't re-derive its own savings
+	 * from live fold state either: for a fold it subtracts `tokens − foldedTokens` for every id in
+	 * `appliedFolds` unconditionally, and for a stratum it subtracts `Σ member tokens − summaryTokens`
+	 * for every entry in `appliedStrata` unconditionally — so a STALE entry keeps crediting a saving
+	 * that no longer exists on the wire, fill under-reports, and the hard-budget invariant is
+	 * defeated with NO overflow status. Because thermocline locks `human-steering` (a human can't
+	 * directly fold/unfold/pin while it's held), a `protect` heal is the ONE remaining channel this
+	 * can happen through.
+	 *
+	 * The fix: re-derive both applied sets from the ACTUAL current view/groups rather than trusting
+	 * our own memory of what we last applied.
+	 *   - an `appliedFolds` entry whose block no longer renders `folded` (healed, or vanished) is
+	 *     dropped;
+	 *   - an `appliedStrata` entry whose engine group id no longer exists is dropped (a restored-but-
+	 *     not-yet-grouped entry — `groupId == null` — is left alone; there is nothing in the engine
+	 *     to check yet).
+	 *
+	 * Dropping an entry never re-folds it here: the freed block/members simply fall OUT of our
+	 * bookkeeping and become visible to `project()`/`planEpoch` again through the NORMAL epoch
+	 * machinery (HOLD/PREPARE/EMERGENCY) on its own schedule, which already refuses to fold/group
+	 * inside the (now possibly larger) protected tail via the engine's own protected clamp — forcing
+	 * an immediate re-fold here would just be clamped right back. Cheap (two small-map scans + one
+	 * `host.groups()` read) and self-contained: no new host event, no disk I/O, safe on every tick.
+	 *
+	 * Returns whether anything was actually dropped, so `onStateChanged` can kick a tick ONLY when
+	 * there was real drift to react to — a `protect` change that heals/prunes nothing (e.g. the
+	 * routine `setProtect` call during initial setup, before any epoch has ever applied anything) must
+	 * stay a complete no-op, exactly as before this fix, rather than spuriously firing a tick against
+	 * an empty/pre-epoch view (which could, for one, trip `validateRestoredStrata` before the first
+	 * real blocks have even landed).
+	 */
+	private reconcileAppliedAgainstView(): boolean {
+		let changed = false;
+		for (const [id] of this.appliedFolds) {
+			const b = this.host.get(id);
+			if (!b || !b.folded) {
+				this.appliedFolds.delete(id);
+				changed = true;
+			}
+		}
+		if (this.appliedStrata.length) {
+			const liveGroupIds = new Set(this.host.groups().map((g) => g.id));
+			const kept = this.appliedStrata.filter((s) => s.groupId == null || liveGroupIds.has(s.groupId));
+			if (kept.length !== this.appliedStrata.length) {
+				this.appliedStrata = kept;
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
 	// ── the main steady-state tick ─────────────────────────────────────────────────
 	/** Run a tick, serialized: if one is already in flight/queued, chain behind it (deferred — it must
 	 *  wait); if the chain is idle, START NOW so the tick's synchronous prefix executes during this
@@ -363,6 +444,9 @@ export class ThermoclineConductor implements Conductor {
 		this.gradAdvanced = false;
 
 		this.validateRestoredStrata(view);
+		// See `reconcileAppliedAgainstView` — before every project()/fill read, drop any appliedFolds/
+		// appliedStrata entry the engine already healed/pruned out from under us (a protect-raise).
+		this.reconcileAppliedAgainstView();
 
 		const cap = capOf(view);
 		let fill = cap > 0 ? project(view, this.appliedForProject()) / cap : 0;
@@ -557,7 +641,13 @@ export class ThermoclineConductor implements Conductor {
 		this.irreducibleOverflow = irreducible;
 		this.overflowTokens = irreducible ? Math.max(0, projected - cap) : 0;
 		this.overflowCapTokens = cap;
-		if (irreducible) this.overflowProtectedTokens = protectedTailTokens(view);
+		if (irreducible) {
+			this.overflowProtectedTokens = protectedTailTokens(view);
+			// Held (human-pinned) content OUTSIDE the tail is an equally genuine, equally immovable
+			// contributor to the irreducible floor — a conductor may never override a pin either. See
+			// `heldOutsideTailTokens` / the status text in `sendStatus`.
+			this.overflowHeldTokens = heldOutsideTailTokens(view);
+		}
 	}
 
 	/**
@@ -935,8 +1025,14 @@ export class ThermoclineConductor implements Conductor {
 				: this.lastAction === "emergency"
 					? "EMERGENCY"
 					: "HOLD";
+		// Name the ACTUAL composition of the irreducible floor — not just the protected tail. A
+		// conductor may never override a human pin either, so held content sitting OUTSIDE the tail
+		// is an equally genuine contributor to an un-winnable configuration; blaming only the tail
+		// would mislead whoever reads the status when a large pin is the real culprit.
 		const text = this.irreducibleOverflow
-			? `over budget and irreducible: protected tail ≈ ${fmtK(this.overflowProtectedTokens)}k > cap ${fmtK(this.overflowCapTokens)}k — raise the budget or shrink the protected tail`
+			? this.overflowHeldTokens > 0
+				? `over budget and irreducible: protected tail ≈ ${fmtK(this.overflowProtectedTokens)}k + held content ≈ ${fmtK(this.overflowHeldTokens)}k > cap ${fmtK(this.overflowCapTokens)}k — raise the budget, shrink the protected tail, or unpin held content`
+				: `over budget and irreducible: protected tail ≈ ${fmtK(this.overflowProtectedTokens)}k > cap ${fmtK(this.overflowCapTokens)}k — raise the budget or shrink the protected tail`
 			: `${action} ${pct}% · ${folded} folded · ${strata} strata${scoring}`;
 
 		if (text === this.lastStatusText) return;
@@ -951,6 +1047,7 @@ export class ThermoclineConductor implements Conductor {
 			highWater: Math.round(this.cfg.highWater * 100),
 			irreducibleOverflow: this.irreducibleOverflow,
 			overflowTokens: this.overflowTokens,
+			overflowHeldTokens: this.overflowHeldTokens,
 		});
 	}
 }
@@ -962,6 +1059,18 @@ function protectedTailTokens(view: ConductorView): number {
 	const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
 	let t = 0;
 	for (let i = pfi; i < view.blocks.length; i++) t += view.blocks[i].tokens;
+	return t;
+}
+
+/** Σ tokens of every HELD (human-pinned) block strictly BEFORE the protected tail boundary — a held
+ *  block INSIDE the tail is already counted by `protectedTailTokens`, so this never double-counts. A
+ *  conductor may never override a human pin, exactly as it may never fold inside the protected tail
+ *  — so a large pin sitting outside the tail is an equally genuine contributor to an un-winnable
+ *  configuration. Used only to name the numbers in the irreducible-overflow status message. */
+function heldOutsideTailTokens(view: ConductorView): number {
+	const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
+	let t = 0;
+	for (let i = 0; i < pfi; i++) if (view.blocks[i].held) t += view.blocks[i].tokens;
 	return t;
 }
 

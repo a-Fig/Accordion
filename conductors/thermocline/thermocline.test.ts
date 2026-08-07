@@ -578,6 +578,55 @@ describe("IRREDUCIBLE OVERFLOW (P1-4)", () => {
 	});
 });
 
+// ── protect-heal reconciliation (P2 fix) ──────────────────────────────────────────────────────
+//
+// BUG (pre-fix): `appliedFolds`/`appliedStrata` are the conductor's OWN private ledger of "what we
+// committed", diffed against on every HOLD and fed straight into `project()`. A human raising
+// `setProtect` mid-session can HEAL an already-applied fold or PRUNE an already-applied stratum's
+// group UNDERNEATH the conductor — Truth's `healProtected`/`pruneProtectedGroups` run synchronously
+// inside `setProtect`, but the `state-changed{what:"protect"}` event carries NO block ids, and
+// `onStateChanged` used to react only to `by:"agent"` touches. Because thermocline locks
+// `human-steering` (a human can't directly fold/unfold/pin while it's held), `setProtect` was the
+// ONE remaining channel through which this could happen — exactly what this test drives. Without
+// the fix, the healed saving stays credited forever, fill under-reports, and the "hard budget
+// invariant" is defeated with NO overflow status ever surfacing.
+test("protect-heal reconciliation: raising setProtect over an applied stratum drops the stale credit and re-evaluates", async () => {
+	const host = new TestHost();
+	const cond = new ThermoclineConductor({ scorer: emptyScorer, sessionKey: null });
+	cond.attach(host);
+	host.setBudget(30_000);
+	host.setProtect(300); // small tail — everything else groupable
+	host.appendBlocks(pairs(8)); // non-foldable pairs → only age-based strata (groups) can compress
+	await flush();
+
+	// The epoch committed at least one stratum (a `group` op) to fit under the 30k cap.
+	expect(host.truth.groups.length).toBeGreaterThanOrEqual(1);
+	expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(30_000);
+
+	// The human raises the protected tail to cover EVERYTHING. Truth's housekeep — inside
+	// `setProtect`, synchronously, BEFORE the state-changed event fires — prunes every stratum group
+	// and heals every fold: the saving is GONE, and (because every block is now protected) the
+	// ladder can never re-fold/re-group any of it either — genuinely irreducible.
+	host.setProtect(1_000_000);
+	await flush();
+
+	expect(host.truth.groups.length).toBe(0); // pruneProtectedGroups really did remove it
+	expect(host.truth.stats().liveTokens).toBeGreaterThan(30_000); // healed content is back to full, over cap
+
+	// THE FIX: thermocline's OWN reported state must reflect this reality — not the stale pre-heal
+	// credit — and must have RE-EVALUATED promptly (not waited for the next natural turn/append).
+	// Pre-fix this assertion fails: appliedStrata still names the pruned group, project() keeps
+	// subtracting its (now-fictional) saving, and no tick even reruns off the bare `setProtect` call
+	// — the last status stays the stale pre-heal one (irreducibleOverflow still false, overflowTokens
+	// still 0). `overflowTokens` (not `fullness`) is the assertion here: it's re-derived fresh from
+	// the post-heal projection every time `setOverflowState` runs, so it can't read stale.
+	const lastMetrics = [...host.statusLog].reverse().find((s) => s.metrics)?.metrics;
+	expect(lastMetrics?.irreducibleOverflow).toBe(true);
+	expect(lastMetrics?.overflowTokens as number).toBeGreaterThan(40_000); // the FULL raw gap, not a stale partial credit
+	const statusText = [...host.statusLog].reverse().find((s) => s.metrics)?.text ?? "";
+	expect(statusText).toMatch(/irreducible/i);
+});
+
 // ── restore validation drops strata whose members vanished ───────────────────────────────────
 test("restore validation: a stratum with a vanished member is dropped (never grouped)", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "thermo-stale-"));
