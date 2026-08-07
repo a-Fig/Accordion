@@ -104,12 +104,11 @@ export function hostEventsFromTruthEvent(truth: Truth, e: TruthEvent): HostEvent
 		return changes.length ? [{ type: "state-changed", changes, rev: e.rev }] : [];
 	}
 	if (e.type === "config") {
-		// `calibration` (v18, issue #11 stage 1) and `systemPrompt` (v19, issue #93) are both
-		// DISPLAY-only (a conductor reads `systemPrompt` via `ConductorHost.systemPrompt()` directly
-		// instead) and must stay invisible as a `state-changed` notification — neither carries a
-		// `budget`/`protectTokens`/`contextWindow` field, so without this guard either would fall
-		// through to the `budget !== undefined ? "budget" : "protect"` default and get mislabeled a
-		// "protect" change, waking every subscribed conductor for a dial it was never meant to see.
+		// `calibration` (v18, issue #11 stage 1) is DISPLAY-only and must stay invisible to a
+		// conductor — it carries no `budget`/`protectTokens`/`contextWindow` field, so without this
+		// guard it would fall through to the `budget !== undefined ? "budget" : "protect"` default and
+		// get mislabeled a "protect" change, waking every subscribed conductor on every calibration
+		// snap (once per model reply) for a dial it was never meant to see.
 		if (e.budget === undefined && e.protectTokens === undefined && e.contextWindow === undefined) return [];
 		const what: StateChange["what"] = e.budget !== undefined ? "budget" : "protect";
 		return [{ type: "state-changed", changes: [{ what, by: "you" }], rev: e.rev }];

@@ -60,9 +60,6 @@ export class TestHost implements ConductorHost {
 	stats(): TruthStats {
 		return this.truth.stats();
 	}
-	systemPrompt(): { text: string; tokens: number } | null {
-		return this.truth.systemPrompt;
-	}
 	countTokens(text: string): number {
 		// Calibrated (issue #11 stage 2, ADR 0025) — see `ConductorHost.countTokens`'s doc.
 		return this.truth.calTokens(estTokens(text));
