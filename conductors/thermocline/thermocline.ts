@@ -310,8 +310,7 @@ export class ThermoclineConductor implements Conductor {
 		this.validateRestoredStrata(view);
 
 		const cap = capOf(view);
-		const fill = cap > 0 ? project(view, this.appliedForProject()) / cap : 0;
-		this.lastFill = fill;
+		let fill = cap > 0 ? project(view, this.appliedForProject()) / cap : 0;
 
 		// everWarm tracks the latest scores on EVERY tick (before any graduation computation), so a
 		// unit that became hot this tick already needs 2K before the graduation decision reads it.
@@ -326,7 +325,13 @@ export class ThermoclineConductor implements Conductor {
 		// EMERGENCY: already over budget — deterministic, immediate, no LLM.
 		if (fill > 1.0) {
 			this.runEmergency(view);
+			// Re-measure AFTER the emergency compressed. (Refinement over the .mjs port, which used the
+			// stale pre-emergency fill and thus kicked a redundant LLM epoch after every emergency — the
+			// "two cache misses in quick succession" the ADR flagged.) A PREPARE fires below only if the
+			// deterministic emergency could NOT bring us under warmWater (e.g. an oversized protected tail).
+			fill = cap > 0 ? project(view, this.appliedForProject()) / cap : fill;
 		}
+		this.lastFill = fill;
 
 		// ANTICIPATE: approaching warmWater and no prepare in flight → start one.
 		if (fill >= this.cfg.warmWater && !this.preparing && this.needNewEpoch(fill)) {

@@ -3,7 +3,6 @@ import { AccordionStore } from "./store.svelte";
 import type { LockName } from "./locks";
 import { LOCK_NAMES, LOCK_LABELS, hasLock, isExclusive } from "./locks";
 import type { Block, ParsedSession } from "./types";
-import { resolveUnfold, resolveRecall } from "../live/plan";
 import { foldCode } from "./digest";
 
 /*
@@ -196,7 +195,7 @@ describe("ADR 0011 — agent-unfold gates the agent's unfold ONLY", () => {
 		s.fold("a:b0:p0", "auto");
 		s.setLocks(["agent-unfold"], "test-host");
 
-		const { restored, missing } = resolveRecall(s, [foldCode("a:b0:p0")]);
+		const { restored, missing } = s.resolveRecall([foldCode("a:b0:p0")]);
 		expect(missing).toEqual([]);
 		expect(restored.length).toBe(1);
 		expect(restored[0].text).toBe(full); // original content, not the digest

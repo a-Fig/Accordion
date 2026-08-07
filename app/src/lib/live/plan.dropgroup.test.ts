@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "../engine/store.svelte";
-import { computeGroupOps } from "./plan";
 import { estTokens, BLOCK_OVERHEAD } from "../engine/tokens";
 import { groupDigestTokens } from "../engine/digest";
 import type { Block, Group, ParsedSession } from "../engine/types";
@@ -104,7 +103,7 @@ describe("computeGroupOps — drop group emits summaryText: null", () => {
 		const s = makeStore();
 		// Inject a drop group directly
 		s.groups = [{ id: "g:a:r1:p0", memberIds: ["a:r1:p0", "a:r1:p1", "a:r1:p2", "r:c1"], folded: true, by: "auto", digest: null }];
-		const ops = computeGroupOps(s);
+		const ops = s.computeGroupOps();
 		expect(ops.length).toBe(1);
 		expect(ops[0].summaryText).toBe(null);
 		expect(ops[0].memberIds).toEqual(["a:r1:p0", "a:r1:p1", "a:r1:p2", "r:c1"]);
@@ -113,7 +112,7 @@ describe("computeGroupOps — drop group emits summaryText: null", () => {
 	it("does NOT skip a drop group — it is valid and must be emitted", () => {
 		const s = makeStore();
 		s.groups = [{ id: "g:u:2", memberIds: ["u:2", "a:r2:p0"], folded: true, by: "auto", digest: null }];
-		const ops = computeGroupOps(s);
+		const ops = s.computeGroupOps();
 		expect(ops.length).toBe(1);
 		expect(ops[0].summaryText).toBeNull();
 	});
@@ -122,7 +121,7 @@ describe("computeGroupOps — drop group emits summaryText: null", () => {
 		const s = makeStore();
 		// "" is a drop (isDropGroup covers null || ""), so computeGroupOps emits null, not skip.
 		s.groups = [{ id: "g:u:2", memberIds: ["u:2", "a:r2:p0"], folded: true, by: "auto", digest: "" }];
-		const ops = computeGroupOps(s);
+		const ops = s.computeGroupOps();
 		// isDropGroup("") = true → summaryText = null → emitted (not skipped)
 		expect(ops.length).toBe(1);
 		expect(ops[0].summaryText).toBeNull();
@@ -131,7 +130,7 @@ describe("computeGroupOps — drop group emits summaryText: null", () => {
 	it("a custom non-empty digest emits that string as summaryText", () => {
 		const s = makeStore();
 		s.groups = [{ id: "g:u:2", memberIds: ["u:2", "a:r2:p0"], folded: true, by: "auto", digest: "{#xyz FOLDED} my summary" }];
-		const ops = computeGroupOps(s);
+		const ops = s.computeGroupOps();
 		expect(ops.length).toBe(1);
 		expect(ops[0].summaryText).toBe("{#xyz FOLDED} my summary");
 	});
@@ -139,7 +138,7 @@ describe("computeGroupOps — drop group emits summaryText: null", () => {
 	it("undefined digest emits the standard groupDigest recap (byte-identical to before)", () => {
 		const s = makeStore();
 		const g = s.createGroup("a:r1:p0", "r:c1")!;
-		const ops = computeGroupOps(s);
+		const ops = s.computeGroupOps();
 		expect(ops.length).toBe(1);
 		expect(ops[0].summaryText).toBeTruthy();
 		expect(typeof ops[0].summaryText).toBe("string");

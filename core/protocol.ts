@@ -255,7 +255,16 @@ export interface CommandMessage {
 	cmd: WireCommand;
 }
 
-export type ClientMessage = CommandMessage;
+/**
+ * Ask the host for a fresh `snapshot`. Sent when a replica detects it has diverged — a replayed
+ * event's rev didn't match, or a `reset` event arrived (which the client resnapshots rather than
+ * replaying, sidestepping any batched-transaction rev ambiguity). Idempotent + cheap.
+ */
+export interface ResnapshotMessage {
+	type: "resnapshot";
+}
+
+export type ClientMessage = CommandMessage | ResnapshotMessage;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 

@@ -1,18 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { connectLive, disconnectLive, setArmed, live } from "./liveClient.svelte";
 import { folding } from "./folding.svelte";
-import { PROTOCOL_VERSION } from "./protocol";
+import { session } from "../session.svelte";
+import { PROTOCOL_VERSION, type SnapshotState, type WireEvent } from "./protocol";
 
 /*
- * liveClient armed-over-wire coverage. The live client is a WebSocket CLIENT, so we drive it
- * against a fake socket installed on `globalThis.WebSocket` (the same pattern conductorClient.test.ts
- * uses, and that extension/smoke.mjs uses against a real WS). `connectLive` also guards on
- * `typeof window` — node is the vitest environment here, so we shim a truthy `window` too.
+ * liveClient Phase B coverage. The live client is a WebSocket CLIENT, so we drive it against a fake
+ * socket installed on `globalThis.WebSocket`. `connectLive` also guards on `typeof window` — node is
+ * the vitest environment, so we shim a truthy `window` too.
  *
- * Scope: the two things this change adds to the client — `setArmed` puts an `armed` frame on the
- * wire (guarded on socket state), and the hello handler re-declares armed:false alongside the
- * folding reset on every attach. Deeper store/plan behavior is covered elsewhere (plan.test.ts,
- * mapping.test.ts) and by the extension smoke tests.
+ * Scope: the replica + remote-control contract — hello → snapshot builds a replica store; `event`s
+ * replay onto it (rev-gap → resnapshot); a human fold routes to the wire as a `command` with NO
+ * optimistic apply (the block folds only when the echo event arrives); the arm toggle sends a
+ * `setFolding` command and tracks the host's `folding` echo; telemetry drives the latency badge.
  */
 
 class FakeWebSocket {
@@ -38,7 +38,6 @@ class FakeWebSocket {
 		this.readyState = FakeWebSocket.CLOSED;
 		this.onclose?.();
 	}
-	// --- test drivers ---
 	open(): void {
 		this.readyState = FakeWebSocket.OPEN;
 		this.onopen?.();
@@ -59,16 +58,41 @@ function helloFrame() {
 		type: "hello",
 		protocolVersion: PROTOCOL_VERSION,
 		sessionId: "s-test",
+		role: "gui",
 		meta: { title: "t", cwd: "/tmp", model: "m", contextWindow: 1000, format: "pi" },
 	};
 }
 
-/** Connect and complete the hello handshake so the socket is OPEN and steerable. */
-function connectAndHello(): FakeWebSocket {
+const BASE_REV = 5;
+function snapshotState(over: Partial<SnapshotState> = {}): SnapshotState {
+	return {
+		blocks: [
+			{ id: "u:1", kind: "user", turn: 1, order: 0, text: "hi", tokens: 100 },
+			{ id: "a:r1:p0", kind: "text", turn: 1, order: 1, text: "reply " + "x".repeat(200), tokens: 200 },
+		],
+		overlay: [],
+		groups: [],
+		budget: 70_000,
+		contextWindow: 1000,
+		protectTokens: 0, // nothing protected → the reply block is foldable
+		locks: [],
+		lockHolder: null,
+		tailTokens: 0,
+		sentThroughOrder: 1,
+		wireAttached: true,
+		foldingEnabled: false,
+		rev: BASE_REV,
+		...over,
+	};
+}
+
+/** Connect, hello, and snapshot so the replica store is built and steerable. */
+function connectHelloSnapshot(over: Partial<SnapshotState> = {}): FakeWebSocket {
 	connectLive(1234);
 	const ws = FakeWebSocket.last!;
-	ws.open(); // OPEN before hello so a send inside the hello handler can land
+	ws.open();
 	ws.emit(helloFrame());
+	ws.emit({ type: "snapshot", state: snapshotState(over) });
 	return ws;
 }
 
@@ -84,6 +108,7 @@ beforeEach(() => {
 	(globalThis as any).window = (globalThis as any).window ?? {};
 	FakeWebSocket.last = null;
 	folding.enabled = false;
+	session.store = null;
 });
 
 afterEach(() => {
@@ -93,88 +118,101 @@ afterEach(() => {
 	else delete (globalThis as any).window;
 });
 
-describe("liveClient — armed over the wire", () => {
-	it("re-declares armed:false alongside the folding reset on every attach (hello)", () => {
-		const ws = connectAndHello();
+describe("liveClient — replica build + event replay", () => {
+	it("builds a rev-aligned replica store from the snapshot", () => {
+		connectHelloSnapshot();
 		expect(live.status).toBe("connected");
-		// The safety reset: a fresh attach always starts disarmed...
+		expect(session.store).not.toBeNull();
+		expect(session.store!.blocks.map((b) => b.id)).toEqual(["u:1", "a:r1:p0"]);
+		expect(session.store!.rev).toBe(BASE_REV);
 		expect(folding.enabled).toBe(false);
-		// ...and that disarmed state is explicitly re-synced to the extension.
-		const armedFrames = ws.framesOfType("armed");
-		expect(armedFrames.length).toBeGreaterThanOrEqual(1);
-		expect(armedFrames.at(-1)).toEqual({ type: "armed", armed: false });
 	});
 
-	it("setArmed(true) flips folding AND sends {type:'armed',armed:true} when connected", () => {
-		const ws = connectAndHello();
-		ws.sent.length = 0; // drop the hello-time armed:false so we assert only the toggle's frame
-
-		setArmed(true);
-		expect(folding.enabled).toBe(true);
-		expect(ws.framesOfType("armed")).toEqual([{ type: "armed", armed: true }]);
-
+	it("replays an appended event and stays rev-aligned (no resnapshot)", () => {
+		const ws = connectHelloSnapshot();
 		ws.sent.length = 0;
-		setArmed(false);
-		expect(folding.enabled).toBe(false);
-		expect(ws.framesOfType("armed")).toEqual([{ type: "armed", armed: false }]);
+		const ev: WireEvent = {
+			kind: "appended",
+			blocks: [{ id: "u:2", kind: "user", turn: 2, order: 2, text: "next", tokens: 100 }],
+			rev: BASE_REV + 1,
+		};
+		ws.emit({ type: "event", event: ev });
+		expect(session.store!.blocks.map((b) => b.id)).toEqual(["u:1", "a:r1:p0", "u:2"]);
+		expect(session.store!.rev).toBe(BASE_REV + 1);
+		expect(ws.framesOfType("resnapshot")).toHaveLength(0);
 	});
 
-	it("setArmed still flips folding but sends nothing on the wire when the socket is closed", () => {
-		const ws = connectAndHello();
-		ws.close(); // readyState → CLOSED; the client's onclose nulls out the active socket
+	it("requests a resnapshot when a replayed event's rev doesn't line up", () => {
+		const ws = connectHelloSnapshot();
 		ws.sent.length = 0;
-
-		setArmed(true);
-		// Local state (the on-screen preview / arm intent) still flips...
-		expect(folding.enabled).toBe(true);
-		// ...but the guarded send is a no-op: no frame goes out on a non-OPEN socket. The state
-		// is re-synced on the next attach from the hello handler, so nothing is lost.
-		expect(ws.framesOfType("armed")).toHaveLength(0);
+		ws.emit({
+			type: "event",
+			event: { kind: "appended", blocks: [{ id: "u:2", kind: "user", turn: 2, order: 2, text: "x", tokens: 100 }], rev: 999 },
+		});
+		expect(ws.framesOfType("resnapshot")).toEqual([{ type: "resnapshot" }]);
 	});
 
-	it("setArmed no-ops the wire send when never connected (folding still flips)", () => {
-		// No connectLive at all → module socket is null.
-		setArmed(true);
-		expect(folding.enabled).toBe(true);
-		// Nothing to assert on a socket; the point is it does not throw and does not require a socket.
-		expect(FakeWebSocket.last).toBeNull();
+	it("requests a resnapshot on a reset event rather than replaying it", () => {
+		const ws = connectHelloSnapshot();
+		ws.sent.length = 0;
+		ws.emit({ type: "event", event: { kind: "reset", by: "you", rev: BASE_REV + 1 } });
+		expect(ws.framesOfType("resnapshot")).toEqual([{ type: "resnapshot" }]);
 	});
 });
 
-/*
- * passthrough-ack handling (issue #60, ADR 0020). The extension acks every `context` hook
- * outcome as a `passthrough` message; the live client tallies `live.planOutcomes` for the
- * "wire N/M" readout. Driven end-to-end through the FakeWebSocket harness (this file's
- * existing pattern).
- */
-describe("liveClient — passthrough ack handling (issue #60)", () => {
-	it("tallies planOutcomes counters per cause and a running total", () => {
-		connectAndHello();
-		const ws = FakeWebSocket.last!;
-		expect(live.planOutcomes.total).toBe(0);
+describe("liveClient — remote control (commands, no optimistic apply)", () => {
+	it("routes a human fold to the wire as a command and only folds on the echoed event", () => {
+		const ws = connectHelloSnapshot();
+		ws.sent.length = 0;
 
-		ws.emit({ type: "passthrough", reqId: 1, cause: "applied", ops: 2, groups: 0 });
-		ws.emit({ type: "passthrough", reqId: 2, cause: "empty-plan", ops: 0, groups: 0 });
-		ws.emit({ type: "passthrough", reqId: 3, cause: "timeout-stale", ops: 1, groups: 0 });
-		ws.emit({ type: "passthrough", reqId: 4, cause: "timeout-raw", ops: 0, groups: 0 });
-		ws.emit({ type: "passthrough", reqId: 5, cause: "epoch-mismatch", ops: 0, groups: 0 });
+		session.store!.fold("a:r1:p0");
+		// No optimistic apply: the block is NOT folded until the host echoes the event back.
+		const b = session.store!.get("a:r1:p0")!;
+		expect(session.store!.isFolded(b)).toBe(false);
+		const cmds = ws.framesOfType("command");
+		expect(cmds).toHaveLength(1);
+		expect(cmds[0].cmd).toEqual({ kind: "ops", ops: [{ kind: "fold", ids: ["a:r1:p0"] }] });
 
-		expect(live.planOutcomes).toEqual({
-			applied: 1,
-			"empty-plan": 1,
-			"timeout-stale": 1,
-			"timeout-raw": 1,
-			"epoch-mismatch": 1,
-			total: 5,
-		});
+		// The host applies the fold and echoes an ops event; the replica folds via replay.
+		ws.emit({ type: "event", event: { kind: "ops", by: "you", ops: [{ kind: "fold", ids: ["a:r1:p0"] }], rev: BASE_REV + 1 } });
+		expect(session.store!.isFolded(session.store!.get("a:r1:p0")!)).toBe(true);
 	});
 
-	it("resets planOutcomes to zero on a fresh connection", () => {
-		connectAndHello();
-		FakeWebSocket.last!.emit({ type: "passthrough", reqId: 1, cause: "applied", ops: 0, groups: 0 });
-		expect(live.planOutcomes.total).toBe(1);
+	it("routes budget + protect dials to the wire as config commands", () => {
+		const ws = connectHelloSnapshot();
+		ws.sent.length = 0;
+		session.store!.setBudget(120_000);
+		session.store!.setProtect(8_000);
+		expect(ws.framesOfType("command").map((f) => f.cmd)).toEqual([
+			{ kind: "setBudget", value: 120_000 },
+			{ kind: "setProtect", value: 8_000 },
+		]);
+	});
 
-		connectAndHello(); // fresh connect — connectLive() drops the prior socket first
-		expect(live.planOutcomes.total).toBe(0);
+	it("setArmed sends a setFolding command; folding.enabled tracks the host's echo, not optimism", () => {
+		const ws = connectHelloSnapshot();
+		ws.sent.length = 0;
+		setArmed(true);
+		expect(ws.framesOfType("command")).toEqual([{ type: "command", seq: expect.any(Number), cmd: { kind: "setFolding", value: true } }]);
+		expect(folding.enabled).toBe(false); // not optimistic — waits for the echo
+		ws.emit({ type: "folding", enabled: true });
+		expect(folding.enabled).toBe(true);
+	});
+});
+
+describe("liveClient — telemetry + protocol guard", () => {
+	it("updates the latency telemetry from a telemetry frame", () => {
+		const ws = connectHelloSnapshot();
+		ws.emit({ type: "telemetry", lastHookMs: 3, maxHookMs: 12, p95HookMs: 7, rebuilds: 1, hookCount: 42 });
+		expect(live.telemetry).toEqual({ lastHookMs: 3, maxHookMs: 12, p95HookMs: 7, rebuilds: 1, hookCount: 42 });
+	});
+
+	it("refuses a protocol-version mismatch loudly", () => {
+		connectLive(1234);
+		const ws = FakeWebSocket.last!;
+		ws.open();
+		ws.emit({ ...helloFrame(), protocolVersion: PROTOCOL_VERSION + 1 });
+		expect(live.status).toBe("error");
+		expect(live.detail).toContain("protocol mismatch");
 	});
 });

@@ -131,7 +131,8 @@ export function applyWireEvent(truth: Truth, ev: WireEvent): void {
 			return;
 		case "config":
 			if (ev.budget !== undefined) truth.setBudget(ev.budget);
-			if (ev.contextWindow !== undefined) truth.setContextWindow(ev.contextWindow);
+			// A config event carries at most one dial; contextWindow is only ever emitted as a number.
+			if (ev.contextWindow !== undefined && ev.contextWindow !== null) truth.setContextWindow(ev.contextWindow);
 			if (ev.protectTokens !== undefined) truth.setProtect(ev.protectTokens);
 			return;
 		case "locks":

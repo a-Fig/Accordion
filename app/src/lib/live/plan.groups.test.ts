@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "../engine/store.svelte";
 import { foldCode } from "../engine/digest";
-import { computeGroupOps, resolveUnfold, resolveRecall } from "./plan";
 import type { Block, ParsedSession } from "../engine/types";
 
 function b(id: string, kind: Block["kind"], turn: number, order: number, tokens: number, callId?: string): Block {
@@ -29,7 +28,7 @@ describe("computeGroupOps", () => {
 	it("emits one GroupOp per FOLDED group, with durable members and the group-tagged summary", () => {
 		const s = makeStore();
 		const g = s.createGroup("a:r1:p0", "r:c1")!;
-		const ops = computeGroupOps(s);
+		const ops = s.computeGroupOps();
 		expect(ops.length).toBe(1);
 		expect(ops[0].id).toBe(g.id);
 		expect(ops[0].memberIds).toEqual(["a:r1:p0", "a:r1:p1", "a:r1:p2", "r:c1"]);
@@ -39,15 +38,15 @@ describe("computeGroupOps", () => {
 	it("preserves conductor custom group summaries with recovery tags", () => {
 		const s = makeStore();
 		const g = s.createGroup("a:r1:p0", "r:c1", "you", `{#${foldCode("g:a:r1:p0")} FOLDED} conductor group summary`)!;
-		const ops = computeGroupOps(s);
+		const ops = s.computeGroupOps();
 		expect(ops.length).toBe(1);
 		expect(ops[0].summaryText).toBe(`{#${foldCode(g.id)} FOLDED} conductor group summary`);
 
-		const recalled = resolveRecall(s, [foldCode(g.id)]);
+		const recalled = s.resolveRecall([foldCode(g.id)]);
 		expect(recalled.missing).toEqual([]);
 		expect(recalled.restored[0].ids).toEqual(g.memberIds);
 
-		const unfolded = resolveUnfold(s, [foldCode(g.id)]);
+		const unfolded = s.resolveUnfold([foldCode(g.id)]);
 		expect(unfolded.missing).toEqual([]);
 		expect(unfolded.restored[0].ids).toEqual(g.memberIds);
 		expect(s.groupById(g.id)!.folded).toBe(false);
@@ -57,14 +56,14 @@ describe("computeGroupOps", () => {
 		const s = makeStore();
 		const g = s.createGroup("a:r1:p0", "r:c1")!;
 		s.unfoldGroup(g.id);
-		expect(computeGroupOps(s)).toEqual([]);
+		expect(s.computeGroupOps()).toEqual([]);
 	});
 
 	it("drops non-durable member ids (positional ids are never collapsed on the wire)", () => {
 		const s = makeStore();
 		// Force a group with a positional member id by constructing it directly.
 		s.groups = [{ id: "g:m9:p0", memberIds: ["m9:p0", "a:r1:p0"], folded: true }];
-		const ops = computeGroupOps(s);
+		const ops = s.computeGroupOps();
 		expect(ops[0].memberIds).toEqual(["a:r1:p0"]); // m9:p0 filtered out
 	});
 });
@@ -74,19 +73,19 @@ describe("resolveUnfold — group code", () => {
 		const s = makeStore();
 		const g = s.createGroup("a:r1:p0", "r:c1")!;
 		expect(g.folded).toBe(true);
-		const { restored, missing } = resolveUnfold(s, [foldCode(g.id)]);
+		const { restored, missing } = s.resolveUnfold([foldCode(g.id)]);
 		expect(missing).toEqual([]);
 		expect(restored.length).toBe(1);
 		expect(restored[0].label).toContain("group");
 		expect(s.groupById(g.id)!.folded).toBe(false); // group is now open → drops from computeGroupOps
-		expect(computeGroupOps(s)).toEqual([]);
+		expect(s.computeGroupOps()).toEqual([]);
 	});
 
 	it("group unfold populates ids with the group's memberIds (not empty)", () => {
 		const s = makeStore();
 		const g = s.createGroup("a:r1:p0", "r:c1")!;
 		// The group covers: a:r1:p0, a:r1:p1, a:r1:p2, r:c1 (snapped to whole messages)
-		const { restored } = resolveUnfold(s, [foldCode(g.id)]);
+		const { restored } = s.resolveUnfold([foldCode(g.id)]);
 		expect(restored.length).toBe(1);
 		// ids must be the group's memberIds — never empty — so the conductor notification
 		// for agentUnfold carries the actual block ids rather than []
@@ -97,7 +96,7 @@ describe("resolveUnfold — group code", () => {
 	it("reports an unknown code as missing and changes nothing", () => {
 		const s = makeStore();
 		const g = s.createGroup("a:r1:p0", "r:c1")!;
-		const { restored, missing } = resolveUnfold(s, ["zzzzzz"]);
+		const { restored, missing } = s.resolveUnfold(["zzzzzz"]);
 		expect(restored).toEqual([]);
 		expect(missing).toEqual(["zzzzzz"]);
 		expect(s.groupById(g.id)!.folded).toBe(true); // untouched

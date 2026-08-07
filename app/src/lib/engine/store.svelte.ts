@@ -18,6 +18,7 @@ import { Truth } from "$core/truth";
 import type { Op, OpResult } from "$core/ops";
 import type { TruthEvent } from "$core/events";
 import { applyWireEvent } from "$core/replica";
+import { resolveUnfold as coreResolveUnfold, resolveRecall as coreResolveRecall } from "$core/agentView";
 import type { WireEvent, WireCommand, FoldOp, GroupOp } from "$core/protocol";
 
 interface LogEntry {
@@ -175,6 +176,52 @@ export class AccordionStore {
 		this._groups = this.truth.groups.map(cloneGroup);
 	}
 
+	// ── Phase B: replica + remote control ───────────────────────────────────
+	/** Install (live mode) / clear (local mode) the wire command sink. */
+	setCommandSink(sink: ((cmd: WireCommand) => void) | null): void {
+		this.commandSink = sink;
+	}
+	/** True iff human actions route to the wire (live mode) rather than the local Truth. */
+	get wireControlled(): boolean {
+		return this.commandSink !== null;
+	}
+	/** The Truth's monotonic rev — the replica gap-check anchor. */
+	get rev(): number {
+		return this.truth.rev;
+	}
+	/** Replay a serialized host event onto the (replica) Truth; the mirror updates via `onEvent`. */
+	replayEvent(ev: WireEvent): void {
+		applyWireEvent(this.truth, ev);
+	}
+	/** Route a steering op transaction to the wire when live, else apply it to the local Truth. */
+	private applyOps(ops: Op[], by: Actor): void {
+		if (this.commandSink && by === "you") {
+			this.commandSink({ kind: "ops", ops });
+			return;
+		}
+		this.truth.apply(ops, by);
+	}
+	/** The wire fold ops for the current state (view-over-truth; used by the fold-alarm diagnostic + tests). */
+	computeFoldOps(): FoldOp[] {
+		return this.truth.computeFoldOps();
+	}
+	/** The wire group-collapse ops for the current state (view-over-truth). */
+	computeGroupOps(): GroupOp[] {
+		return this.truth.computeGroupOps();
+	}
+	/**
+	 * Agent unfold/recall resolution against the underlying Truth. In production this runs
+	 * extension-side (core/agentView over the authoritative Truth); these thin passthroughs expose
+	 * it for read-only/CC contexts and the live-layer tests. NOTE: `resolveUnfold` MUTATES the
+	 * Truth locally — never call it on a live REPLICA (steering must route through the command sink).
+	 */
+	resolveUnfold(codes: string[]) {
+		return coreResolveUnfold(this.truth, codes);
+	}
+	resolveRecall(codes: string[]) {
+		return coreResolveRecall(this.truth, codes);
+	}
+
 	// ── activity log (built from truth events) ──────────────────────────────
 	private emit(by: Actor, action: string, detail: string): void {
 		this.log.unshift({ by, action, detail, n: this.logN++ });
@@ -252,13 +299,24 @@ export class AccordionStore {
 	}
 
 	// ── config dials ────────────────────────────────────────────────────────
+	// Budget + protect are human dials → route to the wire in live mode. contextWindow, append,
+	// and locks are wire FACTS (set from snapshot/events by the live client), never human actions,
+	// so they always apply to the local (replica) Truth directly.
 	setBudget(n: number): void {
+		if (this.commandSink) {
+			this.commandSink({ kind: "setBudget", value: n });
+			return;
+		}
 		this.truth.setBudget(n);
 	}
 	setContextWindow(n: number): void {
 		this.truth.setContextWindow(n);
 	}
 	setProtect(n: number): void {
+		if (this.commandSink) {
+			this.commandSink({ kind: "setProtect", value: n });
+			return;
+		}
 		this.truth.setProtect(n);
 	}
 	appendBlocks(blocks: Block[]): void {
@@ -271,12 +329,12 @@ export class AccordionStore {
 		this.truth.clearLocks();
 	}
 
-	// ── manual actions (forward to the single write path) ───────────────────
+	// ── manual actions (route to the wire in live mode, else the single write path) ──
 	fold(id: string, by: Actor = "you"): void {
-		this.truth.apply([{ kind: "fold", ids: [id] }], by);
+		this.applyOps([{ kind: "fold", ids: [id] }], by);
 	}
 	unfold(id: string, by: Actor = "you"): void {
-		this.truth.apply([{ kind: "unfold", ids: [id] }], by);
+		this.applyOps([{ kind: "unfold", ids: [id] }], by);
 	}
 	toggle(id: string, by: Actor = "you"): void {
 		const b = this.get(id);
@@ -284,16 +342,16 @@ export class AccordionStore {
 		this.isFolded(b) ? this.unfold(id, by) : this.fold(id, by);
 	}
 	pin(id: string): void {
-		this.truth.apply([{ kind: "pin", ids: [id] }], "you");
+		this.applyOps([{ kind: "pin", ids: [id] }], "you");
 	}
 	unpin(id: string): void {
-		this.truth.apply([{ kind: "unpin", ids: [id] }], "you");
+		this.applyOps([{ kind: "unpin", ids: [id] }], "you");
 	}
 	auto(id: string): void {
-		this.truth.apply([{ kind: "auto", ids: [id] }], "you");
+		this.applyOps([{ kind: "auto", ids: [id] }], "you");
 	}
 	resetAll(): void {
-		this.truth.apply([{ kind: "resetAll" }], "you");
+		this.applyOps([{ kind: "resetAll" }], "you");
 	}
 
 	// ── group actions ───────────────────────────────────────────────────────
@@ -343,19 +401,25 @@ export class AccordionStore {
 	}
 
 	createGroup(startId: string, endId: string, by: Actor = "you", digest?: string | null): Group | null {
+		// Live mode: the group materializes when the host's ops-applied event echoes back, so there
+		// is no synchronous group to return — return null (callers must not depend on the handle live).
+		if (this.commandSink && by === "you") {
+			this.commandSink({ kind: "ops", ops: [{ kind: "group", ids: [startId, endId], summary: digest }] });
+			return null;
+		}
 		const r = this.truth.apply([{ kind: "group", ids: [startId, endId], summary: digest }], by);
 		const res = r.results[0];
 		if (!res || !res.applied || !res.detail) return null;
 		return this.groupById(res.detail) ?? null;
 	}
 	deleteGroup(id: string, by: Actor = "you"): void {
-		this.truth.apply([{ kind: "ungroup", groupId: id }], by);
+		this.applyOps([{ kind: "ungroup", groupId: id }], by);
 	}
 	foldGroup(id: string, by: Actor = "you"): void {
-		this.truth.apply([{ kind: "foldGroup", groupId: id }], by);
+		this.applyOps([{ kind: "foldGroup", groupId: id }], by);
 	}
 	unfoldGroup(id: string, by: Actor = "you"): void {
-		this.truth.apply([{ kind: "unfoldGroup", groupId: id }], by);
+		this.applyOps([{ kind: "unfoldGroup", groupId: id }], by);
 	}
 	toggleGroup(id: string, by: Actor = "you"): void {
 		const g = this.groupById(id);
