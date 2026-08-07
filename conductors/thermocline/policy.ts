@@ -49,6 +49,10 @@ import type { BlockKind } from "../../core/types";
 import type { ConductorView } from "../../core/conductor/view";
 // The SINGLE remaining tag-authoring site imports the canonical tag builder — never a copy.
 import { foldTag } from "../../core/digest";
+// The run-boundary snapper mirrors Truth's group snapping EXACTLY by importing the SAME messageKey
+// function the engine's `snappedRange` walks (core/truth.ts → opGroup), never a re-implementation —
+// so a run's member set is a provable fixed point of what Truth actually groups. See `safeRunFromUnits`.
+import { messageKey } from "../../core/truth";
 
 export type { ConductorView, ViewBlock };
 
@@ -326,11 +330,105 @@ export interface Run {
 	lastId: string;
 }
 
+// ── message-atom snapping: keep a run a FIXED POINT of Truth's group snap ─────────────────────
+//
+// THE BUG THIS PREVENTS. Sibling parts of ONE assistant message share a `messageKey` (`a:m1:p0`,
+// `a:m1:p1`, `a:m1:p2` all key `a:m1`) but graduate INDEPENDENTLY (per-part attention is the whole
+// premise). When a run starts or ends mid-message, `core/truth.ts → opGroup`'s `snappedRange` walks
+// the group boundary OUTWARD to the whole message and pulls in sibling blocks the plan never listed:
+//   • the applied group id becomes `g:<first snapped id>` ≠ `g:<firstId>` → the baked recall tag
+//     `foldTag("g:"+firstId)` can't resolve (unfold/recall by code fails);
+//   • an absorbed sibling never reached `buildStratumPrompt` → invisible to the summarizing LLM;
+//   • for a DROP stratum, an absorbed sibling vanishes with no tag at all — silent, irreversible loss.
+//
+// THE FIX. Every run this module hands to `emitOps`/`planEpoch` is snapped INWARD to message atoms so
+// its member set is EXACTLY what `snappedRange` returns for `[firstId, lastId]`. A partial-message
+// cluster at either edge (a graduated part whose siblings are hot buoys, or a lone half of an
+// interleaved parallel tool-pair) is EXCLUDED — it stays at its current fidelity rather than dragging
+// an ineligible sibling into the group.
+
+/** Per-view position/messageKey index, so the snapper walks the SAME array `snappedRange` walks. */
+interface RunCtx {
+	/** block id → its index in view.blocks (== its position in Truth's blockLog). */
+	pos: Map<string, number>;
+	/** index → the block's messageKey (via the engine's own `messageKey`, never a copy). */
+	keys: string[];
+	/** index → block id. */
+	idAt: string[];
+}
+
+function runCtx(view: ConductorView): RunCtx {
+	const pos = new Map<string, number>();
+	const keys: string[] = [];
+	const idAt: string[] = [];
+	view.blocks.forEach((b, i) => {
+		pos.set(b.id, i);
+		keys.push(messageKey(b.id));
+		idAt.push(b.id);
+	});
+	return { pos, keys, idAt };
+}
+
+/**
+ * Trim a candidate run (a list of contiguous eligible/graduated units in conversation order) to the
+ * largest prefix/suffix window whose member set is a FIXED POINT of Truth's `snappedRange`: a
+ * contiguous block range whose two ends sit on messageKey boundaries. Returns that safe Run, or null
+ * if nothing survives.
+ *
+ * It mirrors `snappedRange` verbatim: for the window's `[firstPos..lastPos]` it expands OUTWARD over
+ * blocks sharing the boundary messageKey; the window is a fixed point iff that expansion neither grows
+ * past either end NOR fills an interior hole (an excluded buoy / straddling sibling). If the front
+ * message straddles, the leading unit is dropped; otherwise the trailing unit is dropped — until the
+ * window is exact or empty. For ids with self-messageKeys (no `:p`/`:` siblings) the first window is
+ * always exact, so this is a no-op there.
+ */
+function safeRunFromUnits(runUnits: Unit[], ctx: RunCtx): Run | null {
+	// A member absent from the view can't be located/snapped — bail safe (drop the whole run).
+	for (const u of runUnits) for (const id of u.ids) if (!ctx.pos.has(id)) return null;
+
+	let i0 = 0;
+	let i1 = runUnits.length;
+	while (i0 < i1) {
+		let firstPos = Infinity;
+		let lastPos = -Infinity;
+		const memberSet = new Set<number>();
+		for (let k = i0; k < i1; k++) {
+			for (const id of runUnits[k].ids) {
+				const p = ctx.pos.get(id)!;
+				memberSet.add(p);
+				if (p < firstPos) firstPos = p;
+				if (p > lastPos) lastPos = p;
+			}
+		}
+		// Simulate opGroup's snappedRange: expand the boundary outward over same-messageKey neighbors.
+		let lo = firstPos;
+		let hi = lastPos;
+		while (lo > 0 && ctx.keys[lo - 1] === ctx.keys[lo]) lo--;
+		while (hi < ctx.keys.length - 1 && ctx.keys[hi + 1] === ctx.keys[hi]) hi++;
+		// Fixed point iff the snap moved neither end AND [lo..hi] holds exactly the member set (no hole).
+		let exact = lo === firstPos && hi === lastPos && hi - lo + 1 === memberSet.size;
+		if (exact) for (let p = lo; p <= hi; p++) if (!memberSet.has(p)) { exact = false; break; }
+		if (exact) {
+			const units = runUnits.slice(i0, i1);
+			return {
+				unitIds: units.map((u) => u.id),
+				memberIds: units.flatMap((u) => u.ids),
+				firstId: ctx.idAt[firstPos],
+				lastId: ctx.idAt[lastPos],
+			};
+		}
+		if (lo < firstPos) i0++; // the FRONT message straddles out of the run — drop the leading unit
+		else i1--; // the back straddles, or an interior hole remains — drop the trailing unit
+	}
+	return null;
+}
+
 /**
  * Partition graduated units into STRATA runs. A run is a MAXIMAL contiguous sequence of
- * graduated units bounded by "buoy" units that split runs (hot / held / protected / grouped). A
- * run is kept only if it has ≥ cfg.minRunUnits units AND lies entirely OLDER than
- * protectedFromIndex. Shorter runs stay merely folded — they never sink to a stratum.
+ * graduated units bounded by "buoy" units that split runs (hot / held / protected / grouped), then
+ * snapped INWARD to message atoms (`safeRunFromUnits`) so the group Truth applies equals the plan. A
+ * run is kept only if it STILL has ≥ cfg.minRunUnits units after snapping AND lies entirely OLDER
+ * than protectedFromIndex. Shorter runs stay merely folded — they never sink to a stratum.
  */
 export function sedimentRuns(
 	view: ConductorView,
@@ -345,18 +443,15 @@ export function sedimentRuns(
 	// block AT index pfi to split runs, so a unit's order field has to be monotone with its position
 	// in view.blocks. buildUnits preserves this (a unit's order = its first block's).
 	const protectedFrom = view.blocks[pfi]?.order ?? Infinity;
+	const ctx = runCtx(view);
 
 	const runs: Run[] = [];
 	let cur: Unit[] = [];
 	const flush = () => {
+		// Snap INWARD to message atoms first; only then apply the min-run gate to the SURVIVING units.
 		if (cur.length >= cfg.minRunUnits) {
-			const memberIds = cur.flatMap((u) => u.ids);
-			runs.push({
-				unitIds: cur.map((u) => u.id),
-				memberIds,
-				firstId: memberIds[0],
-				lastId: memberIds[memberIds.length - 1],
-			});
+			const safe = safeRunFromUnits(cur, ctx);
+			if (safe && safe.unitIds.length >= cfg.minRunUnits) runs.push(safe);
 		}
 		cur = [];
 	};
@@ -375,23 +470,21 @@ export function sedimentRuns(
 /**
  * Age-based last-resort runs — same structural constraints as sedimentRuns but WITHOUT requiring
  * graduation. Used by planEpoch's Rung 3.5 when the probe is absent or attention-driven
- * compaction was insufficient. Returns runs in conversation order (oldest first).
+ * compaction was insufficient. Runs are snapped INWARD to message atoms (`safeRunFromUnits`), the
+ * SAME fixed-point guarantee as sedimentRuns — the emergency / hard-cap force-group path must not
+ * absorb an ineligible sibling either. Returns runs in conversation order (oldest first).
  */
 function ageBasedRuns(units: Unit[], view: ConductorView, claimed: Set<string>, cfg: Config, minUnits: number = cfg.minRunUnits): Run[] {
 	const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
 	const protectedFrom = view.blocks[pfi]?.order ?? Infinity;
+	const ctx = runCtx(view);
 
 	const runs: Run[] = [];
 	let cur: Unit[] = [];
 	const flush = () => {
 		if (cur.length >= minUnits) {
-			const memberIds = cur.flatMap((u) => u.ids);
-			runs.push({
-				unitIds: cur.map((u) => u.id),
-				memberIds,
-				firstId: memberIds[0],
-				lastId: memberIds[memberIds.length - 1],
-			});
+			const safe = safeRunFromUnits(cur, ctx);
+			if (safe && safe.unitIds.length >= minUnits) runs.push(safe);
 		}
 		cur = [];
 	};
@@ -736,9 +829,13 @@ export function capOf(view: ConductorView): number {
  *                              prefixes the group's recall tag itself: `foldTag('g:'+firstId)`.
  *                              The 'g:' prefix matches the engine's group id (`g:${memberIds[0]}`,
  *                              core/truth.ts → opGroup), so `foldCode(g.id)` resolves the agent's
- *                              unfold/recall. Sound because the run boundary is already whole-
- *                              message / tool-pair snapped, so the host's snap does not move
- *                              memberIds[0] off firstId.
+ *                              unfold/recall. GUARANTEED to match because every run is snapped INWARD
+ *                              to message atoms during run formation (sedimentRuns / ageBasedRuns →
+ *                              `safeRunFromUnits`): the run's member set is a FIXED POINT of the host's
+ *                              `snappedRange`, so the host cannot move memberIds[0] off firstId nor
+ *                              absorb a sibling the plan omitted. The conductor's `applyDesired` adds a
+ *                              belt-and-braces check on the REAL applied group id + members and repairs
+ *                              any residual mismatch rather than shipping an unresolvable tag.
  *       digestKind:"drop"    → `summary:null` (hard delete; the agent never sees those blocks).
  *
  * Missing LLM text ⇒ fall back to the deterministic tier so an emergency / not-yet-returned epoch
@@ -793,7 +890,9 @@ export function foldBody(unit: Unit, tier: "trim" | "digest", digests?: Map<stri
  * The TAGGED stratum summary for a group op. This is the SINGLE remaining tag-authoring site:
  * verbatim group summaries are untagged by the engine (core/ops.ts), yet strata must stay
  * recall-able, so we prefix the group's recall tag ourselves — `foldTag('g:'+firstId)`, keyed on
- * the engine's group id (`g:${memberIds[0]}`, core/truth.ts → opGroup). Keyed by `stratum:<firstId>`.
+ * the engine's group id (`g:${memberIds[0]}`, core/truth.ts → opGroup). `firstId` is a fixed point of
+ * the host's message-atom snap (guaranteed by `safeRunFromUnits` during run formation), so the tag
+ * keyed here is exactly the code the applied group carries. Keyed by `stratum:<firstId>`.
  */
 export function stratumSummary(stratumUnits: Unit[], firstId: string, digests?: Map<string, string> | null): string {
 	const body = digests?.get(`stratum:${firstId}`) ?? deterministicRecap(stratumUnits);

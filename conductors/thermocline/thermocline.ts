@@ -603,6 +603,11 @@ export class ThermoclineConductor implements Conductor {
 		const baseRev = this.host.stats().rev;
 		const res = this.host.propose({ baseRev, ops });
 
+		// Snapshot the groups AFTER the transaction so the belt-and-braces below reads the REAL member
+		// set Truth applied, not the plan's intent (one query — the loop reuses it).
+		const groupsAfter = this.host.groups();
+		const repairs: Op[] = [];
+
 		// Reconcile the tracked applied state with what ACTUALLY applied (a clamped op must not enter).
 		for (const r of res.results) {
 			if (!r.applied) continue;
@@ -615,21 +620,46 @@ export class ThermoclineConductor implements Conductor {
 				this.appliedStrata = this.appliedStrata.filter((s) => s.groupId !== op.groupId);
 			} else if (op.kind === "group") {
 				const d = desiredStrataByKey.get(stratumKey(op.ids[0], op.ids[op.ids.length - 1]));
-				if (d) {
-					// Drop any prior entry for this range, then record the fresh group id.
+				if (!d) continue;
+				const expectedId = `g:${d.firstId}`;
+				const appliedId = r.detail ?? expectedId;
+				// BELT-AND-BRACES (invariants 1–3). The summary we just put on the wire baked
+				// foldTag("g:"+firstId) as the stratum's recall handle, and project()/the summary prompt
+				// assume EXACTLY d.memberIds were grouped. Run boundaries are snapped to message atoms
+				// (policy → safeRunFromUnits) so Truth's group id + member set match the plan — but if they
+				// somehow DON'T (an engine change, a boundary regression), the tag can't resolve and content
+				// may have been absorbed silently (a drop would lose it with no tag at all). Detect it from
+				// the REAL applied id + member set, undo the group, discard the bookkeeping, and NEVER keep a
+				// stratum whose baked tag is unresolvable.
+				const applied = groupsAfter.find((g) => g.id === appliedId);
+				const membersMatch = applied != null && sameIdSet(applied.memberIds, d.memberIds);
+				if (appliedId !== expectedId || !membersMatch) {
+					repairs.push({ kind: "ungroup", groupId: appliedId });
 					this.appliedStrata = this.appliedStrata.filter((s) => !(s.firstId === d.firstId && s.lastId === d.lastId));
-					this.appliedStrata.push({
-						firstId: d.firstId,
-						lastId: d.lastId,
-						unitIds: d.unitIds,
-						memberIds: d.memberIds,
-						summary: d.summary,
-						summaryTokens: d.summaryTokens,
-						groupId: r.detail ?? `g:${d.firstId}`,
-					});
+					console.warn(
+						`[thermocline] stratum ${expectedId} discarded: applied group ${appliedId}` +
+							` (${applied ? applied.memberIds.length : 0} members) does not match the plan` +
+							` (${d.memberIds.length} members) — recall tag would not resolve; repairing.`,
+					);
+					continue; // do NOT record — the stratum failed
 				}
+				// Drop any prior entry for this range, then record the fresh group id.
+				this.appliedStrata = this.appliedStrata.filter((s) => !(s.firstId === d.firstId && s.lastId === d.lastId));
+				this.appliedStrata.push({
+					firstId: d.firstId,
+					lastId: d.lastId,
+					unitIds: d.unitIds,
+					memberIds: d.memberIds,
+					summary: d.summary,
+					summaryTokens: d.summaryTokens,
+					groupId: appliedId,
+				});
 			}
 		}
+
+		// Apply any belt-and-braces repairs (ungroup a mismatched stratum) so no unresolvable tag rides
+		// the wire. Rare-by-construction — the run-boundary snap makes a mismatch a should-never-happen.
+		if (repairs.length) this.host.propose({ baseRev: this.host.stats().rev, ops: repairs });
 	}
 
 	// ── background scoring ──────────────────────────────────────────────────────────
@@ -814,6 +844,15 @@ export class ThermoclineConductor implements Conductor {
  *  (stratumSummary re-adds the tag). Mirrors the engine's own tag-stripping on recoverable replace. */
 function stripTag(s: string): string {
 	return s.replace(/^\s*\{#[0-9a-z]{6} FOLDED\}\s*/, "");
+}
+
+/** True iff two id collections hold the SAME set of ids (order-independent) — the belt-and-braces
+ *  member-set equality between the plan's stratum and the group Truth actually applied. */
+function sameIdSet(a: readonly string[], b: readonly string[]): boolean {
+	if (a.length !== b.length) return false;
+	const set = new Set(a);
+	for (const id of b) if (!set.has(id)) return false;
+	return true;
 }
 
 /** The project()-shape applied state derived from a working plan's folds + strata. */
