@@ -124,8 +124,11 @@ describe("ADR 0011 — human-steering gates every human entry point", () => {
 		expect(s.get("a:b4:p0")!.override).toBe(null);
 		s.unfold("a:b0:p0"); // human can't unfold the strategy fold
 		expect(s.isFolded(s.get("a:b0:p0")!)).toBe(true);
-		s.auto("a:b0:p0"); // human can't clear the strategy fold's override
-		expect(s.get("a:b0:p0")!.override).toBe("folded");
+		s.auto("a:b0:p0"); // human can't clear the strategy fold
+		// A strategy fold is `autoFolded` (override stays null so a human CAN re-override); the
+		// refused human `auto()` leaves it untouched — still folded, still authored by the strategy.
+		expect(s.isFolded(s.get("a:b0:p0")!)).toBe(true);
+		expect(s.get("a:b0:p0")!.by).toBe("auto");
 		s.unfoldGroup(groupId); // human can't unfold the strategy group
 		s.deleteGroup(groupId); // human can't delete it
 		expect(s.groups.length).toBe(1);
@@ -221,6 +224,40 @@ describe("ADR 0011 — agent-unfold gates the agent's unfold ONLY", () => {
 		s.unfold("a:b0:p0", "agent");
 		expect(s.isFolded(s.get("a:b0:p0")!)).toBe(false);
 		expect(s.get("a:b0:p0")!.by).toBe("agent");
+	});
+});
+
+// ── the two axes are independent (lock-restore review follow-up) ──────────────
+describe("ADR 0011 — human-steering and agent-unfold are independent axes", () => {
+	it("human-steering locked ALONE: the agent's unfold still works", () => {
+		const s = makeStore(Array.from({ length: 4 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		s.fold("a:b0:p0", "auto"); // strategy fold
+		s.setLocks(["human-steering"], "test-host"); // only the HUMAN is locked
+
+		// The human is refused…
+		s.unfold("a:b0:p0", "you");
+		expect(s.isFolded(s.get("a:b0:p0")!)).toBe(true);
+		// …but the agent's unfold axis is untouched, so it still forces the block open.
+		s.unfold("a:b0:p0", "agent");
+		expect(s.isFolded(s.get("a:b0:p0")!)).toBe(false);
+		expect(s.get("a:b0:p0")!.by).toBe("agent");
+	});
+
+	it("BOTH human-steering AND agent-unfold locked: both axes refuse", () => {
+		const s = makeStore(Array.from({ length: 4 }, (_, i) => blk(i)));
+		s.setProtect(0);
+		s.fold("a:b0:p0", "auto"); // strategy fold
+		s.setLocks(["human-steering", "agent-unfold"], "test-host"); // lock both axes
+
+		// The human can't unfold…
+		s.unfold("a:b0:p0", "you");
+		expect(s.isFolded(s.get("a:b0:p0")!)).toBe(true);
+		expect(s.get("a:b0:p0")!.by).toBe("auto"); // no human override written
+		// …and neither can the agent — both axes are held.
+		s.unfold("a:b0:p0", "agent");
+		expect(s.isFolded(s.get("a:b0:p0")!)).toBe(true);
+		expect(s.get("a:b0:p0")!.by).toBe("auto"); // no agent override written either
 	});
 });
 
