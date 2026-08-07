@@ -1039,24 +1039,75 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 		expect(events.length).toBe(0);
 	});
 
-	it("calTokens never affects canFold / protectedFromIndex / stats() — decision math is untouched by the dial", () => {
+	// Stage 1's version of this test asserted calibration NEVER reached canFold/protectedFromIndex/
+	// stats() — the whole point of stage 2 (issue #11, ADR 0025) is to flip exactly that. This
+	// rewritten test checks what genuinely stays invariant (the protect(0) shortcut, and the literal
+	// dial fields of `stats()`) alongside what now legitimately moves (`stats().liveTokens`/
+	// `fullTokens`). See the two dedicated tests below for `protectedFromIndex` itself moving under a
+	// non-zero protect target.
+	it("with protectTokens=0 the tail-boundary shortcut stays calibration-invariant, but stats() liveTokens/fullTokens are now calibrated (stage 2)", () => {
 		const t = bulk(seq(4, 1000));
-		t.setProtect(0);
-		// `rev` legitimately bumps (setCalibration is a state change like any other config dial) — every
-		// OTHER field of `stats()` must stay byte-identical, since none of them may read the dial.
-		const { rev: revBefore, ...statsBefore } = t.stats();
+		t.setProtect(0); // target===0 short-circuits computeProtectedFromIndex before it ever reads calibration
 		const pfiBefore = t.protectedFromIndex();
 		const canFoldBefore = t.canFold(t.get("a:b0:p0")!);
+		const statsBefore = t.stats();
 
 		t.setCalibration(3.7);
 
-		const { rev: revAfter, ...statsAfter } = t.stats();
-		expect(statsAfter).toEqual(statsBefore);
-		expect(revAfter).toBe(revBefore + 1);
+		// The protect(0) shortcut is untouched by the dial — same boundary, same fold verdict.
 		expect(t.protectedFromIndex()).toBe(pfiBefore);
 		expect(t.canFold(t.get("a:b0:p0")!)).toBe(canFoldBefore);
-		// The dial only affects the opt-in display helper.
-		expect(t.calTokens(1000)).toBe(3700);
+
+		const statsAfter = t.stats();
+		// budget / protectTokens / contextWindow / protectedFromIndex / blockCount are literal dial
+		// values / structural facts — untouched by the multiplier (see `TruthStats`'s doc comment).
+		expect(statsAfter.budget).toBe(statsBefore.budget);
+		expect(statsAfter.protectTokens).toBe(statsBefore.protectTokens);
+		expect(statsAfter.contextWindow).toBe(statsBefore.contextWindow);
+		expect(statsAfter.protectedFromIndex).toBe(statsBefore.protectedFromIndex);
+		expect(statsAfter.blockCount).toBe(statsBefore.blockCount);
+		// liveTokens/fullTokens ARE calibrated (stage 2) — the whole point of issue #11.
+		expect(statsAfter.liveTokens).toBe(t.calTokens(statsBefore.liveTokens));
+		expect(statsAfter.fullTokens).toBe(t.calTokens(statsBefore.fullTokens));
+		expect(statsAfter.fullTokens).toBe(Math.round(statsBefore.fullTokens * 3.7));
+	});
+
+	it("protectedFromIndex moves under a non-1 calibration (stage 2): the SAME real protectTokens target maps to a SMALLER raw-estimate region as k grows", () => {
+		const t = bulk(seq(5, 1000)); // 5 blocks, 1000 raw tokens each
+		t.setProtect(2500); // a REAL 2500-token target
+
+		// k=1: raw-equivalent target is still 2500, cap 3125 — walking from the newest block backward,
+		// 3 blocks (3000 raw) crosses the target before the cap does — tail = indices [2,3,4].
+		expect(t.protectedFromIndex()).toBe(2);
+
+		t.setCalibration(2);
+		// raw-equivalent target is now 2500/2 = 1250 (cap 1562.5): 2 blocks (2000 raw) already exceed
+		// the CAP before reaching a 3rd, so the walk stops early — tail shrinks to just [4]. This is
+		// the intended effect: once real tokens run higher than the raw estimate, FEWER raw-estimated
+		// blocks are needed to satisfy the same real-token protection target.
+		expect(t.protectedFromIndex()).toBe(4);
+	});
+
+	it("protectedFromIndex boundary is IDENTICAL between the host and a JSON-round-tripped replica under a non-1 calibration (stage 2 determinism)", () => {
+		const host = live();
+		host.append(seq(6, 1000));
+		host.setProtect(2500);
+		host.setCalibration(1.375);
+		const hostPfi = host.protectedFromIndex();
+
+		// Sanity: calibration genuinely moved the boundary versus k=1, so this test isn't vacuous.
+		const atDefault = live();
+		atDefault.append(seq(6, 1000));
+		atDefault.setProtect(2500);
+		expect(hostPfi).not.toBe(atDefault.protectedFromIndex());
+
+		// Round-trip through JSON (not just object assignment) — any finite double survives
+		// `JSON.stringify`/`JSON.parse` exactly (the shortest-round-tripping-decimal guarantee), which
+		// is the same path `calibration` takes over the real WS wire.
+		const wireState = JSON.parse(JSON.stringify(serializeSnapshot(host, false)));
+		const replica = hydrateSnapshot(META, wireState);
+		expect(replica.calibration).toBe(host.calibration);
+		expect(replica.protectedFromIndex()).toBe(hostPfi);
 	});
 
 	it("survives rebuildFrom (carried like budget/protectTokens), and a fresh build (prev === null) stays at the default", () => {

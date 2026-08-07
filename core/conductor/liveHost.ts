@@ -211,7 +211,12 @@ export class LiveConductorHost implements ConductorHost {
 		return this.deps.truth()?.stats() ?? ZERO_STATS;
 	}
 	countTokens(text: string): number {
-		return estTokens(text);
+		// Calibrated (issue #11 stage 2, ADR 0025) — see `ConductorHost.countTokens`'s doc. Falls back
+		// to the raw estimate when there is no live Truth (mirrors `ZERO_STATS`'s uncalibrated `stats()`
+		// fallback just above).
+		const t = this.deps.truth();
+		const raw = estTokens(text);
+		return t ? t.calTokens(raw) : raw;
 	}
 	digestOf(id: string): string | null {
 		const b = this.deps.truth()?.get(id);

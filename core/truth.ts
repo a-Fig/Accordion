@@ -33,7 +33,34 @@ interface GroupShape {
 	collapsedRuns: Block[][];
 }
 
-/** Aggregate readout of the Truth state (the conductor host's `stats()`). */
+/**
+ * Aggregate readout of the Truth state (the conductor host's `stats()`).
+ *
+ * CALIBRATION CONVENTION (issue #11 stage 2, ADR 0025): `liveTokens`/`fullTokens` are calibrated
+ * (`Truth.calTokens` applied once to the aggregate) — real, provider-anchored numbers, not the raw
+ * chars/4 estimate. `budget`/`protectTokens`/`contextWindow` are NOT converted — they are the
+ * literal dial values a human (or a conductor's declared `tailTokens`) set, which stage 2 treats as
+ * already meaning REAL tokens (that is the whole point of calibrating the numerator against them:
+ * "compaction triggers at 90% of a REAL 70k budget", not "90% of a 70k raw estimate scaled up").
+ * `protectedFromIndex` is the boundary index itself (unitless), already computed against the
+ * calibrated threshold — see `Truth.protectedFromIndex`'s doc.
+ *
+ * The SAME convention applies to every other conductor-facing read surface — `ViewBlock.tokens` /
+ * `ViewBlock.foldedTokens` (`core/conductor/hostAdapter.ts`'s `viewBlockOf`) and
+ * `ConductorHost.countTokens` are ALL calibrated too. This is a deliberate "calibrate at every read
+ * surface" choice over the alternative ("stats calibrated, per-block/countTokens stay raw, conductor
+ * compares like-with-like itself"): `AgedSummaryConductor` (`conductors/in-process/
+ * agedSummaryConductor.ts`) sums `ViewBlock.tokens` directly to build its own trigger baseline
+ * (`sumTokens(view.blocks)`), and thermocline's `project()` (`conductors/ws/thermocline/policy.ts`)
+ * subtracts per-block `tokens − foldedTokens` from the `stats().fullTokens` baseline it reads via
+ * `ConductorHost.stats()` — both mix aggregate and per-block reads in the SAME arithmetic
+ * expression, so leaving one calibrated and the other raw would silently corrupt their math (not
+ * just under/over-trigger, but genuinely wrong numbers, since a raw-per-block subtraction from a
+ * calibrated aggregate baseline is not even the right ORDER of magnitude once `calibration` drifts
+ * from 1). Calibrating every read surface means no shipped conductor needed a single code change to
+ * become calibration-aware — they already read `ViewBlock.tokens`/`stats()`/`countTokens` and treat
+ * whatever those report as the ground truth.
+ */
 export interface TruthStats {
 	rev: number;
 	liveTokens: number;
@@ -123,13 +150,18 @@ export class Truth {
 	private contextWindowTok: number | null = null;
 	private protectTokensTarget = 20_000;
 	/**
-	 * Provider-anchored calibration multiplier (issue #11 stage 1, ADR 0025): `k = realTokens /
+	 * Provider-anchored calibration multiplier (issue #11, ADR 0025): `k = realTokens /
 	 * estimatedTokens` for the same request, snapped by the HOST ONLY (`setCalibration`, called from
 	 * the extension after pairing an assistant reply's real usage against the wire estimate that
 	 * produced it). Default 1 — a session that never observes a real pairing (cold start; read-only /
 	 * demo / CC / file sessions, which have no live host to ever call the setter) stays at 1 forever.
-	 * DISPLAY-ONLY: nothing in `canFold`/`protectedFromIndex`/`stats()`/wire serialization reads this
-	 * — decision math stays on the raw chars/4 estimate (stage 1 invariant). See `calTokens`.
+	 * Stage 1 (display) shipped this dial as read-only plumbing; stage 2 (this) additionally feeds it
+	 * into the DECISION surface: `protectedFromIndex()` sizes the protected tail against a calibrated
+	 * threshold (see that method's doc), and `stats()` reports calibrated `liveTokens`/`fullTokens`
+	 * so a conductor's own budget-trigger math runs on real numbers. `canFold` itself still carries no
+	 * token threshold at all (verified — it only ever calls `isProtected`, never compares a token
+	 * count), so nothing there needed to change directly; it inherits the calibrated boundary
+	 * transitively through `isProtected`/`protectedFromIndex`. See `calTokens`.
 	 */
 	private calibrationMul = 1;
 
@@ -216,8 +248,13 @@ export class Truth {
 	 * otherwise invisible. `carriedSent` MUST round-trip (v15) for the same silent-divergence reason:
 	 * a replica that lost it reclassifies a block the host recorded as already-sent back to fresh
 	 * (birth-fold-eligible / re-listed in `freshIds`), again with both revs still advancing in step.
-	 * `calibration` (v18) is DISPLAY-only (see the field's own doc comment) — a replica that lost it
-	 * just falls back to the safe default (1), never a decision-affecting silent divergence.
+	 * `calibration` (v18) now FEEDS DECISION MATH (stage 2, see the field's own doc comment) — a
+	 * replica that lost it falls back to the safe default (1), which is a decision-affecting
+	 * divergence in principle (a different `protectedFromIndex()`/`stats()` reading than the host's);
+	 * in practice this can only happen via a stale/test literal omitting the field, never a real
+	 * replica (the host serializer always emits it, and a replica that ever legitimately lost track
+	 * would already have mismatched `rev` on the very next event and resnapshotted before the
+	 * divergence could matter).
 	 */
 	adoptSnapshot(s: {
 		blocks: Block[];
@@ -382,14 +419,19 @@ export class Truth {
 		return this.calibrationMul;
 	}
 	/**
-	 * Calibrated DISPLAY value of a raw token estimate — `Math.round(n * calibration)`. A pure helper
-	 * a display consumer routes a number it ALREADY computed (`liveTokens()`, `effTokens(b)`, a
-	 * per-kind sum, …) through to opt into calibration; it never feeds back into `canFold` /
-	 * `protectedFromIndex` / `stats()` / wire serialization, which stay on the raw estimate (stage 1
-	 * invariant, issue #11). One multiplier necessarily SMEARS the fixed system-prompt/tool-schema
+	 * Calibrated value of a raw token estimate — `Math.round(n * calibration)`. A pure helper a
+	 * caller routes a number it ALREADY computed (`liveTokens()`, `effTokens(b)`, a per-kind sum, …)
+	 * through to opt into calibration. Stage 1 (issue #11, ADR 0025) used this for DISPLAY only;
+	 * stage 2 additionally routes it through `stats()` (so `TruthStats.liveTokens`/`fullTokens` are
+	 * calibrated) and through the conductor-facing `ViewBlock.tokens`/`foldedTokens`
+	 * (`core/conductor/hostAdapter.ts`'s `viewBlockOf`) and `ConductorHost.countTokens` — see the
+	 * "convention" note on `TruthStats` for why calibrating every conductor read surface (rather than
+	 * leaving per-block reads raw) is the coherent choice. `protectedFromIndex()` does NOT call this
+	 * helper — it converts the TARGET into raw-estimate space with one division instead (see that
+	 * method's doc for why). One multiplier necessarily SMEARS the fixed system-prompt/tool-schema
 	 * overhead (which belongs to no block) proportionally across every block rather than carrying it
 	 * as its own line item — `real = base + k·est` would be the honest affine model; this ships the
-	 * pure multiplier knowingly (see ADR 0025 for the stage-2 plan).
+	 * pure multiplier knowingly (ADR 0025's Deferred section).
 	 */
 	calTokens(n: number): number {
 		return Math.round(n * this.calibrationMul);
@@ -483,10 +525,15 @@ export class Truth {
 	}
 
 	stats(): TruthStats {
+		// Calibrate the AGGREGATE once (a single `calTokens` call per field), never per-block inside
+		// `liveTokens()`/`fullTokens()` themselves — those stay the raw accessors every other internal
+		// caller (`effTokens`, group accounting, `serializeWire`) still needs untouched. See
+		// `TruthStats`'s doc for the "calibrate every conductor read surface" convention this
+		// implements alongside `viewBlockOf`/`countTokens`.
 		return {
 			rev: this.revCounter,
-			liveTokens: this.liveTokens(),
-			fullTokens: this.fullTokens(),
+			liveTokens: this.calTokens(this.liveTokens()),
+			fullTokens: this.calTokens(this.fullTokens()),
 			budget: this.budgetTok,
 			contextWindow: this.contextWindowTok,
 			protectTokens: this.protectTokensTarget,
@@ -519,6 +566,16 @@ export class Truth {
 	}
 
 	// ── protected working tail ──────────────────────────────────────────────
+	/**
+	 * The first block index inside the protected working tail. Issue #11 stage 2 (ADR 0025):
+	 * `protectTokens` (and a `tail-size` holder's enforced `activeTailTokens`) is the USER-MEANINGFUL
+	 * dial — sized in REAL tokens — so the walk below must size the tail against a CALIBRATED
+	 * reading of the block log, not the raw chars/4 sum it used to compare against directly.
+	 *
+	 * See `computeProtectedFromIndex` for the exact mechanism (one division of the target, not a
+	 * `calTokens` multiplication per block) and why that choice is the deterministic one across a
+	 * host/replica pair.
+	 */
 	protectedFromIndex(): number {
 		if (this.pfiCache.rev === this.revCounter) return this.pfiCache.value;
 		const value = this.computeProtectedFromIndex();
@@ -528,8 +585,22 @@ export class Truth {
 	private computeProtectedFromIndex(): number {
 		const blocks = this.blockLog;
 		if (!blocks.length) return 0;
-		const target = this.isLocked("tail-size") ? this.activeTailTok : this.protectTokensTarget;
-		if (target === 0) return blocks.length;
+		const targetReal = this.isLocked("tail-size") ? this.activeTailTok : this.protectTokensTarget;
+		if (targetReal === 0) return blocks.length;
+		// Convert the REAL-token target into the EQUIVALENT raw-estimate threshold by ONE division,
+		// rather than calibrating (multiplying) each block's raw `tokens` inside the walk below.
+		// `calibrated(rawSum) >= targetReal` iff `rawSum >= targetReal / calibration`, so the two
+		// forms are mathematically identical — but a SINGLE shared division is the deterministic one
+		// across a host/replica pair. `calibrationMul` is a rev-stamped scalar both sides carry
+		// byte-identical (replicated verbatim over the wire, JSON round-trips a float64 exactly), so
+		// one division from the same two operands produces a bit-identical result on both sides
+		// (IEEE-754 basic ops are deterministic). Calibrating per block instead would call
+		// `Math.round` (inside `calTokens`) once per iteration — its cumulative rounding error is a
+		// function of iteration order and count, which a host and a replica have no contractual
+		// guarantee to walk identically over time (a replica may resnapshot mid-walk-history,
+		// reorder-free but not iteration-for-iteration-identical against every historical host pass).
+		// A single division has no such accumulation to diverge on.
+		const target = targetReal / this.calibrationMul;
 		const cap = target * PROTECT_OVERFLOW_CAP;
 		let sum = blocks[blocks.length - 1].tokens;
 		if (sum >= target) return blocks.length - 1;
