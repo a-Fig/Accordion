@@ -135,7 +135,7 @@ describe("registry", () => {
 });
 
 describe("select — required-capability readiness", () => {
-	it("refuses an unavailable spawn without detaching the current conductor", () => {
+	it("refuses an unavailable spawn without detaching or relabeling the current conductor", () => {
 		const t = bulk(textSeq(2));
 		const h = makeDeps(t, {
 			readiness: () => ({
@@ -146,16 +146,34 @@ describe("select — required-capability readiness", () => {
 		});
 		const host = new LiveConductorHost(h.deps);
 		host.select("compaction-naive");
+		host.setStatus("Naive compaction is active", { phase: "idle" });
 		expect(host.activeMeta()?.id).toBe("compaction-naive");
 		expect(t.locks).toEqual(["human-steering", "agent-unfold"]);
+		const statusesBefore = h.broadcastLog.filter((m) => m.type === "conductorStatus");
 
 		host.select("triptych");
 
 		expect(host.activeMeta()?.id).toBe("compaction-naive");
 		expect(t.locks).toEqual(["human-steering", "agent-unfold"]);
 		expect(h.spawned).toHaveLength(0);
-		const status = h.broadcastLog.filter((m) => m.type === "conductorStatus").pop();
-		expect(status && status.type === "conductorStatus" && status.text).toContain("Tree-sitter dependencies are missing. Run npm install.");
+		expect(h.broadcastLog.filter((m) => m.type === "conductorStatus")).toEqual(statusesBefore);
+		expect(host.cachedStatus()).toMatchObject({ text: "Naive compaction is active", metrics: { phase: "idle" } });
+	});
+
+	it("treats an unknown or stale id as inert rather than as detach", () => {
+		const t = bulk(textSeq(2));
+		const h = makeDeps(t);
+		const host = new LiveConductorHost(h.deps);
+		host.select("compaction-naive");
+		host.setStatus("Still active");
+		const stateBefore = h.broadcastLog.filter((m) => m.type === "conductorState");
+
+		host.select("removed-by-newer-catalog");
+
+		expect(host.activeMeta()?.id).toBe("compaction-naive");
+		expect(t.locks).toEqual(["human-steering", "agent-unfold"]);
+		expect(host.cachedStatus()).toMatchObject({ text: "Still active" });
+		expect(h.broadcastLog.filter((m) => m.type === "conductorState")).toEqual(stateBefore);
 	});
 });
 

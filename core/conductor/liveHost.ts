@@ -305,8 +305,9 @@ export class LiveConductorHost implements ConductorHost {
 	/**
 	 * The `selectConductor` command handler. Required-capability readiness is checked BEFORE
 	 * detach, so a stale/forged pick of an unavailable conductor cannot disturb the current one.
-	 * Valid picks then detach-first (freeze→clearLocks→teardown→abort) and attach the chosen
-	 * conductor. `id === null` / `"none"` detaches only.
+	 * Unknown ids are likewise refused without mutating either the active conductor or its status;
+	 * only `id === null` / `"none"` means detach. Valid picks then detach-first
+	 * (freeze→clearLocks→teardown→abort) and attach the chosen conductor.
 	 *
 	 * Fix 2 — TRANSACTIONAL attach: state-mutating lock application happens only at the LAST
 	 * responsible moment, never before we know the conductor is actually going to be live, so a
@@ -327,16 +328,19 @@ export class LiveConductorHost implements ConductorHost {
 	 */
 	select(id: string | null): void {
 		const entry = entryById(id);
-		if (entry?.kind === "spawn") {
+		// A stale client or forged command is not the detach sentinel. Treating an unknown id like
+		// `none` would tear down a healthy conductor merely because catalogs crossed in flight.
+		if (!entry) return;
+		if (entry.kind === "spawn") {
 			const readiness = this.deps.readiness(entry);
 			if (readiness.state === "unavailable") {
-				const remediation = readiness.remediation ? ` ${readiness.remediation}` : "";
-				this.setAndBroadcastStatus(`${entry.label} is unavailable: ${readiness.reason}${remediation}`);
+				// The picker already owns the unavailable explanation. `conductorStatus` belongs only
+				// to the attached conductor, so a rejected selection must not overwrite that channel.
 				return;
 			}
 		}
 		this.detachActive();
-		if (!entry || entry.kind === "none") {
+		if (entry.kind === "none") {
 			this.deps.broadcast({ type: "conductorState", active: null });
 			return;
 		}

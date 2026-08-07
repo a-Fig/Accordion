@@ -45,4 +45,7 @@ Thermocline is the reference boundary: its Node runner is dependency-free, and a
 attention probe still leaves its tested age-based policy fallback operational. Probe failure is
 therefore runtime degradation reported through conductor status, not catalog unavailability.
 Triptych's tree-sitter packages enable its defining skeletonization behavior, so failure to resolve
-either package makes Triptych unavailable until its nested `npm install` has been run.
+either package makes Triptych unavailable until its nested `npm install` has been run. Resolution is
+the generic catalog gate; Triptych adds a runner-side preflight that initializes its parser and every
+grammar before connecting, catching corrupt or incompatible installs without weakening the generic
+registry contract.

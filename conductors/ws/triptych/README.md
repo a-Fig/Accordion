@@ -37,8 +37,10 @@ cd conductors/ws/triptych && npm install   # web-tree-sitter + tree-sitter-wasms
 
 Without it Triptych remains visible but disabled in the conductor picker, which
 shows the setup command before selection. The host rechecks the same module
-resolution on selection, while the runner retains its loud startup failure as a
-race-condition defense. Triptych is **repo-only** (like thermocline): it is not
+resolution on selection. The runner then initializes the parser runtime and all
+four shipped grammars before connecting, so corrupt WASM or incompatible packages
+also fail startup instead of silently producing a summaries-only Triptych. Triptych
+is **repo-only** (like thermocline): it is not
 part of the npm tarball, where its absent runner is also advertised as unavailable.
 
 ## Design lineage
