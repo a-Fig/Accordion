@@ -113,6 +113,38 @@ describe("HandoffConductor — output-token reservation (decline path)", () => {
 	});
 });
 
+describe("HandoffConductor — output-token reservation (middle branch, exact numeric reservation)", () => {
+	// The reservation formula (`launchCompletion`) has three branches: (1) `contextWindow` unknown
+	// → falls back to the flat `MAX_HANDOFF_TOKENS` cap; (2) reserve computed against the window but
+	// below `MIN_HANDOFF_TOKENS` → decline outright (covered by the "decline path" describe block
+	// above); (3) reserve strictly between the floor and the cap → `maxOutputTokens = reserve`. Only
+	// the binary decline case was ever asserted; this test pins down branch (3) with an EXACT
+	// hand-computed number, so a `Math.min`/`Math.max` swap or a doubled `OUTPUT_SAFETY_MARGIN`
+	// would fail it even though every other existing test still passes.
+	//
+	// Derivation (all via the same chars/4 `estTokens` TestHost.countTokens uses):
+	//   - `session(5, 200)` with the test file's `blk()` default text gives a first-handoff prompt
+	//     (`<conversation>` wrapping 5 "[assistant]\n<800 x's>" blocks + the trailing instruction
+	//     line) of 4198 chars → 1050 tokens.
+	//   - `HANDOFF_SYSTEM` is 795 chars → 199 tokens.
+	//   - inputTokens = 199 + 1050 = 1249.
+	//   - Choosing contextWindow = 5761 makes
+	//     reserve = contextWindow - inputTokens - OUTPUT_SAFETY_MARGIN(512) = 5761 - 1249 - 512 = 4000,
+	//     which sits strictly between MIN_HANDOFF_TOKENS(1000) and MAX_HANDOFF_TOKENS(8000) — the
+	//     untested middle branch — so `maxOutputTokens` must land EXACTLY on 4000, not clamped to
+	//     8000 (a min/max swap) and not shrunk further by a doubled margin.
+	it("reserves the exact contextWindow − input − 512 token count when it lands strictly between the 1000 floor and the 8000 cap", () => {
+		const { host } = setup(session(5, 200), 1000);
+		host.truth.setContextWindow(5761);
+		host.queueCompletion({ text: "handoff body" });
+
+		host.commitTurn();
+
+		expect(host.completeLog.length).toBe(1);
+		expect(host.completeLog[0].maxOutputTokens).toBe(4000);
+	});
+});
+
 describe("HandoffConductor — prompt injection defense", () => {
 	it("neutralizes a </conversation> sentinel hidden in a block's text before it reaches the prompt", async () => {
 		const blocks = session(5, 200);
