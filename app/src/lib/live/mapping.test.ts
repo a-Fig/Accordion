@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { linearize, applyPlan, blockId, isDurableId, type PiMessage } from "./mapping";
-import type { FoldOp } from "./protocol";
+import { linearize, applyPlan, blockId, isDurableId, type PiMessage } from "$core/wire";
+import type { FoldOp } from "$core/protocol";
 
 // A small but representative pi context: a user turn, an assistant turn that
 // thinks + replies + calls a tool, and the tool's result.

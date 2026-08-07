@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { estTokens, clip, firstLine, BLOCK_OVERHEAD } from "./tokens";
+import { estTokens, clip, firstLine, BLOCK_OVERHEAD } from "$core/tokens";
 
 // tokens.ts is the engine's single (deliberately crude) token model: ~4 chars per
 // token plus a flat per-block overhead. Everything downstream — budget bar, fold

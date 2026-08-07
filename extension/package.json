@@ -2,15 +2,16 @@
   "name": "@a-fig/accordion",
   "version": "0.1.2",
   "type": "module",
-  "description": "Accordion live link — a pi extension that streams context to the Accordion GUI and applies the fold plan the GUI returns.",
+  "description": "Accordion live link — a pi extension that hosts the session's context Truth and serves a replica + remote-control protocol to the Accordion GUI.",
   "keywords": ["pi-package"],
   "scripts": {
     "build:app": "npm --prefix ../app run build",
     "build:extension": "node ./build-extension.mjs",
     "build:client": "node ./build-client.mjs",
-    "build": "npm run build:app && npm run build:client && npm run build:extension",
+    "build:remote-sdk": "node ./build-remote-sdk.mjs",
+    "build": "npm run build:app && npm run build:client && npm run build:extension && npm run build:remote-sdk",
     "prepack": "npm run build && npm run smoke",
-    "smoke": "node smoke.mjs && node smoke-config.mjs"
+    "smoke": "node smoke.mjs && node smoke-conductor.mjs"
   },
   "pi": {
     "extensions": ["./accordion.js"]

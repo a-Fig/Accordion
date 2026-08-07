@@ -1,14 +1,29 @@
 {
-  "name": "accordion-conductor-thermocline",
-  "version": "0.1.0",
+  "name": "@a-fig/thermocline",
+  "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Thermocline conductor for Accordion — layers block significance and manages multi-tier context folding.",
-  "scripts": {
-    "start": "node thermocline.mjs",
-    "test": "node --test"
+  "description": "Thermocline — an out-of-process, attention-gated LLM context-compression conductor for Accordion, under a hard budget invariant.",
+  "main": "thermocline.ts",
+  "bin": {
+    "thermocline-runner": "runner.mjs"
   },
-  "dependencies": {
-    "ws": "^8.18.0"
-  }
+  "scripts": {
+    "start": "node runner.mjs"
+  },
+  "files": [
+    "policy.ts",
+    "thermocline.ts",
+    "scorer.ts",
+    "runner.mjs",
+    "probe/probe.py",
+    "probe/requirements.txt",
+    "README.md"
+  ],
+  "keywords": [
+    "accordion",
+    "conductor",
+    "context-compression"
+  ],
+  "license": "MIT"
 }

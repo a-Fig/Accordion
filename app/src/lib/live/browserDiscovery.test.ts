@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { REGISTRY_PROTOCOL, type SessionEntry } from "./registry";
-import { PROTOCOL_VERSION } from "./protocol";
+import { PROTOCOL_VERSION } from "$core/protocol";
 
 /*
  * browserDiscovery.test.ts — poll-failure and mid-switch resilience (PR #52 review findings
@@ -18,7 +18,7 @@ import { PROTOCOL_VERSION } from "./protocol";
  *
  * We stub `window`/`fetch` (vitest's environment here is plain node — see vitest.config.ts) and
  * drive the real, exported `poll()` against the real `discovery`/`live` reactive state, the same
- * pattern conductorDiscovery.test.ts and liveClient.test.ts use for their modules.
+ * pattern liveClient.test.ts uses for its module.
  */
 
 import { poll, __resetPollFailureStreakForTest } from "./browserDiscovery.svelte";
@@ -56,7 +56,7 @@ function jsonResponse(body: unknown, ok = true, status = 200): Response {
 let savedFetch: unknown;
 let savedWindow: unknown;
 let hadWindow: boolean;
-let fetchImpl: (url: string) => Promise<Response>;
+let fetchImpl: (url: string, opts?: RequestInit) => Promise<Response>;
 
 beforeEach(() => {
 	savedFetch = (globalThis as any).fetch;
@@ -64,7 +64,7 @@ beforeEach(() => {
 	savedWindow = (globalThis as any).window;
 	(globalThis as any).window = { location: { search: "" } };
 	fetchImpl = async () => jsonResponse({ sessions: [] });
-	(globalThis as any).fetch = (url: string) => fetchImpl(url);
+	(globalThis as any).fetch = (url: string, opts?: RequestInit) => fetchImpl(url, opts);
 
 	discovery.sessions = [];
 	discovery.selected = null;
@@ -305,5 +305,59 @@ describe("poll() — forwards the URL token (finding #5)", () => {
 		await poll();
 
 		expect(seenUrl).toBe("/__accordion/sessions");
+	});
+});
+
+describe("poll() — fetch timeout (a hung connection must count as a failure, not a permanent freeze)", () => {
+	it("aborts a fetch that outlives the timeout and treats it as a failed poll", async () => {
+		vi.useFakeTimers();
+		try {
+			const last = [entry("s1", 100)];
+			publishSessions(last);
+			discovery.selected = "s1";
+
+			// A half-open connection: the mock never settles on its own — only the abort signal
+			// (which the real `fetch` would honor) ever rejects it.
+			fetchImpl = (_url: string, opts?: RequestInit) =>
+				new Promise((_resolve, reject) => {
+					opts?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+				});
+
+			const pending = poll();
+			await vi.advanceTimersByTimeAsync(4000);
+			await pending;
+
+			// Held, same as any other outright failure — not reaped, not published as [].
+			expect(discovery.sessions).toEqual(last);
+			expect(discovery.selected).toBe("s1");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("a hung poll counts toward the sustained-failure threshold like any other failure", async () => {
+		vi.useFakeTimers();
+		try {
+			const last = [entry("s1", 100)];
+			publishSessions(last);
+			discovery.selected = "s1";
+
+			fetchImpl = (_url: string, opts?: RequestInit) =>
+				new Promise((_resolve, reject) => {
+					opts?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+				});
+
+			for (let i = 0; i < 10; i++) {
+				const pending = poll();
+				await vi.advanceTimersByTimeAsync(4000);
+				await pending;
+			}
+
+			// The 10th consecutive timeout gives up holding, same as the sustained-network-failure case.
+			expect(discovery.sessions).toEqual([]);
+			expect(discovery.selected).toBeNull();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

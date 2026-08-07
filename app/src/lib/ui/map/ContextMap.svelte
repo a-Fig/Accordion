@@ -35,13 +35,13 @@
 	};
 
 	// Involvement locks (ADR 0011): under `human-steering` the human's fold/group controls are
-	// the conductor's. Double-click-to-fold becomes a no-op and is not advertised; the inline
+	// the holder's. Double-click-to-fold becomes a no-op and is not advertised; the inline
 	// transcript Fold button and the range→Group affordance disable. Single-click INSPECT and
 	// group PEEK stay enabled — observation is sacred, never lockable. Drive off `store.isLocked`
 	// so preview/demo/read-only mirror it exactly.
 	const steerLocked = $derived(store.isLocked("human-steering"));
 	const lockTip = $derived(
-		`Locked by ${store.lockingConductorLabel ?? "the active conductor"} — detach to take back control`,
+		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
 	);
 
 	// ---- weight as dice faces: every tile is the same square; token weight is
@@ -373,9 +373,10 @@
 		const f = folded ? ` · folded ${b.tokens}→${store.effTokens(b)}` : "";
 		// The hint mirrors what a double-click actually DOES — steerLocked makes it a no-op, else
 		// store.toggle gated by canFold — so the tile never advertises a fold the gate would refuse:
-		// a conductor lock, a live user/tool_call, a pin, or the protected tail. Unfold stays for a folded block.
+		// a human-steering lock, a live user/tool_call, a pin, or the protected tail. Unfold stays
+		// for a folded block.
 		const action = steerLocked
-			? "click to inspect · folding locked by the conductor"
+			? "click to inspect · folding locked by the active strategy"
 			: folded
 				? "click to inspect · double-click to unfold"
 				: store.canFold(b)
@@ -925,7 +926,7 @@
 					</span>
 					{#if groupErr && !steerLocked}<span class="range-err">overlaps a group or protected tail</span>{/if}
 					{#if steerLocked}
-						<span class="range-err" title={lockTip}>Locked by conductor</span>
+						<span class="range-err" title={lockTip}>Locked</span>
 					{:else}
 						<button class="group-btn" onclick={handleCreateGroup}>Group</button>
 					{/if}
@@ -972,7 +973,7 @@
 			<div class="tb-divider"></div>
 
 			<span class="dim" style="font-size:var(--fs-xs)">
-				{steerLocked ? "click = inspect · folding locked by the conductor" : "click = inspect · dbl-click = fold"}
+				{steerLocked ? "click = inspect · folding locked by the active strategy" : "click = inspect · dbl-click = fold"}
 			</span>
 		{/if}
 	</div>
@@ -2037,18 +2038,22 @@
 		outline: none;
 		box-shadow: var(--focus-ring);
 	}
-	/* human-steering locked: the inline Fold control shows disabled (the honest mirror). */
-	.tr-btn.locked,
 	.tr-btn:disabled {
 		cursor: not-allowed;
 		opacity: 0.4;
 	}
+	.tr-btn:disabled:hover {
+		color: var(--muted);
+		background: var(--panel-2);
+		border-color: var(--line);
+	}
+	/* human-steering locked: the inline Fold control shows disabled (the honest mirror) —
+	   held dim even on row hover / selection, which otherwise force opacity back to 1. */
 	.tr-msg:hover .tr-btn.locked,
 	.tr-msg.sel .tr-btn.locked {
 		opacity: 0.4;
 	}
-	.tr-btn.locked:hover,
-	.tr-btn:disabled:hover {
+	.tr-btn.locked:hover {
 		color: var(--muted);
 		background: var(--panel-2);
 		border-color: var(--line);

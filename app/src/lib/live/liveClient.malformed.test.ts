@@ -1,16 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { connectLive, disconnectLive, live } from "./liveClient.svelte";
 import { session } from "../session.svelte";
-import { PROTOCOL_VERSION } from "./protocol";
+import { PROTOCOL_VERSION } from "$core/protocol";
 
 /*
- * Malformed-frame hardening. Browser upgrades are authenticated, but native/Tauri clients
- * remain tokenless and any authorized peer may still send malformed data. isServerMessage
- * only vets the `type` tag — these tests pin that a hello without a real `meta` object and
- * a sync without a real `blocks` array are absorbed gracefully instead of throwing
- * mid-pump and stranding the client half-connected.
+ * Malformed-frame hardening (Phase B). Browser upgrades are authenticated, but native/Tauri
+ * clients remain tokenless and any authorized peer may still send malformed data. isServerMessage
+ * only vets the `type` tag — these tests pin that a hello without a real `meta` object falls back
+ * to placeholder meta, and a snapshot with a non-array / malformed `blocks` field is absorbed
+ * gracefully (bad elements dropped) instead of throwing mid-pump and stranding the client.
  *
- * Same FakeWebSocket pattern as liveClient.test.ts / conductorClient.test.ts.
+ * Same FakeWebSocket pattern as liveClient.test.ts.
  */
 
 class FakeWebSocket {
@@ -79,13 +79,30 @@ function connectAndOpen(): FakeWebSocket {
 	return ws;
 }
 
+const EMPTY_STATE = {
+	blocks: [] as any[],
+	overlay: [] as any[],
+	groups: [] as any[],
+	budget: 70_000,
+	contextWindow: 1000,
+	protectTokens: 0,
+	locks: [] as any[],
+	lockHolder: null,
+	tailTokens: 0,
+	sentThroughOrder: -1,
+	wireAttached: true,
+	foldingEnabled: false,
+	rev: 1,
+};
+
 describe("liveClient — malformed frames from the unauthenticated WS", () => {
-	it("absorbs a hello with no meta object: connects with fallback meta instead of throwing", () => {
+	it("absorbs a hello with no meta object: builds the replica with fallback meta on snapshot", () => {
 		const ws = connectAndOpen();
 		expect(() =>
-			ws.emit({ type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId: "s-x" }),
+			ws.emit({ type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId: "s-x", role: "gui" }),
 		).not.toThrow();
 		expect(live.status).toBe("connected");
+		ws.emit({ type: "snapshot", state: EMPTY_STATE });
 		expect(session.store).not.toBeNull();
 		expect(session.store!.meta.title).toBe("live pi session");
 		expect(session.store!.meta.cwd).toBe("");
@@ -94,51 +111,31 @@ describe("liveClient — malformed frames from the unauthenticated WS", () => {
 	it("absorbs a hello whose meta is a non-object", () => {
 		const ws = connectAndOpen();
 		expect(() =>
-			ws.emit({ type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId: "s-x", meta: 42 }),
+			ws.emit({ type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId: "s-x", role: "gui", meta: 42 }),
 		).not.toThrow();
 		expect(live.status).toBe("connected");
+		ws.emit({ type: "snapshot", state: EMPTY_STATE });
 		expect(session.store!.meta.title).toBe("live pi session");
 	});
 
-	it("absorbs a sync with a non-array blocks field and still replies with a plan", () => {
+	it("absorbs a snapshot with a non-array blocks field: builds an empty replica, no throw", () => {
 		const ws = connectAndOpen();
-		ws.emit({
-			type: "hello",
-			protocolVersion: PROTOCOL_VERSION,
-			sessionId: "s-x",
-			meta: { title: "t", cwd: "/tmp", model: "m", contextWindow: 1000 },
-		});
-		ws.sent.length = 0;
-		expect(() => ws.emit({ type: "sync", reqId: 7, full: false, blocks: "nope" })).not.toThrow();
-		// The pump survived: no blocks were added, and the plan reply still went out —
-		// a throw before the reply would leave the extension waiting for a plan timeout.
+		ws.emit({ type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId: "s-x", role: "gui", meta: { title: "t", cwd: "/tmp", model: "m", contextWindow: 1000, format: "pi" } });
+		expect(() => ws.emit({ type: "snapshot", state: { ...EMPTY_STATE, blocks: "nope" } })).not.toThrow();
+		expect(session.store).not.toBeNull();
 		expect(session.store!.blocks).toHaveLength(0);
-		const plans = ws.framesOfType("plan");
-		expect(plans).toHaveLength(1);
-		expect(plans[0].reqId).toBe(7);
 	});
 
-	it("drops malformed ELEMENTS of a sync blocks array, keeps the valid ones, still replies", () => {
+	it("drops malformed ELEMENTS of a snapshot blocks array, keeps the valid ones", () => {
 		const ws = connectAndOpen();
-		ws.emit({
-			type: "hello",
-			protocolVersion: PROTOCOL_VERSION,
-			sessionId: "s-x",
-			meta: { title: "t", cwd: "/tmp", model: "m", contextWindow: 1000 },
-		});
-		ws.sent.length = 0;
+		ws.emit({ type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId: "s-x", role: "gui", meta: { title: "t", cwd: "/tmp", model: "m", contextWindow: 1000, format: "pi" } });
 		const good = { id: "u:1", kind: "user", turn: 1, order: 0, text: "hi", tokens: 5 };
 		expect(() =>
 			ws.emit({
-				type: "sync",
-				reqId: 8,
-				full: false,
-				blocks: [null, {}, { id: "x", kind: "user" }, { ...good, kind: "nonsense" }, good],
+				type: "snapshot",
+				state: { ...EMPTY_STATE, blocks: [null, {}, { id: "x", kind: "user" }, { ...good, kind: "nonsense" }, good] },
 			}),
 		).not.toThrow();
 		expect(session.store!.blocks.map((b) => b.id)).toEqual(["u:1"]);
-		const plans = ws.framesOfType("plan");
-		expect(plans).toHaveLength(1);
-		expect(plans[0].reqId).toBe(8);
 	});
 });

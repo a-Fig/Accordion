@@ -1,7 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { AccordionStore } from "./store.svelte";
-import { wireFoldable } from "./digest";
-import { computeFoldOps } from "../live/plan";
+import { wireFoldable } from "$core/digest";
 import type { Block, BlockKind, ParsedSession } from "./types";
 
 /*
@@ -138,7 +137,7 @@ function checkInvariants(s: AccordionStore, seed: number, shape: IdShape): void 
 	// LIVE-SET EQUALITY — only meaningful for durable ids (computeFoldOps drops non-durable).
 	if (shape === "durable") {
 		const folded = foldedSet(s);
-		const opIds = new Set(computeFoldOps(s).map((o) => o.id));
+		const opIds = new Set(s.computeFoldOps().map((o) => o.id));
 		expect(
 			[...folded].sort(),
 			`seed=${seed} shape=durable: store-folded set != computeFoldOps id set`,
