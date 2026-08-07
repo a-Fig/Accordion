@@ -56,31 +56,24 @@ aspirational. `handoff.test.ts` still drives `Truth.setLocks` directly in its ow
 setup — that exercises the conductor in isolation against `TestHost`, not the live host, but
 it is the same real enforcement path either way.
 
-## User messages are folded into the handoff too (unlike `compaction-naive`)
+## User messages are folded into the handoff too (same as `compaction-naive`)
 
-The sibling `compaction-naive` conductor (PR #82) excludes `user`-kind blocks from its fold group —
-they stay live, full-fidelity, on the wire, and the summary may only reference them, never claim to
-preserve them. **This conductor does NOT apply the same exclusion.** That is a deliberate product
-difference, not the same bug `compaction-naive` had, for three reasons:
+Both this conductor and the sibling `compaction-naive` swallow every kind — including `user` —
+into their respective groups; neither overrides `AgedSummaryConductor.includeInGroup` (its default:
+every kind). An earlier revision of `compaction-naive`'s port (PR #82) briefly excluded `user`
+blocks there, on the theory that its "reproduce verbatim" prompt promise was mechanically
+unenforceable — that override has since been removed (main parity, restored; see
+`compaction-naive`'s own README), so there is no remaining behavioral fork between the two
+conductors on this point.
 
-1. **Different promise.** `compaction-naive`'s system prompt used to promise VERBATIM user
-   preservation while mechanically failing to guarantee it — that mismatch between promise and
-   mechanism was the bug. This conductor's `HANDOFF_SYSTEM` never promises verbatim preservation of
-   anything; a handoff document is explicitly a paraphrased briefing for a fresh agent, the same way
-   the human-run `handoff` skill it mirrors produces a paraphrased document, not a transcript.
-2. **Different consent.** This conductor requires ALL THREE involvement locks (`human-steering`,
-   `agent-unfold`, `tail-size`) — the strongest consent gate the codebase has — specifically because
-   its whole product is "collapse the ENTIRE prior session, including what the human asked for, to
-   near-zero." `compaction-naive` is a two-lock, budget-driven, otherwise-invisible foil; a human
-   attaching `handoff` has explicitly signed up for exactly this.
-3. **Different intent.** `compaction-naive` exists to demonstrate what happens when a conductor is
-   NOT careful about user words. `handoff` exists to demonstrate what deliberately, consensually
-   starting over looks like. Forcing user-block exclusion onto `handoff` would fold a "the user's own
-   words are removed from the wire" case back into the "fresh session, only a handoff doc survives"
-   design it was built to model in the first place.
-
-See `AgedSummaryConductor.includeInGroup`'s doc comment (`../agedSummaryConductor.ts`) for the
-mechanism both conductors share and where they diverge.
+For `handoff` specifically, folding user blocks in has always been the right call: `HANDOFF_SYSTEM`
+never promises verbatim preservation of anything — a handoff document is explicitly a paraphrased
+briefing for a fresh agent, the same way the human-run `handoff` skill it mirrors produces a
+paraphrased document, not a transcript. And this conductor requires ALL THREE involvement locks
+(`human-steering`, `agent-unfold`, `tail-size`) — the strongest consent gate the codebase has —
+specifically because its whole product is "collapse the ENTIRE prior session, including what the
+human asked for, into one prose document." A human attaching `handoff` has explicitly signed up
+for exactly this.
 
 ## Output-token reservation
 
@@ -119,8 +112,7 @@ derivation, foreign-grouped-id exclusion, group-emission run-walk, completion la
 attempt-key/sticky-status lifecycle, and output-token reservation math. `../agedSummaryConductor.ts`'s
 `AgedSummaryConductor` now owns all of that; this file owns only what is genuinely different for a
 "fold the whole session, all-locks-consented" conductor (documented in its own top-of-file PORT
-FIDELITY notes) — mainly the prompt text, the `tail-size` lock, and (see above) NOT overriding
-`includeInGroup`.
+FIDELITY notes) — mainly the prompt text, the four status messages, and the `tail-size` lock.
 
 ## Group persistence (the one real port hazard)
 
@@ -137,11 +129,17 @@ merged both onto the one shared implementation.
 
 ## Unavailable model link
 
-Unlike the pre-excision conductor, there is no `host.can("complete")` pre-check in the new contract
-— a rejected `complete()` call IS the "unavailable" signal. If the live model link is down (browser
-dev mode, read-only Claude Code transcript, extension disconnected), the conductor still always
-attempts the call (subject to the same `lastAttemptKey` retry gate) and reports the rejection via
-the sticky failure status rather than inventing a deterministic substitute.
+There is no `host.can("complete")` pre-check in the new contract — a rejected `complete()` call IS
+the "unavailable" signal. `AgedSummaryConductor.isUnavailableError` classifies that rejection,
+keyed on the exact `"no model available"` message `extension/accordion.ts`'s `runCompletion` throws
+when the session has no live model. On a match, the conductor shows the calm, main-parity status
+("Handoff unavailable — waiting for live model link") and clears the retry gate (`lastAttemptKey`)
+so the very next pass retries the same newly-aged set automatically once the link returns — mirroring
+main's `host.can("complete")` pre-check exactly, which never recorded a failed attempt for this case
+either. Any OTHER rejection (a real provider error, a timeout, a malformed request) still shows the
+sticky failure status carrying the real error text (`rejectMessage`) and still waits for genuinely
+new content to age in before retrying — inventing a deterministic substitute is deliberately not
+on the table either way.
 
 ## Selecting it
 
