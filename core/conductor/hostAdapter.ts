@@ -34,6 +34,7 @@ export function viewBlockOf(truth: Truth, b: Block): ViewBlock {
 		turn: b.turn,
 		order: b.order,
 		tokens: truth.calTokens(b.tokens),
+		rawTokens: b.tokens,
 		foldedTokens: truth.calTokens(truth.foldedTokensOf(b)),
 		toolName: b.toolName,
 		callId: b.callId,

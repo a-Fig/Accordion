@@ -27,6 +27,8 @@
  */
 import { describe, expect, it } from "vitest";
 import { TestHost } from "../../../core/conductor/testhost";
+import { estTokens, BLOCK_OVERHEAD } from "../../../core/tokens";
+import { roleFloorRecap } from "../../../core/wire";
 import type { Block, BlockKind } from "../../../core/types";
 import { COMPACTION_SYSTEM, NaiveCompactionConductor } from "./compaction-naive";
 
@@ -228,14 +230,15 @@ describe("NaiveCompactionConductor — hysteresis", () => {
 	});
 
 	// The test above passes trivially: with nothing appended, `newlyAged.length === 0` short-
-	// circuits `needSummary` before the visible-window arithmetic is ever evaluated. This test
+	// circuits `needSummary` before the visible-window check is ever evaluated. This test
 	// exercises a genuine PARTIAL REFILL: `newlyAged` is non-empty (the old protected tail plus one
-	// new block ages in) but the correct visible-window math still stays below the high-water mark,
-	// so the arithmetic itself — not the short-circuit — is what must decide to hold.
+	// new block ages in) but the visible window still stays below the high-water mark, so the
+	// window check itself — not the short-circuit — is what must decide to hold.
 	//
-	// After runPass1(), blocks 0-8 (900 raw tokens) are compacted into SUMMARY_A. summaryTokenCost
-	// = estTokens("[Compacted summary of 9 earlier messages]\n\nAlpha summary body.") = 16, so
-	// savedTokens = 900 - 16 = 884.
+	// After runPass1(), blocks 0-8 are collapsed into ONE group whose digest is SUMMARY_A, costing
+	// the wire estTokens("[Compacted summary of 9 earlier messages]\n\nAlpha summary body.") = 16
+	// plus one BLOCK_OVERHEAD = 20 tokens in total (`Truth.runWireTok`), with the other 8 members
+	// costing 0.
 	//
 	// Appending 4 more 100-token blocks (indices 12-15) makes 16 blocks total, so
 	// protectedFromIndex = 16 - 3 = 13 (Truth's uniform-100-token tail formula — see the file
@@ -243,8 +246,8 @@ describe("NaiveCompactionConductor — hysteresis", () => {
 	// protected tail 9,10,11 aging in, plus new block 12) — non-empty, so `needSummary`'s
 	// short-circuit does NOT apply here.
 	//
-	// rawTotal = 16 * 100 = 1600. visible = 1600 - 884 = 716, comfortably under the 900 high-water
-	// mark, so the correct arithmetic must decide to STAY HELD without relaunching.
+	// visible = view.liveTokens = 20 (the collapsed run) + 7 * 100 (blocks 9-15, still live) = 720,
+	// comfortably under the 900 high-water mark, so the conductor must STAY HELD without relaunching.
 	it("holds on a genuine partial refill — newlyAged is non-empty but the visible window stays under the high-water mark", async () => {
 		const { host } = await runPass1();
 
@@ -252,37 +255,36 @@ describe("NaiveCompactionConductor — hysteresis", () => {
 		host.commitTurn();
 		await flush();
 
-		expect(host.completeLog.length).toBe(1); // no relaunch — visible (716) < 900
+		expect(host.completeLog.length).toBe(1); // no relaunch — visible (720) < 900
 		expect(host.truth.groups.length).toBe(1); // unchanged
 		const summary = host.truth.groupSummary(host.truth.groups[0]);
 		expect(summary).toBe(`[Compacted summary of 9 earlier messages]\n\n${SUMMARY_A}`); // still pass 1's summary, untouched
 	});
 });
 
-describe("NaiveCompactionConductor — trigger math uses the full raw token baseline, not view.liveTokens", () => {
-	// Regression coverage for PORT FIDELITY §3: the raw baseline MUST be `sumTokens(view.blocks)`
-	// (every block's full, un-folded token cost), never `view.liveTokens` (which already reflects
-	// this conductor's own group folding and would double-count the saving). The existing
-	// recursive-pass test above happens to add exactly 15 new blocks — a count where the two
-	// formulas agree (both trigger) — so it would NOT catch a regression back to `view.liveTokens`.
-	// This test picks 10 new blocks, inside the 6-14 range where the formulas DIVERGE.
+describe("NaiveCompactionConductor — the visible window IS view.liveTokens, with nothing subtracted from it", () => {
+	// `view.liveTokens` (Truth's own `stats().liveTokens`) is the authoritative visible-wire number
+	// and the whole of the trigger's input — see `conduct()` in ../agedSummaryConductor.ts. It
+	// ALREADY reflects this conductor's own group folding, so subtracting a separately-derived
+	// "saved tokens" term from it double-counts the saving and starves the trigger. This test pins
+	// that: the existing recursive-pass test above happens to add exactly 15 new blocks, a count
+	// where both the correct and the double-subtracting formula trigger, so it would not catch the
+	// regression. 10 new blocks lands inside the range where they DIVERGE.
 	//
-	// After runPass1(), blocks 0-8 (9 blocks) are compacted into SUMMARY_A, savedTokens = 884 (see
-	// the hysteresis test above for the derivation).
+	// After runPass1(), blocks 0-8 are one group whose collapsed run costs the wire
+	// estTokens(summary) + BLOCK_OVERHEAD = 16 + 4 = 20 tokens, the other 8 members costing 0.
 	//
 	// Appending 10 more 100-token blocks makes 22 blocks total: protectedFromIndex = 22 - 3 = 19,
 	// so aged = indices 0-18 (19 blocks) and newlyAged = indices 9-18 (10 blocks).
 	//
-	// CORRECT baseline: rawTotal = sumTokens(view.blocks) = 22 * 100 = 2200.
-	//   visible = 2200 - 884 = 1316 >= 900 → TRIGGERS a second compaction.
+	// CORRECT: visible = view.liveTokens = 20 (the collapsed run) + 13 * 100 (still-ungrouped
+	//   blocks) = 1320 >= 900 → TRIGGERS a second compaction.
 	//
-	// BUGGY baseline (raw = view.liveTokens): the compacted run (blocks 0-8) collapses in Truth's
-	// group-wire accounting to one carrier block costing estTokens(summary) + BLOCK_OVERHEAD
-	// = 16 + 4 = 20 tokens, with the other 8 members costing 0 — so
-	//   view.liveTokens = 20 (carrier) + 0*8 (collapsed) + 13*100 (the 13 still-ungrouped blocks) = 1320.
-	//   buggy visible = 1320 - 884 = 436 < 900 → would NOT trigger — silently stuck on the stale
-	//   pass-1 summary while 10 more blocks' worth of history ages in unaccounted for.
-	it("triggers a genuine second compaction at 10 new blocks — a count where the correct and view.liveTokens baselines diverge", async () => {
+	// DOUBLE-SUBTRACTING: the pre-review formula's `savedTokens` for this state is
+	//   sumTokens(covered survivors) − estTokens(summary) = 900 − 16 = 884, so a `liveTokens −
+	//   savedTokens` visible = 1320 − 884 = 436 < 900 → would NOT trigger — silently stuck on the
+	//   stale pass-1 summary while 10 more blocks' worth of history ages in unaccounted for.
+	it("triggers a genuine second compaction at 10 new blocks — a count where subtracting a saving from liveTokens would not", async () => {
 		const { host } = await runPass1();
 
 		host.appendBlocks(Array.from({ length: 10 }, (_, i) => mkBlock(idOf(12 + i), 12 + i, "text", TOK, `NEW2-${12 + i}`)));
@@ -394,7 +396,16 @@ describe("NaiveCompactionConductor — stale-completion guard", () => {
 });
 
 describe("NaiveCompactionConductor — a held block splits the aged region", () => {
-	it("emits two groups (one per side), both carrying the same summary; the held block stays untouched", async () => {
+	// Issue #90: a held/pinned block fragments the aged prefix into K > 1 survivor runs. Before the
+	// fix, EVERY run carried the full summary as its digest — K copies of the same text on the wire
+	// while the trigger's accounting (`savedTokens`) charged it exactly ONCE, so a fragmented aged
+	// region could make "compaction" grow the wire instead of shrinking it. The fix: only the FIRST
+	// emitted run carries `text`; every later run carries digest `""` (the group vocabulary's
+	// explicit DROP — costs zero wire tokens), which is what the charge-once accounting already
+	// assumed. See the "fragmentation" describe block below for the full non-growth/accounting
+	// invariants; this test keeps the original split-shape assertions (still a real regression
+	// surface) and updates only the summary-duplication assertion the bug fix necessarily changes.
+	it("emits two groups (one per side); only the first carries the summary, the second is dropped; the held block stays untouched", async () => {
 		const { host } = setupHost();
 		// Queue the completion BEFORE pinning: with Fix 4 (ViewConductor reacts to ANY state-changed
 		// event, not just turn-committed — see core/conductor/view.ts), the pin itself immediately
@@ -413,11 +424,559 @@ describe("NaiveCompactionConductor — a held block splits the aged region", () 
 		expect(g2).toBeDefined();
 		expect(g1.memberIds).toEqual([idOf(0), idOf(1), idOf(2), idOf(3)]);
 		expect(g2.memberIds).toEqual([idOf(5), idOf(6), idOf(7), idOf(8)]);
-		expect(host.truth.groupSummary(g1)).toBe(host.truth.groupSummary(g2));
+		// The held block excludes itself from `aged` entirely (agedRegion filters `!b.held`), so the
+		// count preamble reflects the 8 blocks actually fed/covered, not all 9 aged-or-held blocks.
+		expect(host.truth.groupSummary(g1)).toBe(`[Compacted summary of 8 earlier messages]\n\n${SUMMARY_A}`);
+		expect(host.truth.groupSummary(g2)).toBe(""); // DROP — no duplicated summary text on the wire
 
 		const held = host.truth.get(idOf(4))!;
 		expect(held.override).toBe("pinned"); // untouched
 		expect(host.truth.groups.some((g) => g.memberIds.includes(idOf(4)))).toBe(false);
+	});
+});
+
+describe("NaiveCompactionConductor — fragmentation does not grow the wire (issue #90)", () => {
+	it("K=2 runs: exactly one group carries the summary, and folding never increases live wire tokens vs the raw baseline", async () => {
+		const { host } = setupHost();
+		const rawTotal = host.truth.fullTokens(); // 12 blocks * 100 = 1200 — unaffected by folding
+
+		host.queueCompletion({ text: SUMMARY_A });
+		host.humanPin(idOf(4)); // splits the aged region (0-8) into runs [0-3] and [5-8]
+		host.commitTurn();
+		await flush();
+
+		expect(host.truth.groups.length).toBe(2);
+		const digests = host.truth.groups.map((g) => host.truth.groupSummary(g)).sort();
+		// Exactly one non-empty (full-summary) digest and one empty (dropped) digest across the run.
+		expect(digests.filter((d) => d !== "").length).toBe(1);
+		expect(digests.filter((d) => d === "").length).toBe(1);
+
+		// Non-growth invariant: applying the coverage groups never increases live wire tokens versus
+		// the pre-fold raw baseline. Pre-fix, K=2 duplicated the summary into BOTH runs (2 * 20 = 40
+		// wire tokens for the folded portion vs 800 raw tokens for those same 8 blocks) — this would
+		// still have passed non-growth trivially at this scale, which is exactly why a dedicated
+		// accounting-equals-wire test (below) is needed to catch the real bug (the TRIGGER math, not
+		// the wire size alone).
+		expect(host.truth.liveTokens()).toBeLessThanOrEqual(rawTotal);
+	});
+
+	// `Truth`'s role-validity floor (`computeDegradedDropRuns`, core/wire.ts) reconstructs each
+	// block's WIRE ROLE from its id's DURABLE PREFIX (`wireRoleOfId`: `u:` → user, `a:` → assistant,
+	// `r:` → toolResult), NOT from `Block.kind` — so `buildPass1Blocks()`'s shared `idOf` (every id
+	// prefixed `a:`) makes EVERY block "assistant" for this floor's purposes regardless of `kind`.
+	// Dropping a whole run between two other `a:`-prefixed survivors therefore welds two "assistant"
+	// messages together and turns the drop into a PAID recap stub. That is exactly the term a
+	// conductor-side reconstruction of the visible window cannot model — and, post-#90-review, the
+	// reason the trigger reads `view.liveTokens` instead of reconstructing anything. The two tests
+	// below pin both fixture shapes (drop free / drop degraded) to the SAME invariant: the number
+	// the trigger acts on IS the number the wire carries, exactly.
+	it("accounting matches the wire exactly when the dropped run is genuinely free (a u:-prefixed held block keeps its neighbours on different roles)", async () => {
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(PROTECT);
+		const heldId = "u:4"; // durable "user"-role id (wireRoleOfId) — breaks the same-role adjacency
+		host.appendBlocks(
+			Array.from({ length: 12 }, (_, idx) => mkBlock(idx === 4 ? heldId : idOf(idx), idx, "text", TOK, idx <= 8 ? `AGED-${idx}` : `TAIL-${idx}`)),
+		);
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		host.humanPin(heldId); // splits aged 0-8 into runs [0-3] and [5-8]
+		host.commitTurn();
+		await flush();
+
+		expect(host.truth.groups.length).toBe(2);
+
+		// The wire, derived from first principles: the protected tail (9,10,11) plus the held block
+		// (4) stay live at full cost; the carrier run [0-3] costs its verbatim digest + one
+		// BLOCK_OVERHEAD (`Truth.runWireTok`); the dropped run [5-8] costs nothing (no degradation).
+		const summaryText = `[Compacted summary of 8 earlier messages]\n\n${SUMMARY_A}`;
+		const expectedWire = 4 * TOK + estTokens(summaryText) + BLOCK_OVERHEAD;
+		expect(host.truth.liveTokens()).toBe(expectedWire);
+	});
+
+	// The same shape with the drop DEGRADED. `buildPass1Blocks()`'s all-`a:`-prefixed ids make every
+	// block "assistant" to the role-validity floor, so dropping run [5-8] welds the pinned block 4
+	// against tail block 9 — same-role adjacency — and `computeDegradedDropRuns` degrades the drop
+	// into a paid `roleFloorRecap` stub. Pre-review the trigger's charge-once reconstruction knew
+	// nothing of that stub and under-counted the wire by its cost (sol5.6 P1 #1); now the stub is
+	// simply part of `liveTokens`, so there is NO residual left to bound — this test pins that the
+	// gap is zero and that non-growth still holds with the stub paid.
+	it("degraded drop run: the stub is paid, non-growth still holds, and the trigger's number equals the wire with no residual", async () => {
+		const { host } = setupHost();
+		const rawTotal = host.truth.fullTokens(); // 1200
+
+		host.queueCompletion({ text: SUMMARY_A });
+		host.humanPin(idOf(4)); // splits aged 0-8 into [0-3] (text carrier) and [5-8] (drop)
+		host.commitTurn();
+		await flush();
+
+		expect(host.truth.groups.length).toBe(2);
+		const gDrop = host.truth.groups.find((g) => g.memberIds[0] === idOf(5))!;
+		expect(host.truth.groupSummary(gDrop)).toBe(""); // still a DROP by intent — degradation is Truth's, not the conductor's
+
+		// (a) Non-growth: even with the degraded run paying for a recap stub, folding never
+		// increases live wire tokens versus the raw baseline.
+		expect(host.truth.liveTokens()).toBeLessThan(rawTotal);
+
+		// (b) The wire from first principles: the held block (4) + protected tail (9,10,11) live at
+		// full cost, the carrier run [0-3] at its digest + BLOCK_OVERHEAD, and the degraded run [5-8]
+		// at the EXACT text `applyPlan` synthesizes (`roleFloorRecap(groupId, messageCount)`; that run
+		// is 4 single-block messages) + BLOCK_OVERHEAD.
+		const summaryText = `[Compacted summary of 8 earlier messages]\n\n${SUMMARY_A}`;
+		const recapCost = estTokens(roleFloorRecap(gDrop.id, 4)) + BLOCK_OVERHEAD;
+		const expectedWire = 4 * TOK + estTokens(summaryText) + BLOCK_OVERHEAD + recapCost;
+		expect(host.truth.liveTokens()).toBe(expectedWire);
+	});
+
+	// (c) THE TRIGGER ACTS ON THAT NUMBER, STUB INCLUDED — the P1 #1 fix, observed through BEHAVIOR
+	// rather than by re-reading the same field. Sized so the honest wire and the pre-review
+	// reconstruction straddle the 900 high-water mark, which they can only do inside the ~29-token
+	// window between them (the carrier's BLOCK_OVERHEAD framing plus the degraded run's recap stub —
+	// exactly the two terms a conductor-side reconstruction cannot see):
+	//   blocks 0-8 = 100 each (block 4 pinned, splitting aged into carrier [0-3] + drop [5-8]);
+	//   blocks 9-11 = 250 each; the refill block 12 = 20. Protect 600 (cap 750) puts
+	//   protectedFromIndex at 9, then at 10 once block 12 lands — so block 9 ages in and newlyAged is
+	//   non-empty. Uncollapsed tokens then total 870, and
+	//     honest  = 870 + carrier 20 + recap stub 25 = 915  >= 900 → RELAUNCHES
+	//     pre-fix = 870 + summary estimate 16        = 886  <  900 → would have held, silently
+	it("the trigger reacts to the recap stub the old reconstruction could not see", async () => {
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(600);
+		host.appendBlocks([
+			...Array.from({ length: 9 }, (_, i) => mkBlock(idOf(i), i, "text", TOK, `AGED-${i}`)),
+			...Array.from({ length: 3 }, (_, i) => mkBlock(idOf(9 + i), 9 + i, "text", 250, `TAIL-${9 + i}`)),
+		]);
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		host.humanPin(idOf(4));
+		await host.commitTurn();
+		await flush();
+		expect(host.stats().protectedFromIndex).toBe(9);
+		expect(host.truth.groups.length).toBe(2);
+
+		// `blocks-appended` is not a `ViewConductor` re-plan trigger, so this is exactly the state the
+		// next `conduct()` pass will read — assert it BEFORE the turn commits and changes it.
+		host.appendBlocks([mkBlock(idOf(12), 12, "text", 20, "REFILL-12")]);
+		expect(host.stats().protectedFromIndex).toBe(10); // block 9 aged in → newlyAged is non-empty
+		expect(host.truth.liveTokens()).toBe(915); // honest: over the 900 mark only because of the stub
+
+		host.queueCompletion({ text: SUMMARY_B });
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(2); // …and the conductor acted on it
+	});
+
+	it("K=3 runs (two held blocks): only the FIRST (earliest) run carries the summary — every later run is dropped, not just the second", async () => {
+		const { host } = setupHost();
+		host.queueCompletion({ text: SUMMARY_A });
+		host.humanPin(idOf(2));
+		host.humanPin(idOf(6)); // aged 0-8 now splits into three runs: [0-1], [3-5], [7-8]
+		host.commitTurn();
+		await flush();
+
+		expect(host.truth.groups.length).toBe(3);
+		const byStart = (id: string) => host.truth.groups.find((g) => g.memberIds[0] === id)!;
+		const g1 = byStart(idOf(0));
+		const g2 = byStart(idOf(3));
+		const g3 = byStart(idOf(7));
+		expect(g1.memberIds).toEqual([idOf(0), idOf(1)]);
+		expect(g2.memberIds).toEqual([idOf(3), idOf(4), idOf(5)]);
+		expect(g3.memberIds).toEqual([idOf(7), idOf(8)]);
+
+		expect(host.truth.groupSummary(g1)).not.toBe(""); // earliest run: carries the full summary
+		expect(host.truth.groupSummary(g2)).toBe(""); // dropped
+		expect(host.truth.groupSummary(g3)).toBe(""); // dropped — not just the immediately-following run
+	});
+});
+
+describe("NaiveCompactionConductor — heavy fragmentation never grows the wire (#90 review, sol5.6 P1 #1)", () => {
+	// sol5.6's fixture: 101 alternating assistant/user blocks of 10 tokens each (1010 raw), every
+	// `user` block human-held, so the aged region fragments into 51 SINGLE-BLOCK survivor runs. The
+	// ids carry the WIRE role the role-validity floor reads (`wireRoleOfId`: `a:` → assistant,
+	// `u:` → user), so dropping any interior run welds two `user` survivors together and
+	// `computeDegradedDropRuns` degrades it into a paid ~25-token recap stub — a cost that is FLAT
+	// per run regardless of run size. Pre-review the conductor dropped all 50 interior runs: the
+	// wire GREW from 1010 to ~1744 tokens while the trigger's reconstruction believed ~516.
+	const FRAG_TOK = 10;
+	const FRAG_N = 101;
+	const fragId = (i: number): string => (i % 2 === 0 ? `a:f${i}:p0` : `u:${i}`);
+	/** The fixture, with every odd (`user`-role) block already human-held. */
+	function setupFragmented(): TestHost {
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(0); // whole session ages in
+		host.appendBlocks(
+			Array.from({ length: FRAG_N }, (_, i) => mkBlock(fragId(i), i, i % 2 === 0 ? "text" : "user", FRAG_TOK, `FRAG-${i}`)),
+		);
+		// Pin BEFORE attaching: each pin is a `state-changed` the conductor would otherwise react to,
+		// launching 50 completions against 50 successively-different aged sets.
+		for (let i = 1; i < FRAG_N; i += 2) host.humanPin(fragId(i));
+		return host;
+	}
+
+	it("proposes only the summary carrier — every interior drop that cannot pay for its own recap stub is left live", async () => {
+		const host = setupFragmented();
+		const rawTotal = host.truth.fullTokens(); // 101 * 10 = 1010
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+
+		// ONE group: the first (earliest) survivor run, carrying the summary. The other 50 runs are
+		// 10 tokens each — less than the recap stub a degraded drop would cost — so dropping them can
+		// only ever lose, and they stay live instead.
+		expect(host.truth.groups.length).toBe(1);
+		const g = host.truth.groups[0];
+		expect(g.memberIds).toEqual([fragId(0)]);
+		const summary = `[Compacted summary of 51 earlier messages]\n\n${SUMMARY_A}`;
+		expect(host.truth.groupSummary(g)).toBe(summary);
+
+		// The wire from first principles: 100 of the 101 blocks still live at full cost, plus the one
+		// collapsed run's verbatim digest + BLOCK_OVERHEAD.
+		const carrierCost = estTokens(summary) + BLOCK_OVERHEAD;
+		const expectedWire = (FRAG_N - 1) * FRAG_TOK + carrierCost;
+		expect(host.truth.liveTokens()).toBe(expectedWire);
+		// Growth is bounded by the summary carrier's own cost — the conductor's entire product, and
+		// the only thing it still writes here. Pre-review this fixture reached ~1744.
+		expect(host.truth.liveTokens()).toBeLessThanOrEqual(rawTotal + carrierCost);
+	});
+
+	// THE PAID-RETRY BACK-OFF (#90 review round 2). Honest accounting has a cost of its own: this
+	// fixture's wire (1020) sits permanently over the 900 high-water mark and nothing in it is worth
+	// collapsing, so every turn that ages one more block in would change `attemptKey` and buy another
+	// `host.complete()` call for the same nothing — forever. `conduct()`'s gate: a COMMITTED pass that
+	// shrank the wire by no more than MIN_PASS_SAVING (this one GREW it, by the carrier's 10 tokens)
+	// stops relaunching on attempt-key drift alone, and re-opens only on genuine REFILL — newly-aged
+	// tokens exceeding everything that unproductive pass was already handed (510 here).
+	it("backs off after an unproductive pass: attempt-key drift alone no longer buys another model call", async () => {
+		const host = setupFragmented();
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+
+		// Ten more turns, each aging one block in: attemptKey changes every time, the wire stays over
+		// the mark every time — and not one of them relaunches.
+		for (let n = 0; n < 10; n++) {
+			host.appendBlocks([mkBlock(`a:f${FRAG_N + n}:p0`, FRAG_N + n, "text", FRAG_TOK, `MORE-${n}`)]);
+			await host.commitTurn();
+			await flush();
+		}
+		expect(host.completeLog.length).toBe(1); // still one paid call, not eleven
+	});
+
+	it("the back-off re-opens on a genuine refill — newly-aged content larger than the last pass's whole aged region", async () => {
+		const host = setupFragmented();
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+
+		// 62 contiguous new blocks (620 tokens) clear the 510-token bar the unproductive pass set —
+		// and, unlike the fragmented prefix, they form ONE run big enough to be worth dropping.
+		host.appendBlocks(Array.from({ length: 62 }, (_, i) => mkBlock(`a:f${FRAG_N + i}:p0`, FRAG_N + i, "text", FRAG_TOK, `MORE-${i}`)));
+		host.queueCompletion({ text: SUMMARY_B });
+		await host.commitTurn();
+		await flush();
+
+		expect(host.completeLog.length).toBe(2);
+		// The refill run really was collapsible: it commits as a DROP alongside the summary carrier.
+		expect(host.truth.groups.length).toBe(2);
+		const digests = host.truth.groups.map((g) => host.truth.groupSummary(g)).sort();
+		expect(digests.filter((d) => d === "").length).toBe(1);
+		expect(digests.filter((d) => d !== "").length).toBe(1);
+	});
+});
+
+describe("NaiveCompactionConductor — a run with no viable carrier is never proposed (#90 review, sol5.6 P1 #2)", () => {
+	// sol5.6's repro: the aged region opens with a `tool_call` whose paired `tool_result` is HELD, so
+	// the tool_call sits alone in its own survivor run. `Truth.opGroup` rejects a group over that run
+	// outright ("nothing collapses (all stragglers)" — the pair is unbalanced), but `Truth.apply`
+	// validates each op INDEPENDENTLY and `ViewConductor.applyDesired` silently drops the failures:
+	// pre-review the conductor proposed the summary on that doomed first run and `digest: ""` on the
+	// following text run, so the DROP committed while the summary did not — 750 tokens left the wire
+	// with no summary anywhere. `collapsibleMessageKeys` (core/groupShape.ts — the SAME fixpoint
+	// `Truth.classifyGroup` runs) now excludes the doomed run before it is ever proposed.
+	it("excludes the doomed run, moves the summary to the first viable one, and never drops content without a committed carrier", async () => {
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(0); // whole session ages in
+		host.appendBlocks([
+			mkBlock("a:c0:p0", 0, "tool_call", 200, "CALL-0", { callId: "call-1", toolName: "run" }),
+			mkBlock("r:call-1", 1, "tool_result", 200, "RESULT-1", { callId: "call-1", toolName: "run" }),
+			...Array.from({ length: 5 }, (_, i) => mkBlock(idOf(2 + i), 2 + i, "text", 150, `TEXT-${2 + i}`)),
+		]);
+		host.humanPin("r:call-1"); // the tool_call's other half is held OUTSIDE any survivor run
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+
+		// The tool_call's run is never proposed — it stays live and ungrouped, exactly as a held block
+		// keeps itself out of a run.
+		expect(host.truth.groups.some((g) => g.memberIds.includes("a:c0:p0"))).toBe(false);
+
+		// The summary lands on the first VIABLE run instead of vanishing with the rejected one.
+		expect(host.truth.groups.length).toBe(1);
+		const g = host.truth.groups[0];
+		expect(g.memberIds).toEqual([idOf(2), idOf(3), idOf(4), idOf(5), idOf(6)]);
+		const summary = `[Compacted summary of 6 earlier messages]\n\n${SUMMARY_A}`;
+		expect(host.truth.groupSummary(g)).toBe(summary);
+
+		// THE INVARIANT: no committed group removes content while its summary is absent. Pre-review
+		// this fixture produced exactly one group whose digest was "" — a bare DROP of 750 tokens.
+		for (const grp of host.truth.groups) expect(host.truth.groupSummary(grp)).not.toBe("");
+
+		// The wire: the tool_call + its held result live at full cost, the collapsed run at its digest.
+		expect(host.truth.liveTokens()).toBe(400 + estTokens(summary) + BLOCK_OVERHEAD);
+	});
+});
+
+describe("NaiveCompactionConductor — a proposed run is a fixed point of the host's range snap (#90 review round 2)", () => {
+	// `Truth.opGroup` does not group the ids it is handed — it groups `snappedRange(first, last)`,
+	// which walks each boundary OUTWARD over blocks sharing its `messageKey`. Sibling parts of ONE
+	// assistant message share a key (`a:m1:p0`/`a:m1:p1` → `a:m1`) but are excluded from a run
+	// INDEPENDENTLY, so a run that starts or ends mid-message gets silently widened by the host into
+	// something the conductor never vetted. `snapToMessageAtoms` now trims each run inward to the
+	// largest window `snappedRange` leaves alone, and proposes exactly that window.
+
+	it("REPRO A: a HELD sibling part no longer sinks the carrier while a sibling DROP commits", async () => {
+		// Pre-fix: run [a:m1:p0] looks viable, is proposed as the summary carrier, and Truth snaps it
+		// to [a:m1:p0, a:m1:p1] — which contains a human pin, so `opGroup` clamps `human-override`.
+		// The op is dropped silently while the SECOND run's `digest: ""` commits: 750 tokens off the
+		// wire, no summary anywhere — the exact P1 #2 end state, reached around the viability check.
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(0); // whole session ages in
+		host.appendBlocks([
+			mkBlock("a:m1:p0", 0, "text", 200, "PART-0"),
+			mkBlock("a:m1:p1", 1, "text", 200, "PART-1"), // same messageKey `a:m1` — pinned below
+			...Array.from({ length: 5 }, (_, i) => mkBlock(idOf(2 + i), 2 + i, "text", 150, `TEXT-${2 + i}`)),
+		]);
+		host.humanPin("a:m1:p1");
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+
+		// The straddling run is excluded outright: neither part is grouped.
+		expect(host.truth.groups.some((g) => g.memberIds.includes("a:m1:p0"))).toBe(false);
+		expect(host.truth.groups.some((g) => g.memberIds.includes("a:m1:p1"))).toBe(false);
+		// The summary moves to the first snap-stable, viable run — and nothing is dropped bare.
+		expect(host.truth.groups.length).toBe(1);
+		expect(host.truth.groups[0].memberIds).toEqual([idOf(2), idOf(3), idOf(4), idOf(5), idOf(6)]);
+		const summary = `[Compacted summary of 6 earlier messages]\n\n${SUMMARY_A}`;
+		expect(host.truth.groupSummary(host.truth.groups[0])).toBe(summary);
+		for (const g of host.truth.groups) expect(host.truth.groupSummary(g)).not.toBe("");
+	});
+
+	it("REPRO B: the host can no longer widen a group onto a protected sibling the summary never saw", async () => {
+		// The protected boundary is an INDEX, not a message boundary, so it can split one assistant
+		// message: `a:m1:p0` ages in while its sibling `a:m1:p1` — a `tool_call` whose result is
+		// further down the protected tail — does not. Pre-fix the run ended on `a:m1:p0`, and Truth's
+		// snap pulled `a:m1:p1` into the group: a member never fed to the summarizer, and (when such a
+		// run is a message on its own) the block that flips the carrier verdict to "nothing collapses".
+		//
+		// Sizing: blocks 6..9 are 100,100,150,150. With protect 450 (cap 562.5) Truth's tail walk
+		// stops at index 6 — so aged = 0..5 and `a:m1:p1` (index 6) is protected.
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(450);
+		host.appendBlocks([
+			...Array.from({ length: 5 }, (_, i) => mkBlock(idOf(i), i, "text", 150, `TEXT-${i}`)),
+			mkBlock("a:m1:p0", 5, "text", 100, "PART-0"),
+			mkBlock("a:m1:p1", 6, "tool_call", 100, "CALL", { callId: "call-1", toolName: "run" }),
+			mkBlock("r:call-1", 7, "tool_result", 100, "RESULT", { callId: "call-1", toolName: "run" }),
+			mkBlock(idOf(8), 8, "text", 150, "TAIL-8"),
+			mkBlock(idOf(9), 9, "text", 150, "TAIL-9"),
+		]);
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		expect(host.stats().protectedFromIndex).toBe(6); // the boundary really does split `a:m1`
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+
+		// The group is EXACTLY the snap-stable window — the straddling `a:m1:p0` is trimmed off the
+		// back rather than dragging its protected `tool_call` sibling in. Pre-fix `memberIds` also
+		// contained `a:m1:p0` AND `a:m1:p1`.
+		expect(host.truth.groups.length).toBe(1);
+		expect(host.truth.groups[0].memberIds).toEqual([idOf(0), idOf(1), idOf(2), idOf(3), idOf(4)]);
+		expect(host.truth.groups.some((g) => g.memberIds.includes("a:m1:p1"))).toBe(false);
+		// The trimmed block stays fully live — exclusion is lossless.
+		expect(host.get("a:m1:p0")!.grouped).toBe(false);
+		expect(host.get("a:m1:p0")!.folded).toBe(false);
+	});
+});
+
+describe("NaiveCompactionConductor — a drop must pay for itself (#90 review round 2)", () => {
+	// `dropEconomics` compares what a DROP actually removes (only members the wire may genuinely
+	// remove — a straggler stays live at full cost) against the most it can cost (one role-floor
+	// recap stub per COLLAPSED SUB-RUN, since an interior straggler splits a group into several runs
+	// and `computeDegradedDropRuns` degrades each independently). Counting straggler tokens as saved,
+	// or one stub per group rather than per sub-run, both approve groups that GROW the wire.
+
+	/** Exact worst-case stub cost for a one-message run — `roleFloorRecap`'s own text, framed. */
+	const STUB = estTokens(roleFloorRecap("g:a:g2:p0", 1)) + BLOCK_OVERHEAD;
+
+	it("boundary: a run saving EXACTLY the stub cost is skipped; one token more is dropped", async () => {
+		const host = new TestHost();
+		host.setBudget(BUDGET); // 1000 — Truth floors `budget` at 1000, so the fixture is sized to it
+		host.setProtect(0);
+		host.appendBlocks([
+			mkBlock("a:g0:p0", 0, "text", 800, "CARRIER"),
+			mkBlock("u:1", 1, "user", 100, "HELD-1"),
+			mkBlock("a:g2:p0", 2, "text", STUB, "EXACTLY-BREAK-EVEN"),
+			mkBlock("u:3", 3, "user", 100, "HELD-3"),
+			mkBlock("a:g4:p0", 4, "text", STUB + 1, "ONE-OVER"),
+		]);
+		host.humanPin("u:1");
+		host.humanPin("u:3");
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+
+		// `saving <= cost` skips the break-even run: a drop that at best breaks even is not worth the
+		// risk of the stub, and taking it would let a rounding change tip the wire into growth.
+		expect(host.truth.groups.some((g) => g.memberIds.includes("a:g2:p0"))).toBe(false);
+		// One token of headroom is enough to be worth dropping.
+		const gDrop = host.truth.groups.find((g) => g.memberIds.includes("a:g4:p0"));
+		expect(gDrop).toBeDefined();
+		expect(host.truth.groupSummary(gDrop!)).toBe(""); // a real DROP
+		// …and the carrier still carries the summary.
+		expect(host.truth.groupSummary(host.truth.groups.find((g) => g.memberIds.includes("a:g0:p0"))!)).not.toBe("");
+	});
+
+	it("provider calibration cannot make a raw-wire-growing DROP look profitable", async () => {
+		// Integration regression against calibrated devmain: ViewBlock.tokens is calibrated, but the
+		// wire's recap + framing cost is defined in original estTokens units. At k=2 the old mixed-unit
+		// comparison saw this 24-token run as saving 48 while pricing the 25-token recap as 42 + the
+		// UNCALIBRATED overhead 4, and approved it — growing the raw wire by one token. Structural
+		// non-growth now compares rawTokens to the raw recap cost; calibration remains decision-bearing
+		// for the 90% trigger, but cannot change the sign of this safety verdict.
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(0);
+		host.truth.setCalibration(2);
+		host.appendBlocks([
+			mkBlock("a:g0:p0", 0, "text", 800, "CARRIER"),
+			mkBlock("u:1", 1, "user", 100, "HELD-1"),
+			mkBlock("a:g2:p0", 2, "text", STUB - 1, "RAW-GROWTH"),
+			mkBlock("u:3", 3, "user", 100, "HELD-3"),
+			mkBlock("a:g4:p0", 4, "text", 100, "TAIL"),
+		]);
+		host.humanPin("u:1");
+		host.humanPin("u:3");
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+
+		expect(host.truth.groups.some((g) => g.memberIds.includes("a:g2:p0"))).toBe(false);
+		expect(host.truth.groupSummary(host.truth.groups.find((g) => g.memberIds.includes("a:g0:p0"))!)).not.toBe("");
+	});
+
+	it("a straggler's tokens are not counted as saved, and each collapsed sub-run is charged its own stub", async () => {
+		// One run, split by an INTERIOR straggler: `a:s2:p0` holds a `tool_call` whose result is in
+		// the protected tail, so the tool-pair fixpoint demotes it — it stays live INSIDE the group
+		// and splits the collapse into TWO sub-runs, each independently degradable. Counting its 400
+		// tokens as saved (and charging one stub instead of two) is what made the old guard approve a
+		// group whose live cost exceeded what it removed.
+		const host = new TestHost();
+		host.setBudget(700); // high-water mark 630
+		host.setProtect(200);
+		host.appendBlocks([
+			mkBlock("a:c0:p0", 0, "text", 300, "CARRIER"),
+			mkBlock("u:1", 1, "user", 60, "HELD-1"),
+			mkBlock("a:s1:p0", 2, "text", 20, "SMALL-A"),
+			mkBlock("a:s2:p0", 3, "tool_call", 400, "CALL", { callId: "call-1", toolName: "run" }),
+			mkBlock("a:s3:p0", 4, "text", 20, "SMALL-B"),
+			mkBlock("r:call-1", 5, "tool_result", 200, "RESULT", { callId: "call-1", toolName: "run" }),
+		]);
+		host.humanPin("u:1");
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+
+		const rawTotal = host.truth.fullTokens();
+		// The straggler-split run removes only 40 tokens across two sub-runs that can cost ~50 in
+		// stubs, so it is not dropped: `a:s1:p0`/`a:s3:p0` stay live and ungrouped.
+		expect(host.truth.groups.some((g) => g.memberIds.includes("a:s1:p0"))).toBe(false);
+		expect(host.truth.groups.some((g) => g.memberIds.includes("a:s3:p0"))).toBe(false);
+		// NON-GROWTH, the invariant the old guard could violate.
+		expect(host.truth.liveTokens()).toBeLessThanOrEqual(rawTotal);
+	});
+});
+
+describe("NaiveCompactionConductor — durability verdict agrees with Truth under a live wire (#90 review round 2)", () => {
+	// The conductor asks `collapsibleMessageKeys(..., requireDurable: true)` because every live pi
+	// session sets `Truth.wireAttached` (extension/accordion.ts). `TestHost.setWireAttached` makes
+	// that reachable in tests, so the two verdicts can be cross-validated on the one fixture where
+	// the flag actually bites: POSITIONAL (`m<i>:…`) ids, which the wire would silently refuse to
+	// collapse.
+	it("a run of positional ids is excluded by the conductor, and Truth rejects the same group", async () => {
+		const host = new TestHost();
+		host.setWireAttached(true);
+		host.setBudget(BUDGET);
+		host.setProtect(0);
+		host.appendBlocks([
+			mkBlock("m0:p0", 0, "text", 200, "POSITIONAL-0"),
+			mkBlock("m1:p0", 1, "text", 200, "POSITIONAL-1"),
+			mkBlock("u:2", 2, "user", 100, "HELD-2"),
+			...Array.from({ length: 4 }, (_, i) => mkBlock(idOf(3 + i), 3 + i, "text", 150, `TEXT-${3 + i}`)),
+		]);
+		host.humanPin("u:2"); // splits the positional run off from the durable one
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+
+		// The conductor never proposes the positional run…
+		expect(host.truth.groups.length).toBe(1);
+		expect(host.truth.groups[0].memberIds).toEqual([idOf(3), idOf(4), idOf(5), idOf(6)]);
+		expect(host.truth.groupSummary(host.truth.groups[0])).not.toBe("");
+
+		// …and Truth agrees: the very group it declined to propose is rejected outright.
+		const res = host.truth.apply([{ kind: "group", ids: ["m0:p0", "m1:p0"], summary: "x" }], "auto");
+		expect(res.results[0].applied).toBe(false);
+		expect(res.results[0].clamped).toBe("invalid-group");
+		expect(res.results[0].detail).toBe("nothing collapses (all stragglers)");
+	});
+});
+
+describe("NaiveCompactionConductor — K=1 regression: zero fragmentation stays byte-identical (issue #90)", () => {
+	// The common case (no held/pinned blocks, no foreign groups splitting the aged run) must be
+	// completely unaffected by the fix: same single group, same verbatim digest, same accounting.
+	it("a single contiguous aged run still gets the full summary as its digest, unchanged", async () => {
+		const { host } = await runPass1();
+
+		expect(host.truth.groups.length).toBe(1);
+		const g = host.truth.groups[0];
+		expect(g.memberIds[0]).toBe(idOf(0));
+		expect(g.memberIds[g.memberIds.length - 1]).toBe(idOf(8));
+		const summary = host.truth.groupSummary(g);
+		expect(summary).toBe(`[Compacted summary of 9 earlier messages]\n\n${SUMMARY_A}`);
+		expect(summary).not.toBe(""); // K=1: never dropped
+
+		// Accounting: the visible window is the wire — the collapsed run's verbatim digest plus one
+		// BLOCK_OVERHEAD, and the 3 protected-tail blocks still live at full cost.
+		expect(host.truth.liveTokens()).toBe(estTokens(summary) + BLOCK_OVERHEAD + 3 * TOK);
 	});
 });
 

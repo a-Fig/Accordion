@@ -19,6 +19,7 @@ import { hasLock } from "./locks";
 import { digest, digestTokens, substTokens, groupDigest, groupDigestTokens, wireFoldable, foldTag } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { isDurableId, applyPlan, computeDegradedDropRuns, roleFloorRecap, type PiMessage, type WireMsgShape } from "./wire";
+import { collapsibleMessageKeys, messageKey } from "./groupShape";
 import type { FoldOp, GroupOp } from "./protocol";
 import type { Op, OpResult, TxnResult, ClampReason } from "./ops";
 import type { TruthEvent } from "./events";
@@ -79,19 +80,10 @@ const PROTECT_OVERFLOW_CAP = 1.25;
  *  recoverable `replace` body. Stripped so the engine stays the SOLE author of the tag. */
 const LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
 
-/**
- * The "message key" of a block id — the id with its assistant-part suffix removed, so every part
- * of one assistant message shares a key while scalar user/result/summary blocks stay their own
- * key. Two id regimes share the app (live `…:p<j>`, loaded `<eid>:<j>`); scalar durable ids like
- * `u:<ts>` / `s:<ts>` / `r:<callId>` must NOT be stripped.
- */
-export function messageKey(id: string): string {
-	const live = id.match(/^(.*):p(?:\d+|\?)$/);
-	if (live) return live[1];
-	const parsed = id.match(/^(.+):\d+$/);
-	if (parsed && !/^[a-z]:\d+$/.test(id)) return parsed[1];
-	return id;
-}
+/** Re-exported from its new home in `core/groupShape.ts` (which owns the per-MESSAGE collapse
+ *  fixpoint keyed on it), so every existing `import { messageKey } from ".../core/truth"` is
+ *  unchanged. */
+export { messageKey };
 
 /**
  * Recover a block id's WIRE role class — the inverse of `blockId()`'s own `u:`/`a:`/`r:`/`s:`
@@ -836,59 +828,20 @@ export class Truth {
 		flush();
 		return { shapes, keys };
 	}
+	/**
+	 * Classify a group's members for accounting + the wire. The durability/tool-pair fixpoint that
+	 * decides which MESSAGES actually collapse is `collapsibleMessageKeys` (core/groupShape.ts) —
+	 * exported and pure so a conductor can ask the SAME question before proposing a group, rather
+	 * than re-deriving a second copy of the rule that could drift from the one enforced here (the
+	 * same reason `computeDegradedDropRuns` lives in `core/wire.ts`).
+	 */
 	private classifyGroup(g: Group): GroupShape {
 		const members: Block[] = [];
 		for (const id of g.memberIds) {
 			const b = this.get(id);
 			if (b) members.push(b);
 		}
-		const byMsg = new Map<string, Block[]>();
-		for (const b of members) {
-			const k = messageKey(b.id);
-			const arr = byMsg.get(k);
-			if (arr) arr.push(b);
-			else byMsg.set(k, [b]);
-		}
-		const msgOrder = [...byMsg.keys()];
-		const msgCalls = new Map<string, string[]>();
-		const msgResults = new Map<string, string[]>();
-		for (const k of msgOrder) {
-			const calls: string[] = [];
-			const results: string[] = [];
-			for (const b of byMsg.get(k)!) {
-				if (!b.callId) continue;
-				if (b.kind === "tool_call") calls.push(b.callId);
-				else if (b.kind === "tool_result") results.push(b.callId);
-			}
-			msgCalls.set(k, calls);
-			msgResults.set(k, results);
-		}
-		const live = this.wireAttached;
-		const removable = new Set<string>();
-		for (const k of msgOrder) {
-			const msgBlocks = byMsg.get(k)!;
-			if (live && msgBlocks.some((b) => !isDurableId(b.id))) continue;
-			removable.add(k);
-		}
-		let changed = true;
-		do {
-			changed = false;
-			const calls = new Set<string>();
-			const results = new Set<string>();
-			for (const k of msgOrder) {
-				if (!removable.has(k)) continue;
-				for (const c of msgCalls.get(k)!) calls.add(c);
-				for (const c of msgResults.get(k)!) results.add(c);
-			}
-			for (const k of msgOrder) {
-				if (!removable.has(k)) continue;
-				const unbalanced = msgCalls.get(k)!.some((c) => !results.has(c)) || msgResults.get(k)!.some((c) => !calls.has(c));
-				if (unbalanced) {
-					removable.delete(k);
-					changed = true;
-				}
-			}
-		} while (changed);
+		const removable = collapsibleMessageKeys(members, this.wireAttached);
 		const collapsed = new Set<string>();
 		const stragglers = new Set<string>();
 		const collapsedMembers: Block[] = [];
