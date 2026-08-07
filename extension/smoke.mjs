@@ -1188,6 +1188,79 @@ await new Promise((r) => setTimeout(r, 50));
 		else if (!line.includes("Browser: http://127.0.0.1:")) fails.push(`extension Z did not fall back to an ephemeral Browser URL (got ${JSON.stringify(line)})`);
 	}
 
+	// (e)/(f)/(g) door-secret crash recovery (F2, ADR 0024 §8): the old "wx" open-then-write could
+	// leave a permanently INVALID file (creator crashed between open and write) that every later
+	// extension read once, failed to validate, and gave up on — no door, forever. The rework must
+	// recover: reap a STALE invalid file and re-create atomically (tmp+link), and while the secret is
+	// unresolved the door must NOT bind (gated), with the bounded retry re-kicking the bind when it
+	// resolves.
+	const DOOR_SECRET = path.join(HOME, ".accordion", "door-secret");
+	const HEX64 = /^[0-9a-f]{64}$/i;
+	const backdate = () => { const past = (Date.now() - 60_000) / 1000; fs.utimesSync(DOOR_SECRET, past, past); };
+
+	// (e) A pre-existing EMPTY door-secret (simulated crashed creator; old mtime) → the extension
+	//     reaps it, creates a valid secret, and the door still comes up on that recovered secret.
+	fs.writeFileSync(DOOR_SECRET, "");
+	backdate();
+	const DOOR_E = await freePort();
+	process.env.ACCORDION_DOOR_PORT = String(DOOR_E);
+	const W1 = makeExtension();
+	W1.h.session_start({ type: "session_start", reason: "startup" }, W1.ctx);
+	if (!(await waitForAsync(async () => (await doorMeta(DOOR_E))?.served === true, 4000)))
+		fails.push("door-secret recovery (empty file): the door never came up after a crashed-creator empty secret file");
+	{
+		let onDisk = "";
+		try { onDisk = fs.readFileSync(DOOR_SECRET, "utf8").trim(); } catch { /* leave empty */ }
+		if (!HEX64.test(onDisk)) fails.push(`door-secret recovery (empty file): on-disk secret is still invalid (${JSON.stringify(onDisk.slice(0, 20))})`);
+		await Promise.resolve(W1.cmd?.("", W1.ctx));
+		const line = W1.notes.map((n) => n.message).reverse().find((msg) => msg.includes("Browser: http"));
+		if (!line || !line.includes(`http://127.0.0.1:${DOOR_E}/?token=${onDisk}`))
+			fails.push(`door-secret recovery (empty file): /accordion did not print the door URL with the RECOVERED secret (got ${JSON.stringify(line)})`);
+	}
+	W1.h.session_shutdown({}, W1.ctx);
+
+	// (f) Same recovery from GARBAGE content (not 64-hex; old mtime).
+	fs.writeFileSync(DOOR_SECRET, "deadbeef-not-a-valid-secret\n");
+	backdate();
+	const DOOR_F = await freePort();
+	process.env.ACCORDION_DOOR_PORT = String(DOOR_F);
+	const W2 = makeExtension();
+	W2.h.session_start({ type: "session_start", reason: "startup" }, W2.ctx);
+	if (!(await waitForAsync(async () => (await doorMeta(DOOR_F))?.served === true, 4000)))
+		fails.push("door-secret recovery (garbage file): the door never came up after a garbage secret file");
+	{
+		let onDisk = "";
+		try { onDisk = fs.readFileSync(DOOR_SECRET, "utf8").trim(); } catch { /* leave empty */ }
+		if (!HEX64.test(onDisk)) fails.push(`door-secret recovery (garbage file): on-disk secret is still invalid (${JSON.stringify(onDisk.slice(0, 20))})`);
+	}
+	W2.h.session_shutdown({}, W2.ctx);
+
+	// (g) A YOUNG invalid file (current mtime — possibly a live writer, so it must NOT be reaped):
+	//     the door must stay DOWN while the secret is unresolved (the bind is gated on a valid
+	//     secret), and when the file later becomes valid (the "writer" completes), the bounded retry
+	//     adopts it and re-kicks the door bind — the door comes up bearing EXACTLY that secret.
+	fs.writeFileSync(DOOR_SECRET, ""); // young: NOT backdated
+	const DOOR_G = await freePort();
+	process.env.ACCORDION_DOOR_PORT = String(DOOR_G);
+	process.env.ACCORDION_DOOR_SECRET_RETRY_MS = "50"; // fast retry ticks for the test
+	const W3 = makeExtension();
+	W3.h.session_start({ type: "session_start", reason: "startup" }, W3.ctx);
+	await new Promise((r) => setTimeout(r, 250)); // several retry ticks elapse against the invalid file
+	if ((await doorMeta(DOOR_G))?.served === true)
+		fails.push("door-secret gate: the door bound while the secret file was still invalid (empty)");
+	const LATE_SECRET = "ab".repeat(32); // the simulated writer completes with a valid 64-hex secret
+	fs.writeFileSync(DOOR_SECRET, LATE_SECRET);
+	if (!(await waitForAsync(async () => (await doorMeta(DOOR_G))?.served === true, 4000)))
+		fails.push("door-secret retry: the door did not come up after the secret file became valid");
+	else {
+		await Promise.resolve(W3.cmd?.("", W3.ctx));
+		const line = W3.notes.map((n) => n.message).reverse().find((msg) => msg.includes("Browser: http"));
+		if (!line || !line.includes(`http://127.0.0.1:${DOOR_G}/?token=${LATE_SECRET}`))
+			fails.push(`door-secret retry: /accordion did not print the door URL with the late-resolved secret (got ${JSON.stringify(line)})`);
+	}
+	W3.h.session_shutdown({}, W3.ctx);
+	delete process.env.ACCORDION_DOOR_SECRET_RETRY_MS;
+
 	// Cleanup: shut down the door-test extensions (deletes their registry entries) + the foreign server,
 	// and disable the door again so the main shutdown/cleanup below sees a quiet, empty sessions dir.
 	Y.h.session_shutdown({}, Y.ctx);

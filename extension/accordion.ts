@@ -118,6 +118,16 @@ const DOOR_RETRY_MS = 4_000;
 // both to classify an EADDRINUSE occupant (live Accordion vs. foreign software) and to decide the
 // /accordion URL. Never blocks a model call.
 const DOOR_PROBE_MS = 750;
+// Door-secret recovery (ADR 0024 §8/§9). When the secret file is absent or INVALID (empty/partial —
+// a crashed or mid-write creator), re-attempt the atomic ensure on a bare unref'd timer instead of
+// giving up with an empty (unusable) secret. Bounded so a permanently-broken file can't spin forever.
+const DOOR_SECRET_RETRY_MS = 400;
+const DOOR_SECRET_MAX_TRIES = 10;
+// An INVALID secret file older than this is treated as an abandoned crash artifact and unlinked so
+// the atomic create can re-run — no legitimate writer holds the file invalid for anywhere near this
+// long (a tmp+link create is sub-millisecond). Bounded convergence: two extensions both recovering
+// race the link/EEXIST primitive rather than fighting.
+const DOOR_SECRET_STALE_MS = 10_000;
 /**
  * Three-way classification of whatever holds the door port (C2/S3):
  *   • "accordion"  — a completed 200 from a loopback peer that is a MATCHING-version live Accordion
@@ -202,6 +212,15 @@ function currentDoorRetryMs(): number {
 	if (raw === undefined) return DOOR_RETRY_MS;
 	const n = Number(raw);
 	return Number.isInteger(n) && n > 0 ? n : DOOR_RETRY_MS;
+}
+
+/** Door-secret recovery retry cadence, overridable via ACCORDION_DOOR_SECRET_RETRY_MS for fast tests
+ *  (default DOOR_SECRET_RETRY_MS). Test-only seam; production always uses DOOR_SECRET_RETRY_MS. */
+function currentDoorSecretRetryMs(): number {
+	const raw = process.env.ACCORDION_DOOR_SECRET_RETRY_MS;
+	if (raw === undefined) return DOOR_SECRET_RETRY_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : DOOR_SECRET_RETRY_MS;
 }
 
 /** Controller heartbeat cadence, overridable via ACCORDION_CONTROLLER_HEARTBEAT_MS for fast tests
@@ -411,6 +430,8 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	let doorBinding = false;   // a bind attempt is in flight (guards concurrent tryBindDoor)
 	let doorForeign = false;   // the door port is held by NON-Accordion software -> stood down permanently
 	let doorRetryTimer: ReturnType<typeof setTimeout> | null = null; // slow re-attempt while an Accordion door holds it
+	let doorSecretRetryTimer: ReturnType<typeof setTimeout> | null = null; // re-attempt the secret ensure (absent/invalid file)
+	let doorSecretTries = 0;   // bounded retry counter for the secret ensure (DOOR_SECRET_MAX_TRIES)
 
 	// -- the controller lease (ADR 0024) --
 	// In-memory view of the GLOBAL controller.json lease, kept current by our own claim writes and a
@@ -1276,34 +1297,111 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		);
 	}
 
-	// -- door secret: the shared browser bearer (ADR 0024) --
-	// Read the existing secret, or CREATE it with an EXCLUSIVE ("wx") open so the first extension to
-	// need it wins the race and every later one adopts that same value. (Deliberately NOT write-rename
-	// like controller.json/registry entries: this file is written ONCE and must be STABLE across
-	// processes -- a later rename would clobber an in-use secret and desync every already-cached
-	// extension. Exclusive-create is the atomic primitive that gives first-writer-wins; it satisfies
-	// the same "never read a half-written file" intent as write-rename. See the delivery notes.)
-	// Best-effort throughout: any failure leaves doorSecret "" (the door URL just isn't offered, and
-	// the door secret isn't an accepted bearer -- the per-session webToken path is unaffected).
-	function loadOrCreateDoorSecret(): void {
-		if (doorSecret) return;
-		const valid = (v: string): boolean => /^[0-9a-f]{64}$/i.test(v);
+	// -- door secret: the shared browser bearer (ADR 0024 §8) --
+	// One value, written EXACTLY once, stable for as long as any extension has it cached. Creation is
+	// atomic-WITH-CONTENT: write the full secret to a same-dir tmp file (0600), then
+	// fs.linkSync(tmp, DOOR_SECRET_PATH) -- the destination appears with COMPLETE bytes or not at all,
+	// and EEXIST means a racer won (adopt theirs). This replaces the earlier "wx" open-then-write,
+	// whose open->write gap let a racer read empty/partial bytes and cache "" with NO retry, and whose
+	// crash window (creator dies between open and write) left a permanently invalid file on disk.
+	// (Still deliberately NOT write-rename like controller.json: a rename would clobber an in-use
+	// secret out from under every extension that already cached + handed it out. link/EEXIST keeps
+	// first-writer-wins; the tmp step just guarantees the winner's bytes are complete.)
+	// Reader side: an absent/invalid read schedules a BOUNDED re-attempt on an unref'd timer (never a
+	// one-shot give-up), and an invalid file whose mtime is older than DOOR_SECRET_STALE_MS is a
+	// crashed creator's artifact -- unlinked and re-created (two extensions both recovering converge
+	// via the link/EEXIST primitive rather than fighting). The retry budget (~22s of linear backoff)
+	// deliberately exceeds the staleness threshold (10s), so a young invalid file always ages into
+	// reapability within the budget. The door itself is GATED on a valid secret: tryBindDoor refuses
+	// to bind while doorSecret is "", and the retry timer re-kicks it the moment the secret resolves,
+	// so the door is never up (nor its URL printable) while the bearer it would serve is empty.
+	// Retries exhausted => doorSecret stays "" (no door; the per-session webToken path is unaffected,
+	// and every bearer/cookie comparison pre-checks doorSecret so "" can never match).
+	const DOOR_SECRET_RE = /^[0-9a-f]{64}$/i;
+
+	/** The on-disk secret iff present AND well-formed (64 hex chars), else null. */
+	function readValidDoorSecret(): string | null {
 		try {
 			const existing = fs.readFileSync(DOOR_SECRET_PATH, "utf8").trim();
-			if (valid(existing)) { doorSecret = existing; return; }
-		} catch { /* not present yet */ }
+			return DOOR_SECRET_RE.test(existing) ? existing : null;
+		} catch {
+			return null; // absent / unreadable
+		}
+	}
+
+	/** Attempt the atomic create (tmp + linkSync). Sets doorSecret iff WE created the file. On a
+	 *  filesystem without hard links (EPERM/ENOSYS/EXDEV/ENOTSUP -- non-NTFS edge) falls back to the
+	 *  old exclusive "wx" create-then-write; its open->write window is exactly what the reader-side
+	 *  retry exists to cover. EEXIST (either path) = a racer won -- the caller re-reads. The tmp file
+	 *  is always unlinked, success or failure. */
+	function tryCreateDoorSecret(): void {
+		const secret = crypto.randomBytes(32).toString("hex");
+		const tmp = `${DOOR_SECRET_PATH}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
 		try {
 			fs.mkdirSync(REGISTRY_ROOT, { recursive: true });
-			const secret = crypto.randomBytes(32).toString("hex");
-			const fd = fs.openSync(DOOR_SECRET_PATH, "wx", 0o600); // exclusive create; EEXIST if a racer won
-			try { fs.writeSync(fd, secret); } finally { fs.closeSync(fd); }
-			doorSecret = secret;
-			return;
-		} catch { /* EEXIST (a racer created it first) or other -- adopt whatever is on disk below */ }
+			fs.writeFileSync(tmp, secret, { mode: 0o600 });
+			try {
+				fs.linkSync(tmp, DOOR_SECRET_PATH); // appears with COMPLETE bytes or not at all
+				doorSecret = secret;
+			} catch (e) {
+				const code = (e as NodeJS.ErrnoException)?.code;
+				if (code === "EPERM" || code === "ENOSYS" || code === "EXDEV" || code === "ENOTSUP") {
+					const fd = fs.openSync(DOOR_SECRET_PATH, "wx", 0o600); // fallback; EEXIST if a racer won
+					try { fs.writeSync(fd, secret); } finally { fs.closeSync(fd); }
+					doorSecret = secret;
+				}
+				// EEXIST or anything else: a racer won / creation failed -- caller re-reads + retries.
+			}
+		} catch {
+			/* best-effort: mkdir / tmp write / wx fallback failed -- the bounded retry re-attempts */
+		} finally {
+			try { fs.unlinkSync(tmp); } catch { /* never created / already gone */ }
+		}
+	}
+
+	/** Crash recovery: an INVALID secret file whose mtime is older than DOOR_SECRET_STALE_MS has no
+	 *  live writer (a tmp+link create is sub-millisecond; even the wx fallback's window is micro-
+	 *  seconds) -- unlink it so the atomic create can re-run. Never touches a VALID file, and leaves
+	 *  a YOUNG invalid file alone (possibly a legacy-path writer mid-write; it either completes or
+	 *  ages into reapability within the retry budget). */
+	function reapStaleInvalidDoorSecret(): void {
 		try {
-			const existing = fs.readFileSync(DOOR_SECRET_PATH, "utf8").trim();
-			if (valid(existing)) doorSecret = existing;
-		} catch { /* best-effort */ }
+			const st = fs.statSync(DOOR_SECRET_PATH);
+			if (Date.now() - st.mtimeMs <= DOOR_SECRET_STALE_MS) return;
+			if (readValidDoorSecret() !== null) return; // valid -- never reap a good secret
+			fs.unlinkSync(DOOR_SECRET_PATH);
+		} catch {
+			/* absent or unreadable -- nothing to reap */
+		}
+	}
+
+	/**
+	 * Ensure the shared door secret exists on disk, is valid, and is cached in `doorSecret` -- with
+	 * bounded retry instead of the old one-shot. Synchronous happy path (valid file, or we win the
+	 * create). Otherwise: reap a stale-invalid file, attempt the atomic create, re-read (a racer may
+	 * have won), and if STILL unresolved schedule a bounded, linearly backed-off, unref'd re-attempt
+	 * that re-kicks the (secret-gated) door bind when the secret finally resolves. Idempotent; a
+	 * session swap re-arms it via startServer. Never on the context hook path.
+	 */
+	function ensureDoorSecret(): void {
+		if (doorSecret) return;
+		const existing = readValidDoorSecret();
+		if (existing !== null) { doorSecret = existing; doorSecretTries = 0; return; }
+		reapStaleInvalidDoorSecret();
+		tryCreateDoorSecret();
+		if (!doorSecret) {
+			const again = readValidDoorSecret(); // a racer may have completed while we tried
+			if (again !== null) doorSecret = again;
+		}
+		if (doorSecret) { doorSecretTries = 0; return; }
+		if (doorSecretRetryTimer || doorSecretTries >= DOOR_SECRET_MAX_TRIES) return;
+		doorSecretTries++;
+		doorSecretRetryTimer = setTimeout(() => {
+			doorSecretRetryTimer = null;
+			ensureDoorSecret();
+			if (doorSecret) tryBindDoor(); // the secret just resolved -- the gated door bind may proceed
+		}, currentDoorSecretRetryMs() * doorSecretTries); // linear backoff: n * base
+		doorSecretRetryTimer.unref?.();
 	}
 
 	// -- the door: an ADDITIONAL fixed-port listener, one extension at a time (ADR 0024) --
@@ -1390,6 +1488,11 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (doorHeld || doorForeign || doorBinding) return;
 		const dp = currentDoorPort();
 		if (dp === null) return; // door disabled (test isolation)
+		// GATED on a valid shared secret (ADR 0024 §8): never bind/advertise the door while doorSecret
+		// is "" -- a door with no bearer to serve is a door nobody can be authorized through, and the
+		// /accordion print path must never see doorHeld=true with an empty secret. ensureDoorSecret's
+		// bounded retry re-invokes this the moment the secret resolves.
+		if (!doorSecret) { ensureDoorSecret(); if (!doorSecret) return; }
 		doorBinding = true;
 		let server: http.Server;
 		let dwss: WebSocketServer;
@@ -1445,9 +1548,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		});
 	}
 
-	/** Close the door listener if we hold it (releases the port for a standing-by extension). */
+	/** Close the door listener if we hold it (releases the port for a standing-by extension). Also
+	 *  stops any pending secret-ensure retry and resets its budget (a session swap re-arms both via
+	 *  startServer). The cached doorSecret itself is kept -- it is stable for the process lifetime. */
 	function closeDoor(): void {
 		if (doorRetryTimer) { clearTimeout(doorRetryTimer); doorRetryTimer = null; }
+		if (doorSecretRetryTimer) { clearTimeout(doorSecretRetryTimer); doorSecretRetryTimer = null; }
+		doorSecretTries = 0;
 		try { doorWss?.close(); } catch { /* ignore */ }
 		try { doorServer?.close(); } catch { /* ignore */ }
 		doorServer = null; doorWss = null; doorHeld = false; doorBinding = false;
@@ -1799,10 +1906,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// Per-session token for the HTTP surface and browser WebSocket upgrades. Native/Tauri
 		// clients and verified sibling Accordion origins are the only tokenless paths.
 		webToken = crypto.randomBytes(16).toString("hex");
-		// v16 (ADR 0024): load/create the shared door secret (accepted as a bearer everywhere the
-		// webToken is), start the controller lease timers, and attempt to become the door holder. All
-		// idempotent + best-effort; re-run on a session swap after `closeDoor`/`stopControllerTimers`.
-		loadOrCreateDoorSecret();
+		// v16 (ADR 0024): ensure the shared door secret (accepted as a bearer everywhere the webToken
+		// is; bounded-retry, never a one-shot -- see ensureDoorSecret), start the controller lease
+		// timers, and attempt to become the door holder. tryBindDoor is gated on a valid secret; when
+		// the secret only resolves on a later retry tick, that tick re-kicks the bind. All idempotent +
+		// best-effort; re-run on a session swap after `closeDoor`/`stopControllerTimers`.
+		ensureDoorSecret();
 		startControllerTimers();
 		tryBindDoor();
 		try {

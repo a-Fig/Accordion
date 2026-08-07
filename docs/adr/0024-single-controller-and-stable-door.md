@@ -253,12 +253,14 @@ returns the **ACCORDION** verdict for a sibling), it prints `http://127.0.0.1:24
 otherwise (foreign-occupied, or a merely-ambiguous probe) it falls back to this session's own ephemeral
 URL exactly as before.
 
-### 8. The door-secret: exclusive-create, a deliberate deviation from write-rename
+### 8. The door-secret: atomic create-with-content, a deliberate deviation from write-rename
 
-`~/.accordion/door-secret` (32 random bytes, hex-encoded, `0600` best-effort) is written with
-`fs.openSync(path, "wx", 0o600)` — exclusive create, which fails with `EEXIST` if the file already
-exists (`loadOrCreateDoorSecret`, `accordion.ts:1243`) — **not** the write-rename pattern every other
-file in this ADR (and every existing registry file) uses.
+`~/.accordion/door-secret` (32 random bytes, hex-encoded, `0600` best-effort) is created by writing
+the full secret to a same-directory temp file and then **`fs.linkSync(tmp, path)`** — the destination
+appears with its complete bytes or not at all, and the link fails with `EEXIST` if a racer created
+the file first (`ensureDoorSecret`/`tryCreateDoorSecret`, `extension/accordion.ts`; the tmp is always
+unlinked afterward). This is **not** the write-rename pattern every other file in this ADR (and every
+existing registry file) uses.
 
 The reason is a real difference in value-lifecycle semantics, not an inconsistency to clean up.
 Write-rename exists to make a value that **changes over time**, where the newest write should win,
@@ -269,10 +271,33 @@ tabs. If secret creation used write-rename, a second extension racing to create 
 the file's bytes out from under a first extension that already created — and, by then, possibly
 already distributed to a connected browser — a different secret: an in-use, already-handed-out
 credential clobbered by a peer that merely lost an unrelated timing race, desyncing every extension
-that had already cached the old value. Exclusive-create removes that window entirely: the loser of
-the race gets `EEXIST`, falls through to reading the now-guaranteed-present file the winner wrote, and
-every extension in the process group converges on the one value that was ever actually created,
-regardless of who wrote it.
+that had already cached the old value. link-into-place removes that window entirely: the loser of the
+race gets `EEXIST` and adopts the winner's file, and every extension in the process group converges on
+the one value that was ever actually created, regardless of who wrote it.
+
+An earlier draft of this section (and an earlier implementation) used a bare exclusive-create —
+`fs.openSync(path, "wx", 0o600)` followed by a separate write — and claimed that `EEXIST` implied the
+winner's bytes were already present. **That claim was false**: with open-then-write, a racer that hit
+`EEXIST` could read the file in the winner's open→write gap and cache an empty/partial secret with no
+retry, and a creator crashing between open and write left a permanently invalid file that every later
+extension would read, fail to validate, and give up on forever. The shipped mechanism closes both
+holes:
+
+- **Appears-complete create**: tmp + `linkSync` as above — `EEXIST` now genuinely implies complete
+  bytes, because the destination name never exists without them. Where hard links are unsupported
+  (`EPERM`/`ENOSYS`/`EXDEV`/`ENOTSUP` — a non-NTFS edge), creation falls back to the old `"wx"`
+  create-then-write; the reader-side retry below covers that fallback's window.
+- **Reader validation + bounded retry**: every read is validated against `/^[0-9a-f]{64}$/i`; an
+  absent or invalid read schedules a bounded re-read/re-create attempt (up to 10 tries, linear
+  backoff on a bare unref'd timer) instead of settling on an empty secret after one shot.
+- **Stale-invalid recovery**: a file that exists but is *invalid* and whose mtime is older than 10s
+  (no legitimate writer holds it invalid for anywhere near that long) is treated as a crash artifact,
+  unlinked, and re-created — two extensions both recovering converge via the link/`EEXIST` primitive
+  rather than fighting. The retry budget (~22s) deliberately exceeds the staleness threshold, so a
+  young invalid file always ages into reapability within the budget.
+- **The door is gated on a valid secret**: `tryBindDoor` refuses to bind (and `/accordion` never
+  prints the door URL) while the secret is unresolved; the retry timer re-kicks the bind the moment
+  it resolves. A door with no bearer to serve is never up.
 
 ### 9. Security posture: no new local exposure, but new secret-lifecycle properties to own
 
@@ -372,7 +397,7 @@ The only real difference is the affordance next to the badge, not the badge's me
   §8's reasoning: consistency with the *other* files is the wrong axis to optimize, since the secret
   has fundamentally different value-lifecycle semantics (write-once-and-stay-stable) than a
   lease/heartbeat file (replace-on-every-change). Applying the wrong primitive for the sake of
-  uniformity would have reintroduced exactly the clobber window exclusive-create exists to close.
+  uniformity would have reintroduced exactly the clobber window the tmp+link create exists to close.
 
 ## Deferred
 
