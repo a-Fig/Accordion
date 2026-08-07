@@ -145,6 +145,25 @@ describe("select — eager locks + attach broadcast", () => {
 	});
 });
 
+// Issue #93: LiveConductorHost.systemPrompt() is a thin pass-through to the live Truth's own
+// scalar — null with no live Truth, and the captured value once `Truth.setSystemPrompt` has run.
+describe("systemPrompt() — pass-through to the live Truth", () => {
+	it("returns null when there is no live Truth", () => {
+		const h = makeDeps(null);
+		const host = new LiveConductorHost(h.deps);
+		expect(host.systemPrompt()).toBeNull();
+	});
+
+	it("returns null before capture, and the captured value once Truth.setSystemPrompt has run", () => {
+		const t = bulk(textSeq(2));
+		const h = makeDeps(t);
+		const host = new LiveConductorHost(h.deps);
+		expect(host.systemPrompt()).toBeNull();
+		t.setSystemPrompt("You are a helpful assistant.", 8);
+		expect(host.systemPrompt()).toEqual({ text: "You are a helpful assistant.", tokens: 8 });
+	});
+});
+
 // ── fix 2: transactional attach — a failed create()/attach() must never strand a lock ──────────
 describe("select — a throwing create() never acquires a lock (fix 2a)", () => {
 	it("leaves Truth completely unlocked and nothing advertised active when the factory throws", () => {
