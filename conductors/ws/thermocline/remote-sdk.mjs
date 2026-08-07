@@ -2999,7 +2999,12 @@ var ThermoclineConductor = class {
   appliedForProject() {
     return {
       foldedIds: new Set(this.appliedFolds.keys()),
-      strata: this.appliedStrata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens }))
+      // Applied strata can outlive a calibration observation. Recount the exact wire summary
+      // so project() compares values measured under the host's current calibration.
+      strata: this.appliedStrata.map((s) => ({
+        memberIds: s.memberIds,
+        summaryTokens: s.summary == null ? 0 : this.host.countTokens(s.summary)
+      }))
     };
   }
   /**

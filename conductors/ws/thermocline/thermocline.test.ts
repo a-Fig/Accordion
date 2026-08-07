@@ -14,6 +14,7 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TestHost } from "../../../core/conductor/testhost";
+import type { ConductorHost } from "../../../core/conductor/contract";
 import type { Block } from "../../../core/types";
 import type { Op, TxnResult } from "../../../core/ops";
 import { foldTag } from "../../../core/digest";
@@ -348,6 +349,84 @@ test("no double-count: after epoch 1 folds, a second over-budget batch still tri
 
 	expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(5_000); // epoch 2 fired and compressed
 	expect(host.truth.blocks.filter((b) => host.truth.isFolded(b)).length).toBeGreaterThan(foldedAfterEpoch1);
+});
+
+// An applied stratum can survive a calibration snap. Its projection must recount the full wire
+// summary under the current calibration instead of reusing the token count captured at commit.
+test("wire-departing recounts an already-applied stratum after calibration changes", async () => {
+	const blocks: ViewBlock[] = ["a", "b"].map((id, order) => ({
+		id,
+		kind: "text",
+		turn: 1,
+		order,
+		tokens: 1_000,
+		foldedTokens: 20,
+		held: false,
+		folded: true,
+		protected: false,
+		grouped: true,
+		sent: true,
+		text: id,
+	}));
+	const host: ConductorHost = {
+		on: () => () => {},
+		get: (id) => blocks.find((b) => b.id === id),
+		blocks: () => blocks,
+		groups: () => [{ id: "g:a", memberIds: ["a", "b"], folded: true, by: "auto", summary: "TAGGED SUMMARY" }],
+		textOf: (id) => blocks.find((b) => b.id === id)?.text ?? null,
+		stats: () => ({
+			rev: 1,
+			liveTokens: 200,
+			fullTokens: 2_000,
+			budget: 150,
+			contextWindow: 150,
+			protectTokens: 0,
+			protectedFromIndex: 2,
+			blockCount: 2,
+		}),
+		countTokens: () => 200,
+		digestOf: () => null,
+		complete: async () => {
+			throw new Error("unused");
+		},
+		setStatus: () => {},
+		propose: async () => {
+			throw new Error("unused");
+		},
+	};
+	const cond = new ThermoclineConductor({ scorer: emptyScorer, sessionKey: null });
+	cond.attach(host);
+	const internals = cond as unknown as {
+		appliedStrata: Array<{
+			firstId: string;
+			lastId: string;
+			unitIds: string[];
+			memberIds: string[];
+			summary: string | null;
+			summaryTokens: number;
+			groupId: string | null;
+		}>;
+		onWireDeparting(): Promise<void>;
+		runEmergency(view: ConductorView): Promise<void>;
+	};
+	internals.appliedStrata = [{
+		firstId: "a",
+		lastId: "b",
+		unitIds: ["a", "b"],
+		memberIds: ["a", "b"],
+		summary: "TAGGED SUMMARY",
+		summaryTokens: 100,
+		groupId: "g:a",
+	}];
+	let emergencyCalls = 0;
+	internals.runEmergency = async () => {
+		emergencyCalls++;
+	};
+
+	await internals.onWireDeparting();
+
+	expect(host.stats().liveTokens).toBeGreaterThan(150);
+	expect(emergencyCalls).toBe(1); // pre-fix: 0 — stale projection was 100 ≤ 150
 });
 
 // ── probe-absent fallback — empty/rejecting scorer still compresses via age-based rungs ───────
