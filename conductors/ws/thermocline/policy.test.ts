@@ -116,6 +116,33 @@ test("project subtracts fold + stratum savings from liveTokens, no double-count"
 	expect(project(v, { foldedIds: new Set(), strata: [{ memberIds: ["b", "c"], summaryTokens: 200 }] })).toBe(10_200);
 });
 
+// F1 (issue #11, ADR 0025 stage 2): `ConductorView.liveTokens`/`ViewBlock.tokens` are CALIBRATED
+// (real, provider-anchored numbers) — `project()` mixes them with `summaryTokens` in one expression
+// (`members − s.summaryTokens`), so `summaryTokens` must ALSO be calibrated or the subtraction is not
+// even the right order of magnitude once `calibration !== 1`. This models the bug thermocline.ts had:
+// substituting a RAW chars/4 `summaryTokens` into a plan whose member tokens are already calibrated.
+test("project() stays unit-consistent only when summaryTokens is calibrated to the same k (F1)", () => {
+	_order = 0;
+	const k = 2; // simulated session calibration
+	// Two 1000-raw-token members, reported CALIBRATED (the ViewBlock.tokens convention) → 2000 each.
+	const blocks = [blk({ id: "a", tokens: 1000 * k, foldedTokens: 40 }), blk({ id: "b", tokens: 1000 * k, foldedTokens: 40 })];
+	const v = view(blocks); // liveTokens = 4000 (calibrated)
+
+	const rawSummaryChars = 400;
+	const rawSummaryTokens = Math.ceil(rawSummaryChars / 4); // 100 — the F1 bug: never scaled by k
+	const calibratedSummaryTokens = Math.round(rawSummaryTokens * k); // 200 — what host.countTokens reports
+
+	const projectedWithBug = project(v, { foldedIds: new Set(), strata: [{ memberIds: ["a", "b"], summaryTokens: rawSummaryTokens }] });
+	const projectedFixed = project(v, { foldedIds: new Set(), strata: [{ memberIds: ["a", "b"], summaryTokens: calibratedSummaryTokens }] });
+
+	// members = 4000 (calibrated). Bug: saving overstated → projected wire size UNDER-reported.
+	expect(projectedWithBug).toBe(4000 - (4000 - rawSummaryTokens)); // = 100 — too low: looks nearly free
+	expect(projectedFixed).toBe(4000 - (4000 - calibratedSummaryTokens)); // = 200 — the honest, calibrated cost
+	// The uncalibrated summary understates the real wire cost by exactly (k−1)·digestTokens — the hard-
+	// budget invariant could pass on `projectedWithBug` while the real wire is over cap.
+	expect(projectedFixed - projectedWithBug).toBe((k - 1) * rawSummaryTokens);
+});
+
 // ── BUDGET INVARIANT ──────────────────────────────────────────────────────────────────────────
 describe("budget invariant", () => {
 	test("planEpoch folds rendered down to ≤ lowWater·cap when possible", () => {

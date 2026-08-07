@@ -22,6 +22,10 @@ import type { HostEvent, ViewBlock, StateChange } from "./contract";
 /**
  * Project one Truth block into the `ViewBlock` shape every conductor/host client sees — the
  * per-block read a `ConductorHost.get`/`blocks()` implementation serves.
+ *
+ * `tokens`/`foldedTokens` are CALIBRATED (issue #11 stage 2, ADR 0025 — `truth.calTokens`), not the
+ * raw chars/4 estimate `Block.tokens`/`foldedTokensOf` carry — see `TruthStats`'s doc comment
+ * (`core/truth.ts`) for why every conductor-facing read surface shares this one convention.
  */
 export function viewBlockOf(truth: Truth, b: Block): ViewBlock {
 	return {
@@ -29,8 +33,8 @@ export function viewBlockOf(truth: Truth, b: Block): ViewBlock {
 		kind: b.kind,
 		turn: b.turn,
 		order: b.order,
-		tokens: b.tokens,
-		foldedTokens: truth.foldedTokensOf(b),
+		tokens: truth.calTokens(b.tokens),
+		foldedTokens: truth.calTokens(truth.foldedTokensOf(b)),
 		toolName: b.toolName,
 		callId: b.callId,
 		isError: b.isError,
@@ -100,6 +104,12 @@ export function hostEventsFromTruthEvent(truth: Truth, e: TruthEvent): HostEvent
 		return changes.length ? [{ type: "state-changed", changes, rev: e.rev }] : [];
 	}
 	if (e.type === "config") {
+		// `calibration` (v18, issue #11 stage 1) is DISPLAY-only and must stay invisible to a
+		// conductor — it carries no `budget`/`protectTokens`/`contextWindow` field, so without this
+		// guard it would fall through to the `budget !== undefined ? "budget" : "protect"` default and
+		// get mislabeled a "protect" change, waking every subscribed conductor on every calibration
+		// snap (once per model reply) for a dial it was never meant to see.
+		if (e.budget === undefined && e.protectTokens === undefined && e.contextWindow === undefined) return [];
 		const what: StateChange["what"] = e.budget !== undefined ? "budget" : "protect";
 		return [{ type: "state-changed", changes: [{ what, by: "you" }], rev: e.rev }];
 	}

@@ -3,7 +3,7 @@ import { Truth } from "./truth";
 import type { Block, ParsedSession } from "./types";
 import { linearize, wireToBlock, type PiMessage } from "./wire";
 import { foldCode } from "./digest";
-import { wireEventFromTruthEvent, applyWireEvent } from "./replica";
+import { wireEventFromTruthEvent, applyWireEvent, serializeSnapshot, hydrateSnapshot } from "./replica";
 import type { WireEvent } from "./protocol";
 
 const META = { format: "pi" as const, title: "t", cwd: "", model: "" };
@@ -176,6 +176,42 @@ describe("Truth — birth-fold", () => {
 		const newest = t.blocks[t.blocks.length - 1];
 		expect(t.sent(newest)).toBe(true);
 		expect(t.canFold(newest, "auto")).toBe(false); // protected + sent → no exemption
+	});
+});
+
+// F2 (issue #11 stage 2, ADR 0025): `setCalibration` used to only bump rev + emit, unlike
+// `setBudget`/`setProtect` which both run `housekeep()` since they can move `protectedFromIndex()`.
+// `calibration` is a THIRD boundary-moving dial (`computeProtectedFromIndex` divides the real-token
+// target by `calibrationMul`), so a `k` decrease that grows the raw threshold used to leave a fold
+// standing inside the newly-enlarged protected tail until some unrelated mutation happened to run
+// `housekeep()` next. These assert `setCalibration` now heals in the SAME rev it moves the boundary,
+// mirroring the existing `setProtect` heal test, and that the birth-fold exemption still holds.
+describe("Truth — setCalibration housekeep (F2)", () => {
+	it("a strategy fold outside the tail heals when calibration shrinks and grows the raw threshold", () => {
+		const t = bulk(seq(5, 1000)); // 5 already-sent blocks, 1000 tokens each
+		t.setProtect(1500); // k=1: target=1500, cap=1875 → only index 4 protected
+		expect(t.protectedFromIndex()).toBe(4);
+		t.apply([{ kind: "fold", ids: ["a:b3:p0"] }], "auto"); // outside the tail — ordinary strategy fold
+		expect(t.isFolded(t.get("a:b3:p0")!)).toBe(true);
+		t.setCalibration(0.5); // raw threshold doubles (target/k = 1500/0.5 = 3000) → tail grows to cover index 3
+		expect(t.protectedFromIndex()).toBeLessThanOrEqual(3);
+		expect(t.isFolded(t.get("a:b3:p0")!)).toBe(false); // healed in the SAME setCalibration call
+		expect(t.get("a:b3:p0")!.override).toBe(null);
+	});
+	it("a birth-folded block does NOT heal when calibration shrinks and grows the tail over it", () => {
+		const t = live();
+		t.append(seq(6, 1000)); // live → all unsent
+		t.setProtect(1500); // k=1 → protectedFromIndex covers only the newest block
+		const newest = t.blocks[t.blocks.length - 1];
+		expect(t.isProtected(newest)).toBe(true);
+		expect(t.sent(newest)).toBe(false);
+		const r = t.apply([{ kind: "fold", ids: [newest.id] }], "auto"); // birth-fold (protected + unsent)
+		expect(r.results[0].applied).toBe(true);
+		expect(t.isFolded(t.get(newest.id)!)).toBe(true);
+		t.setCalibration(0.001); // raw threshold explodes → tail grows to cover the whole log
+		expect(t.protectedFromIndex()).toBe(0);
+		expect(t.isFolded(t.get(newest.id)!)).toBe(true); // still folded — birth-fold exemption survives
+		expect(t.birthFoldedIds).toContain(newest.id);
 	});
 });
 
@@ -993,5 +1029,177 @@ describe("Truth — config dials refuse non-finite input (fix #5)", () => {
 
 		t.setBudget(50_000); // a real value still applies
 		expect(t.budget).toBe(50_000);
+	});
+});
+
+// Issue #11 stage 1 (ADR 0025): the `calibration` dial — default, raw-snap (no clamp/smoothing),
+// non-finite/non-positive refusal (same guard shape as the other config dials), the display-only
+// `calTokens` helper, and survival across `rebuildFrom` + a snapshot/replica round trip.
+describe("Truth — calibration (issue #11 stage 1)", () => {
+	it("defaults to 1, and calTokens is the identity at the default", () => {
+		const t = bulk(seq(2, 1000));
+		expect(t.calibration).toBe(1);
+		expect(t.calTokens(1234)).toBe(1234);
+	});
+
+	it("setCalibration raw-snaps (no clamp, no smoothing) and emits a config event", () => {
+		const t = bulk(seq(2, 1000));
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+		const rev0 = t.rev;
+
+		t.setCalibration(1.5);
+		expect(t.calibration).toBe(1.5);
+		expect(t.calTokens(1000)).toBe(1500);
+		expect(t.rev).toBe(rev0 + 1);
+		expect(events.at(-1)).toMatchObject({ type: "config", calibration: 1.5 });
+
+		// A SECOND observation overwrites the first outright — no averaging/EMA toward it.
+		t.setCalibration(0.8);
+		expect(t.calibration).toBe(0.8);
+		expect(t.rev).toBe(rev0 + 2);
+	});
+
+	it("refuses non-finite / non-positive input — no poison, no rev bump, no event (same guard shape as setBudget/setProtect)", () => {
+		const t = bulk(seq(2, 1000));
+		const rev0 = t.rev;
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+
+		t.setCalibration(NaN);
+		t.setCalibration(Infinity);
+		t.setCalibration(0);
+		t.setCalibration(-1.2);
+		expect(t.calibration).toBe(1); // unchanged, not poisoned
+		expect(t.rev).toBe(rev0);
+		expect(events.length).toBe(0);
+	});
+
+	// Stage 1's version of this test asserted calibration NEVER reached canFold/protectedFromIndex/
+	// stats() — the whole point of stage 2 (issue #11, ADR 0025) is to flip exactly that. This
+	// rewritten test checks what genuinely stays invariant (the protect(0) shortcut, and the literal
+	// dial fields of `stats()`) alongside what now legitimately moves (`stats().liveTokens`/
+	// `fullTokens`). See the two dedicated tests below for `protectedFromIndex` itself moving under a
+	// non-zero protect target.
+	it("with protectTokens=0 the tail-boundary shortcut stays calibration-invariant, but stats() liveTokens/fullTokens are now calibrated (stage 2)", () => {
+		const t = bulk(seq(4, 1000));
+		t.setProtect(0); // target===0 short-circuits computeProtectedFromIndex before it ever reads calibration
+		const pfiBefore = t.protectedFromIndex();
+		const canFoldBefore = t.canFold(t.get("a:b0:p0")!);
+		const statsBefore = t.stats();
+
+		t.setCalibration(3.7);
+
+		// The protect(0) shortcut is untouched by the dial — same boundary, same fold verdict.
+		expect(t.protectedFromIndex()).toBe(pfiBefore);
+		expect(t.canFold(t.get("a:b0:p0")!)).toBe(canFoldBefore);
+
+		const statsAfter = t.stats();
+		// budget / protectTokens / contextWindow / protectedFromIndex / blockCount are literal dial
+		// values / structural facts — untouched by the multiplier (see `TruthStats`'s doc comment).
+		expect(statsAfter.budget).toBe(statsBefore.budget);
+		expect(statsAfter.protectTokens).toBe(statsBefore.protectTokens);
+		expect(statsAfter.contextWindow).toBe(statsBefore.contextWindow);
+		expect(statsAfter.protectedFromIndex).toBe(statsBefore.protectedFromIndex);
+		expect(statsAfter.blockCount).toBe(statsBefore.blockCount);
+		// liveTokens/fullTokens ARE calibrated (stage 2) — the whole point of issue #11.
+		expect(statsAfter.liveTokens).toBe(t.calTokens(statsBefore.liveTokens));
+		expect(statsAfter.fullTokens).toBe(t.calTokens(statsBefore.fullTokens));
+		expect(statsAfter.fullTokens).toBe(Math.round(statsBefore.fullTokens * 3.7));
+	});
+
+	it("protectedFromIndex moves under a non-1 calibration (stage 2): the SAME real protectTokens target maps to a SMALLER raw-estimate region as k grows", () => {
+		const t = bulk(seq(5, 1000)); // 5 blocks, 1000 raw tokens each
+		t.setProtect(2500); // a REAL 2500-token target
+
+		// k=1: raw-equivalent target is still 2500, cap 3125 — walking from the newest block backward,
+		// 3 blocks (3000 raw) crosses the target before the cap does — tail = indices [2,3,4].
+		expect(t.protectedFromIndex()).toBe(2);
+
+		t.setCalibration(2);
+		// raw-equivalent target is now 2500/2 = 1250 (cap 1562.5): 2 blocks (2000 raw) already exceed
+		// the CAP before reaching a 3rd, so the walk stops early — tail shrinks to just [4]. This is
+		// the intended effect: once real tokens run higher than the raw estimate, FEWER raw-estimated
+		// blocks are needed to satisfy the same real-token protection target.
+		expect(t.protectedFromIndex()).toBe(4);
+	});
+
+	it("protectedFromIndex boundary is IDENTICAL between the host and a JSON-round-tripped replica under a non-1 calibration (stage 2 determinism)", () => {
+		const host = live();
+		host.append(seq(6, 1000));
+		host.setProtect(2500);
+		host.setCalibration(1.375);
+		const hostPfi = host.protectedFromIndex();
+
+		// Sanity: calibration genuinely moved the boundary versus k=1, so this test isn't vacuous.
+		const atDefault = live();
+		atDefault.append(seq(6, 1000));
+		atDefault.setProtect(2500);
+		expect(hostPfi).not.toBe(atDefault.protectedFromIndex());
+
+		// Round-trip through JSON (not just object assignment) — any finite double survives
+		// `JSON.stringify`/`JSON.parse` exactly (the shortest-round-tripping-decimal guarantee), which
+		// is the same path `calibration` takes over the real WS wire.
+		const wireState = JSON.parse(JSON.stringify(serializeSnapshot(host, false)));
+		const replica = hydrateSnapshot(META, wireState);
+		expect(replica.calibration).toBe(host.calibration);
+		expect(replica.protectedFromIndex()).toBe(hostPfi);
+	});
+
+	it("survives rebuildFrom (carried like budget/protectTokens), and a fresh build (prev === null) stays at the default", () => {
+		const host = live();
+		host.append(seq(3, 1000));
+		host.setCalibration(1.42);
+
+		const fresh = seq(3, 1000);
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(next.calibration).toBe(1.42);
+
+		const firstBuild = Truth.rebuildFrom(null, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(firstBuild.calibration).toBe(1); // not polluted by ANY prior state
+	});
+
+	it("round-trips through serializeSnapshot → hydrateSnapshot (replica replay parity)", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		host.setCalibration(2.25);
+
+		const state = serializeSnapshot(host, false);
+		expect(state.calibration).toBe(2.25);
+
+		const replica = hydrateSnapshot(META, state);
+		expect(replica.calibration).toBe(2.25);
+		expect(replica.rev).toBe(host.rev);
+
+		// A stale-format peer that omits `calibration` (pre-v18) falls back to the safe cold-start
+		// default rather than forking on `undefined` — never a decision-affecting divergence.
+		const stale = hydrateSnapshot(META, { ...state, calibration: undefined });
+		expect(stale.calibration).toBe(1);
+	});
+
+	it("a config event carrying ONLY calibration replays via applyWireEvent without touching the other dials", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		const budget0 = host.budget;
+		const protect0 = host.protectTokens;
+
+		const events: WireEvent[] = [];
+		const off = host.onEvent((e) => {
+			const w = wireEventFromTruthEvent(e);
+			if (w) events.push(w);
+		});
+		host.setCalibration(1.1);
+		off();
+		const cfgEv = events.find((e) => e.kind === "config");
+		expect(cfgEv).toMatchObject({ kind: "config", calibration: 1.1 });
+		expect((cfgEv as any).budget).toBeUndefined();
+		expect((cfgEv as any).protectTokens).toBeUndefined();
+
+		const replica = live();
+		replica.append(seq(2, 1000));
+		applyWireEvent(replica, cfgEv!);
+		expect(replica.calibration).toBe(1.1);
+		expect(replica.budget).toBe(budget0);
+		expect(replica.protectTokens).toBe(protect0);
 	});
 });

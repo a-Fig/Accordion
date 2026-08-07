@@ -230,7 +230,10 @@ export function runRemoteConductor(conductor: Conductor, opts: RemoteConductorOp
 					return replica!.stats();
 				},
 				countTokens(text: string): number {
-					return estTokens(text);
+					// Calibrated (issue #11 stage 2, ADR 0025) — see `ConductorHost.countTokens`'s doc. The
+					// replica carries the same `calibration` the host does (replicated via `config` events),
+					// so this agrees with the in-process hosts' own `countTokens` byte-for-byte.
+					return replica!.calTokens(estTokens(text));
 				},
 				digestOf(id): string | null {
 					const b = replica!.get(id);
