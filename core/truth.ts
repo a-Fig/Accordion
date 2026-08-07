@@ -38,8 +38,9 @@ interface GroupShape {
  * Aggregate readout of the Truth state (the conductor host's `stats()`).
  *
  * CALIBRATION CONVENTION (issue #11 stage 2, ADR 0025): `liveTokens`/`fullTokens` are calibrated
- * (`Truth.calTokens` applied once to the aggregate) — real, provider-anchored numbers, not the raw
- * chars/4 estimate. `budget`/`protectTokens`/`contextWindow` are NOT converted — they are the
+ * only for the system prompt and blocks covered by the latest provider receipt. Blocks appended
+ * after that receipt's departing wire remain raw chars/4 estimates until a later receipt covers
+ * them (issue #102). `budget`/`protectTokens`/`contextWindow` are NOT converted — they are the
  * literal dial values a human (or a conductor's declared `tailTokens`) set, which stage 2 treats as
  * already meaning REAL tokens (that is the whole point of calibrating the numerator against them:
  * "compaction triggers at 90% of a REAL 70k budget", not "90% of a 70k raw estimate scaled up").
@@ -167,6 +168,16 @@ export class Truth {
 	 * transitively through `isProtected`/`protectedFromIndex`. See `calTokens`.
 	 */
 	private calibrationMul = 1;
+	/**
+	 * Highest block order covered by the request whose receipt produced `calibrationMul`, or `null`
+	 * before the first usable receipt. This is deliberately distinct from `sentThroughOrder`: the
+	 * context hook advances sent-ness as soon as a wire departs, while calibration coverage advances
+	 * only when that exact wire's provider receipt arrives. Applying an old k to blocks appended in
+	 * between is the issue #102 spike.
+	 */
+	private calibrationThroughOrderValue: number | null = null;
+	/** Whether the current system prompt is the one covered by the latest calibration receipt. */
+	private systemPromptCalibratedValue = false;
 
 	private activeLocks: readonly LockName[] = [];
 	private activeTailTok = 0;
@@ -273,6 +284,8 @@ export class Truth {
 		birthFolded: readonly string[];
 		carriedSent: readonly string[];
 		calibration: number;
+		calibrationThroughOrder: number | null;
+		systemPromptCalibrated: boolean;
 		systemPrompt: { text: string; tokens: number } | null;
 		rev: number;
 	}): void {
@@ -289,13 +302,20 @@ export class Truth {
 		this.sentThroughOrderValue = s.sentThroughOrder;
 		this.birthFolded = new Set(s.birthFolded);
 		this.carriedSent = new Set(s.carriedSent);
-		this.calibrationMul = Number.isFinite(s.calibration) && s.calibration > 0 ? s.calibration : 1;
+		const maxOrder = this.blockLog.length ? this.blockLog[this.blockLog.length - 1].order : -1;
+		this.calibrationThroughOrderValue = Number.isInteger(s.calibrationThroughOrder) && s.calibrationThroughOrder! >= -1
+			? Math.min(s.calibrationThroughOrder!, maxOrder)
+			: null;
+		this.calibrationMul = this.calibrationThroughOrderValue !== null && Number.isFinite(s.calibration) && s.calibration > 0
+			? s.calibration
+			: 1;
 		// Self-validated exactly like `calibration` above — a malformed shape (bad `text`/`tokens` type,
 		// e.g. from a hand-built test literal or a corrupted wire frame) falls back to unset rather than
 		// poisoning `liveTokens()`/`fullTokens()` with NaN.
 		const sp = s.systemPrompt;
 		this.systemPromptText = sp && typeof sp.text === "string" && Number.isFinite(sp.tokens) && sp.tokens >= 0 ? sp.text : null;
 		this.systemPromptTokensVal = this.systemPromptText === null ? 0 : Math.round(sp!.tokens);
+		this.systemPromptCalibratedValue = this.calibrationThroughOrderValue !== null && s.systemPromptCalibrated === true && this.systemPromptText !== null;
 		this.lastChangedRev.clear();
 		this.revCounter = s.rev;
 		// Rev-keyed read caches are stamped stale so they recompute against the adopted rev.
@@ -330,7 +350,13 @@ export class Truth {
 		next.activeLocks = prev.activeLocks.slice();
 		next.holderLabel = prev.holderLabel;
 		next.activeTailTok = prev.activeTailTok;
-		next.calibrationMul = prev.calibrationMul;
+		// A structural rebuild can insert/reorder blocks under stable order values. A scalar coverage
+		// frontier can no longer prove which representations the last receipt actually covered, so
+		// return to a cold estimate until the request departing from this rebuilt Truth gets a receipt.
+		// Carrying k here would recreate issue #102 for a newly inserted block below the old frontier.
+		next.calibrationMul = 1;
+		next.calibrationThroughOrderValue = null;
+		next.systemPromptCalibratedValue = false;
 		// Issue #93: carried, unlike `contextWindow` — the system prompt IS a preserved captured fact,
 		// not a live re-derived one. `refreshFromCtx` runs before a rebuild can be triggered (it's called
 		// at the top of the `context` hook, before `ingestMessages`), so without this carry `next` would
@@ -438,10 +464,22 @@ export class Truth {
 	get calibration(): number {
 		return this.calibrationMul;
 	}
+	/** Latest provider-receipt coverage frontier; `null` means no usable observation yet. */
+	get calibrationThroughOrder(): number | null {
+		return this.calibrationThroughOrderValue;
+	}
+	/** Whether the current system prompt was present on the wire covered by the latest receipt. */
+	get systemPromptCalibrated(): boolean {
+		return this.systemPromptCalibratedValue;
+	}
+	/** True when this block existed on the departing wire covered by the latest receipt. */
+	isCalibrated(b: Block): boolean {
+		return this.calibrationThroughOrderValue !== null && b.order <= this.calibrationThroughOrderValue;
+	}
 	/**
-	 * Calibrated value of a raw token estimate — `Math.round(n * calibration)`. A pure helper a
-	 * caller routes a number it ALREADY computed (`liveTokens()`, `effTokens(b)`, a per-kind sum, …)
-	 * through to opt into calibration. Stage 1 (issue #11, ADR 0025) used this for DISPLAY only;
+	 * Calibrated value of a non-block raw token estimate — `Math.round(n * calibration)`. Block and
+	 * aggregate reads must use `calBlockTokens` / `calibrated*Tokens` so issue #102's receipt frontier
+	 * is honored. Stage 1 (issue #11, ADR 0025) used this for DISPLAY only;
 	 * stage 2 additionally routes it through `stats()` (so `TruthStats.liveTokens`/`fullTokens` are
 	 * calibrated) and through the conductor-facing `ViewBlock.tokens`/`foldedTokens`
 	 * (`core/conductor/hostAdapter.ts`'s `viewBlockOf`) and `ConductorHost.countTokens` — see the
@@ -457,6 +495,38 @@ export class Truth {
 	 */
 	calTokens(n: number): number {
 		return Math.round(n * this.calibrationMul);
+	}
+	/** Calibrate a block-local estimate only when the latest provider receipt covered that block. */
+	calBlockTokens(b: Block, n: number): number {
+		return this.isCalibrated(b) ? this.calTokens(n) : Math.round(n);
+	}
+	/** Calibrate the current system prompt only when the latest receipt covered this exact prompt. */
+	calSystemPromptTokens(): number {
+		return this.systemPromptCalibratedValue ? this.calTokens(this.systemPromptTokensVal) : this.systemPromptTokensVal;
+	}
+	private calibratedAggregate(blocks: readonly Block[], tokensOf: (b: Block) => number, includeSystemPrompt = false): number {
+		let covered = includeSystemPrompt && this.systemPromptCalibratedValue ? this.systemPromptTokensVal : 0;
+		let raw = includeSystemPrompt && !this.systemPromptCalibratedValue ? this.systemPromptTokensVal : 0;
+		for (const b of blocks) {
+			if (this.isCalibrated(b)) covered += tokensOf(b);
+			else raw += tokensOf(b);
+		}
+		return Math.round(covered * this.calibrationMul + raw);
+	}
+	calibratedLiveTokens(): number {
+		return this.calibratedAggregate(this.blockLog, (b) => this.effTokens(b), true);
+	}
+	calibratedFullTokens(): number {
+		return this.calibratedAggregate(this.blockLog, (b) => b.tokens, true);
+	}
+	calibratedProtectedTokens(): number {
+		return this.calibratedAggregate(this.blockLog.slice(this.protectedFromIndex()), (b) => b.tokens);
+	}
+	calibratedGroupFullTokens(g: Group): number {
+		return this.calibratedAggregate(this.groupMembers(g), (b) => b.tokens);
+	}
+	calibratedGroupLiveTokens(g: Group): number {
+		return this.calibratedAggregate(this.groupMembers(g), (b) => this.effTokens(b));
 	}
 	get locks(): readonly LockName[] {
 		return this.activeLocks;
@@ -556,15 +626,13 @@ export class Truth {
 	}
 
 	stats(): TruthStats {
-		// Calibrate the AGGREGATE once (a single `calTokens` call per field), never per-block inside
-		// `liveTokens()`/`fullTokens()` themselves — those stay the raw accessors every other internal
-		// caller (`effTokens`, group accounting, `serializeWire`) still needs untouched. See
-		// `TruthStats`'s doc for the "calibrate every conductor read surface" convention this
-		// implements alongside `viewBlockOf`/`countTokens`.
+		// Keep the raw accessors untouched for wire accounting. The calibrated aggregate partitions
+		// covered and newly-appended blocks so the latest k is applied exactly once to the former and
+		// never to the latter (issue #102).
 		return {
 			rev: this.revCounter,
-			liveTokens: this.calTokens(this.liveTokens()),
-			fullTokens: this.calTokens(this.fullTokens()),
+			liveTokens: this.calibratedLiveTokens(),
+			fullTokens: this.calibratedFullTokens(),
 			budget: this.budgetTok,
 			contextWindow: this.contextWindowTok,
 			protectTokens: this.protectTokensTarget,
@@ -603,9 +671,8 @@ export class Truth {
 	 * dial — sized in REAL tokens — so the walk below must size the tail against a CALIBRATED
 	 * reading of the block log, not the raw chars/4 sum it used to compare against directly.
 	 *
-	 * See `computeProtectedFromIndex` for the exact mechanism (one division of the target, not a
-	 * `calTokens` multiplication per block) and why that choice is the deterministic one across a
-	 * host/replica pair.
+	 * See `computeProtectedFromIndex` for the exact mixed covered/raw walk and why it is deterministic
+	 * across a host/replica pair.
 	 */
 	protectedFromIndex(): number {
 		if (this.pfiCache.rev === this.revCounter) return this.pfiCache.value;
@@ -618,28 +685,18 @@ export class Truth {
 		if (!blocks.length) return 0;
 		const targetReal = this.isLocked("tail-size") ? this.activeTailTok : this.protectTokensTarget;
 		if (targetReal === 0) return blocks.length;
-		// Convert the REAL-token target into the EQUIVALENT raw-estimate threshold by ONE division,
-		// rather than calibrating (multiplying) each block's raw `tokens` inside the walk below.
-		// `calibrated(rawSum) >= targetReal` iff `rawSum >= targetReal / calibration`, so the two
-		// forms are mathematically identical — but a SINGLE shared division is the deterministic one
-		// across a host/replica pair. `calibrationMul` is a rev-stamped scalar both sides carry
-		// byte-identical (replicated verbatim over the wire, JSON round-trips a float64 exactly), so
-		// one division from the same two operands produces a bit-identical result on both sides
-		// (IEEE-754 basic ops are deterministic). Calibrating per block instead would call
-		// `Math.round` (inside `calTokens`) once per iteration — its cumulative rounding error is a
-		// function of iteration order and count, which a host and a replica have no contractual
-		// guarantee to walk identically over time (a replica may resnapshot mid-walk-history,
-		// reorder-free but not iteration-for-iteration-identical against every historical host pass).
-		// A single division has no such accumulation to diverge on.
-		const target = targetReal / this.calibrationMul;
-		const cap = target * PROTECT_OVERFLOW_CAP;
-		let sum = blocks[blocks.length - 1].tokens;
-		if (sum >= target) return blocks.length - 1;
+		// Covered blocks use k; blocks newer than the receipt frontier stay raw. Use unrounded float
+		// costs during the walk so cumulative per-block rounding cannot move the boundary. Host and
+		// replica carry the same k/frontier and block order, so this is deterministic on both sides.
+		const realCost = (b: Block) => b.tokens * (this.isCalibrated(b) ? this.calibrationMul : 1);
+		const cap = targetReal * PROTECT_OVERFLOW_CAP;
+		let sum = realCost(blocks[blocks.length - 1]);
+		if (sum >= targetReal) return blocks.length - 1;
 		for (let i = blocks.length - 2; i >= 0; i--) {
-			const next = sum + blocks[i].tokens;
+			const next = sum + realCost(blocks[i]);
 			if (next > cap) return i + 1;
 			sum = next;
-			if (sum >= target) return i;
+			if (sum >= targetReal) return i;
 		}
 		return 0;
 	}
@@ -941,6 +998,9 @@ export class Truth {
 		if (typeof text !== "string" || !Number.isFinite(tokens) || tokens < 0) return;
 		this.systemPromptText = text;
 		this.systemPromptTokensVal = Math.round(tokens);
+		// This prompt did not ride the request that produced the current k. The next provider receipt
+		// will cover it and set this flag again atomically with the new frontier.
+		this.systemPromptCalibratedValue = false;
 		const rev = ++this.revCounter;
 		this.emit({ type: "config", systemPrompt: { text: this.systemPromptText, tokens: this.systemPromptTokensVal }, rev });
 	}
@@ -956,8 +1016,9 @@ export class Truth {
 		this.emit({ type: "config", protectTokens: this.protectTokensTarget, rev });
 	}
 	/**
-	 * HOST-ONLY calibration snap (issue #11 stage 1, ADR 0025): `k = realTokens / estWireTokens` for
-	 * the request that just completed. Raw snap, no clamp, no smoothing/EMA — owner-approved v1
+	 * HOST-ONLY calibration snap (issues #11/#102, ADR 0025): `k = realTokens / estWireTokens` for
+	 * the request that just completed, plus the last block order that exact wire covered. Raw snap,
+	 * no clamp, no smoothing/EMA — owner-approved v1
 	 * policy: the dial always reflects the MOST RECENT observation, not a running average. There is
 	 * no `WireCommand` kind for this — a client can never call it; only the extension's own host code
 	 * does, after pairing an assistant message's real usage against the estimate of the wire that
@@ -966,22 +1027,31 @@ export class Truth {
 	 * shape as `setBudget`/`setProtect`.
 	 *
 	 * HOUSEKEEP (issue #11 stage 2 F2, ADR 0025): `protectedFromIndex()` sizes the protected tail
-	 * against a calibration-converted threshold (`targetReal / calibration` — see
-	 * `computeProtectedFromIndex`'s doc), so `calibration` is a THIRD boundary-moving dial alongside
+	 * against a mixed covered/raw walk (see `computeProtectedFromIndex`), so calibration is a THIRD
+	 * boundary-moving dial alongside
 	 * `budget`/`protectTokens` — a `k` decrease grows the raw-estimate threshold and can leave folds/
 	 * groups standing inside the now-larger protected tail. Run `housekeep()` + stamp
 	 * `lastChangedRev` exactly like `setBudget`/`setProtect` do, so a k-decrease heals any fold/group
 	 * the tail just grew over in the SAME rev it moved, instead of leaving it stale until the next
 	 * unrelated mutation happens to call `housekeep()`.
 	 */
-	setCalibration(k: number): void {
-		if (!Number.isFinite(k) || k <= 0) return;
+	setCalibration(k: number, throughOrder = this.blockLog.length ? this.blockLog[this.blockLog.length - 1].order : -1): void {
+		if (!Number.isFinite(k) || k <= 0 || !Number.isInteger(throughOrder) || throughOrder < -1) return;
 		this.calibrationMul = k;
+		const maxOrder = this.blockLog.length ? this.blockLog[this.blockLog.length - 1].order : -1;
+		this.calibrationThroughOrderValue = Math.min(throughOrder, maxOrder);
+		this.systemPromptCalibratedValue = this.systemPromptText !== null;
 		const touched = new Set<string>();
 		this.housekeep(touched);
 		const rev = ++this.revCounter;
 		for (const id of touched) this.lastChangedRev.set(id, rev);
-		this.emit({ type: "config", calibration: this.calibrationMul, rev });
+		this.emit({
+			type: "config",
+			calibration: this.calibrationMul,
+			calibrationThroughOrder: this.calibrationThroughOrderValue,
+			systemPromptCalibrated: this.systemPromptCalibratedValue,
+			rev,
+		});
 	}
 	markSent(order: number): void {
 		if (order <= this.sentThroughOrderValue) return;
