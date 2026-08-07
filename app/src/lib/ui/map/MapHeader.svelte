@@ -687,7 +687,7 @@
 		cursor: default;
 	}
 	.lat-read .lat-ok {
-		color: var(--fg);
+		color: var(--text);
 	}
 	.lat-read .lat-amber {
 		color: var(--warn, #d9a03a);
