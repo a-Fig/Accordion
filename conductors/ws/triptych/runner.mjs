@@ -12,8 +12,9 @@
 //
 //     cd conductors/ws/triptych && npm install     # one-time, repo checkouts only
 //
-// A missing install fails the spawn loudly (nonzero exit + a clear stderr line the extension
-// surfaces via conductorStatus) rather than silently degrading.
+// The extension normally catches a missing install before selection through catalog readiness.
+// This runner still fails loudly (nonzero exit + clear stderr) if dependencies disappear between
+// the readiness check and spawn, rather than silently degrading.
 //
 // Spawn env (set by the extension): ACCORDION_PORT (required), ACCORDION_TOKEN (required).
 

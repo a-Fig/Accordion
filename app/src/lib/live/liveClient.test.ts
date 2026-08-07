@@ -75,6 +75,7 @@ function conductorMeta(over: Partial<ActiveConductorMeta> = {}): ActiveConductor
 		tailTokens: 4000,
 		holdWireUpToMs: 50,
 		remote: false,
+		readiness: { state: "ready" },
 		...over,
 	};
 }
@@ -261,6 +262,22 @@ describe("liveClient — conductor catalog + state (Phase C, v13)", () => {
 		const ws = FakeWebSocket.last!;
 		ws.open();
 		const meta = conductorMeta({ id: "cond-a", label: "Conductor A" });
+		ws.emit(helloFrame({ conductors: [meta] }));
+		expect(conductors).toEqual([meta]);
+	});
+
+	it("keeps an unavailable conductor and its setup explanation in the catalog", () => {
+		connectLive(1234);
+		const ws = FakeWebSocket.last!;
+		ws.open();
+		const meta = conductorMeta({
+			id: "triptych",
+			readiness: {
+				state: "unavailable",
+				reason: "Tree-sitter dependencies are missing.",
+				remediation: "Run npm install.",
+			},
+		});
 		ws.emit(helloFrame({ conductors: [meta] }));
 		expect(conductors).toEqual([meta]);
 	});

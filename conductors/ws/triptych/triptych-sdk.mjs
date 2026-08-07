@@ -1904,7 +1904,7 @@ function recallHostEvent(ids, by, rev) {
 }
 
 // core/protocol.ts
-var PROTOCOL_VERSION = 20;
+var PROTOCOL_VERSION = 21;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
   "snapshot",

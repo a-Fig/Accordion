@@ -35,10 +35,11 @@ one one-way door (only a human detach — the freeze kill switch — recovers it
 cd conductors/ws/triptych && npm install   # web-tree-sitter + tree-sitter-wasms (wasm grammars)
 ```
 
-Without it the spawn fails loudly (clear stderr via `conductorStatus`) and the
-conductor degrades to nothing — the extension itself is unaffected. Triptych is
-**repo-only** (like thermocline): not part of the npm tarball, catalog-gated on
-its runner resolving on disk.
+Without it Triptych remains visible but disabled in the conductor picker, which
+shows the setup command before selection. The host rechecks the same module
+resolution on selection, while the runner retains its loud startup failure as a
+race-condition defense. Triptych is **repo-only** (like thermocline): it is not
+part of the npm tarball, where its absent runner is also advertised as unavailable.
 
 ## Design lineage
 

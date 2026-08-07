@@ -26,6 +26,7 @@ import { applyGuardingHostOnly } from "../ops";
 import type {
 	ServerMessage,
 	ActiveConductorMeta,
+	ConductorReadiness,
 	ConductorStatusMessage,
 	ProposeMessage,
 	CompleteRequestMessage,
@@ -59,6 +60,8 @@ export interface LiveHostDeps {
 	sendToSocket(socket: unknown, msg: ServerMessage): void;
 	/** Mint a single-use bearer for a spawn conductor's WS attach. */
 	mintToken(): string;
+	/** Recheck a spawn conductor's required startup capabilities immediately before selection. */
+	readiness(entry: RegistryEntry): ConductorReadiness;
 	/** Launch a spawn conductor's runner. Returns null if the runner is unavailable on this install. */
 	spawnRunner(entryFile: string, env: Record<string, string>): SpawnedRunner | null;
 	/** Run an out-of-band model completion off the hot path. Rejects on failure/unavailability. */
@@ -180,6 +183,7 @@ export class LiveConductorHost implements ConductorHost {
 			tailTokens: e.tailTokens,
 			holdWireUpToMs: e.holdWireUpToMs,
 			remote: this.mode === "spawn",
+			readiness: { state: "ready" },
 		};
 	}
 	cachedStatus(): ConductorStatusMessage | null {
@@ -299,8 +303,10 @@ export class LiveConductorHost implements ConductorHost {
 
 	// ── select / attach / detach ──────────────────────────────────────────────────
 	/**
-	 * The `selectConductor` command handler. Detach-first (freeze→clearLocks→teardown→abort), then
-	 * attach the chosen conductor. `id === null` / `"none"` detaches only.
+	 * The `selectConductor` command handler. Required-capability readiness is checked BEFORE
+	 * detach, so a stale/forged pick of an unavailable conductor cannot disturb the current one.
+	 * Valid picks then detach-first (freeze→clearLocks→teardown→abort) and attach the chosen
+	 * conductor. `id === null` / `"none"` detaches only.
 	 *
 	 * Fix 2 — TRANSACTIONAL attach: state-mutating lock application happens only at the LAST
 	 * responsible moment, never before we know the conductor is actually going to be live, so a
@@ -320,8 +326,16 @@ export class LiveConductorHost implements ConductorHost {
 	 *     comment there for why that keeps the accept→locks→snapshot→initial-pass sequencing intact.
 	 */
 	select(id: string | null): void {
-		this.detachActive();
 		const entry = entryById(id);
+		if (entry?.kind === "spawn") {
+			const readiness = this.deps.readiness(entry);
+			if (readiness.state === "unavailable") {
+				const remediation = readiness.remediation ? ` ${readiness.remediation}` : "";
+				this.setAndBroadcastStatus(`${entry.label} is unavailable: ${readiness.reason}${remediation}`);
+				return;
+			}
+		}
+		this.detachActive();
 		if (!entry || entry.kind === "none") {
 			this.deps.broadcast({ type: "conductorState", active: null });
 			return;
