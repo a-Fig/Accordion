@@ -60,6 +60,8 @@ export function serializeSnapshot(truth: Truth, foldingEnabled: boolean): Snapsh
 		birthFolded: [...truth.birthFoldedIds],
 		carriedSent: [...truth.carriedSentIds],
 		calibration: truth.calibration,
+		calibrationThroughOrder: truth.calibrationThroughOrder,
+		systemPromptCalibrated: truth.systemPromptCalibrated,
 		systemPrompt: truth.systemPrompt,
 		rev: truth.rev,
 	};
@@ -67,6 +69,7 @@ export function serializeSnapshot(truth: Truth, foldingEnabled: boolean): Snapsh
 
 /** Build a rev-aligned replica Truth from a snapshot. `meta` comes from the `hello` frame. */
 export function hydrateSnapshot(meta: SessionMeta, state: SnapshotState): Truth {
+	const calibrationThroughOrder = state.calibrationThroughOrder ?? null;
 	const overlayById = new Map<string, WireOverlay>();
 	for (const o of state.overlay) overlayById.set(o.id, o);
 	const blocks: Block[] = state.blocks.map((w) => {
@@ -100,7 +103,12 @@ export function hydrateSnapshot(meta: SessionMeta, state: SnapshotState): Truth 
 		carriedSent: state.carriedSent ?? [],
 		// Optional on the wire (v18, same treatment as v15's `carriedSent` above); default to the
 		// cold-start value `1` for a peer/test literal that omits it — the host serializer always emits it.
-		calibration: state.calibration ?? 1,
+		// A pre-v20-shaped snapshot may carry the old global k but no coverage frontier. Treat the
+		// pair atomically and fall back to the cold state rather than reviving issue #102 on a stale
+		// hand-built/test literal (real peers are version-gated before hydration).
+		calibration: calibrationThroughOrder === null ? 1 : (state.calibration ?? 1),
+		calibrationThroughOrder,
+		systemPromptCalibrated: calibrationThroughOrder === null ? false : (state.systemPromptCalibrated ?? false),
 		// Optional AND nullable on the wire (v19, issue #93); default `null` for a peer/test literal
 		// that omits it — the host serializer always emits the field (as `null` before first capture).
 		systemPrompt: state.systemPrompt ?? null,
@@ -152,6 +160,8 @@ export function wireEventFromTruthEvent(e: TruthEvent): WireEvent | null {
 				contextWindow: e.contextWindow,
 				protectTokens: e.protectTokens,
 				calibration: e.calibration,
+				calibrationThroughOrder: e.calibrationThroughOrder,
+				systemPromptCalibrated: e.systemPromptCalibrated,
 				systemPrompt: e.systemPrompt,
 				rev: e.rev,
 			};
@@ -178,7 +188,9 @@ export function applyWireEvent(truth: Truth, ev: WireEvent): void {
 			// A config event carries at most one dial; contextWindow is only ever emitted as a number.
 			if (ev.contextWindow !== undefined && ev.contextWindow !== null) truth.setContextWindow(ev.contextWindow);
 			if (ev.protectTokens !== undefined) truth.setProtect(ev.protectTokens);
-			if (ev.calibration !== undefined) truth.setCalibration(ev.calibration);
+			if (ev.calibration !== undefined && ev.calibrationThroughOrder !== undefined) {
+				truth.setCalibration(ev.calibration, ev.calibrationThroughOrder);
+			}
 			if (ev.systemPrompt !== undefined) truth.setSystemPrompt(ev.systemPrompt.text, ev.systemPrompt.tokens);
 			return;
 		case "locks":

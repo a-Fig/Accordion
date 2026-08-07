@@ -110,13 +110,19 @@
  *    visibly shift (expected downward) on a session's first post-upgrade observation. Bumped so a
  *    pre-v19 peer (which has none of this vocabulary) cannot pair with a v19 host/client that
  *    assumes it.
+ *  - v20: calibration coverage frontier (issue #102). A provider receipt's multiplier now applies
+ *    only through the last block order on the exact departing wire it measured; blocks appended
+ *    afterward remain raw estimates until a later receipt covers them. `SnapshotState` and config
+ *    events carry `calibrationThroughOrder`; snapshots also carry `systemPromptCalibrated` so a
+ *    prompt changed after the last receipt remains raw. Bumped because older peers would apply k to
+ *    every newly appended block and recreate the transient context spike.
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import { sanitizeOps, type Op, type OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 19;
+export const PROTOCOL_VERSION = 20;
 
 /**
  * The DOOR: a fixed, well-known loopback port that exactly ONE extension binds at a time as an
@@ -269,11 +275,15 @@ export interface SnapshotState {
 	 * The current provider-anchored calibration multiplier (`Truth.calibration`, v18) — see the
 	 * protocol History note above and ADR 0025. Optional so a peer/test constructing a `SnapshotState`
 	 * literal without it still type-checks (the v18 version bump is the real cross-version gate, same
-	 * treatment as v15's `carriedSent`); a hydrating replica defaults it to `1` (the cold-start value),
-	 * and the host serializer always emits it. DISPLAY-only — losing it on a stale peer just falls
-	 * back to the safe default, never a decision-affecting silent divergence.
+	 * treatment as v15's `carriedSent`); the host serializer always emits it. Since stage 2 it is
+	 * decision-bearing, and v20 treats it atomically with `calibrationThroughOrder`: a stale literal
+	 * missing the frontier falls back to k=1 rather than applying a global multiplier.
 	 */
 	calibration?: number;
+	/** Last block order covered by `calibration`, or `null` before the first usable receipt (v20). */
+	calibrationThroughOrder?: number | null;
+	/** Whether the current system prompt was covered by that same receipt (v20). */
+	systemPromptCalibrated?: boolean;
 	/**
 	 * The current effective system prompt (`Truth.systemPrompt`, v19, issue #93) — see the protocol
 	 * History note above. Optional AND nullable: a peer/test literal without the field still
@@ -308,6 +318,8 @@ export type WireEvent =
 			contextWindow?: number | null;
 			protectTokens?: number;
 			calibration?: number;
+			calibrationThroughOrder?: number;
+			systemPromptCalibrated?: boolean;
 			systemPrompt?: { text: string; tokens: number };
 			rev: number;
 	  }

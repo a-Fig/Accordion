@@ -50,7 +50,7 @@
 	const liveByKind = $derived.by(() => {
 		const m: Record<string, number> = {};
 		for (const k of LADDER) m[k.kind] = 0;
-		for (const b of store.blocks) if (b.kind in m) m[b.kind] += store.effTokens(b);
+		for (const b of store.blocks) if (b.kind in m) m[b.kind] += store.calBlockTokens(b, store.effTokens(b));
 		return m;
 	});
 
@@ -64,7 +64,7 @@
 	// stage-1 version of this derived `calTokens(store.budget)`'d it, which is what let the hero
 	// number and the color/bar disagree — see ADR 0025's stage-1 Consequences). `calLiveTokens` is
 	// still the one side that genuinely needs `calTokens` — `store.liveTokens` stays the raw Truth
-	// accessor. `notAnchored` is the "≈" marker gate: `calibration === 1` alone — covers BOTH cold
+	// accessor. `notAnchored` is the "≈" marker gate: a null receipt frontier covers BOTH cold
 	// start (the session's own default before any observation has landed) AND every read-only/demo/
 	// CC/file session (k pinned at 1 forever, ADR 0025's "Cold start, model switch, and read-only
 	// sessions" section) in the one check, matching `ContextMap`/`Inspector`'s gate exactly (F4,
@@ -73,12 +73,12 @@
 	// observed, and showing "≈" over that factually-anchored number (while the other two surfaces
 	// showed it bare) was a real disagreement, not a hedge — the anchored numbers now stay bare
 	// everywhere, consistently, even once a session goes read-only.
-	const calLiveTokens = $derived(store.calTokens(store.liveTokens));
+	const calLiveTokens = $derived(store.calLiveTokens);
 	const calBudget = $derived(store.budget);
 	const calOverBy = $derived(calLiveTokens - calBudget);
-	const calFullTokens = $derived(store.calTokens(store.fullTokens));
-	const calProtectedTokens = $derived(store.calTokens(store.protectedTokens));
-	const notAnchored = $derived(store.calibration === 1);
+	const calFullTokens = $derived(store.calFullTokens);
+	const calProtectedTokens = $derived(store.calProtectedTokens);
+	const notAnchored = $derived(store.calibrationThroughOrder === null);
 
 	// `denom` is the composition bar's whole token axis — `budget`/`protectTarget` are already
 	// real-token dial values, so `calFullTokens` (not the raw `store.fullTokens`) is what keeps this
@@ -458,13 +458,13 @@
 		<div class="bar" bind:this={barEl} role="img" aria-label="Context composition">
 			{#each LADDER as seg (seg.kind)}
 				{@const v = liveByKind[seg.kind]}
-				{@const calV = store.calTokens(v)}
+				{@const calV = v}
 				{#if v > 0}
 					<span class="seg k-{seg.kind}" style:width="{(calV / denom) * 100}%" title="{seg.label}: {fmt(calV)} live"></span>
 				{/if}
 			{/each}
-			{#if store.savedTokens > 0}
-				{@const calSaved = store.calTokens(store.savedTokens)}
+			{#if store.calSavedTokens > 0}
+				{@const calSaved = store.calSavedTokens}
 				<span class="seg saved-seg" style:width="{(calSaved / denom) * 100}%" title="folded away: {fmt(calSaved)}"></span>
 			{/if}
 			{#if headroomPct > 0.5}

@@ -334,11 +334,12 @@ await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2
 		usage: { input: 5000, output: 999_999, cacheRead: 100, cacheWrite: 50 },
 	};
 	handlers.message_end({ message: calibAssistant }, ctx); // pairs + raw-snaps truth.calibration
+	const messagesWithCalib = [...messagesPlus, calibAssistant]; // the next real context includes the finished reply
 
 	// `message_end` does not itself broadcast telemetry (only the `context` hook does) — fire one more
 	// hook so `telemetryMsg()` streams the just-observed realTokens/estWireTokens.
 	a.inbox.telemetry.length = 0;
-	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
+	await Promise.resolve(handlers.context({ messages: messagesWithCalib }, ctx));
 	await waitFor(() => a.inbox.telemetry.length > 0, 2000, "telemetry after calibration probe").catch(
 		() => fails.push("context hook did not stream telemetry after the calibration probe"),
 	);
@@ -356,6 +357,11 @@ await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2
 	if (typeof snap.state.calibration !== "number" || Math.abs(snap.state.calibration - expectedK) > 1e-9)
 		fails.push(`snapshot.calibration expected ${expectedK} (realTokens/estWireTokens), got ${snap.state.calibration}`);
 	if (snap.state.calibration === 1) fails.push("calibration probe did not move the dial away from the cold-start default");
+	if (!Number.isInteger(snap.state.calibrationThroughOrder))
+		fails.push(`snapshot.calibrationThroughOrder expected an integer frontier, got ${snap.state.calibrationThroughOrder}`);
+	const probeBlock = snap.state.blocks.find((b) => b.id.includes("resp-calib-probe"));
+	if (!probeBlock || probeBlock.order <= snap.state.calibrationThroughOrder)
+		fails.push("issue #102: the assistant block appended after the measured wire was incorrectly placed under its stale calibration frontier");
 }
 
 // ── F3 (issue #11, ADR 0025): the agent_end backstop must not let an EARLIER newly-appended ──
@@ -392,7 +398,8 @@ await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2
 	a.inbox.telemetry.length = 0;
 	handlers.agent_end({ type: "agent_end", messages: [earlierAssistant, finalOfRun] }, ctx);
 
-	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx)); // stream telemetry
+	const messagesAfterF3 = [...messagesPlus, earlierAssistant, finalOfRun];
+	await Promise.resolve(handlers.context({ messages: messagesAfterF3 }, ctx)); // stream telemetry without a divergence reset
 	await waitFor(() => a.inbox.telemetry.length > 0, 2000, "telemetry after F3 backstop probe").catch(
 		() => fails.push("context hook did not stream telemetry after the F3 backstop probe"),
 	);
