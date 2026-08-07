@@ -65,7 +65,9 @@ describe("runFoldCheck — universal kind gate (all modes)", () => {
 		];
 		const s = makeStore(blocks);
 		s.setProtect(40);
-		s.setBudget(1000); // auto-fold the old foldable blocks (foldable kinds only)
+		// The auto-folder was removed on this branch — fold the old foldable blocks by hand.
+		s.fold("evt1:r");
+		s.fold("evt2:0");
 		expect(s.foldedCount).toBeGreaterThan(0);
 
 		// off-wire (isLive=false): only the universal kind gate runs; everything folded is a
@@ -131,7 +133,10 @@ describe("runFoldCheck — live-only view↔wire symmetric difference", () => {
 		];
 		const s = makeStore(blocks);
 		s.setProtect(80);
-		s.setBudget(1000); // auto-fold the old durable foldable blocks
+		// The auto-folder was removed on this branch — fold the old durable foldable blocks by hand.
+		s.fold("a:resp1:p0");
+		s.fold("a:resp1:p1");
+		s.fold("r:call1");
 		expect(s.foldedCount).toBeGreaterThan(0);
 
 		runFoldCheck(s, true);
@@ -150,7 +155,10 @@ describe("runFoldCheck — live-only view↔wire symmetric difference", () => {
 		];
 		const s = makeStore(blocks);
 		s.setProtect(40);
-		s.setBudget(1000); // auto-fold the old blocks (incl. the non-durable one)
+		// The auto-folder was removed on this branch — fold the old blocks (incl. the non-durable
+		// one) by hand.
+		s.fold("m9:p0");
+		s.fold("a:resp1:p0");
 		expect(s.isFolded(s.get("m9:p0")!)).toBe(true); // folded in the view
 
 		// off-wire: only Layer 1 runs, and a foldable-kind fold is no lie there → inactive.

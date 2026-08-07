@@ -22,8 +22,6 @@ import { fileURLToPath } from "node:url";
 // ACCORDION_HOME at module load) so we never touch the real ~/.accordion.
 const HOME = path.join(os.tmpdir(), `accordion-smoke-${process.pid}`);
 process.env.ACCORDION_HOME = HOME;
-// Exercise the completion watchdog without waiting for the 110 s production deadline.
-process.env.ACCORDION_COMPLETION_TIMEOUT_MS = "500";
 // Prevent the /accordion command smoke assertion from launching a real developer
 // build via the repo-local default candidates. An explicit-but-missing path must
 // stop fallback, which is also one of the launcher contract's safety rules.
@@ -57,7 +55,6 @@ let unfoldTool = null; // captured registerTool def for the `unfold` tool (M3)
 let recallTool = null; // captured registerTool def for the `recall` tool (ADR 0011)
 const flags = new Map();
 const notifications = [];
-let completionImpl = async () => { throw new Error("unexpected injected completion call"); };
 const pi = {
 	on: (name, fn) => (handlers[name] = fn),
 	registerFlag: (name, def) => flags.set(name, def?.default),
@@ -71,7 +68,7 @@ const pi = {
 	},
 	appendEntry: () => {},
 };
-accordionLive(pi, { complete: (...args) => completionImpl(...args) });
+accordionLive(pi);
 const ctx = {
 	ui: { setStatus() {}, notify(message, type) { notifications.push({ message, type }); }, theme: { fg: (_c, s) => s } },
 	// Mirror the REAL pi ExtensionContext: `model` is a property (getter), not a
@@ -1334,10 +1331,10 @@ if (!(armedSmoke.nextDisarmedMs !== null && armedSmoke.nextDisarmedMs < 900))
 	await new Promise((r) => setTimeout(r, 50));
 }
 
-// ── WebSocket authorization, payload, and paid-completion bounds ────────────
+// ── WebSocket authorization and payload bounds ──────────────────────────────
 // These are security regressions with concrete browser/client paths, not helper-only tests:
 // real upgrade requests exercise Origin/token/cookie handling, and real WS frames exercise ws's
-// maxPayload and the extension's completion admission state across a reconnect.
+// maxPayload enforcement.
 {
 	const browserLine = notifications.map((n) => n.message).reverse().find((m) => m.includes("Browser: http"));
 	const TOKEN = browserLine && (browserLine.match(/token=([0-9a-f]+)/) || [])[1];
@@ -1505,90 +1502,6 @@ if (!(armedSmoke.nextDisarmedMs !== null && armedSmoke.nextDisarmedMs < 900))
 		candidate.on("error", () => {});
 	});
 	if (oversized.code !== 1009) fails.push(`ws-hardening: oversized frame did not close with 1009 (${JSON.stringify(oversized)})`);
-
-	// Park API-key lookups to observe admission without making provider calls.
-	const heldResolvers = [];
-	const holdCtx = {
-		ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
-		model: { id: "test/hold-model", contextWindow: 2000 },
-		getContextUsage: () => ({ tokens: 1, contextWindow: 2000 }),
-		modelRegistry: { getApiKeyAndHeaders: () => new Promise((resolve) => heldResolvers.push(resolve)) },
-	};
-	const completionWs = new WebSocket(`ws://127.0.0.1:${PORT}`);
-	await new Promise((resolve, reject) => { completionWs.on("open", resolve); completionWs.on("error", reject); });
-	const completionResults = [];
-	completionWs.on("message", (data) => {
-		try { const message = JSON.parse(data.toString()); if (message.type === "completeResult") completionResults.push(message); } catch { /* ignore */ }
-	});
-	handlers.context({ messages: [] }, holdCtx); // refresh latestCtx synchronously
-	await new Promise((resolve) => setTimeout(resolve, 50));
-
-	completionWs.send(JSON.stringify({ type: "completeRequest", reqId: 100, prompt: "original" }));
-	await waitFor(() => heldResolvers.length === 1, 1000, "original completion admission").catch(() => {});
-	completionWs.send(JSON.stringify({ type: "completeRequest", reqId: 100, prompt: "duplicate" }));
-	await new Promise((resolve) => setTimeout(resolve, 50));
-	if (heldResolvers.length !== 1) fails.push("completion-hardening: duplicate reqId launched another call");
-	if (completionResults.some((r) => r.reqId === 100)) fails.push("completion-hardening: duplicate settled the original correlation");
-	heldResolvers[0]?.({ ok: false, error: "original-finished" });
-	await waitFor(() => completionResults.some((r) => r.reqId === 100), 1000, "original completion result").catch(() => {});
-	heldResolvers.length = 0;
-
-	for (const reqId of [101, 102, 103, 104]) completionWs.send(JSON.stringify({ type: "completeRequest", reqId, prompt: "hold" }));
-	await waitFor(() => heldResolvers.length === 4, 1000, "completion ceiling fill").catch(() => {});
-	completionWs.send(JSON.stringify({ type: "completeRequest", reqId: 105, prompt: "over cap" }));
-	await waitFor(() => completionResults.some((r) => r.reqId === 105), 1000, "completion ceiling rejection").catch(() => {});
-	if (!completionResults.some((r) => r.reqId === 105 && /concurrent/i.test(r.error || ""))) fails.push("completion-hardening: fifth call was not rejected");
-
-	// Replacing the socket must not clear the four still-running global slots.
-	const replacementWs = new WebSocket(`ws://127.0.0.1:${PORT}`);
-	await new Promise((resolve, reject) => { replacementWs.on("open", resolve); replacementWs.on("error", reject); });
-	const replacementResults = [];
-	replacementWs.on("message", (data) => {
-		try { const message = JSON.parse(data.toString()); if (message.type === "completeResult") replacementResults.push(message); } catch { /* ignore */ }
-	});
-	replacementWs.send(JSON.stringify({ type: "completeRequest", reqId: 201, prompt: "still capped" }));
-	await waitFor(() => replacementResults.some((r) => r.reqId === 201), 1000, "reconnect-preserved cap").catch(() => {});
-	if (!replacementResults.some((r) => r.reqId === 201 && /concurrent/i.test(r.error || ""))) fails.push("completion-hardening: reconnect bypassed the global cap");
-
-	// The 500 ms test watchdog releases exact slots even though these auth lookups never settle.
-	await new Promise((resolve) => setTimeout(resolve, 650));
-	replacementWs.send(JSON.stringify({ type: "completeRequest", reqId: 202, prompt: "after timeout" }));
-	await waitFor(() => heldResolvers.length === 5, 1000, "watchdog slot release").catch(() => {});
-	if (heldResolvers.length !== 5) fails.push("completion-hardening: timed-out calls did not release capacity");
-	else heldResolvers[4]({ ok: false, error: "cleanup" });
-	await waitFor(() => replacementResults.some((r) => r.reqId === 202), 1000, "post-timeout completion result").catch(() => {});
-
-	// Once provider work has actually launched, a client-facing timeout must NOT reopen its
-	// global slot until the provider promise settles. This fake deliberately ignores AbortSignal.
-	const providerCalls = [];
-	completionImpl = (_model, _context, options) => new Promise((resolve) => providerCalls.push({ resolve, signal: options.signal }));
-	const providerCtx = {
-		ui: { setStatus() {}, notify() {}, theme: { fg: (_c, s) => s } },
-		model: { id: "test/provider-model", contextWindow: 2000, maxTokens: 1000 },
-		getContextUsage: () => ({ tokens: 1, contextWindow: 2000 }),
-		modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "test-key", headers: {} }) },
-	};
-	handlers.context({ messages: [] }, providerCtx);
-	for (const reqId of [301, 302, 303, 304]) replacementWs.send(JSON.stringify({ type: "completeRequest", reqId, prompt: "provider hold" }));
-	await waitFor(() => providerCalls.length === 4, 1000, "four provider calls launched").catch(() => {});
-	await new Promise((resolve) => setTimeout(resolve, 650)); // all four client deadlines fire
-	if (!providerCalls.every((call) => call.signal?.aborted)) fails.push("completion-hardening: provider timeout did not abort every signal");
-	replacementWs.send(JSON.stringify({ type: "completeRequest", reqId: 305, prompt: "must remain capped" }));
-	await waitFor(() => replacementResults.some((r) => r.reqId === 305), 1000, "abort-ignoring provider cap").catch(() => {});
-	if (!replacementResults.some((r) => r.reqId === 305 && /concurrent/i.test(r.error || "")) || providerCalls.length !== 4)
-		fails.push("completion-hardening: timed-out but unsettled provider calls released global slots");
-
-	// Settlement of exactly one upstream call reopens exactly one slot.
-	providerCalls[0]?.resolve({ content: [], model: "test/provider-model", usage: {} });
-	await new Promise((resolve) => setTimeout(resolve, 0));
-	replacementWs.send(JSON.stringify({ type: "completeRequest", reqId: 306, prompt: "after provider settlement" }));
-	await waitFor(() => providerCalls.length === 5, 1000, "provider settlement slot release").catch(() => {});
-	if (providerCalls.length !== 5) fails.push("completion-hardening: settled provider call did not release its slot");
-	for (const call of providerCalls.slice(1)) call.resolve({ content: [], model: "test/provider-model", usage: {} });
-	await waitFor(() => replacementResults.some((r) => r.reqId === 306), 1000, "post-provider-settlement result").catch(() => {});
-	try { completionWs.close(); } catch { /* ignore */ }
-	try { replacementWs.close(); } catch { /* ignore */ }
-	await new Promise((resolve) => setTimeout(resolve, 50));
 }
 
 // ── assertions ───────────────────────────────────────────────────────────────
@@ -1645,6 +1558,6 @@ console.log(
 							`passthrough acks (applied/empty-plan/timeout-stale/timeout-raw) ✓  /__accordion/meta planOutcomes ✓  ` +
 							`port-qualified cookie (collision guard) ✓  ` +
 							`ack counts reflect applied-not-submitted ✓  ` +
-							`WS auth (CSWSH/rebinding/cookie/sibling bounds) ✓  payload cap ✓  completion bounds ✓`,
+							`WS auth (CSWSH/rebinding/cookie/sibling bounds) ✓  payload cap ✓`,
 );
 process.exit(0);

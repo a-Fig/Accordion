@@ -36,7 +36,7 @@ export const FOLDABLE_KINDS: ReadonlySet<BlockKind> = new Set<BlockKind>(["text"
 /**
  * The ONE foldability predicate, shared by the view and the wire. A block may be folded —
  * its content substituted by a digest on the agent's wire — iff its KIND is foldable. This
- * is the single gate `store.fold()` / `store.substOne()` / `store.canFold()` AND the wire
+ * is the single gate `store.fold()` / `store.canFold()` AND the wire
  * (`computeFoldOps` / `resolveUnfold`) all consult, so the screen can NEVER show a per-block
  * fold the wire would refuse. That refusal is the "UI lie" this predicate exists to make impossible: a folded
  * `tool_call` whose tile recesses and whose tokens are counted as saved, while the agent
