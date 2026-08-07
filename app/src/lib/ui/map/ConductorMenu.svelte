@@ -23,7 +23,13 @@
 	import ConsentDialog from "./ConsentDialog.svelte";
 	import { isExclusive } from "$core/locks";
 	import type { ActiveConductorMeta } from "$core/protocol";
-	import { live, conductors, conductorState, selectConductor } from "$lib/live/liveClient.svelte";
+	import { live, conductors, conductorState, selectConductor, isController } from "$lib/live/liveClient.svelte";
+	import { attemptSteer, readOnlyTip } from "$lib/live/controllerUi.svelte";
+
+	// READ-ONLY gate (v16, ADR 0024, spec Part 3): some OTHER surface holds the controller lease.
+	// This component is only ever mounted while `live.status === "connected"` (see its own gate at
+	// the bottom), so "not controller" here always means "read-only", never "no wire at all".
+	const notController = $derived(!isController());
 
 	let open = $state(false);
 	// Held selection behind the consent gate (ADR 0011 §6) — nothing is sent to the wire until
@@ -48,8 +54,10 @@
 		}
 	});
 
-	function toggle(): void {
-		open = !open;
+	function toggle(e: MouseEvent): void {
+		attemptSteer({ live: true, isController: !notController, verb: "steer", x: e.clientX, y: e.clientY }, () => {
+			open = !open;
+		});
 	}
 	function closeMenu(): void {
 		open = false;
@@ -111,14 +119,18 @@
 			class="cond-trigger"
 			class:locked={activeExclusive}
 			class:open
+			class:ro-dim={notController}
 			bind:this={triggerEl}
 			aria-haspopup="menu"
 			aria-expanded={open}
+			aria-disabled={notController}
 			aria-label="Switch conductor"
-			title={"Conductor: " +
-				activeLabel +
-				(activeExclusive ? " · exclusive — pick None to release" : "") +
-				" — click to switch"}
+			title={notController
+				? readOnlyTip("steer")
+				: "Conductor: " +
+					activeLabel +
+					(activeExclusive ? " · exclusive — pick None to release" : "") +
+					" — click to switch"}
 			onclick={toggle}
 		>
 			<Icon name={activeExclusive ? "lock" : "sliders-horizontal"} size={11} />
@@ -241,6 +253,14 @@
 		background: color-mix(in srgb, var(--warn) 18%, var(--panel));
 		border-color: var(--warn);
 		color: var(--warn);
+	}
+
+	/* READ-ONLY "whisper" treatment (v16, ADR 0024): some OTHER surface holds the controller lease.
+	   Quiet dim, matching MapHeader's own `.ro-dim` — stays clickable so a click can flash the
+	   blocked-interaction hint (see `toggle()`). */
+	.cond-trigger.ro-dim {
+		opacity: 0.35;
+		cursor: not-allowed;
 	}
 
 	/* ── Popover ── */
