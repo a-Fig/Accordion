@@ -16,7 +16,10 @@
  *      over the real socket, holding its snapshot — proposes real age-based GROUP ops (strata) that
  *      land in Truth. The Python probe is forced absent, so the strategy degrades to its age-based
  *      fallback (deterministic, no LLM) — verified by its actual grouping behavior, not by faking.
- *   6. wireDeparting holds release promptly (empty/real propose) — hold telemetry stays sane.
+ *      (P1-6: the extension now fires an initial turnCommitted the instant the child attaches, so the
+ *      first pass runs without waiting for a real turn — strata typically land on the very first hook.)
+ *   6. wireDeparting holds release promptly via the v14 `holdRelease { holdId }` message (sent when
+ *      the child's wire-departing handler settles) — hold telemetry stays sane (0 timeouts).
  *   7. selectConductor null → the child is killed, locks clear, and the freeze kill-switch preserves
  *      the strata as human-owned groups.
  *
@@ -193,10 +196,12 @@ if (landedGroups >= 1) {
 	if (afterFreeze.some((g) => g.by !== "auto")) fails.push(`a GUI freeze seized a conductor stratum (by !== "auto"): ${JSON.stringify(afterFreeze.map((g) => g.by))}`);
 }
 
-// (6) hold telemetry sane: the child releases each wire-departing hold promptly (a real emergency
-//     propose or the sanctioned empty-ops release over the socket), so timeouts stay at/near zero and
-//     the last hold is well under the 200ms window. The hold counters ride the streamed `telemetry`
-//     WS frame (alongside the hook duration) — see accordion.ts broadcastTelemetry.
+// (6) hold telemetry sane: the child releases each wire-departing hold via the v14 dedicated
+//     `holdRelease { holdId }` message — sent the instant its wire-departing handler settles (whether
+//     that handler ran a real emergency propose or did nothing) — so timeouts stay at zero and the
+//     last hold is well under the 200ms window. A propose NO LONGER releases the hold, so a background
+//     tick's propose can't race it. The hold counters ride the streamed `telemetry` WS frame
+//     (alongside the hook duration) — see accordion.ts broadcastTelemetry.
 let holdTimeouts = null, lastHoldMs = null;
 {
 	// nudge one more hook so a fresh telemetry frame reflects the settled (post-strata) state.
@@ -205,7 +210,7 @@ let holdTimeouts = null, lastHoldMs = null;
 	const tel = inbox.telemetry.at(-1);
 	holdTimeouts = tel?.holdTimeouts;
 	lastHoldMs = tel?.lastHoldMs;
-	if (typeof holdTimeouts !== "number" || holdTimeouts > 1) fails.push(`wire-departing hold timed out too often (holdTimeouts=${holdTimeouts})`);
+	if (typeof holdTimeouts !== "number" || holdTimeouts !== 0) fails.push(`wire-departing hold timed out (holdTimeouts=${holdTimeouts}) — holdRelease should end each hold promptly`);
 	if (typeof lastHoldMs !== "number" || lastHoldMs > 200) fails.push(`last wire-departing hold exceeded the 200ms window (lastHoldMs=${lastHoldMs})`);
 }
 

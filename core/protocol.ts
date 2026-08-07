@@ -47,13 +47,28 @@
  *    calls over the wire; `setConductorStatus` carries `ConductorHost.setStatus`; `WireCommand`
  *    gains `selectConductor` (GUI picker → host attach/detach). Bumped so a pre-v13 peer (which
  *    has none of this vocabulary) cannot pair with a v13 host/client that assumes it's there.
+ *  - v14: wire-departing hold correlation + completion abort forwarding.
+ *      • `wireDeparting` gains a unique `holdId`; a NEW client→server `holdRelease { holdId }` ends
+ *        the hold. Release is now tied to the conductor's wire-departing HANDLER SETTLING (mirroring
+ *        the in-process semantics), NOT to any `propose`. The old convention — the first `propose`
+ *        after `wireDeparting` released the hold — could not distinguish the handler's own proposal
+ *        from a concurrent background-tick proposal (e.g. thermocline's prepare epoch), so a
+ *        background propose racing the hold released it before the handler's last-moment fold landed.
+ *        The host releases ONLY on `holdRelease` carrying the CURRENT `holdId`; a stale/unknown id is
+ *        ignored, a timeout still releases + counts, and a late `holdRelease` after timeout is a no-op.
+ *        A `propose` is now just an ordinary proposal (an empty-ops `propose` no longer means "release").
+ *      • A NEW client→server `cancelComplete { reqId }` forwards a conductor's `complete()` abort
+ *        (the SDK wired its `AbortSignal` → `cancelComplete`) so the host aborts the in-flight
+ *        completion's controller for that `reqId` (unknown/settled reqIds are ignored).
+ *    Bumped so a pre-v14 peer (which has neither the `holdId` correlation nor the new client messages)
+ *    cannot pair with a v14 host/client that assumes them.
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import type { Op, OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 13;
+export const PROTOCOL_VERSION = 14;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi session binds an
@@ -301,8 +316,10 @@ export interface ConductorStatusMessage {
  * Sent ONLY to the client holding the `"conductor"` role: the wire is about to depart to the
  * model. The wire host-adapter equivalent (`hostAdapter.ts → wireDepartingEvent`) already computes
  * the same `rev`/`liveTokens`/`budget`/`freshIds`; `holdMs` is this attached conductor's own
- * `holdWireUpToMs` — how long the host will wait for a `propose` before letting the wire depart
- * unchanged. A GUI-role client never receives this (it has no last-moment proposal to make).
+ * `holdWireUpToMs` — how long the host will wait before letting the wire depart unchanged. `holdId`
+ * (v14) uniquely identifies THIS hold: the conductor ends it by sending `holdRelease { holdId }` the
+ * moment its wire-departing handler settles — NOT via a `propose` (see the v14 History note). A
+ * GUI-role client never receives this (it has no last-moment proposal to make).
  */
 export interface WireDepartingMessage {
 	type: "wireDeparting";
@@ -311,6 +328,7 @@ export interface WireDepartingMessage {
 	budget: number;
 	freshIds: string[];
 	holdMs: number;
+	holdId: number;
 }
 
 /** Sent ONLY to the conductor-role client: a turn settled — the canonical re-plan trigger. */
@@ -414,6 +432,31 @@ export interface SetConductorStatusMessage {
 }
 
 /**
+ * A conductor-role client's wire-departing hold RELEASE (v14). Sent the instant the conductor's
+ * `wire-departing` handler settles (resolve OR reject), mirroring the in-process semantics where the
+ * hold resolves when the handler's returned promise settles. `holdId` echoes the `wireDeparting`
+ * message this releases; the host releases the departing wire ONLY on a matching CURRENT `holdId`,
+ * ignores a stale/unknown one, and treats a `holdRelease` arriving after the hold already timed out
+ * as a no-op. This REPLACES the old "first `propose` releases the hold" convention — a `propose` is
+ * now always just an ordinary proposal, never a hold-release signal.
+ */
+export interface HoldReleaseMessage {
+	type: "holdRelease";
+	holdId: number;
+}
+
+/**
+ * A conductor-role client's completion ABORT (v14) — the wire form of aborting a `complete()` call's
+ * `AbortSignal`. The SDK sends this when the signal the conductor passed to `host.complete` fires;
+ * the host aborts the in-flight completion's `AbortController` for that `reqId`. An unknown/settled
+ * `reqId` is ignored (the completion already resolved, or never existed on this socket).
+ */
+export interface CancelCompleteMessage {
+	type: "cancelComplete";
+	reqId: number;
+}
+
+/**
  * Ask the host for a fresh `snapshot`. Sent when a replica detects it has diverged — a replayed
  * event's rev didn't match, or a `reset` event arrived (which the client resnapshots rather than
  * replaying, sidestepping any batched-transaction rev ambiguity). Idempotent + cheap.
@@ -422,7 +465,14 @@ export interface ResnapshotMessage {
 	type: "resnapshot";
 }
 
-export type ClientMessage = CommandMessage | ResnapshotMessage | ProposeMessage | CompleteRequestMessage | SetConductorStatusMessage;
+export type ClientMessage =
+	| CommandMessage
+	| ResnapshotMessage
+	| ProposeMessage
+	| CompleteRequestMessage
+	| SetConductorStatusMessage
+	| HoldReleaseMessage
+	| CancelCompleteMessage;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -448,7 +498,7 @@ export function isServerMessage(v: unknown): v is ServerMessage {
 	return SERVER_TYPES.has((v as { type: unknown }).type as string);
 }
 
-const CLIENT_TYPES = new Set(["command", "resnapshot", "propose", "completeRequest", "setConductorStatus"]);
+const CLIENT_TYPES = new Set(["command", "resnapshot", "propose", "completeRequest", "setConductorStatus", "holdRelease", "cancelComplete"]);
 
 export function isClientMessage(v: unknown): v is ClientMessage {
 	if (!v || typeof v !== "object" || !("type" in v)) return false;

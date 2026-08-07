@@ -30,6 +30,8 @@ import type {
 	ProposeMessage,
 	CompleteRequestMessage,
 	SetConductorStatusMessage,
+	HoldReleaseMessage,
+	CancelCompleteMessage,
 } from "../protocol";
 import type { Conductor, ConductorHost, HostEvent, ViewBlock, GroupInfo, CompletionRequest, CompletionResult } from "./contract";
 import { viewBlockOf, hostEventsFromTruthEvent, recallHostEvent, wireDepartingEvent } from "./hostAdapter";
@@ -116,13 +118,20 @@ export class LiveConductorHost implements ConductorHost {
 
 	// ── in-flight completions (abortable on detach) ──────────────────────────────
 	private completions = new Set<AbortController>();
+	// Per-reqId completion controllers, so a conductor's `cancelComplete { reqId }` (v14, S7) can abort
+	// the exact completion it started. Cleared alongside `completions` on detach.
+	private completionsByReqId = new Map<number, AbortController>();
 
 	// ── conductor display status (broadcast + cached for late-joining clients) ────
 	private cachedStatusMsg: ConductorStatusMessage | null = null;
 
 	// ── wire-departing hold (remote) ─────────────────────────────────────────────
-	private holdWaiter: { gen: number; resolve: () => void; timer: ReturnType<typeof setTimeout> } | null = null;
-	private holdGen = 0;
+	// `holdId` is minted per hold (monotonic `holdSeq`) and rides the `wireDeparting` message; the
+	// remote conductor echoes it back in `holdRelease` to end exactly THIS hold (v14). The id acts as
+	// the generation guard: a stale/unknown release — including one arriving after the hold already
+	// timed out — never resolves a later hold.
+	private holdWaiter: { holdId: number; resolve: () => void; timer: ReturnType<typeof setTimeout> } | null = null;
+	private holdSeq = 0;
 	private lastHoldMsValue = 0;
 	private holdTimeoutsValue = 0;
 
@@ -244,6 +253,11 @@ export class LiveConductorHost implements ConductorHost {
 			} catch {
 				/* a throwing attach must not crash select */
 			}
+			// P1-6: give the freshly attached conductor an immediate pass over the EXISTING state so it
+			// doesn't idle until the next real turn settles. (The remote seam fires its initial
+			// turnCommitted from the extension AFTER the conductor's snapshot is dispatched — see
+			// `fireInitialTurnCommitted`.)
+			this.fireInitialTurnCommitted();
 		} else {
 			this.mode = "spawn";
 			const token = this.deps.mintToken();
@@ -307,10 +321,21 @@ export class LiveConductorHost implements ConductorHost {
 			const ops = Array.isArray(pm.ops) ? pm.ops : [];
 			const r = this.applyPropose(typeof pm.baseRev === "number" ? pm.baseRev : undefined, ops);
 			this.deps.sendToConductor({ type: "proposeResult", seq: pm.seq, rev: r.rev, results: r.results });
-			// A propose (even an EMPTY-ops "nothing to fold" ack) releases the wire-departing hold.
-			this.releaseHold();
+			// v14 (P1-2): a `propose` NO LONGER releases the wire-departing hold — the dedicated
+			// `holdRelease` message does. A propose here (even empty-ops) is just an ordinary proposal, so
+			// a background tick's propose racing the hold can't release it out from under the handler's
+			// last-moment fold.
+		} else if (m.type === "holdRelease" && Number.isSafeInteger((msg as HoldReleaseMessage).holdId)) {
+			// Release the departing wire ONLY for the CURRENT hold; a stale/unknown id — including a
+			// release that lands after this hold already timed out — is ignored by the generation guard.
+			this.releaseHoldById((msg as HoldReleaseMessage).holdId);
 		} else if (m.type === "completeRequest" && Number.isSafeInteger((msg as CompleteRequestMessage).reqId)) {
 			this.handleCompleteRequest(from, msg as CompleteRequestMessage);
+		} else if (m.type === "cancelComplete" && Number.isSafeInteger((msg as CancelCompleteMessage).reqId)) {
+			// S7: forward the conductor's `complete()` abort to the in-flight completion for this reqId.
+			// An unknown/settled reqId is a no-op (it already resolved, or never existed on this socket).
+			const controller = this.completionsByReqId.get((msg as CancelCompleteMessage).reqId);
+			if (controller) controller.abort();
 		} else if (m.type === "setConductorStatus") {
 			const sm = msg as SetConductorStatusMessage;
 			this.setAndBroadcastStatus(typeof sm.text === "string" ? sm.text : null, sm.metrics);
@@ -326,7 +351,11 @@ export class LiveConductorHost implements ConductorHost {
 		// locks — a strategy fold outside the protected tail survives detach as a human fold.
 		if (t) {
 			t.apply([{ kind: "freeze" }], "you");
-			t.clearLocks();
+			// P1-5: inherit the conductor-enforced tail as the human's `protectTokens` BEFORE the lock
+			// releases. Without this, a `tail-size` conductor's (often zero) tail snaps back to the
+			// human's larger dial and the next housekeep prunes the freeze-converted whole-session group
+			// and heals the frozen folds — destroying exactly the work `freeze` promised to preserve.
+			t.clearLocks({ inheritTail: true });
 		}
 		if (this.inProcessConductor) {
 			try {
@@ -356,6 +385,7 @@ export class LiveConductorHost implements ConductorHost {
 			}
 		}
 		this.completions.clear();
+		this.completionsByReqId.clear();
 		this.releaseHold(); // unblock any pending wire-departing hold so a stalled hook proceeds
 		// Reset the last-hold gauge (keep the cumulative `holdTimeouts` counter): with no conductor
 		// attached no hold ever fires, so a stale `lastHoldMs` would keep MapHeader subtracting a
@@ -431,6 +461,22 @@ export class LiveConductorHost implements ConductorHost {
 		else this.deps.sendToConductor({ type: "turnCommitted", turn, rev });
 	}
 
+	/**
+	 * Fire an initial turn-committed so a freshly attached conductor evaluates the EXISTING state at
+	 * once (P1-6), instead of idling until the next real turn settles. IN-PROCESS: `select` calls this
+	 * at the end of attach, so the just-subscribed conductor gets an immediate pass. REMOTE: the
+	 * extension calls this AFTER it has dispatched the conductor's first `snapshot`, so the spawned
+	 * SDK has hydrated its replica and run `conductor.attach` — its listener is live, so the
+	 * `turnCommitted` message it then receives actually drives a pass (sent before the snapshot it
+	 * would be dropped by the not-yet-attached SDK). Turn/rev are the current tail's.
+	 */
+	fireInitialTurnCommitted(): void {
+		const t = this.deps.truth();
+		if (!this.active || !t) return;
+		const last = t.blocks[t.blocks.length - 1];
+		this.fireTurnCommitted(last ? last.turn : 0, t.rev);
+	}
+
 	/** An agent `recall` observation. In-process fires the derived state-changed; remote already
 	 *  receives the broadcast `{type:"recall"}` message. */
 	dispatchRecall(ids: string[], by: Actor): void {
@@ -439,23 +485,31 @@ export class LiveConductorHost implements ConductorHost {
 	}
 
 	/**
-	 * Fire `wire-departing` and hold the departing wire for a last-moment proposal (pinned semantics):
+	 * Fire `wire-departing` and hold the departing wire for a last-moment proposal (v14 semantics):
 	 *  - IN-PROCESS: dispatch synchronously to the listener(s). If a handler returns a promise, race
 	 *    it against `holdWireUpToMs`; a purely synchronous handler resolves immediately (same tick).
-	 *  - REMOTE: send `wireDeparting`, then resolve on the FIRST subsequent `propose` from the active
-	 *    conductor (an empty-ops propose is the sanctioned release ack), raced against the timeout.
+	 *    Release is tied to the handler's returned promise SETTLING.
+	 *  - REMOTE: send `wireDeparting` (carrying a unique `holdId`), then resolve when the conductor
+	 *    sends `holdRelease { holdId }` — which the SDK emits the moment its handler settles, exactly
+	 *    mirroring the in-process semantics — raced against the timeout. A `propose` no longer releases
+	 *    the hold (P1-2): a concurrent background-tick propose used to race the hold and release it
+	 *    before the handler's last-moment fold landed.
 	 *
-	 * A generation token prevents a timed-out hold's stale timer from firing against a later hold, and
-	 * `lastHoldMs` is recorded each call; a timeout increments `holdTimeouts`.
+	 * The `holdId` doubles as the generation guard: a stale/unknown `holdRelease` (or a timed-out
+	 * hold's late release) never resolves a later hold. `lastHoldMs` is recorded each call; a timeout
+	 * increments `holdTimeouts`.
 	 */
 	async fireWireDepartingAndAwaitHold(): Promise<void> {
 		const t = this.deps.truth();
 		if (!t || !this.active) return;
 		const holdMs = this.active.holdWireUpToMs || 0;
 		const start = this.deps.now();
+		const holdId = ++this.holdSeq;
 		const { event } = wireDepartingEvent(t);
 		if (this.mode === "in-process") {
-			const rets = this.dispatchToListeners(event);
+			// `holdId` rides the event for symmetry with the remote seam; the hold resolves purely on
+			// the handler's returned promise settling (below), not on any id correlation here.
+			const rets = this.dispatchToListeners({ ...event, holdId });
 			const promises = rets.filter(isThenable);
 			if (promises.length && holdMs > 0) {
 				const timer = timeoutMarker(holdMs);
@@ -471,27 +525,38 @@ export class LiveConductorHost implements ConductorHost {
 				budget: event.budget,
 				freshIds: event.freshIds.slice(),
 				holdMs,
+				holdId,
 			});
-			if (holdMs > 0 && this.conductorSocket) await this.awaitRemoteHold(holdMs);
+			if (holdMs > 0 && this.conductorSocket) await this.awaitRemoteHold(holdId, holdMs);
 		}
 		this.lastHoldMsValue = this.deps.now() - start;
 	}
 
-	private awaitRemoteHold(holdMs: number): Promise<void> {
+	private awaitRemoteHold(holdId: number, holdMs: number): Promise<void> {
 		return new Promise<void>((resolve) => {
-			const gen = ++this.holdGen;
 			const timer = setTimeout(() => {
-				if (this.holdWaiter && this.holdWaiter.gen === gen) {
+				if (this.holdWaiter && this.holdWaiter.holdId === holdId) {
 					this.holdWaiter = null;
 					this.holdTimeoutsValue++;
 					resolve();
 				}
 			}, holdMs);
 			(timer as { unref?: () => void }).unref?.();
-			this.holdWaiter = { gen, resolve, timer };
+			this.holdWaiter = { holdId, resolve, timer };
 		});
 	}
 
+	/** Release the current wire-departing hold ONLY if `holdId` matches it (the `holdRelease` path). A
+	 *  stale/unknown id — including a release arriving after this hold already timed out — is ignored. */
+	private releaseHoldById(holdId: number): void {
+		const w = this.holdWaiter;
+		if (!w || w.holdId !== holdId) return;
+		this.holdWaiter = null;
+		clearTimeout(w.timer);
+		w.resolve();
+	}
+
+	/** Unconditionally release any pending wire-departing hold (detach path — unblock a stalled hook). */
 	private releaseHold(): void {
 		const w = this.holdWaiter;
 		if (!w) return;
@@ -516,6 +581,7 @@ export class LiveConductorHost implements ConductorHost {
 	private handleCompleteRequest(from: unknown, req: CompleteRequestMessage): void {
 		const controller = new AbortController();
 		this.completions.add(controller);
+		this.completionsByReqId.set(req.reqId, controller); // so a `cancelComplete { reqId }` (S7) can abort it
 		const cr: CompletionRequest = { prompt: req.prompt, system: req.system, maxOutputTokens: req.maxOutputTokens, model: req.model, signal: controller.signal };
 		// Reply to the ORIGINATING socket, not the currently-active one: a completion resolving after
 		// an A→B conductor swap must route back to the A that asked (a no-op if A is gone), never leak
@@ -535,7 +601,10 @@ export class LiveConductorHost implements ConductorHost {
 					}),
 				(err) => this.deps.sendToSocket(from, { type: "completeResult", reqId: req.reqId, ok: false, error: err instanceof Error ? err.message : String(err) }),
 			)
-			.finally(() => this.completions.delete(controller));
+			.finally(() => {
+				this.completions.delete(controller);
+				this.completionsByReqId.delete(req.reqId);
+			});
 	}
 
 	private setAndBroadcastStatus(text: string | null, metrics?: Record<string, number | string | boolean>): void {

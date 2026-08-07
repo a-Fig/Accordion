@@ -1,6 +1,6 @@
 /*
  * remote.ts — the out-of-process conductor SDK (Phase C). Runs a `Conductor` (`./contract`) as a
- * WebSocket CLIENT against the v13 wire (`../protocol`), presenting it with a `ConductorHost` built
+ * WebSocket CLIENT against the v14 wire (`../protocol`), presenting it with a `ConductorHost` built
  * from a local REPLICA `Truth` — never a second, hand-rolled derivation. Every read (`get` /
  * `blocks` / `textOf` / `stats` / `groups` / `countTokens` / `digestOf`) goes through the exact
  * same `hostAdapter.ts` helpers `TestHost` uses, and every mutation of the replica goes through
@@ -121,10 +121,6 @@ export function runRemoteConductor(conductor: Conductor, opts: RemoteConductorOp
 		const listeners = new Set<(e: HostEvent) => void | Promise<void>>();
 		const pendingProposes = new Map<number, { ops: Op[]; resolve: (r: TxnResult) => void }>();
 		const pendingCompletes = new Map<number, { resolve: (r: CompletionResult) => void; reject: (e: unknown) => void }>();
-		// The hold-release flag (see the `wireDeparting` case below): reset immediately before
-		// dispatching a wire-departing HostEvent, flipped true the moment `propose` is CALLED
-		// (invocation, not resolution) at any point up to the handler settling.
-		let proposedSinceDispatch = false;
 
 		let ws: WSLike;
 		try {
@@ -174,7 +170,6 @@ export function runRemoteConductor(conductor: Conductor, opts: RemoteConductorOp
 		}
 
 		function sendPropose(baseRev: number, ops: Op[]): Promise<TxnResult> {
-			proposedSinceDispatch = true;
 			return new Promise<TxnResult>((resolve) => {
 				const seq = ++proposeSeq;
 				pendingProposes.set(seq, { ops, resolve });
@@ -194,6 +189,21 @@ export function runRemoteConductor(conductor: Conductor, opts: RemoteConductorOp
 					maxOutputTokens: req.maxOutputTokens,
 					model: req.model && req.model !== "current" ? req.model : undefined,
 				});
+				// S7: forward the conductor's abort. When the signal it passed fires, tell the host to
+				// cancel the in-flight completion (`cancelComplete`) and reject locally with an abort
+				// error, so a detach/swap/timeout on the conductor side actually stops the model spend
+				// rather than silently waiting for a result that will be discarded.
+				const signal = req.signal;
+				if (signal) {
+					const onAbort = (): void => {
+						if (!pendingCompletes.has(id)) return; // already resolved/rejected — nothing to cancel
+						pendingCompletes.delete(id);
+						send({ type: "cancelComplete", reqId: id });
+						reject(signal.reason instanceof Error ? signal.reason : new Error("remote conductor: completion aborted"));
+					};
+					if (signal.aborted) onAbort();
+					else signal.addEventListener("abort", onAbort, { once: true });
+				}
 			});
 		}
 
@@ -358,22 +368,17 @@ export function runRemoteConductor(conductor: Conductor, opts: RemoteConductorOp
 				}
 				case "wireDeparting": {
 					if (!replica) return;
-					const event: HostEvent = { type: "wire-departing", rev: msg.rev, liveTokens: msg.liveTokens, budget: msg.budget, freshIds: msg.freshIds };
-					proposedSinceDispatch = false;
-					void dispatch(event).then(() => {
-						// HOLD RELEASE CONTRACT (pinned): if the handler never called `propose` while it was
-						// running (tracked via the flag above, set the instant `propose` is INVOKED — not
-						// when it resolves), send the sanctioned "nothing to fold" empty propose so the
-						// host's bounded hold on the departing wire is released. A handler that calls
-						// `propose` asynchronously AFTER this point (e.g. from a forgotten `.then()` or a
-						// timer that fires later) does NOT retroactively cancel this — the empty release
-						// still goes out the instant the handler settles with no propose seen, and the
-						// late real propose that follows is just an ORDINARY subsequent propose (against
-						// whatever baseRev is current then), not a hold-satisfying one. `host.propose` is a
-						// generally available service, not exclusively a wire-departing-hold mechanism, so
-						// that later call is still meaningful — it is simply no longer racing the hold.
-						if (!proposedSinceDispatch) send({ type: "propose", seq: ++proposeSeq, baseRev: msg.rev, ops: [] });
-					});
+					const holdId = msg.holdId;
+					const event: HostEvent = { type: "wire-departing", rev: msg.rev, liveTokens: msg.liveTokens, budget: msg.budget, freshIds: msg.freshIds, holdId };
+					// HOLD RELEASE CONTRACT (v14, P1-2): the hold ends when the wire-departing HANDLER
+					// SETTLES — resolve OR reject — exactly mirroring the in-process host, which resolves on
+					// the handler's returned promise settling. A DEDICATED `holdRelease { holdId }` carries
+					// that signal (never a `propose`), so a concurrent background-tick propose can no longer
+					// race the hold and release it before the handler's last-moment fold lands. `dispatch`
+					// already swallows a rejecting listener (it never crashes the pump), so `.finally` here
+					// fires whether the handler resolved or threw; the host ignores a stale/unknown holdId,
+					// so a duplicate or post-timeout release is harmless.
+					void dispatch(event).finally(() => send({ type: "holdRelease", holdId }));
 					break;
 				}
 				case "turnCommitted": {
