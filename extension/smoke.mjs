@@ -35,6 +35,13 @@ process.env.ACCORDION_APP_PATH = path.join(HOME, "missing-accordion-app.exe");
 // door URL). The door itself is exercised by a dedicated, self-contained section at the end that flips
 // this env to a free port and races two fresh extension instances. `0` = door disabled.
 process.env.ACCORDION_DOOR_PORT = "0";
+// C1 regression seams (test-only): a FAST controller heartbeat and a SLOW poll. This makes the C1
+// clobber test deterministic — after a foreign extension writes controller.json directly, a heartbeat
+// is guaranteed to fire (before the slow poll could "rescue" a regressed heartbeat) so a heartbeat
+// that re-asserted its stale cached holder would visibly clobber the foreign claim. Production never
+// sets these (defaults: 2s heartbeat / 1s poll).
+process.env.ACCORDION_CONTROLLER_HEARTBEAT_MS = "60";
+process.env.ACCORDION_CONTROLLER_POLL_MS = "5000";
 const SESSIONS_DIR = path.join(HOME, ".accordion", "sessions");
 const FOCUS_PATH = path.join(HOME, ".accordion", "focus.json");
 const CONTROLLER_PATH = path.join(HOME, ".accordion", "controller.json");
@@ -888,6 +895,50 @@ if (unfoldTool && foldCodeStr) {
 	a.inbox.controller.length = 0;
 	a.claim();
 	await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2000, "A reclaims control").catch(() => {});
+}
+
+// ── C1 regression: a FOREIGN extension's fresh claim must NOT be clobbered by THIS extension's
+//    heartbeat (which formerly re-asserted its stale in-memory holder). We stand in for "another
+//    extension" by writing controller.json DIRECTLY (atomic write-rename) with a DIFFERENT surfaceId
+//    and a fresh heartbeat, while A (a local surface) is still connected as the prior holder. With the
+//    fast-heartbeat / slow-poll seams set at the top of this file, a heartbeat is guaranteed to fire
+//    (before the slow poll) after the foreign write — so a REGRESSED heartbeat would clobber it here.
+{
+	const FOREIGN_SURFACE = "surface-foreign-9999";
+	a.inbox.controller.length = 0; // A is the current holder (just reclaimed above) + connected
+	const writeForeignLease = () => {
+		const lease = { registryProtocol: 1, surfaceId: FOREIGN_SURFACE, label: "Foreign surface", claimedAt: Date.now(), heartbeatAt: Date.now() };
+		const tmp = `${CONTROLLER_PATH}.foreign-${process.pid}.tmp`;
+		fs.writeFileSync(tmp, JSON.stringify(lease));
+		fs.renameSync(tmp, CONTROLLER_PATH);
+	};
+	writeForeignLease();
+	// (b) THIS extension observes the foreign claim (via its heartbeat's fresh disk re-read) and
+	//     broadcasts the change of hands to A.
+	await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === FOREIGN_SURFACE), 3000, "A observes the foreign claim").catch(
+		() => fails.push("C1: extension did not broadcast the foreign controller claim it observed on disk"),
+	);
+	// Give several MORE heartbeat intervals a chance to (wrongly) re-assert surface A over the foreign lease.
+	await new Promise((r) => setTimeout(r, 400));
+	// (a) controller.json STILL names the foreign surface — the heartbeat never wrote surface A back over it.
+	try {
+		const lease = JSON.parse(fs.readFileSync(CONTROLLER_PATH, "utf8"));
+		if (lease.surfaceId !== FOREIGN_SURFACE)
+			fails.push(`C1: the heartbeat CLOBBERED a foreign claim — controller.json names ${JSON.stringify(lease.surfaceId)}, expected ${FOREIGN_SURFACE}`);
+	} catch (e) {
+		fails.push(`C1: could not read controller.json after the foreign claim (${e.message})`);
+	}
+	// (c) A (connected here, but no longer the on-disk holder) is now refused read-only.
+	a.inbox.commandResult.length = 0;
+	a.sendCmd({ kind: "ops", ops: [{ kind: "fold", ids: [ASST_ID] }] });
+	await waitFor(() => a.inbox.commandResult.length > 0, 2000, "A fold commandResult after the foreign claim").catch(
+		() => fails.push("C1: demoted client A's fold received no commandResult after the foreign claim"),
+	);
+	{
+		const r = a.inbox.commandResult.at(-1);
+		if (!r || r.refused !== "read-only")
+			fails.push(`C1: after a foreign claim, local surface A's fold was not refused read-only (got ${JSON.stringify(r)})`);
+	}
 }
 
 a.ws.close();
