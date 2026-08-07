@@ -404,12 +404,18 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	 * make "compaction" grow the wire and starve the trigger. Every run AFTER the first instead gets
 	 * digest `""` — the group-op vocabulary's explicit DROP sentinel (`Truth.isDropGroup`/
 	 * `core/ops.ts`'s `group.summary` doc: `null`/`""` → no wire message at all), not the
-	 * default-recap `undefined` would trigger. A dropped run costs zero wire tokens (barring the
-	 * unrelated, pre-existing role-validity-floor degradation `Truth` can still apply to ANY drop
-	 * group), which is exactly what the charge-once accounting already assumes — so `savedTokens`
-	 * needs no change at all: it was always "one full-text charge, the rest free," and this is what
-	 * now actually reaches the wire. K = 1 (the common case, no fragmentation) is unaffected: the
-	 * single run still gets the full `text` digest, byte-identical to before this fix.
+	 * default-recap `undefined` would trigger. A dropped run normally costs zero wire tokens, which
+	 * is exactly what the charge-once accounting already assumes — so `savedTokens` needs no change
+	 * at all: it was always "one full-text charge, the rest free," and this is what now actually
+	 * reaches the wire. One bounded caveat: the wire's pre-existing role-validity floor
+	 * (`computeDegradedDropRuns`, core/wire.ts — unrelated to this fix) can degrade a dropped run
+	 * into a small paid recap stub when removing it would weld two same-role neighbors together; in
+	 * that case the trigger under-counts the true wire by ~one recap (~25 tokens including its
+	 * BLOCK_OVERHEAD) per degraded run — small and bounded, vs. the unbounded K× full-summary error
+	 * this fix removes, and pinned exactly by the "degraded-recap residual" test in
+	 * `compaction-naive/compaction-naive.test.ts`. K = 1 (the common case, no fragmentation) is
+	 * unaffected: the single run still gets the full `text` digest, byte-identical to before this
+	 * fix.
 	 *
 	 * Returns:
 	 *   - null  → no result yet (used ONLY while a first-trip completion is in-flight).
