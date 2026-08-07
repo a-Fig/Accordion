@@ -26,8 +26,10 @@
 import { ViewConductor, type Command, type ConductorView } from "../../core/conductor/view";
 import type { ConductorHost, LockName, ViewBlock } from "../../core/conductor/contract";
 
-/** Fraction of budget at which a run triggers (high-water mark). Shared by both conductors. */
-const TRIGGER = 0.9;
+/** Fraction of budget at which a run triggers (high-water mark). Shared by every subclass;
+ *  exported so a subclass with its own activation logic (triptych's sticky pressure gate) keys off
+ *  the same mark rather than growing a second constant to drift. */
+export const TRIGGER = 0.9;
 
 /**
  * Soft cap on completion output tokens. Sized for the job: both conductors summarize/hand off
@@ -212,6 +214,41 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		return true;
 	}
 
+	/**
+	 * The EXCLUSIVE upper index of the region this conductor may summarize — `agedRegion` and
+	 * `emitCoverageGroup` walk blocks `[0, agedBoundaryIndex)`. Default: the host's protected-tail
+	 * boundary (both shipped subclasses summarize everything older than the tail, main parity). A
+	 * subclass with its own banding (triptych's thirds) overrides this to a NARROWER boundary; it must
+	 * never return an index past `view.protectedFromIndex` (the protected tail is not this
+	 * conductor's to summarize — `Truth` would clamp the group anyway, but the accounting here
+	 * assumes the boundary is honest).
+	 */
+	protected agedBoundaryIndex(view: ConductorView): number {
+		return view.protectedFromIndex;
+	}
+
+	/**
+	 * Extra visible-window savings (tokens) this conductor achieves OUTSIDE the summary group —
+	 * subtracted alongside the group's own savings when computing the trigger's visible window.
+	 * Default 0 (the two shipped subclasses fold nothing but the group). A subclass that also folds
+	 * blocks individually (triptych's skeleton `replace` folds) overrides this so the 90% mark
+	 * measures the REAL wire cost — otherwise the trigger re-fires while the actual window still
+	 * has room, defeating its own compression.
+	 */
+	protected extraSavedTokens(_view: ConductorView): number {
+		return 0;
+	}
+
+	/**
+	 * The text a block contributes to the completion prompt (`buildPrompt`). Default: the block's
+	 * full original text. A subclass that has already compressed a block (triptych's skeletons)
+	 * overrides this to feed the compressed form instead — the conversation as the agent actually
+	 * experienced it, and a much smaller prompt.
+	 */
+	protected promptTextOf(b: ViewBlock): string {
+		return (b.text ?? "").trim();
+	}
+
 	// ── shared instance state ────────────────────────────────────────────────────
 
 	/** The current completion result (with its subclass-formatted count preamble). Null until the
@@ -296,7 +333,8 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// kind) contributes NOTHING here — it was never actually removed from the wire, so crediting
 		// it as "saved" would understate the real visible window and starve the trigger.
 		const survivors = aged.filter((b) => this.coveredIds.has(b.id) && this.includeInGroup(b));
-		const savedTokens = this.text !== null ? Math.max(0, sumTokens(survivors) - this.textTokenCost()) : 0;
+		const groupSaved = this.text !== null ? Math.max(0, sumTokens(survivors) - this.textTokenCost()) : 0;
+		const savedTokens = groupSaved + this.extraSavedTokens(view);
 
 		// RAW baseline: Σ full token cost over EVERY block (aged or protected).
 		const rawTotal = sumTokens(view.blocks);
@@ -377,7 +415,8 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	private agedRegion(view: ConductorView): ViewBlock[] {
 		const foreign = this.foreignGroupedIds();
 		const aged: ViewBlock[] = [];
-		for (let i = 0; i < view.protectedFromIndex && i < view.blocks.length; i++) {
+		const boundary = Math.min(this.agedBoundaryIndex(view), view.protectedFromIndex);
+		for (let i = 0; i < boundary && i < view.blocks.length; i++) {
 			const b = view.blocks[i];
 			if (!b.held && !foreign.has(b.id)) aged.push(b);
 		}
@@ -416,7 +455,7 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 			runStart = -1;
 			runEnd = -1;
 		};
-		const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
+		const pfi = Math.min(this.agedBoundaryIndex(view), view.protectedFromIndex, view.blocks.length);
 		for (let i = 0; i < pfi; i++) {
 			const b = view.blocks[i];
 			if (this.coveredIds.has(b.id) && !b.held && !foreign.has(b.id) && this.includeInGroup(b)) {
@@ -605,7 +644,7 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 				// unreachable today — but it costs nothing to run the label through the same
 				// neutralizer as every other interpolated value instead of trusting the charset.
 				const label = this.neutralize(blockLabel(b));
-				const text = this.neutralize((b.text ?? "").trim());
+				const text = this.neutralize(this.promptTextOf(b));
 				return text ? `[${label}]\n${text}` : `[${label}]`;
 			})
 			.join("\n\n");

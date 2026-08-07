@@ -570,11 +570,15 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		now: () => Date.now(),
 	});
 
-	/** Resolve a thermocline-style runner file on disk (repo checkout only this phase), or null. */
+	/** Resolve a spawn conductor's runner file on disk (repo checkout only this phase), or null.
+	 *  `entryFile` is relative to `conductors/ws/` (registry contract) — sanitized here so a
+	 *  malformed catalog entry can never resolve outside that directory. */
 	function resolveRunnerPath(entryFile: string): string | null {
 		try {
+			if (typeof entryFile !== "string" || entryFile.length === 0) return null;
+			if (path.isAbsolute(entryFile) || entryFile.split(/[\\/]/).includes("..")) return null;
 			const here = path.dirname(fileURLToPath(import.meta.url));
-			const p = path.resolve(here, "..", "conductors", "ws", "thermocline", entryFile);
+			const p = path.resolve(here, "..", "conductors", "ws", entryFile);
 			return fs.existsSync(p) ? p : null;
 		} catch {
 			return null;
