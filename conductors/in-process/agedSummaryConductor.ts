@@ -20,11 +20,17 @@
  * swallow every kind, including `user`, matching main's original behavior byte-for-byte), but the
  * hook stays available for a future conductor that genuinely needs to exclude a kind.
  *
- * No Svelte, no `$state`, no engine imports. Types only from `../conductor/contract` and
- * `../conductor/view`.
+ * No Svelte, no `$state`, no engine imports. Types come from `../conductor/contract` and
+ * `../conductor/view`; the only VALUE imports outside those are the pure `core/` primitives that
+ * decide what the wire will do with a proposed group (`hasCollapsibleCarrier` / `messageKey` /
+ * `roleFloorRecap` / `BLOCK_OVERHEAD`) — imported rather than re-derived precisely so this
+ * conductor's judgment can never drift from the one `Truth`/`applyPlan` actually enforce.
  */
 import { ViewConductor, type Command, type ConductorView } from "../../core/conductor/view";
 import type { ConductorHost, LockName, ViewBlock } from "../../core/conductor/contract";
+import { hasCollapsibleCarrier, messageKey } from "../../core/groupShape";
+import { roleFloorRecap } from "../../core/wire";
+import { BLOCK_OVERHEAD } from "../../core/tokens";
 
 /** Fraction of budget at which a run triggers (high-water mark). Shared by both conductors. */
 const TRIGGER = 0.9;
@@ -289,18 +295,18 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// If a completion is in-flight, hold the current state — never launch a second.
 		if (this.inflight !== null) return this.emitCoverageGroup(view);
 
-		// The blocks already represented by `text` that are still in the aged region AND actually
-		// eligible to be folded away (see `includeInGroup`). These are what the group covers, and
-		// their tokens are the saving that shrinks the VISIBLE window below the raw baseline. A
-		// covered-but-excluded block (were a subclass to override `includeInGroup` to exclude a
-		// kind) contributes NOTHING here — it was never actually removed from the wire, so crediting
-		// it as "saved" would understate the real visible window and starve the trigger.
-		const survivors = aged.filter((b) => this.coveredIds.has(b.id) && this.includeInGroup(b));
-		const savedTokens = this.text !== null ? Math.max(0, sumTokens(survivors) - this.textTokenCost()) : 0;
-
-		// RAW baseline: Σ full token cost over EVERY block (aged or protected).
-		const rawTotal = sumTokens(view.blocks);
-		const visible = rawTotal - savedTokens;
+		// VISIBLE WINDOW: what the model actually receives right now — `Truth.stats().liveTokens`,
+		// surfaced as `view.liveTokens`. This is the AUTHORITATIVE number and the only one the
+		// trigger reads (#90 review, sol5.6 P1 #1). It already incorporates every term a conductor-
+		// side reconstruction cannot see: per-run group wire costs (`Truth.groupLiveTokens` /
+		// `runWireTok`), stragglers left live inside a group, human folds, and — the term that broke
+		// the old `rawTotal − savedTokens` formula — a DROP run the wire's role-validity floor
+		// degraded into a PAID recap stub (`computeDegradedDropRuns`, core/wire.ts). That stub costs
+		// ~25 tokens per degraded run REGARDLESS of run size, so a heavily fragmented aged region
+		// (many tiny runs) made the old formula under-count the true wire without bound and starve
+		// the trigger. Deriving the number instead of reading it was the bug; there is no separate
+		// "saved tokens" bookkeeping left to drift.
+		const visible = view.liveTokens;
 		// Trigger on the EFFECTIVE cap, not raw budget: a mid-session swap to a smaller-window model
 		// can leave `budget` oversized relative to `contextWindow` for one hook tick (the extension
 		// clamps it back down, but defense in depth here means this conductor never depends on that
@@ -392,68 +398,104 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	 *     (fed to the model at least once) but which is NOT group-eligible (only possible if a
 	 *     subclass overrides `includeInGroup` to exclude a kind) is never a survivor here — it
 	 *     stays live and forces the run to split.
-	 *   - If no survivors → `[]` (clear to raw; lossless).
-	 *   - Otherwise emit one `group(first, last, digest)` per MAXIMAL CONTIGUOUS run of survivors,
-	 *     walking the FULL aged prefix (including held/foreign-grouped/excluded blocks) so any of
-	 *     those SPLIT the run rather than being spanned.
+	 *   - Runs are the MAXIMAL CONTIGUOUS spans of survivors, found by walking the FULL aged prefix
+	 *     (including held/foreign-grouped/excluded blocks) so any of those SPLIT a run rather than
+	 *     being spanned by it.
+	 *   - Each surviving run becomes one `group(first, last, digest)` unless a run-level exclusion
+	 *     below keeps it out; no run proposed → `[]` (clear to raw; lossless).
 	 *
 	 * ONLY THE FIRST EMITTED RUN CARRIES `text` (issue #90): a held/pinned block or a foreign group
 	 * can fragment the aged prefix into K > 1 survivor runs, and every run used to get the FULL
-	 * summary as its digest — the wire then carried K copies of the same text while `conduct()`'s
-	 * `savedTokens` (below) charges `textTokenCost()` exactly ONCE, so a fragmented aged region could
-	 * make "compaction" grow the wire and starve the trigger. Every run AFTER the first instead gets
-	 * digest `""` — the group-op vocabulary's explicit DROP sentinel (`Truth.isDropGroup`/
-	 * `core/ops.ts`'s `group.summary` doc: `null`/`""` → no wire message at all), not the
-	 * default-recap `undefined` would trigger. A dropped run normally costs zero wire tokens, which
-	 * is exactly what the charge-once accounting already assumes — so `savedTokens` needs no change
-	 * at all: it was always "one full-text charge, the rest free," and this is what now actually
-	 * reaches the wire. One bounded caveat: the wire's pre-existing role-validity floor
-	 * (`computeDegradedDropRuns`, core/wire.ts — unrelated to this fix) can degrade a dropped run
-	 * into a small paid recap stub when removing it would weld two same-role neighbors together; in
-	 * that case the trigger under-counts the true wire by ~one recap (~25 tokens including its
-	 * BLOCK_OVERHEAD) per degraded run — small and bounded, vs. the unbounded K× full-summary error
-	 * this fix removes, and pinned exactly by the "degraded-recap residual" test in
-	 * `compaction-naive/compaction-naive.test.ts`. K = 1 (the common case, no fragmentation) is
-	 * unaffected: the single run still gets the full `text` digest, byte-identical to before this
-	 * fix.
+	 * summary as its digest — the wire then carried K copies of the same text while the trigger
+	 * charged it once. Every run after the first instead gets digest `""` — the group-op
+	 * vocabulary's explicit DROP sentinel (`Truth.isDropGroup` / `core/ops.ts`'s `group.summary`
+	 * doc: `null`/`""` → no wire message at all), not the default-recap `undefined` would trigger.
+	 * K = 1 (the common case, no fragmentation) is unaffected: the single run still gets the full
+	 * `text` digest, byte-identical to before that fix.
+	 *
+	 * TWO RUN-LEVEL EXCLUSIONS (#90 review, sol5.6). An excluded run is simply not proposed — its
+	 * blocks stay live exactly as a held/foreign block already keeps itself out of a run — so both
+	 * exclusions are lossless, and both are re-evaluated from the live view every pass:
+	 *
+	 *   1. NO VIABLE CARRIER (P1 #2 — silent data loss). `Truth.opGroup` rejects a group whose run
+	 *      has nothing the wire may actually remove (`"nothing collapses (all stragglers)"` — e.g. a
+	 *      run holding a `tool_call` whose paired `tool_result` is held OUTSIDE it). `Truth.apply`
+	 *      validates each op INDEPENDENTLY and `ViewConductor.applyDesired` silently drops the
+	 *      failures, so a rejected FIRST run (the summary carrier) alongside an accepted sibling
+	 *      DROP removed content from the wire with no summary anywhere. Asking
+	 *      `hasCollapsibleCarrier` (core/groupShape.ts — the SAME fixpoint `Truth.classifyGroup`
+	 *      runs, not a re-derivation) BEFORE proposing means a doomed carrier is never proposed, so
+	 *      no sibling drop is ever built on a summary that will not commit. Note the coupling: if
+	 *      the first run is excluded, `text` moves to the first run that IS viable.
+	 *   2. A DROP THAT COSTS MORE THAN IT SAVES (P1 #1 — the wire growing). The wire's role-validity
+	 *      floor (`computeDegradedDropRuns`, core/wire.ts) turns a DROP run into a paid recap stub
+	 *      when removing it would weld two same-role neighbors, at a cost that is ~flat per run
+	 *      regardless of run size. Under heavy fragmentation (many tiny runs) that turned
+	 *      "compaction" into net wire GROWTH. A run whose own content is smaller than the stub it
+	 *      may be degraded into can never pay for itself, so it is not dropped at all. The check is
+	 *      deliberately LOCAL and worst-case (the floor's real verdict is a global fixpoint over
+	 *      every run at once, unavailable here): it can leave a small saving on the table, never
+	 *      cause growth. The summary CARRIER is exempt — it is this conductor's entire product, and
+	 *      a REPLACE run is never degraded — so growth stays bounded by one summary's own cost.
 	 *
 	 * Returns:
 	 *   - null  → no result yet (used ONLY while a first-trip completion is in-flight).
-	 *   - []    → no surviving covered blocks to cover (clear to raw; lossless).
-	 *   - [...] → one `group` command per contiguous survivor run — the first carries `text`,
-	 *             every subsequent one carries `""` (DROP).
+	 *   - []    → nothing worth (or able to) collapse (clear to raw; lossless).
+	 *   - [...] → one `group` command per proposed run — the first carries `text`, every subsequent
+	 *             one carries `""` (DROP).
 	 */
 	private emitCoverageGroup(view: ConductorView): Command[] | null {
 		if (this.text === null) return null;
 
 		const foreign = this.foreignGroupedIds();
-		const cmds: Command[] = [];
-		let runStart = -1;
-		let runEnd = -1;
-		let survivorCount = 0;
-		let carriedText = false; // true once the first run has claimed the full-text digest
-		const flush = (): void => {
-			if (runStart === -1) return;
-			const digest = carriedText ? "" : this.text!;
-			carriedText = true;
-			cmds.push({ kind: "group", ids: [view.blocks[runStart].id, view.blocks[runEnd].id], digest });
-			runStart = -1;
-			runEnd = -1;
-		};
+		const runs: ViewBlock[][] = [];
+		let run: ViewBlock[] | null = null;
 		const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
 		for (let i = 0; i < pfi; i++) {
 			const b = view.blocks[i];
 			if (this.coveredIds.has(b.id) && !b.held && !foreign.has(b.id) && this.includeInGroup(b)) {
-				survivorCount++;
-				if (runStart === -1) runStart = i;
-				runEnd = i;
+				if (run) run.push(b);
+				else runs.push((run = [b]));
 			} else {
-				flush();
+				run = null;
 			}
 		}
-		flush();
-		if (survivorCount === 0) return [];
+
+		const cmds: Command[] = [];
+		for (const r of runs) {
+			// Exclusion 1 — a doomed carrier is never proposed. `requireDurable: true` matches the
+			// live host this conductor always runs under (`Truth.wireAttached` is set for every live
+			// pi session); it is also the STRICTER of the two verdicts, so a run judged viable here is
+			// viable under either, which is the direction that cannot lose data.
+			if (!hasCollapsibleCarrier(r, true)) continue;
+			// Exclusion 2 applies only to DROP runs — the carrier always commits (see the doc above).
+			if (cmds.length > 0 && sumTokens(r) <= this.worstCaseDropCost(r)) continue;
+			cmds.push({ kind: "group", ids: [r[0].id, r[r.length - 1].id], digest: cmds.length === 0 ? this.text : "" });
+		}
 		return cmds;
+	}
+
+	/**
+	 * The most a DROP over `run` could cost the wire: the role-validity floor's recap stub, at the
+	 * EXACT text `applyPlan` would synthesize for it (`roleFloorRecap`, exported from `core/wire.ts`
+	 * so the estimate matches token-for-token rather than in shape) plus the same `BLOCK_OVERHEAD`
+	 * framing `Truth.runWireTok` charges it. Zero when the floor does not degrade this run — but
+	 * that verdict depends on every OTHER run at once, so the worst case is what is compared
+	 * against. The group id is predicted the way `Truth.opGroup` mints it (`g:<first member id>`);
+	 * only the string's LENGTH matters here, and `foldTag` is fixed-width, so a boundary the host's
+	 * range-snapping would widen cannot change the estimate.
+	 */
+	private worstCaseDropCost(run: readonly ViewBlock[]): number {
+		let messages = 0;
+		let prevKey: string | null = null;
+		for (const b of run) {
+			const k = messageKey(b.id);
+			if (k !== prevKey) {
+				messages++;
+				prevKey = k;
+			}
+		}
+		return this.host.countTokens(roleFloorRecap(`g:${run[0].id}`, messages)) + BLOCK_OVERHEAD;
 	}
 
 	/** Surface the sticky failure status (or clear the bar when there is none). Used in every
@@ -462,13 +504,6 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	 *  genuine retry launches (see `launchCompletion`) or a result commits. */
 	private surfaceIdleStatus(): void {
 		this.host.setStatus(this.failureStatus);
-	}
-
-	/** The token cost of the current `text`, via the host's tokenizer. Used only to compute the
-	 *  VISIBLE window for the trigger. */
-	private textTokenCost(): number {
-		if (this.text === null) return 0;
-		return this.host.countTokens(this.text);
 	}
 
 	/** Neutralize a sentinel-breakout attempt against BOTH tags this conductor's prompt ever wraps
