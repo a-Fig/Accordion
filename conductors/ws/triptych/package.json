@@ -1,0 +1,19 @@
+{
+  "name": "@a-fig/triptych",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Triptych — a tree-sitter-driven code skeletonizer (L2: signatures kept, bodies/comments/docstrings/large literals elided) for the Accordion \"triptych\" conductor.",
+  "main": "skeleton.mjs",
+  "dependencies": {
+    "web-tree-sitter": "^0.25.0",
+    "tree-sitter-wasms": "^0.1.11"
+  },
+  "keywords": [
+    "accordion",
+    "conductor",
+    "code-skeleton",
+    "tree-sitter"
+  ],
+  "license": "MIT"
+}

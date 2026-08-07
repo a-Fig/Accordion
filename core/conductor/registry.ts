@@ -13,10 +13,11 @@
  * The lock/tail/hold metadata for the in-process conductors is SOURCED FROM THE CONDUCTOR
  * DEFINITIONS THEMSELVES — each is instantiated once at module load and its declared `locks` /
  * `tailTokens` / `holdWireUpToMs` read off the instance — so the catalog can never drift from what
- * the conductor actually claims. Thermocline is the exception: it runs out of process, and its
- * class cannot be imported here without pulling its `child_process` attention-probe into the
- * extension bundle, so its metadata is mirrored verbatim from
- * `conductors/ws/thermocline/thermocline.ts` (kept in lockstep by the comment on `THERMOCLINE`).
+ * the conductor actually claims. The spawn conductors are the exception: they run out of process,
+ * and their classes cannot be imported here without pulling process-only baggage into the
+ * extension bundle (thermocline's `child_process` attention-probe; triptych's wasm tree-sitter
+ * engine), so their metadata is mirrored verbatim from their class definitions (kept in lockstep
+ * by the comments on `THERMOCLINE` / `TRIPTYCH`).
  */
 import type { LockName } from "../locks";
 import type { Conductor } from "./contract";
@@ -40,7 +41,9 @@ export interface RegistryEntry {
 	kind: "none" | "in-process" | "spawn";
 	/** In-process factory — a FRESH conductor per attach. */
 	create?: () => Conductor;
-	/** Spawn descriptor — the runner file the extension launches out of process. */
+	/** Spawn descriptor — the runner file the extension launches out of process. `entryFile` is
+	 *  relative to `conductors/ws/` (e.g. `"thermocline/runner.mjs"`) so one resolver serves every
+	 *  spawn conductor; the extension sanitizes it (no absolute paths, no `..`). */
 	spawn?: { entryFile: string };
 }
 
@@ -83,7 +86,24 @@ const THERMOCLINE: RegistryEntry = {
 	tailTokens: 0,
 	holdWireUpToMs: 200,
 	kind: "spawn",
-	spawn: { entryFile: "runner.mjs" },
+	spawn: { entryFile: "thermocline/runner.mjs" },
+};
+
+/*
+ * Triptych (spawn). Metadata MIRRORED from `conductors/ws/triptych/triptych.ts`:
+ *   readonly locks = ["human-steering", "agent-unfold"];  (no holdWireUpToMs ⇒ 0; no tailTokens ⇒ 0)
+ * Keep in lockstep with that class — like thermocline it cannot be imported here (its runner
+ * injects a wasm tree-sitter engine that must never enter the extension bundle).
+ */
+const TRIPTYCH: RegistryEntry = {
+	id: "triptych",
+	label: "Triptych",
+	description: "Pressure-gated thirds: raw recent band, code-skeleton middle band, lossy compaction summary top band.",
+	locks: ["human-steering", "agent-unfold"],
+	tailTokens: 0,
+	holdWireUpToMs: 0,
+	kind: "spawn",
+	spawn: { entryFile: "triptych/runner.mjs" },
 };
 
 /** The full catalog, in picker order: detach first, then the shipped conductors. */
@@ -93,6 +113,7 @@ export const ENTRIES: readonly RegistryEntry[] = [
 	inProcess(() => new HandoffConductor()),
 	inProcess(() => new DoormanConductor()),
 	THERMOCLINE,
+	TRIPTYCH,
 ];
 
 /** Look up an entry by id. `null` ⇒ the detach sentinel (`NONE`). Unknown id ⇒ undefined. */
