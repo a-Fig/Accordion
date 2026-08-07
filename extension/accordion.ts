@@ -55,10 +55,11 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { Truth } from "../core/truth";
-import { linearize, type PiMessage } from "../core/wire";
+import { linearize, messageInfo, wireToBlock, type PiMessage } from "../core/wire";
 import { serializeSnapshot, wireEventFromTruthEvent } from "../core/replica";
 import { resolveUnfold, resolveRecall } from "../core/agentView";
-import { messageInfo } from "../core/wire";
+import type { SessionMeta } from "../core/types";
+import type { OpResult } from "../core/ops";
 import type { TruthEvent } from "../core/events";
 import {
 	DEFAULT_PORT,
@@ -67,7 +68,6 @@ import {
 	type ServerMessage,
 	type StreamMessage,
 	type WireCommand,
-	type SnapshotState,
 } from "../core/protocol";
 import {
 	REGISTRY_PROTOCOL,
@@ -999,98 +999,171 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	 *   • "timeout" — sent, but no reply within the governing wait (the caller falls back to
 	 *                 the last known plan). `waitedMs` is that wait: PLAN_DEADLINE_MS when the
 	 *                 caller passes `armedNow`, PLAN_TIMEOUT_MS otherwise. Snapshotted by the
-	 *                 caller (the `context` hook) so an in-flight wait keeps its value.
-	 *   • "plan"    — the GUI replied (delivered via the pending resolver / flushPending).
-	 * The pending resolver is also driven by flushPending() (→ "unsent") on a superseded /
-	 * dropped / shutting-down GUI, so a mid-wait disconnect never runs out the full timer.
-	 *
-	 * This is the ONE sync site whose reply is actually APPLIED to a model call (the `context`
-	 * hook below). Every other sync site in this file is VIEW-ONLY.
-	 */
-	function requestPlan(reqId: number, full: boolean, blocks: ReturnType<typeof linearize>, armedNow: boolean): Promise<PlanResult> {
-		const waitMs = armedNow ? PLAN_DEADLINE_MS : PLAN_TIMEOUT_MS;
-		return new Promise((resolve) => {
-			const ws = client;
-			if (!ws || ws.readyState !== 1) return resolve({ kind: "unsent" });
-			const timer = setTimeout(() => {
-				if (pending.has(reqId)) {
-					pending.delete(reqId);
-					resolve({ kind: "timeout", waitedMs: waitMs }); // delivered but no reply in time → caller applies last known plan
-				}
-			}, waitMs);
-			pending.set(reqId, (r) => {
-				clearTimeout(timer);
-				resolve(r);
-			});
-			send(ws, { type: "sync", reqId, full, blocks, contextWindow });
-		});
+	// ── Phase B host helpers (the truth lives here now) ─────────────────────────
+
+	/** Parse the client role from the connect URL (`?role=conductor`); default "gui". */
+	function roleFromUrl(url: string | undefined): Role {
+		try {
+			const r = new URL(url || "/", "http://accordion.local").searchParams.get("role");
+			return r === "conductor" ? "conductor" : "gui";
+		} catch {
+			return "gui";
+		}
 	}
 
-	/** Ask the GUI to restore folded blocks by their codes; mirrors requestPlan in structure. */
-	function requestUnfold(codes: string[]): Promise<{ restored: Array<{ code: string; kind: string; label: string }>; missing: string[] } | null> {
-		return new Promise((resolve) => {
-			const ws = client;
-			if (!ws || ws.readyState !== 1) return resolve(null);
-			const reqId = ++unfoldSeq;
-			// Generous timeout: this runs during the agent's own turn, not on the critical
-			// model-call path, so 2 s gives the GUI time to process and reply.
-			const timer = setTimeout(() => {
-				if (pendingUnfold.has(reqId)) { pendingUnfold.delete(reqId); resolve(null); }
-			}, UNFOLD_TIMEOUT_MS);
-			pendingUnfold.set(reqId, (res) => { clearTimeout(timer); resolve(res); });
-			send(ws, { type: "unfoldRequest", reqId, codes } as UnfoldRequestMessage);
-		});
+	/** SessionMeta for a Truth built from the current discovery meta. */
+	function metaForTruth(): SessionMeta {
+		return { format: "pi", title: meta.title, cwd: meta.cwd, model: meta.model };
+	}
+
+	/** The current folding arm, echoed in snapshots + on toggle. Only broadcasts on a real change. */
+	function setFolding(on: boolean): void {
+		if (foldingEnabled === on) return;
+		foldingEnabled = on;
+		broadcast({ type: "folding", enabled: foldingEnabled });
 	}
 
 	/**
-	 * Ask the GUI for the ORIGINAL full content of folded blocks by their codes (ADR 0011).
-	 * Mirrors requestUnfold in structure, but the GUI replies with the blocks' full content
-	 * (a pure READ — fold state is never changed). The tool echoes that content to the agent
-	 * THIS turn. Resolves null if unsent (no GUI) or on timeout.
+	 * (Re)build the authoritative Truth from a full messages array. Subscribes the event forwarder
+	 * so every subsequent Truth mutation streams to clients as a replayable `event`. The Truth
+	 * constructor marks all loaded history as sent (born sent). Sets `wireAttached` + the known
+	 * context window BEFORE subscribing so those internal bumps ride the snapshot, not a stray event.
 	 */
-	function requestRecall(codes: string[]): Promise<{ restored: RecallContent[]; missing: string[] } | null> {
-		return new Promise((resolve) => {
-			const ws = client;
-			if (!ws || ws.readyState !== 1) return resolve(null);
-			const reqId = ++recallSeq;
-			const timer = setTimeout(() => {
-				if (pendingRecall.has(reqId)) { pendingRecall.delete(reqId); resolve(null); }
-			}, RECALL_TIMEOUT_MS);
-			pendingRecall.set(reqId, (res) => { clearTimeout(timer); resolve(res); });
-			send(ws, { type: "recallRequest", reqId, codes } as RecallRequestMessage);
-		});
+	function buildTruth(messages: PiMessage[]): void {
+		if (unsubTruth) {
+			unsubTruth();
+			unsubTruth = null;
+		}
+		const blocks = linearize(messages).map(wireToBlock);
+		const t = new Truth({ meta: metaForTruth(), blocks, lineCount: 0, skipped: 0 });
+		t.wireAttached = true; // a live pi session is always a live wire (durability-aware accounting)
+		if (contextWindow != null) t.setContextWindow(contextWindow);
+		unsubTruth = t.onEvent(forwardTruthEvent);
+		truth = t;
+		lastMessages = messages;
 	}
 
+	/**
+	 * Rebuild on structural DIVERGENCE (compaction / fork / tree-nav / another extension rewriting
+	 * messages). Counts the rebuild in telemetry and forces every connected client to resnapshot.
+	 * The first build (session_start, `truth === null`) is NOT a divergence rebuild.
+	 */
+	function rebuildTruth(messages: PiMessage[]): void {
+		const isDivergence = truth !== null;
+		buildTruth(messages);
+		if (isDivergence) {
+			rebuilds++;
+			broadcast({ type: "snapshot", state: serializeSnapshot(truth!, foldingEnabled) });
+		}
+	}
+
+	/** Two messages share identity iff they emit the same durable block ids (cheap; no token work). */
+	function sameMessageIdentity(a: PiMessage, b: PiMessage, i: number): boolean {
+		if (a.role !== b.role) return false;
+		const ia = messageInfo(a, i).ids;
+		const ib = messageInfo(b, i).ids;
+		if (ia.length !== ib.length) return false;
+		for (let k = 0; k < ia.length; k++) if (ia[k] !== ib[k]) return false;
+		return true;
+	}
+
+	/** Linearize `messages.slice(from)` with globally-correct numbering and append it to the Truth. */
+	function appendSuffix(messages: PiMessage[], from: number): void {
+		if (!truth) return;
+		const lastB = truth.blocks[truth.blocks.length - 1];
+		const orderStart = truth.blocks.length; // orders are contiguous from 0 → next order = count
+		const turnStart = lastB ? lastB.turn : 0;
+		const fresh = linearize(messages.slice(from), orderStart, turnStart).map(wireToBlock);
+		truth.append(fresh); // idempotent by id; emits `appended` → forwarded to clients
+	}
+
+	/**
+	 * Reconcile pi's messages against the Truth by a cheap durable-id walk: if `messages` is our
+	 * last array plus a new suffix, linearize ONLY the suffix and append (O(Δ) text work); if it
+	 * diverges structurally, REBUILD. Mutations broadcast automatically via the Truth subscription.
+	 */
+	function ingestMessages(messages: PiMessage[]): void {
+		if (!truth) {
+			rebuildTruth(messages);
+			return;
+		}
+		const prev = lastMessages;
+		let diverged = messages.length < prev.length;
+		if (!diverged) {
+			for (let i = 0; i < prev.length; i++) {
+				if (!sameMessageIdentity(prev[i], messages[i], i)) {
+					diverged = true;
+					break;
+				}
+			}
+		}
+		if (diverged) {
+			rebuildTruth(messages);
+			return;
+		}
+		if (messages.length > prev.length) appendSuffix(messages, prev.length);
+		lastMessages = messages;
+	}
+
+	/**
+	 * Append ONE just-finished message (message_end) to the Truth immediately — this is what kills
+	 * the one-turn lag. Deduped on the message's durable ids so a re-fire or an already-appended
+	 * message is skipped (and `lastMessages` is extended so the next context prefix still matches).
+	 */
+	function ingestFinishedMessage(msg: PiMessage): void {
+		if (!truth) return;
+		const ids = messageInfo(msg, 0).ids;
+		if (!ids.length) return;
+		if (ids.every((id) => truth!.get(id))) return; // already represented → nothing to do
+		appendSuffix([...lastMessages, msg], lastMessages.length);
+		lastMessages = [...lastMessages, msg];
+	}
+
+	/** Apply a client command to the authoritative Truth; returns the per-op results + resulting rev. */
+	function applyCommand(cmd: WireCommand): { results: OpResult[]; rev: number } {
+		if (!truth) return { results: [], rev: 0 };
+		switch (cmd.kind) {
+			case "ops": {
+				const r = truth.apply(Array.isArray(cmd.ops) ? cmd.ops : [], "you");
+				return { results: r.results, rev: r.rev };
+			}
+			case "setBudget":
+				truth.setBudget(cmd.value);
+				return { results: [], rev: truth.rev };
+			case "setProtect":
+				truth.setProtect(cmd.value);
+				return { results: [], rev: truth.rev };
+			case "setFolding":
+				setFolding(!!cmd.value);
+				return { results: [], rev: truth.rev };
+			default:
+				return { results: [], rev: truth.rev };
+		}
+	}
 	// ── lifecycle ──────────────────────────────────────────────────────────────
 	pi.on("session_start", (_event, ctx: ExtensionContext) => {
-		// Invalidate any `context` await still in flight from the OLD session BEFORE resetting
-		// the cursor below — mirrors the GUI-reconnect path (flushPending() then epoch++).
-		// Without this, a plan for the old session that lands after this switch still passes
-		// the epoch guard (`epoch !== myEpoch`) and applies against the NEW session: it
-		// re-inflates `sentCount` with the old session's block count (delta-cursor corruption)
-		// and overwrites `lastPlan` with the old session's plan.
-		flushPending();
-		epoch++;
+		// Tear down the OLD session's Truth + event forwarder before building the new one; a
+		// session swap invalidates the whole context state (a fresh Truth is authoritative).
+		if (unsubTruth) {
+			unsubTruth();
+			unsubTruth = null;
+		}
+		truth = null;
+		lastMessages = [];
 		latestCtx = ctx;
 		sessionId = `s-${process.pid}-${Date.now()}`;
-		sentCount = 0;
-		lastPlan = null; // fresh session → no known plan yet (cursor also resets here)
-		armed = false; // fresh session → disarmed until the (re)attached client declares otherwise
-		lastPlanRttMs = null;
-		pendingSince = [];
-		// Seed the cache from the session itself. For a fresh session this is []; for a
-		// RESUMED/loaded session (reason "resume"/"startup"/"fork") it is the full prior
-		// conversation, which would otherwise stay invisible until the first `context` hook
-		// (i.e. the user's next message) — the bug. Reading here means an attach that lands
-		// before any turn still has a correct baseline to flush.
-		lastMessages = readSessionMessages(ctx);
 		startedAt = Date.now();
 		try {
 			meta = { title: "pi session", cwd: process?.cwd?.() ?? "", model: "", contextWindow: null, format: "pi" };
 		} catch {
 			/* keep defaults */
 		}
-		refreshFromCtx(ctx); // model may be known already
+		refreshFromCtx(ctx); // model / context window may be known already
+		// Build the authoritative Truth from the session's current history. For a fresh session
+		// this is []; for a RESUMED/loaded session it is the full prior conversation, born SENT
+		// (the Truth constructor marks all loaded blocks sent). A client that attaches before any
+		// turn still gets a correct snapshot.
+		buildTruth(readSessionMessages(ctx));
 		startServer();
 		try {
 			ctx.ui.setStatus("accordion", ctx.ui.theme.fg("accent", "\u{1FA97} accordion"));
@@ -1111,8 +1184,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// Kind mapping: text_start/end → "text", thinking_start/end → "thinking",
 	//               toolcall_start/end → "tool_call". error → abort sweep.
 	pi.on("message_update", (event: any) => {
-		const ws = client;
-		if (!ws || ws.readyState !== 1) return;
+		if (!attached()) return;
 
 		const ev = event?.assistantMessageEvent;
 		if (!ev || typeof ev.type !== "string") return;
@@ -1149,276 +1221,67 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		// firehose) are silently dropped — we never forward token deltas over the wire.
 	});
 
-	// ── the loop: stream context, await a plan, apply it ────────────────────────
-	// Returning `undefined` keeps pi's original messages (documented passthrough);
-	// only an explicit `{ messages }` replaces them. Every passthrough path below
-	// returns undefined, so we never alter a model call without a plan.
-	pi.on("context", async (event, ctx: ExtensionContext) => {
-		// Clear any stash from a previous request FIRST, before the no-GUI early return below.
-		// Otherwise an aborted turn (no assistant message_end to consume it) followed by a GUI
-		// detach leaves the old RTT sitting in the stash, and the next message_end — for an
-		// unrelated message — stamps it on the wrong reply.
-		lastPlanRttMs = null;
-		latestCtx = ctx;
-		const myEpoch = epoch;
-		// Snapshot the armed flag SYNCHRONOUSLY with myEpoch, BEFORE the await below. Mid-toggle
-		// semantics: an in-flight `context` wait keeps the value it started with; the NEXT request
-		// picks up a value the client changed meanwhile. This governs whether requestPlan waits the
-		// hard deadline (armed) or the short timeout (disarmed), and which log fires on a miss.
-		const myArmed = armed;
-		// Refresh model/usage in memory only — NO disk I/O on the model-call critical
-		// path. The 5s heartbeat persists these to the registry for the sidebar.
-		refreshFromCtx(ctx);
-		// Cache the snapshot so `message_end` can build a globally-correct full array.
-		// Note: pi passes a structuredClone here (runner.js emitContext), so this is
-		// always a safe point-in-time snapshot of messages going INTO the model call.
-		// This snapshot is authoritative, so any messages we accumulated since the last
-		// one are now subsumed by it — drop them.
-		lastMessages = event.messages as unknown as PiMessage[];
-		pendingSince = [];
-		const all = linearize(lastMessages);
-		if (!attached()) {
-			recordPlanOutcome("no-gui", null, { ops: 0, groups: 0 }, null);
-			return; // no GUI → pass through untouched
-		}
-
-		const fresh = all.slice(sentCount);
-		const reqId = ++reqSeq;
-		const full = sentCount === 0;
-		// Measure the plan round-trip (Feature C). Stashed for `message_end` regardless of
-		// outcome — the assistant message this request produces waited this long, whatever
-		// the result (applied / stale-fallback / timeout).
+	// ── the loop: LOCAL reconcile + optional serialize + telemetry ──────────────
+	// Phase B: pi's `context` hook is a LOCAL operation against the in-process Truth. No client
+	// round trip, no await, no disk I/O. Returning `undefined` passes pi's messages through
+	// unchanged (the default when folding is disabled); an explicit `{ messages }` replaces them.
+	pi.on("context", (event, ctx: ExtensionContext) => {
 		const t0 = Date.now();
-		const result = await requestPlan(reqId, full, fresh, myArmed);
-		lastPlanRttMs = Date.now() - t0;
-
-		if (epoch !== myEpoch) {
-			// A new client attached mid-wait, superseding the view this request was sent to.
-			// Ack the CURRENT client anyway (it can still count the outcome) — its `reqId`
-			// belongs to the superseded view, not to anything the current client itself sent.
-			recordPlanOutcome("epoch-mismatch", reqId, { ops: 0, groups: 0 }, client);
-			return; // GUI reconnected mid-flight → don't apply/advance
-		}
-		if (result.kind === "unsent") {
-			recordPlanOutcome("unsent", reqId, { ops: 0, groups: 0 }, null);
-			return; // couldn't deliver (no GUI / dropped) → pass through, don't advance
-		}
-
-		if (result.kind === "timeout") {
-			// Issue #58: the plan missed the wait. Blocks WERE delivered, so advance the cursor
-			// as before — but instead of shipping unfolded, re-apply the LAST KNOWN plan (a
-			// one-turn-stale, id-addressed plan is strictly better than none; applyPlan passes
-			// through ops for ids no longer present). Never silent: log cause + reqId + elapsed.
-			sentCount = Math.max(sentCount, all.length);
-			const elapsed = lastPlanRttMs;
-			const hasStale = !!lastPlan && (lastPlan.ops.length > 0 || lastPlan.groups.length > 0);
-			// Three distinct outcomes, not two: a cached EMPTY plan (lastPlan set, 0 ops/groups
-			// — the conductor explicitly asked for no folds) still passes through unfolded,
-			// same as genuinely having no cached plan at all — but the two causes are worth telling
-			// apart in the log rather than both reading as "no cached plan".
-			const detail = hasStale
-				? `applying last known plan (${lastPlan!.ops.length} ops, ${lastPlan!.groups.length} groups)`
-				: lastPlan
-					? "cached plan is empty (no folds) — passing through unfolded"
-					: "no cached plan — passing through unfolded";
-			if (myArmed) {
-				// Armed promised to hold the budget and didn't: shout, don't whisper. `result.waitedMs`
-				// is the deadline this request was supposed to honor (carried out of requestPlan).
-				console.error(`[accordion] armed deadline missed: plan reqId=${reqId} did not arrive within ${result.waitedMs}ms (waited ${elapsed}ms) — ${detail}`);
-			} else {
-				console.warn(`[accordion] plan timeout: reqId=${reqId} after ${elapsed}ms — ${detail}`);
+		latestCtx = ctx;
+		// Refresh model/usage in memory only — NO disk I/O on the model-call critical path.
+		refreshFromCtx(ctx);
+		const messages = event.messages as unknown as PiMessage[];
+		// (a) Reconcile pi's messages against the Truth: append a new suffix, or rebuild on
+		//     structural divergence (both broadcast to clients via the Truth subscription).
+		ingestMessages(messages);
+		// (b) PHASE C: wire-departing hold — a conductor's last-moment fold plugs in here (no-op today).
+		let ret: { messages: AgentMessage[] } | undefined;
+		if (truth) {
+			// (c) If folding is armed, serialize the wire from the Truth and replace; else passthrough.
+			if (foldingEnabled) {
+				ret = { messages: truth.serializeWire(messages) as unknown as AgentMessage[] };
 			}
-			// `recordPlanOutcome` below acks `timeout-stale`/`timeout-raw` to the GUI for its
-			// wire-outcome tally (ADR 0020).
-			if (hasStale) {
-				// Apply FIRST, ack AFTER — with the counts applyPlan actually substituted, not the
-				// stale plan's submitted lengths. A stale plan re-applied against messages that have
-				// moved on can easily have ids that no longer match anything live; the old code acked
-				// `lastPlan!.ops.length` etc. regardless, over-reporting what really rode the wire
-				// (ADR 0020 promises counts ACTUALLY applied).
-				const appliedCounts: AppliedCounts = { ops: 0, groups: 0 };
-				const newMessages = applyPlan(
-					event.messages as unknown as PiMessage[],
-					lastPlan!.ops,
-					lastPlan!.groups,
-					appliedCounts,
-				);
-				recordPlanOutcome("timeout-stale", reqId, appliedCounts, client);
-				return { messages: newMessages as unknown as AgentMessage[] };
-			}
-			recordPlanOutcome("timeout-raw", reqId, { ops: 0, groups: 0 }, client);
-			return;
+			// (d) markSent through the last block — everything present has now reached the model.
+			const last = truth.blocks[truth.blocks.length - 1];
+			if (last) truth.markSent(last.order);
 		}
-
-		// result.kind === "plan": the GUI replied. Cache it (even when empty — that is the
-		// conductor explicitly asking for NO folds, and caching it stops a later timeout from
-		// wrongly resurrecting an older non-empty plan).
-		const plan = result.plan;
-		lastPlan = plan;
-		sentCount = Math.max(sentCount, all.length); // advance cursor; never rewind (a message_end during the await may have advanced it further)
-		if (plan.ops.length === 0 && plan.groups.length === 0) {
-			recordPlanOutcome("empty-plan", reqId, { ops: 0, groups: 0 }, client);
-			return; // empty plan → pass through
-		}
-
-		// Apply FIRST, ack AFTER (same reasoning as the timeout-stale branch above): a shape-valid
-		// op/group whose id matches nothing live in `messages` is silently skipped by applyPlan, so
-		// the SUBMITTED plan length (`plan.ops.length` etc.) can overstate what actually rode the
-		// wire. `appliedCounts` reflects the real substitutions.
-		const appliedCounts: AppliedCounts = { ops: 0, groups: 0 };
-		const newMessages = applyPlan(event.messages as unknown as PiMessage[], plan.ops, plan.groups, appliedCounts);
-		recordPlanOutcome("applied", reqId, appliedCounts, client);
-		return { messages: newMessages as unknown as AgentMessage[] };
+		// (e) Measure the whole hook and stream it as telemetry (proves the local path is fast).
+		recordHook(Date.now() - t0);
+		broadcastTelemetry();
+		return ret;
 	});
 
-	// ── model swap: keep the GUI's context window (and budget) in lockstep ───────
-	// `/model` fires `model_select` immediately, carrying the NEW model. Adopt its
-	// context window and push it to the GUI right away (a view-only sync with no
-	// blocks) so the budget tracks the swap without waiting for the next model call.
-	// No plan is awaited — this never touches a model call.
+	// ── model swap: keep the context window in lockstep ─────────────────────────
+	// `/model` fires `model_select` immediately, carrying the NEW model. Adopt its context window
+	// into the Truth right away (emits a `config` event to every client) so the budget tracks the
+	// swap without waiting for the next model call.
 	pi.on("model_select", (event) => {
 		applyModel(event?.model as { id?: string; contextWindow?: number } | undefined);
-		const ws = client;
-		if (ws && ws.readyState === 1) {
-			send(ws, { type: "sync", reqId: ++reqSeq, full: false, blocks: [], contextWindow });
-		}
+		if (truth && contextWindow != null) truth.setContextWindow(contextWindow);
 	});
 
-	// ── committed streaming: push blocks the instant pi finishes a message ──────
-	// `context` only fires BEFORE a model call (messages going IN); `agent_end` fires
-	// only once at loop end. `message_end` fires the moment each message is finalized
-	// — including assistant replies mid-tool-loop — so the GUI sees new blocks
-	// immediately rather than waiting for the next turn.
-	//
-	// Implementation path: SAFE FALLBACK (not the simple array-cache path).
-	// Evidence: pi's runner.js emitContext() calls structuredClone() before passing
-	// the array to the `context` extension hook, so `lastMessages` cached there is a
-	// snapshot of messages BEFORE the model call — it does NOT include the reply that
-	// `message_end` is delivering. We therefore build a synthetic full array,
-	// `[...lastMessages, ...pendingSince]`, where `pendingSince` accumulates EVERY
-	// message finished since that snapshot (in finish order). Linearizing the whole
-	// thing gives correct global turn/order numbering.
-	//
-	// Why accumulate, not just append the latest: in a tool loop the assistant message
-	// AND its tool result both finish before the next `context` fires. Appending only
-	// the latest to a stale `lastMessages` would drop the earlier message — the later
-	// one would then be mis-numbered or (because the cursor already counted the dropped
-	// one) skipped entirely until the next `context` caught up. Accumulating preserves
-	// both with correct numbering and keeps the cursor aligned.
-	//
-	// Hazard guarded: a message already represented in `lastMessages` (e.g. a user
-	// message that went through the context snapshot) or already in `pendingSince` is
-	// NOT added again — double-counting would over-advance `sentCount` and open a gap
-	// at the next `context` that the GUI's dedup cannot fix.
-	//
-	// View-only: no reqId registered in `pending`; folding may only happen at `context`.
-	// The `agent_end` handler below remains the loop-end backstop — with dedup it is
-	// harmless; it catches anything missed (e.g. if message_end fired with no GUI).
-	//
-	// This handler ALSO carries the Feature C RTT injection. That is deliberately merged
-	// here rather than split into a second `pi.on("message_end", …)`:
-	//   • The vendored pi SDK composes multiple handlers on one event reliably (loader.js
-	//     pushes each into a per-event array; runner.js emitMessageEnd chains their returned
-	//     messages, so a second handler WOULD work in production) — but smoke.mjs's mock
-	//     `pi.on` overwrites per event (last-wins), so a second handler would silently drop
-	//     one of the two in tests.
-	//   • Injection must run even when no GUI is attached, otherwise a value stashed while a
-	//     GUI was briefly attached could leak onto a later assistant message. Keeping it in
-	//     ONE handler, above the no-GUI guard, guarantees the stash is always consumed+cleared.
-	// So the RTT stamp is computed first (and returned at every exit), then the view-only
-	// sync push runs only when a GUI is attached.
+	// ── committed streaming: append finished messages to the Truth immediately ──
+	// `context` only fires BEFORE a model call (messages going IN); `agent_end` fires once at loop
+	// end. `message_end` fires the moment each message is finalized — including assistant replies
+	// mid-tool-loop — so appending here (idempotent by id) is what KILLS the one-turn lag: the
+	// reply's blocks enter the Truth (and stream to every client) the instant they exist, not at
+	// the next model call. View-only: folding still happens only at `context`.
 	pi.on("message_end", (event) => {
-		// ── Feature C: stamp usage.rttMs onto the assistant message this request produced ──
-		// Persisted verbatim: pi applies this replacement in place (agent-session._replace-
-		// MessageInPlace) and SessionManager.appendMessage JSON-serializes the whole message,
-		// so arbitrary `usage` keys survive to the session file. Consume+clear the stash so a
-		// message with no preceding context RTT (null) gets no field.
-		let replacement: AgentMessage | undefined;
-		const finished = event.message as unknown as PiMessage & { role?: string; usage?: Record<string, unknown> };
-		if (finished && finished.role === "assistant" && lastPlanRttMs !== null) {
-			const rttMs = lastPlanRttMs;
-			lastPlanRttMs = null;
-			replacement = { ...(event.message as object), usage: { ...(finished.usage ?? {}), rttMs } } as unknown as AgentMessage;
-		}
-
-		// pi's MessageEndEventResult requires `{ message }` — emitMessageEnd does
-		// `if (!handlerResult?.message) continue;`, so a bare message is silently
-		// dropped and the RTT stamp never reaches the session file. Wrap every exit.
-		const finish = () => (replacement ? { message: replacement } : undefined);
-
-		const ws = client;
-		if (!ws || ws.readyState !== 1) return finish(); // no GUI → nothing to push (still stamp RTT)
-
-		// Guaranteed teardown (invariant #2, ADR 0003): sweep all active ghosts as a
-		// backstop. Any ghost not already resolved by its own *_end frame is cleared
-		// here so no ghost can outlive the message. Sent BEFORE the sync so the GUI
-		// clears ghost placeholders exactly when it receives the real committed blocks.
+		// Sweep all active ghosts (invariant #2, ADR 0003) BEFORE the committed blocks stream, so a
+		// client swaps its ghost placeholders for the real blocks in the same tick.
 		sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
-
 		const msg = event.message as unknown as PiMessage;
-
-		// Add to `pendingSince` only if NONE of the durable ids this message emits are
-		// already represented — in the authoritative snapshot or already accumulated
-		// this turn. We dedup on the message's FULL id set, not a single probe id:
-		//   • a probe of only part 0 misses a message whose leading part is empty
-		//     (linearize drops empty non-result parts, so `:p0` is never emitted), and
-		//   • a reference check (`pendingSince.includes(msg)`) misses a re-fired message
-		//     delivered as a different object with the same durable id.
-		// Either escape would double-count and over-advance `sentCount`. Durable ids are
-		// position-independent, so linearizing each set in isolation is sound (we read
-		// only `.id`, never the locally-numbered turn/order).
-		const msgIds = new Set(linearize([msg]).map((b) => b.id));
-		const baseIds = new Set(linearize(lastMessages).map((b) => b.id));
-		const pendIds = new Set(linearize(pendingSince).map((b) => b.id));
-		const alreadySeen = [...msgIds].some((id) => baseIds.has(id) || pendIds.has(id));
-		if (msgIds.size > 0 && !alreadySeen) pendingSince.push(msg);
-
-		const all = linearize([...lastMessages, ...pendingSince]);
-		if (all.length <= sentCount) return finish(); // nothing new to push (RTT stamp still returned)
-		const reqId = ++reqSeq;
-		const full = sentCount === 0;
-		send(ws, { type: "sync", reqId, full, blocks: all.slice(sentCount) });
-		sentCount = all.length; // advance cursor; agent_end and next context will dedup
-		return finish(); // hand the RTT-stamped assistant message back to pi, wrapped per MessageEndEventResult (undefined = unchanged)
+		if (msg) ingestFinishedMessage(msg);
 	});
 
-	// ── live view: push the assistant's reply the moment the loop ends ──────────
-	// `context` only fires BEFORE a model call, so it sees messages going IN, never
-	// the reply coming OUT — the GUI would otherwise lag one turn (the assistant's
-	// response only appears at the next user message). `agent_end` fires when the
-	// agent loop finishes and carries the FULL message array, so we stream the new
-	// blocks as a VIEW-ONLY sync: we do NOT await or apply a fold plan here (folding
-	// may legally happen only at `context`, the one place we can alter the outgoing
-	// call). It shares the `sentCount` cursor with `context`, so the deltas never
-	// overlap; any plan the GUI replies with carries an unknown reqId and is ignored.
+	// ── loop-end backstop: reconcile the final full array ───────────────────────
+	// `agent_end` carries the FULL message array; reconciling it catches anything message_end
+	// missed (e.g. a message that finished with no client attached) and keeps `lastMessages`
+	// authoritative for the next turn. Idempotent — the delta is usually empty by now.
 	pi.on("agent_end", (event, ctx: ExtensionContext) => {
 		latestCtx = ctx;
-		// Cache for next message_end (backstop path); also keeps lastMessages current
-		// after the loop ends so any late message_end fires against the right context.
-		// This snapshot is authoritative, so drop anything accumulated since the last.
-		//
-		// Done BEFORE the no-GUI guard ON PURPOSE: even when no app is attached, this
-		// keeps the cached history COMPLETE (including this turn's final reply) so that a
-		// later `/accordion` attach can flush the whole conversation immediately. `context`
-		// alone keeps the cache only up to the last model call — one reply short.
-		lastMessages = event.messages as unknown as PiMessage[];
-		pendingSince = [];
-
-		const ws = client;
-		if (!ws || ws.readyState !== 1) return; // no GUI → cache refreshed, nothing to push
-
-		// Guaranteed teardown (invariant #2, ADR 0003): sweep all active ghosts as a
-		// backstop at loop end. Any ghost that survived the message_end sweep (e.g. if
-		// the loop ended without a message_end, or a ghost spawned in the last turn) is
-		// cleared here so no ghost can survive the agent loop.
 		sendStream({ type: "stream", phase: "abort", kind: "text", contentIndex: -1 });
-
-		const all = linearize(lastMessages);
-		if (all.length <= sentCount) return; // nothing new since the last sync
-		const reqId = ++reqSeq;
-		const full = sentCount === 0;
-		send(ws, { type: "sync", reqId, full, blocks: all.slice(sentCount) });
-		sentCount = all.length; // advance so the next `context` doesn't resend these
+		ingestMessages(event.messages as unknown as PiMessage[]);
 	});
 
 	// ── suppress pi's native compaction ONLY while the GUI is driving ───────────
@@ -1440,12 +1303,20 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			heartbeat = null;
 		}
 		deleteEntry(); // stop advertising — the app drops our row immediately
-		flushPending(); // resolve any awaiting context hook as passthrough
-		try {
-			client?.close();
-		} catch {
-			/* ignore */
+		// Tear down the Truth + its event forwarder, and close every client.
+		if (unsubTruth) {
+			unsubTruth();
+			unsubTruth = null;
 		}
+		truth = null;
+		for (const ws of clients.keys()) {
+			try {
+				ws.close();
+			} catch {
+				/* ignore */
+			}
+		}
+		clients.clear();
 		try {
 			wss?.close();
 		} catch {
@@ -1460,7 +1331,6 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 		httpServer = null;
 		wss = null;
-		client = null;
 		latestCtx = null;
 	});
 
@@ -1480,9 +1350,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// "starting…" on an EADDRINUSE-type error — see startServer's httpServer "error"
 			// handler), or "starting" while the async listen() is still pending.
 			const portStatus = port ? String(port) : bindError ? `failed (${bindError})` : "starting";
+			const blockCount = truth ? truth.blocks.length : 0;
 			const lines = [
 				action.text,
-				`Live link: ${wasAttached ? "attached" : "detached"} · port ${portStatus} · streamed ${sentCount} blocks`,
+				`Live link: ${clients.size} client(s) · port ${portStatus} · ${blockCount} blocks · folding ${foldingEnabled ? "on" : "off"}`,
 			];
 			// Browser entry point: the extension also serves the web build of Accordion on
 			// the same ephemeral loopback port, gated by a per-session token. Surface the
@@ -1499,12 +1370,9 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	});
 
 	// ── unfold tool: let the live agent restore its own folded context ─────────
-	// "GUI drives, extension is thin": the extension makes no unfold decisions. It
-	// relays the agent's request to the GUI and reports back what the GUI scheduled.
-	// The actual content restoration happens at the NEXT `context` hook — the unfolded
-	// block simply doesn't appear in the fold plan — so the agent's past context changes
-	// on its next turn. We don't echo the full content back: the past-context change
-	// is the primary mechanism; echoing is a documented fallback if needed.
+	// Phase B: resolved LOCALLY against the in-process Truth (no client needed). The unfolded
+	// block becomes standing-open (sticky, provenance "agent") and its content returns to the
+	// model on the NEXT `context` hook — it simply no longer appears in the fold serialization.
 	pi.registerTool({
 		name: "unfold",
 		label: "Unfold Context",
@@ -1526,13 +1394,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			if (!codes.length) {
 				return { content: [{ type: "text", text: 'No fold codes given. Pass the code(s) from a {#<code> FOLDED} tag, e.g. unfold({codes:["3f9a2c"]}).' }] };
 			}
-			if (!attached()) {
-				return { content: [{ type: "text", text: "Accordion isn't attached, so nothing in your context is folded right now — it is already full." }] };
+			// Nothing rides the wire folded unless folding is armed, so there is nothing to unfold.
+			if (!truth || !foldingEnabled) {
+				return { content: [{ type: "text", text: "Accordion isn't folding your context right now, so nothing is folded to restore — it is already full." }] };
 			}
-			const res = await requestUnfold(codes);
-			if (res === null) {
-				return { content: [{ type: "text", text: "Accordion did not respond. Folded content restores automatically if it detaches; otherwise try again." }], isError: true };
-			}
+			const res = resolveUnfold(truth, codes); // LOCAL: mutates the Truth (broadcasts to clients)
 			const lines: string[] = [];
 			if (res.restored.length) {
 				lines.push(`Unfolded ${res.restored.length} block(s); full content returns on your next turn:`);
@@ -1549,10 +1415,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// ── recall tool: an UNBLOCKABLE READ of folded content (ADR 0011) ───────────
 	// recall is the agent's counterpart to the human's "peek": it returns a folded block's
 	// ORIGINAL full content AS a tool result THIS turn (like read_file) and does NOT change
-	// what is standing in the agent's context — no override is created, the block stays
-	// folded. That makes it safe-by-construction and therefore never lockable: it is the net
-	// that keeps a locked `unfold` from blinding the agent. "GUI drives, extension is thin":
-	// the extension only relays the request and echoes back the content the GUI returns.
+	// what is standing in the agent's context — no override is created, the block stays folded.
+	// Phase B: resolved LOCALLY against the Truth (a pure read, never a mutation). Because it
+	// changes no state it is never lockable — the net that keeps a locked `unfold` from blinding
+	// the agent. A `recall` observation is broadcast so clients/conductors can see the read.
 	pi.registerTool({
 		name: "recall",
 		label: "Recall Folded Content",
@@ -1574,13 +1440,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			if (!codes.length) {
 				return { content: [{ type: "text", text: 'No fold codes given. Pass the code(s) from a {#<code> FOLDED} tag, e.g. recall({codes:["3f9a2c"]}).' }] };
 			}
-			if (!attached()) {
+			if (!truth) {
 				return { content: [{ type: "text", text: "Accordion isn't attached, so nothing in your context is folded right now — it is already full." }] };
 			}
-			const res = await requestRecall(codes);
-			if (res === null) {
-				return { content: [{ type: "text", text: "Accordion did not respond. If it has detached, your context is already full; otherwise try again." }], isError: true };
-			}
+			const res = resolveRecall(truth, codes); // LOCAL, pure read — never mutates fold state
+			// Surface the read so clients/conductors can observe it (no Truth state changed).
+			if (res.restored.length) broadcast({ type: "recall", ids: res.restored.flatMap((r) => r.ids), by: "agent" });
 			// The defining difference from `unfold`: echo the FULL original content back THIS turn,
 			// one text block per recalled item, each prefixed with its label + code so the agent
 			// knows what it is reading. A short note lists any codes that resolved to nothing.

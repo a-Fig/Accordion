@@ -17,6 +17,8 @@ import { hasLock } from "./locks";
 import { Truth } from "$core/truth";
 import type { Op, OpResult } from "$core/ops";
 import type { TruthEvent } from "$core/events";
+import { applyWireEvent } from "$core/replica";
+import type { WireEvent, WireCommand, FoldOp, GroupOp } from "$core/protocol";
 
 interface LogEntry {
 	by: Actor;
@@ -79,9 +81,23 @@ export class AccordionStore {
 	private logN = 0;
 	private mirrorIndex = new Map<string, number>();
 
-	constructor(parsed: ParsedSession) {
-		this.meta = parsed.meta;
-		this.truth = new Truth(parsed);
+	/**
+	 * Phase B command sink. When set (live mode), the store is a REPLICA + remote control: human
+	 * steering actions are forwarded to the wire as `WireCommand`s instead of applied to the local
+	 * Truth. The authoritative extension applies them and the resulting events echo back through
+	 * `replayEvent` — no optimistic apply, so the mirror only ever moves via the event stream.
+	 * Null (local mode: CC / file / demo) ⇒ actions apply directly to the local Truth as before.
+	 */
+	private commandSink: ((cmd: WireCommand) => void) | null = null;
+
+	/**
+	 * @param parsed        the parsed session (local mode). For a live replica, pass `existingTruth`.
+	 * @param existingTruth a pre-built (Phase B: replica-hydrated, rev-aligned) Truth to wrap; the
+	 *                      mirror seeds from IT, and `parsed` is ignored except as a type placeholder.
+	 */
+	constructor(parsed: ParsedSession, existingTruth?: Truth) {
+		this.truth = existingTruth ?? new Truth(parsed);
+		this.meta = this.truth.meta;
 		this.truth.onEvent((e) => this.applyTruthEvent(e));
 		// Seed the mirror from the truth's initial (post-construction) state.
 		this.blocks = this.truth.blocks.map(cloneBlock);
