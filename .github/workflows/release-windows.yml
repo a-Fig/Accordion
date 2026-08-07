@@ -1,0 +1,48 @@
+name: Build Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the Windows build to"
+        required: false
+        default: "0.1"
+      ref:
+        description: "Branch/commit to build"
+        required: false
+        default: "devmain"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend deps
+        working-directory: app
+        run: npm ci
+
+      - name: Build Tauri app
+        working-directory: app
+        run: npm run tauri build
+
+      - name: Upload installers to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release upload "${{ github.event.inputs.tag }}" \
+            app/src-tauri/target/release/bundle/nsis/*.exe \
+            app/src-tauri/target/release/bundle/msi/*.msi \
+            --clobber --repo "${{ github.repository }}"
