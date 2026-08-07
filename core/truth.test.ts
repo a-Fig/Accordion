@@ -179,6 +179,42 @@ describe("Truth — birth-fold", () => {
 	});
 });
 
+// F2 (issue #11 stage 2, ADR 0025): `setCalibration` used to only bump rev + emit, unlike
+// `setBudget`/`setProtect` which both run `housekeep()` since they can move `protectedFromIndex()`.
+// `calibration` is a THIRD boundary-moving dial (`computeProtectedFromIndex` divides the real-token
+// target by `calibrationMul`), so a `k` decrease that grows the raw threshold used to leave a fold
+// standing inside the newly-enlarged protected tail until some unrelated mutation happened to run
+// `housekeep()` next. These assert `setCalibration` now heals in the SAME rev it moves the boundary,
+// mirroring the existing `setProtect` heal test, and that the birth-fold exemption still holds.
+describe("Truth — setCalibration housekeep (F2)", () => {
+	it("a strategy fold outside the tail heals when calibration shrinks and grows the raw threshold", () => {
+		const t = bulk(seq(5, 1000)); // 5 already-sent blocks, 1000 tokens each
+		t.setProtect(1500); // k=1: target=1500, cap=1875 → only index 4 protected
+		expect(t.protectedFromIndex()).toBe(4);
+		t.apply([{ kind: "fold", ids: ["a:b3:p0"] }], "auto"); // outside the tail — ordinary strategy fold
+		expect(t.isFolded(t.get("a:b3:p0")!)).toBe(true);
+		t.setCalibration(0.5); // raw threshold doubles (target/k = 1500/0.5 = 3000) → tail grows to cover index 3
+		expect(t.protectedFromIndex()).toBeLessThanOrEqual(3);
+		expect(t.isFolded(t.get("a:b3:p0")!)).toBe(false); // healed in the SAME setCalibration call
+		expect(t.get("a:b3:p0")!.override).toBe(null);
+	});
+	it("a birth-folded block does NOT heal when calibration shrinks and grows the tail over it", () => {
+		const t = live();
+		t.append(seq(6, 1000)); // live → all unsent
+		t.setProtect(1500); // k=1 → protectedFromIndex covers only the newest block
+		const newest = t.blocks[t.blocks.length - 1];
+		expect(t.isProtected(newest)).toBe(true);
+		expect(t.sent(newest)).toBe(false);
+		const r = t.apply([{ kind: "fold", ids: [newest.id] }], "auto"); // birth-fold (protected + unsent)
+		expect(r.results[0].applied).toBe(true);
+		expect(t.isFolded(t.get(newest.id)!)).toBe(true);
+		t.setCalibration(0.001); // raw threshold explodes → tail grows to cover the whole log
+		expect(t.protectedFromIndex()).toBe(0);
+		expect(t.isFolded(t.get(newest.id)!)).toBe(true); // still folded — birth-fold exemption survives
+		expect(t.birthFoldedIds).toContain(newest.id);
+	});
+});
+
 describe("Truth — groups", () => {
 	it("group op collapses a run; ungroup restores; the created group id is reported", () => {
 		const t = bulk([blk("a:b0:p0", "text", 0), blk("a:b1:p0", "text", 1), blk("a:b2:p0", "text", 2), blk("a:b3:p0", "text", 3), blk("a:b4:p0", "text", 4)]);

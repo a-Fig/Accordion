@@ -268,9 +268,20 @@ describe("commit helpers", () => {
 		const p = mkPlan();
 		expect(reconcilePlan(p, new Set())).toBe(p);
 	});
-	test("planWithRealStratumTokens substitutes the real summary length (~len/4)", () => {
-		const out = planWithRealStratumTokens(mkPlan(), new Map([["stratum:b", "y".repeat(800)]]));
+	test("planWithRealStratumTokens substitutes the real summary length (~len/4) via the given countTokens", () => {
+		const out = planWithRealStratumTokens(mkPlan(), new Map([["stratum:b", "y".repeat(800)]]), (t) => Math.ceil(t.length / 4));
 		expect(out.strata[0].summaryTokens).toBe(200); // 800 chars → 200 tokens, was 100 estimate
+	});
+	// F1 (issue #11, ADR 0025): `summaryTokens` MUST come from the host's CALIBRATED `countTokens`,
+	// not a raw chars/4 estimate — `project()` mixes it with calibrated `ViewBlock.tokens` in the same
+	// expression, so an uncalibrated `summaryTokens` overstates every committed stratum's saving by
+	// (k−1)·digestTokens once `calibration !== 1`. Assert the substituted value is whatever the passed
+	// counter reports, NOT chars/4, by using a counter that scales chars/4 by a k != 1.
+	test("planWithRealStratumTokens uses the CALLER's countTokens, not a hardcoded chars/4 (F1)", () => {
+		const k = 2;
+		const calibratedCountTokens = (t: string) => Math.round((t.length / 4) * k);
+		const out = planWithRealStratumTokens(mkPlan(), new Map([["stratum:b", "y".repeat(800)]]), calibratedCountTokens);
+		expect(out.strata[0].summaryTokens).toBe(400); // 800 chars → 200 raw → 400 calibrated (k=2), NOT 200
 	});
 	test("dropOwnStrataOldestFirst converts the OLDER stratum first (conversation order)", () => {
 		const v: ConductorView = {
