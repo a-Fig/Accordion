@@ -41,11 +41,13 @@ It declares all three steering locks:
 - `tail-size` with `tailTokens = 0` prevents any verbatim old-session tail from leaking into the
   simulated fresh session.
 
-**Nothing applies these locks today.** The conductor-v2 contract has no host yet that turns a
-conductor's declared `locks`/`tailTokens` into a real `Truth.setLocks(...)` call on attach — that
-host (referred to as "Phase C" in this port) doesn't exist. This conductor only *declares* the
-intent; `handoff.test.ts` drives `Truth.setLocks` directly in test setup to simulate what that
-host will eventually do.
+**The Phase-C host now applies these locks.** `LiveConductorHost.select` (`core/conductor/liveHost.ts`)
+eagerly calls `Truth.setLocks(entry.locks, entry.label, entry.tailTokens)` the instant this
+conductor attaches to a live session, and reverses it (the freeze kill switch, then
+`clearLocks`) on detach — this conductor's `locks`/`tailTokens` declaration is no longer
+aspirational. `handoff.test.ts` still drives `Truth.setLocks` directly in its own unit-test
+setup — that exercises the conductor in isolation against `TestHost`, not the live host, but
+it is the same real enforcement path either way.
 
 ## Output-token reservation
 
@@ -100,9 +102,9 @@ the sticky failure status rather than inventing a deterministic substitute.
 
 ## Selecting it
 
-Not wired into any registry yet — this is a standalone port. A future conductor-selection surface
-would instantiate `HandoffConductor` and attach it the same way any other `ViewConductor` subclass
-is attached.
+Wired into `core/conductor/registry.ts`'s shipped catalog — pick "Handoff (fresh start)" from
+the GUI's Conductor menu on a live session. Because it declares all three locks, attaching it
+goes through the consent dialog first.
 
 ## Limitations
 

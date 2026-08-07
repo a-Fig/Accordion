@@ -1,4 +1,9 @@
-# ADR 0015 — Bear-2 hybrid conductor: a recency-graded compression gradient
+# ADR 0024 — Bear-2 hybrid conductor: a recency-graded compression gradient
+
+**Renumbered from ADR 0015** (duplicate number collision with
+[0015-thermocline-conductor.md](0015-thermocline-conductor.md), which keeps 0015 — it is
+referenced by section number in a live code comment, `conductors/thermocline/thermocline.ts`).
+No other content changed.
 
 **Status:** accepted (implemented — PR #70)
 **Date:** 2026-06-20
