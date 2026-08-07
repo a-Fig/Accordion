@@ -48,6 +48,7 @@
 import { AgedSummaryConductor, TRIGGER, sumTokens, truncateForStatus } from "../../in-process/agedSummaryConductor";
 import { COMPACTION_SYSTEM } from "../../in-process/compaction-naive/compaction-naive";
 import { classifyCodeRead } from "../../in-process/doorman/classify";
+import { messageKey } from "../../../core/truth";
 import type { Command, ConductorView } from "../../../core/conductor/view";
 import type { ConductorHost, LockName, ViewBlock } from "../../../core/conductor/contract";
 
@@ -123,7 +124,10 @@ export class TriptychConductor extends AgedSummaryConductor {
 			() => this.rerun(),
 			(err) => {
 				const msg = err instanceof Error ? err.message : String(err);
-				this.host.setStatus(truncateForStatus(`Triptych: skeleton engine failed to load — summaries only (${msg})`));
+				// Join the base class's STICKY failure mechanism — a bare setStatus here would be
+				// wiped by the very next idle pass's surfaceIdleStatus (adversarial-review finding).
+				this.failureStatus = truncateForStatus(`Triptych: skeleton engine failed to load — summaries only (${msg})`);
+				this.host.setStatus(this.failureStatus);
 			},
 		);
 	}
@@ -187,6 +191,15 @@ export class TriptychConductor extends AgedSummaryConductor {
 		}
 		bottomStart = Math.min(bottomStart, view.protectedFromIndex);
 		topEnd = Math.min(topEnd, bottomStart);
+		// Snap topEnd DOWN to a message boundary. The aged region [0, topEnd) feeds the summary
+		// prompt, but Truth's `group` op snaps OUTWARD to whole messages when applied — so a topEnd
+		// that bisects a multi-part assistant message would let the group swallow parts the
+		// summarizer never saw (adversarial-review finding: un-summarized content vanishing into
+		// the lossy group). Shrinking the top band is the conservative direction: the bisected
+		// message stays whole in the middle band until ALL its parts age past the boundary.
+		while (topEnd > 0 && topEnd < view.blocks.length && messageKey(view.blocks[topEnd].id) === messageKey(view.blocks[topEnd - 1].id)) {
+			topEnd--;
+		}
 		return { bottomStart, topEnd };
 	}
 
