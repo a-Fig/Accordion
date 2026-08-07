@@ -367,9 +367,7 @@ function roleFloorRecap(groupId, runLength) {
   return `${foldTag(groupId)} group \xB7 ${runLength} message${runLength === 1 ? "" : "s"} dropped (kept live as a stub for wire validity)`;
 }
 
-// core/truth.ts
-var PROTECT_OVERFLOW_CAP = 1.25;
-var LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
+// core/groupShape.ts
 function messageKey(id) {
   const live = id.match(/^(.*):p(?:\d+|\?)$/);
   if (live) return live[1];
@@ -377,6 +375,56 @@ function messageKey(id) {
   if (parsed && !/^[a-z]:\d+$/.test(id)) return parsed[1];
   return id;
 }
+function collapsibleMessageKeys(members, requireDurable) {
+  const byMsg = /* @__PURE__ */ new Map();
+  for (const b of members) {
+    const k = messageKey(b.id);
+    const arr = byMsg.get(k);
+    if (arr) arr.push(b);
+    else byMsg.set(k, [b]);
+  }
+  const msgOrder = [...byMsg.keys()];
+  const msgCalls = /* @__PURE__ */ new Map();
+  const msgResults = /* @__PURE__ */ new Map();
+  for (const k of msgOrder) {
+    const calls = [];
+    const results = [];
+    for (const b of byMsg.get(k)) {
+      if (!b.callId) continue;
+      if (b.kind === "tool_call") calls.push(b.callId);
+      else if (b.kind === "tool_result") results.push(b.callId);
+    }
+    msgCalls.set(k, calls);
+    msgResults.set(k, results);
+  }
+  const removable = /* @__PURE__ */ new Set();
+  for (const k of msgOrder) {
+    if (requireDurable && byMsg.get(k).some((b) => !isDurableId(b.id))) continue;
+    removable.add(k);
+  }
+  for (let changed = true; changed; ) {
+    changed = false;
+    const calls = /* @__PURE__ */ new Set();
+    const results = /* @__PURE__ */ new Set();
+    for (const k of msgOrder) {
+      if (!removable.has(k)) continue;
+      for (const c of msgCalls.get(k)) calls.add(c);
+      for (const c of msgResults.get(k)) results.add(c);
+    }
+    for (const k of msgOrder) {
+      if (!removable.has(k)) continue;
+      if (msgCalls.get(k).some((c) => !results.has(c)) || msgResults.get(k).some((c) => !calls.has(c))) {
+        removable.delete(k);
+        changed = true;
+      }
+    }
+  }
+  return removable;
+}
+
+// core/truth.ts
+var PROTECT_OVERFLOW_CAP = 1.25;
+var LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
 function wireRoleOfId(id) {
   if (id.startsWith("u:") || /^m\d+:u$/.test(id)) return "user";
   if (id.startsWith("a:") || /^m\d+:p/.test(id)) return "assistant";
@@ -990,59 +1038,20 @@ var Truth = class _Truth {
     flush();
     return { shapes, keys };
   }
+  /**
+   * Classify a group's members for accounting + the wire. The durability/tool-pair fixpoint that
+   * decides which MESSAGES actually collapse is `collapsibleMessageKeys` (core/groupShape.ts) —
+   * exported and pure so a conductor can ask the SAME question before proposing a group, rather
+   * than re-deriving a second copy of the rule that could drift from the one enforced here (the
+   * same reason `computeDegradedDropRuns` lives in `core/wire.ts`).
+   */
   classifyGroup(g) {
     const members = [];
     for (const id of g.memberIds) {
       const b = this.get(id);
       if (b) members.push(b);
     }
-    const byMsg = /* @__PURE__ */ new Map();
-    for (const b of members) {
-      const k = messageKey(b.id);
-      const arr = byMsg.get(k);
-      if (arr) arr.push(b);
-      else byMsg.set(k, [b]);
-    }
-    const msgOrder = [...byMsg.keys()];
-    const msgCalls = /* @__PURE__ */ new Map();
-    const msgResults = /* @__PURE__ */ new Map();
-    for (const k of msgOrder) {
-      const calls = [];
-      const results = [];
-      for (const b of byMsg.get(k)) {
-        if (!b.callId) continue;
-        if (b.kind === "tool_call") calls.push(b.callId);
-        else if (b.kind === "tool_result") results.push(b.callId);
-      }
-      msgCalls.set(k, calls);
-      msgResults.set(k, results);
-    }
-    const live = this.wireAttached;
-    const removable = /* @__PURE__ */ new Set();
-    for (const k of msgOrder) {
-      const msgBlocks = byMsg.get(k);
-      if (live && msgBlocks.some((b) => !isDurableId(b.id))) continue;
-      removable.add(k);
-    }
-    let changed = true;
-    do {
-      changed = false;
-      const calls = /* @__PURE__ */ new Set();
-      const results = /* @__PURE__ */ new Set();
-      for (const k of msgOrder) {
-        if (!removable.has(k)) continue;
-        for (const c of msgCalls.get(k)) calls.add(c);
-        for (const c of msgResults.get(k)) results.add(c);
-      }
-      for (const k of msgOrder) {
-        if (!removable.has(k)) continue;
-        const unbalanced = msgCalls.get(k).some((c) => !results.has(c)) || msgResults.get(k).some((c) => !calls.has(c));
-        if (unbalanced) {
-          removable.delete(k);
-          changed = true;
-        }
-      }
-    } while (changed);
+    const removable = collapsibleMessageKeys(members, this.wireAttached);
     const collapsed = /* @__PURE__ */ new Set();
     const stragglers = /* @__PURE__ */ new Set();
     const collapsedMembers = [];
@@ -1744,6 +1753,7 @@ function viewBlockOf(truth, b) {
     turn: b.turn,
     order: b.order,
     tokens: truth.calTokens(b.tokens),
+    rawTokens: b.tokens,
     foldedTokens: truth.calTokens(truth.foldedTokensOf(b)),
     toolName: b.toolName,
     callId: b.callId,

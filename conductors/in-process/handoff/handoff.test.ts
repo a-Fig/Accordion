@@ -309,6 +309,39 @@ describe("HandoffConductor — recursive round (PORT FIDELITY §3/§4 regression
 	});
 });
 
+describe("HandoffConductor — a held block fragments the coverage into K=2 runs (issue #90)", () => {
+	// A held block splits a survivor run in the shared base's `emitCoverageGroup` walk. Same fix,
+	// same base class as compaction-naive (where the full fragmentation matrix lives) — this just
+	// proves the handoff subclass inherits it: exactly one run carries the handoff text, every
+	// later run is a wire DROP. Deliberately does NOT apply the conductor's declared locks (unlike
+	// this suite's `setup()` helper): acquiring `human-steering` releases every pre-existing human
+	// override (`Truth.releaseLockedDomains`, core/truth.ts), pin included, so a locked fixture
+	// cannot fragment this way at all — the lock-free setup matches the compaction-naive suite's
+	// own fragmentation tests and exercises the identical base-class walk. (Fragmentation stays
+	// reachable under locks too, e.g. via a FOREIGN conductor's group — same split, same walk.)
+	it("only the first run carries the handoff text; the later run gets the empty (DROP) digest", async () => {
+		const parsed: ParsedSession = { meta: META, blocks: session(5, 200), lineCount: 0, skipped: 0 };
+		const host = new TestHost(parsed);
+		host.truth.setBudget(1000);
+		host.truth.setProtect(0); // handoff's tail-size lock isn't applied — zero the tail directly
+		host.humanPin("a:b2:p0"); // the split point
+		const conductor = new HandoffConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: "Fresh agent: continue from here." });
+
+		host.commitTurn();
+		await flush();
+
+		expect(host.truth.groups.length).toBe(2);
+		const g1 = host.truth.groups.find((g) => g.memberIds[0] === "a:b0:p0")!;
+		const g2 = host.truth.groups.find((g) => g.memberIds[0] === "a:b3:p0")!;
+		expect(g1.memberIds).toEqual(["a:b0:p0", "a:b1:p0"]);
+		expect(g2.memberIds).toEqual(["a:b3:p0", "a:b4:p0"]);
+		expect(host.truth.groupSummary(g1)).toContain("Fresh agent: continue from here.");
+		expect(host.truth.groupSummary(g2)).toBe(""); // DROP — no duplicated handoff text on the wire
+	});
+});
+
 describe("handoff.ts utilities", () => {
 	it("neutralizeSentinels breaks closing sentinels case-insensitively without touching opening tags", () => {
 		expect(neutralizeSentinels("safe text")).toBe("safe text");

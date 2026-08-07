@@ -44,11 +44,11 @@
  *
  *   1. Everything the `AgedSummaryConductor` base now owns (`../agedSummaryConductor.ts`'s own
  *      banner documents these in full): no `host.can()` pre-flight (a rejected `complete()` IS the
- *      "unavailable" signal); `this.rerun()` in place of the old `host.requestRerun()`; the raw
- *      trigger baseline reconstructed from `sumTokens(view.blocks)` rather than `view.liveTokens`
- *      (which — now that a `group` op is a PERSISTENT Truth overlay, not something the host clears
- *      every pass — already reflects this conductor's own prior folding, so subtracting the same
- *      saving again would double-count it and starve the trigger); `foreignGroupedIds()` in place
+ *      "unavailable" signal); `this.rerun()` in place of the old `host.requestRerun()`; the trigger
+ *      reading `view.liveTokens` DIRECTLY as the visible window (a `group` op is a PERSISTENT Truth
+ *      overlay, not something the host clears every pass, so `liveTokens` already reflects this
+ *      conductor's own prior folding — it is the answer, and subtracting a separately-derived
+ *      "saving" from it double-counts, see `conduct()`); `foreignGroupedIds()` in place
  *      of the blanket `ViewBlock.grouped` (which, for the identical persistent-overlay reason,
  *      would also be true of this conductor's OWN prior group by the second pass); and the sticky
  *      reject/empty-output/window-too-tight status (the old reject handler only cleared `inflight`,

@@ -138,6 +138,17 @@ export class TestHost implements ConductorHost {
 	setProtect(n: number): void {
 		this.truth.setProtect(n);
 	}
+	/**
+	 * Declare a live pi wire attached, exactly as `extension/accordion.ts` does for every real
+	 * session. Turns on Truth's durability-aware gating (a positional `m<i>:…` id can no longer be
+	 * folded or collapsed, since `computeGroupOps` would drop the op and the model would still
+	 * receive full content). OFF by default so the existing fixtures — all durable ids, where the
+	 * flag changes nothing — stay unchanged; a test that wants to cross-validate a conductor's own
+	 * durability verdict against Truth's turns it on.
+	 */
+	setWireAttached(v: boolean): void {
+		this.truth.wireAttached = v;
+	}
 	setBudget(n: number): void {
 		this.truth.setBudget(n);
 	}

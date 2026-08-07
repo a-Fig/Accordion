@@ -30,8 +30,8 @@
  *   - When skeletonized code ages into the summary, the summarizer is fed the SKELETON
  *     (`promptTextOf` override) — the conversation as the agent experienced it, and the owner
  *     chose lossy for that band anyway.
- *   - The summary trigger's visible-window math credits skeleton savings (`extraSavedTokens`
- *     override) — otherwise the 90% mark would re-fire while the real wire still has room.
+ *   - The summary trigger reads Truth's authoritative `view.liveTokens`, so it reasons over the
+ *     actual post-skeleton wire instead of reconstructing savings from raw text.
  *
  * RUNS OUT OF PROCESS (repo-only v1, thermocline's pattern): the extension spawns
  * `conductors/ws/triptych/runner.mjs`, which imports the committed `triptych-sdk.mjs` bundle and
@@ -209,17 +209,6 @@ export class TriptychConductor extends AgedSummaryConductor {
 	protected agedBoundaryIndex(view: ConductorView): number {
 		if (!this.active) return 0;
 		return this.bands(view).topEnd;
-	}
-
-	/** Credit skeleton savings to the trigger's visible window (implementer decision #2). */
-	protected extraSavedTokens(view: ConductorView): number {
-		let saved = 0;
-		for (const b of view.blocks) {
-			if (!b.folded || b.grouped || b.held) continue;
-			if (this.skelCache.get(b.id) == null) continue; // not one of our skeleton folds
-			saved += Math.max(0, b.tokens - b.foldedTokens);
-		}
-		return saved;
 	}
 
 	/** Feed the summarizer the skeleton for skeletonized blocks (implementer decision #1). */
