@@ -10,9 +10,13 @@
  * `holdRelease`/`cancelComplete` messages and a `holdId` on `wireDeparting`.
  */
 import { describe, it, expect } from "vitest";
-import { isServerMessage, isClientMessage, sanitizeCommand, PROTOCOL_VERSION } from "./protocol";
+import { isServerMessage, isClientMessage, sanitizeCommand, sanitizeSurfaceId, sanitizeSurfaceLabel, PROTOCOL_VERSION } from "./protocol";
 import type {
 	HelloMessage,
+	ControllerMessage,
+	ClaimControllerMessage,
+	ControllerInfo,
+	CommandResultMessage,
 	ActiveConductorMeta,
 	ConductorStateMessage,
 	ConductorStatusMessage,
@@ -30,8 +34,8 @@ import type {
 } from "./protocol";
 
 describe("PROTOCOL_VERSION", () => {
-	it("is bumped to 15 for the SnapshotState.carriedSent addition (sent-frontier carry across a rebuild)", () => {
-		expect(PROTOCOL_VERSION).toBe(15);
+	it("is bumped to 16 for single-controller + the stable door (ADR 0024)", () => {
+		expect(PROTOCOL_VERSION).toBe(16);
 	});
 });
 
@@ -189,5 +193,68 @@ describe("sanitizeCommand — numeric-dial + ops ingress gate (fix #5)", () => {
 	it("returns null on a non-object or an unknown kind", () => {
 		expect(sanitizeCommand(null)).toBeNull();
 		expect(sanitizeCommand({ kind: "not-a-command" })).toBeNull();
+	});
+});
+
+// ── v16: single-controller + the stable door (ADR 0024) ──────────────────────
+describe("v16 — controller/claimController message guards", () => {
+	it("accepts a hello carrying the controller lease (present and null alike)", () => {
+		const info: ControllerInfo = { surfaceId: "s-abc", label: "Desktop app", fresh: true };
+		const withLease: HelloMessage = {
+			type: "hello", protocolVersion: PROTOCOL_VERSION, role: "gui",
+			meta: { title: "t", cwd: "/tmp", model: "m", contextWindow: null, format: "pi" }, controller: info,
+		};
+		const noLease: HelloMessage = {
+			type: "hello", protocolVersion: PROTOCOL_VERSION, role: "gui",
+			meta: { title: "t", cwd: "/tmp", model: "m", contextWindow: null, format: "pi" }, controller: null,
+		};
+		expect(isServerMessage(withLease)).toBe(true);
+		expect(isServerMessage(noLease)).toBe(true);
+	});
+
+	it("accepts a controller broadcast (server→client)", () => {
+		const msg: ControllerMessage = { type: "controller", surfaceId: "s-abc", label: "Browser tab" };
+		expect(isServerMessage(msg)).toBe(true);
+	});
+
+	it("accepts a claimController request (client→server)", () => {
+		const msg: ClaimControllerMessage = { type: "claimController" };
+		expect(isClientMessage(msg)).toBe(true);
+	});
+
+	it("a commandResult may carry the read-only refusal (type-level)", () => {
+		const refused: CommandResultMessage = { type: "commandResult", seq: 3, results: [], rev: 9, refused: "read-only" };
+		expect(isServerMessage(refused)).toBe(true);
+		expect(refused.refused).toBe("read-only");
+	});
+});
+
+// Surface-identity dial params are the SAME "authorized ≠ well-formed" ingress class as
+// sanitizeCommand: a malformed/hostile value must never reach the controller.json lease or a broadcast.
+describe("v16 — sanitizeSurfaceId / sanitizeSurfaceLabel ingress gates", () => {
+	it("accepts a UUID-shaped surface id and other bounded [A-Za-z0-9._-] tokens", () => {
+		expect(sanitizeSurfaceId("3f9a2c00-1111-2222-3333-444455556666")).toBe("3f9a2c00-1111-2222-3333-444455556666");
+		expect(sanitizeSurfaceId("surface_A.1-2")).toBe("surface_A.1-2");
+		expect(sanitizeSurfaceId("  trimmed  ")).toBe("trimmed");
+	});
+	it("refuses a non-string, empty, over-length, or charset-violating surface id", () => {
+		expect(sanitizeSurfaceId(42)).toBeNull();
+		expect(sanitizeSurfaceId("")).toBeNull();
+		expect(sanitizeSurfaceId("   ")).toBeNull();
+		expect(sanitizeSurfaceId("bad id with spaces")).toBeNull();
+		expect(sanitizeSurfaceId("inject/../path")).toBeNull();
+		expect(sanitizeSurfaceId("x".repeat(65))).toBeNull();
+	});
+	it("keeps a printable label (spaces allowed), strips control chars, caps length", () => {
+		expect(sanitizeSurfaceLabel("Desktop app")).toBe("Desktop app");
+		expect(sanitizeSurfaceLabel("Browser tab")).toBe("Browser tab");
+		expect(sanitizeSurfaceLabel("bad	chars")).toBe("badchars");
+		expect(sanitizeSurfaceLabel("  spaced  ")).toBe("spaced");
+		expect(sanitizeSurfaceLabel("x".repeat(80))!.length).toBe(48);
+	});
+	it("refuses a non-string or an all-control/empty label", () => {
+		expect(sanitizeSurfaceLabel(7)).toBeNull();
+		expect(sanitizeSurfaceLabel("")).toBeNull();
+		expect(sanitizeSurfaceLabel("")).toBeNull();
 	});
 });
