@@ -345,7 +345,16 @@ describe("NaiveCompactionConductor — stale-completion guard", () => {
 });
 
 describe("NaiveCompactionConductor — a held block splits the aged region", () => {
-	it("emits two groups (one per side), both carrying the same summary; the held block stays untouched", async () => {
+	// Issue #90: a held/pinned block fragments the aged prefix into K > 1 survivor runs. Before the
+	// fix, EVERY run carried the full summary as its digest — K copies of the same text on the wire
+	// while the trigger's accounting (`savedTokens`) charged it exactly ONCE, so a fragmented aged
+	// region could make "compaction" grow the wire instead of shrinking it. The fix: only the FIRST
+	// emitted run carries `text`; every later run carries digest `""` (the group vocabulary's
+	// explicit DROP — costs zero wire tokens), which is what the charge-once accounting already
+	// assumed. See the "fragmentation" describe block below for the full non-growth/accounting
+	// invariants; this test keeps the original split-shape assertions (still a real regression
+	// surface) and updates only the summary-duplication assertion the bug fix necessarily changes.
+	it("emits two groups (one per side); only the first carries the summary, the second is dropped; the held block stays untouched", async () => {
 		const { host } = setupHost();
 		// Queue the completion BEFORE pinning: with Fix 4 (ViewConductor reacts to ANY state-changed
 		// event, not just turn-committed — see core/conductor/view.ts), the pin itself immediately
@@ -364,11 +373,134 @@ describe("NaiveCompactionConductor — a held block splits the aged region", () 
 		expect(g2).toBeDefined();
 		expect(g1.memberIds).toEqual([idOf(0), idOf(1), idOf(2), idOf(3)]);
 		expect(g2.memberIds).toEqual([idOf(5), idOf(6), idOf(7), idOf(8)]);
-		expect(host.truth.groupSummary(g1)).toBe(host.truth.groupSummary(g2));
+		// The held block excludes itself from `aged` entirely (agedRegion filters `!b.held`), so the
+		// count preamble reflects the 8 blocks actually fed/covered, not all 9 aged-or-held blocks.
+		expect(host.truth.groupSummary(g1)).toBe(`[Compacted summary of 8 earlier messages]\n\n${SUMMARY_A}`);
+		expect(host.truth.groupSummary(g2)).toBe(""); // DROP — no duplicated summary text on the wire
 
 		const held = host.truth.get(idOf(4))!;
 		expect(held.override).toBe("pinned"); // untouched
 		expect(host.truth.groups.some((g) => g.memberIds.includes(idOf(4)))).toBe(false);
+	});
+});
+
+describe("NaiveCompactionConductor — fragmentation does not grow the wire (issue #90)", () => {
+	it("K=2 runs: exactly one group carries the summary, and folding never increases live wire tokens vs the raw baseline", async () => {
+		const { host } = setupHost();
+		const rawTotal = host.truth.fullTokens(); // 12 blocks * 100 = 1200 — unaffected by folding
+
+		host.queueCompletion({ text: SUMMARY_A });
+		host.humanPin(idOf(4)); // splits the aged region (0-8) into runs [0-3] and [5-8]
+		host.commitTurn();
+		await flush();
+
+		expect(host.truth.groups.length).toBe(2);
+		const digests = host.truth.groups.map((g) => host.truth.groupSummary(g)).sort();
+		// Exactly one non-empty (full-summary) digest and one empty (dropped) digest across the run.
+		expect(digests.filter((d) => d !== "").length).toBe(1);
+		expect(digests.filter((d) => d === "").length).toBe(1);
+
+		// Non-growth invariant: applying the coverage groups never increases live wire tokens versus
+		// the pre-fold raw baseline. Pre-fix, K=2 duplicated the summary into BOTH runs (2 * 20 = 40
+		// wire tokens for the folded portion vs 800 raw tokens for those same 8 blocks) — this would
+		// still have passed non-growth trivially at this scale, which is exactly why a dedicated
+		// accounting-equals-wire test (below) is needed to catch the real bug (the TRIGGER math, not
+		// the wire size alone).
+		expect(host.truth.liveTokens()).toBeLessThanOrEqual(rawTotal);
+	});
+
+	// `Truth`'s role-validity floor (`computeDegradedDropRuns`, core/wire.ts) reconstructs each
+	// block's WIRE ROLE from its id's DURABLE PREFIX (`wireRoleOfId`: `u:` → user, `a:` → assistant,
+	// `r:` → toolResult), NOT from `Block.kind` — so `buildPass1Blocks()`'s shared `idOf` (every id
+	// prefixed `a:`) makes EVERY block "assistant" for this floor's purposes regardless of `kind`.
+	// Dropping a whole run between two other `a:`-prefixed survivors therefore welds two "assistant"
+	// messages together — a real, pre-existing mechanism wholly unrelated to issue #90, but one that
+	// would leak a non-zero recap cost into a same-role-neighbors fixture and contaminate this
+	// specific comparison. This test uses a genuine `u:`-prefixed id for the held block (4) so it is
+	// unambiguously "user"-role on both sides of the drop, isolating exactly the invariant issue #90
+	// is about (a dropped run costing what the conductor's accounting already assumes: zero).
+	it("accounting matches the wire: the trigger's computed visible-window size equals the true post-fold wire size (within BLOCK_OVERHEAD's fixed per-run framing, already unaccounted by the K=1 formula today)", async () => {
+		const host = new TestHost();
+		host.setBudget(BUDGET);
+		host.setProtect(PROTECT);
+		const heldId = "u:4"; // durable "user"-role id (wireRoleOfId) — breaks the same-role adjacency
+		host.appendBlocks(
+			Array.from({ length: 12 }, (_, idx) => mkBlock(idx === 4 ? heldId : idOf(idx), idx, "text", TOK, idx <= 8 ? `AGED-${idx}` : `TAIL-${idx}`)),
+		);
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		host.humanPin(heldId); // splits aged 0-8 into runs [0-3] and [5-8]
+		host.commitTurn();
+		await flush();
+
+		expect(host.truth.groups.length).toBe(2);
+
+		// Reconstruct the conductor's own `visible` computation from the SAME public facts its
+		// `conduct()` reads (rawTotal = sumTokens(view.blocks); savedTokens = coveredSurvivorTokens −
+		// textTokenCost()) — see `conduct()` in ../agedSummaryConductor.ts. Survivors are the 8 aged,
+		// non-held, covered blocks (0,1,2,3,5,6,7,8); the held block (4) and the protected tail
+		// (9,10,11) are never survivors.
+		const rawTotal = host.truth.fullTokens(); // 1200
+		const summaryText = `[Compacted summary of 8 earlier messages]\n\n${SUMMARY_A}`;
+		const textTokenCost = Math.ceil(summaryText.length / 4);
+		const survivorTokens = 8 * 100;
+		const savedTokens = survivorTokens - textTokenCost;
+		const conductorVisible = rawTotal - savedTokens;
+
+		// The true wire size adds back exactly one `BLOCK_OVERHEAD` (core/tokens.ts) — the fixed
+		// per-carrier framing cost `Truth.runWireTok` charges a REPLACE run that this conductor's own
+		// `textTokenCost()` has never modeled, in the K=1 case either (out of scope for issue #90 —
+		// K=1 must stay byte-identical). With exactly one surviving full-text carrier (the fix's
+		// entire point) and the dropped run genuinely free (no role-floor degradation — see the
+		// banner comment above), that is the ONLY discrepancy between the two numbers.
+		const BLOCK_OVERHEAD = 4;
+		expect(host.truth.liveTokens()).toBe(conductorVisible + BLOCK_OVERHEAD);
+	});
+
+	it("K=3 runs (two held blocks): only the FIRST (earliest) run carries the summary — every later run is dropped, not just the second", async () => {
+		const { host } = setupHost();
+		host.queueCompletion({ text: SUMMARY_A });
+		host.humanPin(idOf(2));
+		host.humanPin(idOf(6)); // aged 0-8 now splits into three runs: [0-1], [3-5], [7-8]
+		host.commitTurn();
+		await flush();
+
+		expect(host.truth.groups.length).toBe(3);
+		const byStart = (id: string) => host.truth.groups.find((g) => g.memberIds[0] === id)!;
+		const g1 = byStart(idOf(0));
+		const g2 = byStart(idOf(3));
+		const g3 = byStart(idOf(7));
+		expect(g1.memberIds).toEqual([idOf(0), idOf(1)]);
+		expect(g2.memberIds).toEqual([idOf(3), idOf(4), idOf(5)]);
+		expect(g3.memberIds).toEqual([idOf(7), idOf(8)]);
+
+		expect(host.truth.groupSummary(g1)).not.toBe(""); // earliest run: carries the full summary
+		expect(host.truth.groupSummary(g2)).toBe(""); // dropped
+		expect(host.truth.groupSummary(g3)).toBe(""); // dropped — not just the immediately-following run
+	});
+});
+
+describe("NaiveCompactionConductor — K=1 regression: zero fragmentation stays byte-identical (issue #90)", () => {
+	// The common case (no held/pinned blocks, no foreign groups splitting the aged run) must be
+	// completely unaffected by the fix: same single group, same verbatim digest, same accounting.
+	it("a single contiguous aged run still gets the full summary as its digest, unchanged", async () => {
+		const { host } = await runPass1();
+
+		expect(host.truth.groups.length).toBe(1);
+		const g = host.truth.groups[0];
+		expect(g.memberIds[0]).toBe(idOf(0));
+		expect(g.memberIds[g.memberIds.length - 1]).toBe(idOf(8));
+		const summary = host.truth.groupSummary(g);
+		expect(summary).toBe(`[Compacted summary of 9 earlier messages]\n\n${SUMMARY_A}`);
+		expect(summary).not.toBe(""); // K=1: never dropped
+
+		// Accounting: unchanged from before this fix — savedTokens = sumTokens(survivors) − textTokenCost.
+		const textTokenCost = Math.ceil(summary.length / 4); // 16
+		const savedTokens = 9 * 100 - textTokenCost; // 900 - 16 = 884
+		const rawTotal = host.truth.fullTokens(); // 1200 (12 blocks * 100)
+		const conductorVisible = rawTotal - savedTokens;
+		expect(conductorVisible).toBe(1200 - 884);
 	});
 });
 
