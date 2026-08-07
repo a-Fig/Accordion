@@ -84,7 +84,11 @@ export type ClampReason =
 	/** A targeted block/group changed since the op's `baseRev` (optimistic-concurrency stale). */
 	| "stale"
 	/** The op was a no-op (e.g. restoring an already-live block). */
-	| "noop";
+	| "noop"
+	/** The command's source surface is not the current controller — READ-ONLY enforcement refused it
+	 *  before it reached Truth (ADR 0024, single-controller). NEVER produced by `Truth.apply` itself;
+	 *  synthesized only at the extension's command ingress for a non-controller surface's ops. */
+	| "read-only";
 
 /** One op's outcome. `applied` is true iff it changed state; `clamped` explains a refusal. */
 export interface OpResult {

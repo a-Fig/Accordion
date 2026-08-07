@@ -62,11 +62,15 @@ import { applyGuardingHostOnly, sanitizeOps, type OpResult } from "../core/ops";
 import type { TruthEvent } from "../core/events";
 import {
 	PROTOCOL_VERSION,
+	DOOR_PORT,
 	sanitizeCommand,
+	sanitizeSurfaceId,
+	sanitizeSurfaceLabel,
 	type Role,
 	type ServerMessage,
 	type StreamMessage,
 	type WireCommand,
+	type ControllerInfo,
 } from "../core/protocol";
 import { LiveConductorHost, type SpawnedRunner } from "../core/conductor/liveHost";
 import { catalogMeta } from "../core/conductor/registry";
@@ -76,10 +80,15 @@ import {
 	REGISTRY_DIR,
 	SESSIONS_SUBDIR,
 	FOCUS_FILE,
+	CONTROLLER_FILE,
+	DOOR_SECRET_FILE,
 	HEARTBEAT_INTERVAL_MS,
 	isLiveEntry,
+	isFreshLease,
+	isControllerLease,
 	type SessionEntry,
 	type FocusRequest,
+	type ControllerLease,
 } from "../app/src/lib/live/registry";
 
 // Phase B: pi's `context` hook is a LOCAL operation against the in-process Truth — there is no
@@ -100,6 +109,49 @@ const MAX_PENDING_SIBLING_ORIGIN_PROBES = 8;
 // safety timeout.
 const MAX_CONCURRENT_COMPLETIONS = 4;
 const COMPLETION_TIMEOUT_MS = 110_000;
+// ── the door (ADR 0024) ──────────────────────────────────────────────────────
+// Slow, best-effort cadence at which a standing-by extension re-attempts to bind the door port
+// after it found it held by ANOTHER live Accordion door — so when that holder dies, this extension
+// claims the door within a few seconds. NEVER on the context hook (a bare unref'd timer).
+const DOOR_RETRY_MS = 4_000;
+// Bounded probe of the door port's /__accordion/meta (reuses the sibling-origin probe bound), used
+// both to classify an EADDRINUSE occupant (live Accordion vs. foreign software) and to decide the
+// /accordion URL. Never blocks a model call.
+const DOOR_PROBE_MS = 750;
+// Door-secret recovery (ADR 0024 §8/§9). When the secret file is absent or INVALID (empty/partial —
+// a crashed or mid-write creator), re-attempt the atomic ensure on a bare unref'd timer instead of
+// giving up with an empty (unusable) secret. Bounded so a permanently-broken file can't spin forever.
+const DOOR_SECRET_RETRY_MS = 400;
+const DOOR_SECRET_MAX_TRIES = 10;
+// An INVALID secret file older than this is treated as an abandoned crash artifact and unlinked so
+// the atomic create can re-run — no legitimate writer holds the file invalid for anywhere near this
+// long (a tmp+link create is sub-millisecond). Bounded convergence: two extensions both recovering
+// race the link/EEXIST primitive rather than fighting.
+const DOOR_SECRET_STALE_MS = 10_000;
+/**
+ * Three-way classification of whatever holds the door port (C2/S3):
+ *   • "accordion"  — a completed 200 from a loopback peer that is a MATCHING-version live Accordion
+ *                    (served:true AND protocolVersion===PROTOCOL_VERSION AND its sessionId is in the
+ *                    registry). Trust it: stand down this cycle, and /accordion may print the door URL.
+ *   • "foreign"    — a COMPLETED HTTP response that fails the served/shape check (definitive evidence
+ *                    of non-Accordion software). Permanent stand-down for this run.
+ *   • "transient"  — probe timeout, connection error/refused, or an Accordion of a DIFFERENT protocol
+ *                    version (served:true but protocolVersion mismatched), or a matching Accordion whose
+ *                    sessionId we could not confirm in the registry (likely a startup race). Ambiguous:
+ *                    keep retrying, NEVER permanent, and NEVER trust it with the secret door URL.
+ */
+type DoorProbe = "accordion" | "foreign" | "transient";
+// ── the controller lease (ADR 0024) ──────────────────────────────────────────
+// The lease-holder's extension refreshes controller.json's heartbeat this often while a matching
+// socket is connected; other extensions observe changes by polling + content-comparing the file
+// this often (no mtime gating — see pollControllerFile).
+// Both are bare unref'd timers, best-effort, NEVER on the context hook.
+const CONTROLLER_HEARTBEAT_MS = 2_000;
+const CONTROLLER_POLL_MS = 1_000;
+// Fixed cookie name for the shared door secret. Unlike the per-session webToken cookie (port-
+// qualified so two sessions on the same host don't clobber each other), the door secret is shared
+// across every extension, so a single stable name survives a door takeover (the value stays valid).
+const DOOR_COOKIE = "accordion_door";
 
 /** Test seam mirroring dc037bc: production resolves pi-ai lazily through pi's package alias. */
 type CompletionFunction = (
@@ -136,6 +188,59 @@ const HOME = process.env.ACCORDION_HOME || os.homedir();
 const REGISTRY_ROOT = path.join(HOME, REGISTRY_DIR);
 const SESSIONS_DIR = path.join(REGISTRY_ROOT, SESSIONS_SUBDIR);
 const FOCUS_PATH = path.join(REGISTRY_ROOT, FOCUS_FILE);
+const CONTROLLER_PATH = path.join(REGISTRY_ROOT, CONTROLLER_FILE);
+const DOOR_SECRET_PATH = path.join(REGISTRY_ROOT, DOOR_SECRET_FILE);
+
+/**
+ * The door's loopback port. Fixed at DOOR_PORT (ADR 0024), but overridable via ACCORDION_DOOR_PORT
+ * for TEST ISOLATION (mirrors ACCORDION_HOME) — a smoke run points it at a free port so it never
+ * collides with a real running door, and `0`/invalid DISABLES the door entirely (bind nothing).
+ * Read dynamically (not cached) so a test can flip it between extension instances. Production never
+ * sets the env, so it is always DOOR_PORT.
+ */
+function currentDoorPort(): number | null {
+	const raw = process.env.ACCORDION_DOOR_PORT;
+	if (raw === undefined) return DOOR_PORT;
+	const n = Number(raw);
+	if (!Number.isInteger(n) || n <= 0 || n > 65535) return null; // 0 / invalid ⇒ door disabled
+	return n;
+}
+
+/** The door retry cadence, overridable via ACCORDION_DOOR_RETRY_MS for fast tests (default DOOR_RETRY_MS). */
+function currentDoorRetryMs(): number {
+	const raw = process.env.ACCORDION_DOOR_RETRY_MS;
+	if (raw === undefined) return DOOR_RETRY_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : DOOR_RETRY_MS;
+}
+
+/** Door-secret recovery retry cadence, overridable via ACCORDION_DOOR_SECRET_RETRY_MS for fast tests
+ *  (default DOOR_SECRET_RETRY_MS). Test-only seam; production always uses DOOR_SECRET_RETRY_MS. */
+function currentDoorSecretRetryMs(): number {
+	const raw = process.env.ACCORDION_DOOR_SECRET_RETRY_MS;
+	if (raw === undefined) return DOOR_SECRET_RETRY_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : DOOR_SECRET_RETRY_MS;
+}
+
+/** Controller heartbeat cadence, overridable via ACCORDION_CONTROLLER_HEARTBEAT_MS for fast tests
+ *  (default CONTROLLER_HEARTBEAT_MS). Test-only seam mirroring ACCORDION_DOOR_RETRY_MS; production
+ *  never sets the env, so it is always CONTROLLER_HEARTBEAT_MS. */
+function currentControllerHeartbeatMs(): number {
+	const raw = process.env.ACCORDION_CONTROLLER_HEARTBEAT_MS;
+	if (raw === undefined) return CONTROLLER_HEARTBEAT_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : CONTROLLER_HEARTBEAT_MS;
+}
+
+/** Controller poll cadence, overridable via ACCORDION_CONTROLLER_POLL_MS for fast tests
+ *  (default CONTROLLER_POLL_MS). Test-only seam; production always uses CONTROLLER_POLL_MS. */
+function currentControllerPollMs(): number {
+	const raw = process.env.ACCORDION_CONTROLLER_POLL_MS;
+	if (raw === undefined) return CONTROLLER_POLL_MS;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : CONTROLLER_POLL_MS;
+}
 
 const ACCORDION_APP_FLAG = "accordion-app";
 const ACCORDION_APP_ENV = "ACCORDION_APP_PATH";
@@ -298,7 +403,9 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// Connected clients (Phase B: broadcast Truth events to ALL). Each carries its declared role;
 	// `conductor` is carried through auth + tagged for Phase C. A client is a REPLICA + remote
 	// control — it never mutates optimistically, only via the echoed event stream.
-	const clients = new Map<WebSocket, { role: Role }>();
+	// v16 (ADR 0024): a gui socket also carries the connecting surface's sanitized identity —
+	// surfaceId/label decide who may steer (the READ-ONLY controller gate) and who claimed the lease.
+	const clients = new Map<WebSocket, { role: Role; surfaceId: string | null; label: string | null }>();
 	let sessionId = "";
 	let meta = { title: "pi session", cwd: "", model: "", contextWindow: null as number | null, format: "pi" as const };
 	let pendingSiblingOriginProbes = 0;
@@ -310,6 +417,31 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	let latestModelObj: any = null;
 	// Process-wide in-flight completion count, bounded by MAX_CONCURRENT_COMPLETIONS.
 	let activeCompletions = 0;
+
+	// -- the door (ADR 0024) --
+	// The shared browser bearer secret (32 hex bytes), read/created at startServer from
+	// ~/.accordion/door-secret. EVERY extension accepts it wherever the per-session webToken is
+	// accepted, which makes the door URL session-independent. Empty until loaded.
+	let doorSecret = "";
+	// The additional fixed-port listeners this extension binds IFF it currently holds the door.
+	let doorServer: http.Server | null = null;
+	let doorWss: WebSocketServer | null = null;
+	let doorHeld = false;      // we successfully bound and hold the door port
+	let doorBinding = false;   // a bind attempt is in flight (guards concurrent tryBindDoor)
+	let doorForeign = false;   // the door port is held by NON-Accordion software -> stood down permanently
+	let doorRetryTimer: ReturnType<typeof setTimeout> | null = null; // slow re-attempt while an Accordion door holds it
+	let doorSecretRetryTimer: ReturnType<typeof setTimeout> | null = null; // re-attempt the secret ensure (absent/invalid file)
+	let doorSecretTries = 0;   // bounded retry counter for the secret ensure (DOOR_SECRET_MAX_TRIES)
+	let doorSecretGaveUp = false; // exhaustion warned once (parity with the foreign-occupant warn)
+
+	// -- the controller lease (ADR 0024) --
+	// In-memory view of the GLOBAL controller.json lease, kept current by our own claim writes and a
+	// ~1s poll. null => no lease exists. Enforcement reads this; the poll, the heartbeat, and a claim
+	// all re-read the file fresh (content-level, not mtime-gated — see reloadControllerLease / C4).
+	let controllerLease: ControllerLease | null = null;
+	let lastBroadcastHolder: string | null = null; // last surfaceId we broadcast (dedupe `controller` frames)
+	let controllerPollTimer: ReturnType<typeof setInterval> | null = null;
+	let controllerHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 	// ── the authoritative Truth (Phase B) ──────────────────────────────────────
 	// The single source of context state for this live session. Built at session_start, rebuilt on
@@ -830,12 +962,40 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		return `accordion_token_p${port}`;
 	}
 
-	/** Is this request authenticated for static-file serving? (token query OR cookie.) */
+	/**
+	 * True iff `token` is one this extension accepts as a bearer: the per-session `webToken` OR the
+	 * shared door secret (v16, ADR 0024). EVERY extension accepts the door secret wherever the
+	 * webToken is accepted — that is what makes the door URL session-independent and lets a
+	 * door-served page dial any sibling session's ephemeral port.
+	 *
+	 * Security posture (honest version — an earlier comment wrongly said "both live on disk"): the
+	 * per-session `webToken` is MEMORY-ONLY — minted with `crypto.randomBytes` per session, never
+	 * written to disk (a `SessionEntry`/`buildEntry` carries no token). Only the door secret is a file
+	 * (`~/.accordion/door-secret`). What stops a hostile WEB PAGE is unchanged and is the boundary that
+	 * matters: it can read neither files nor this process's memory, so neither secret is reachable to
+	 * it. A same-user LOCAL process is explicitly OUTSIDE the threat model — it can already read pi's
+	 * own session data on disk directly, so reading `door-secret` grants it nothing new. What the door
+	 * secret DOES newly introduce, versus the ephemeral in-memory webToken, and which is owned rather
+	 * than hand-waved: it is persisted (survives reboots), never rotated for the life of the file,
+	 * shared machine-wide, and rides a bookmarkable URL (history/bookmark-sync exposure — the address
+	 * bar is scrubbed client-side after capture, S1b, but a link the user copies/shares still carries a
+	 * live, non-expiring, machine-wide credential). Secret rotation is a NAMED FOLLOW-UP, not shipped.
+	 */
+	function isBearer(token: string | null | undefined): boolean {
+		if (typeof token !== "string" || !token) return false;
+		if (webToken && token === webToken) return true;
+		if (doorSecret && token === doorSecret) return true;
+		return false;
+	}
+
+	/** Is this request authenticated for static-file serving? (bearer token query OR a matching cookie.) */
 	function isWebAuthed(req: http.IncomingMessage, u: URL): boolean {
-		if (!webToken) return false;
-		if (u.searchParams.get("token") === webToken) return true;
+		if (isBearer(u.searchParams.get("token"))) return true;
 		const cookie = req.headers["cookie"];
-		if (typeof cookie === "string" && cookie.split(";").some((c) => c.trim() === `${accordionCookieName()}=${webToken}`)) return true;
+		if (typeof cookie !== "string") return false;
+		const parts = cookie.split(";").map((c) => c.trim());
+		if (webToken && parts.includes(`${accordionCookieName()}=${webToken}`)) return true;
+		if (doorSecret && parts.includes(`${DOOR_COOKIE}=${doorSecret}`)) return true;
 		return false;
 	}
 
@@ -900,10 +1060,15 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				return;
 			}
 			// A valid ?token mints a cookie so subsequent same-origin requests (the SvelteKit
-			// asset fetches, which don't carry the query string) stay authenticated.
+			// asset fetches, which don't carry the query string) stay authenticated. The webToken and
+			// the shared door secret each mint their OWN cookie: the webToken's is port-qualified (per
+			// session), the door secret's is the fixed DOOR_COOKIE (shared, survives a door takeover).
 			const headers: Record<string, string> = {};
-			if (u.searchParams.get("token") === webToken) {
+			const qtoken = u.searchParams.get("token");
+			if (webToken && qtoken === webToken) {
 				headers["Set-Cookie"] = `${accordionCookieName()}=${webToken}; HttpOnly; SameSite=Strict; Path=/`;
+			} else if (doorSecret && qtoken === doorSecret) {
+				headers["Set-Cookie"] = `${DOOR_COOKIE}=${doorSecret}; HttpOnly; SameSite=Strict; Path=/`;
 			}
 
 			const root = resolveClientRoot();
@@ -972,6 +1137,14 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		const cookie = req.headers.cookie;
 		return !!webToken && typeof cookie === "string"
 			&& cookie.split(";").some((part) => part.trim() === `${accordionCookieName()}=${webToken}`);
+	}
+
+	/** v16: does this request carry the shared door-secret cookie? (The door-served page's ambient
+	 *  auth for its no-query asset fetches; still gated by an exact-served-Origin check at upgrade.) */
+	function hasDoorCookie(req: http.IncomingMessage): boolean {
+		const cookie = req.headers.cookie;
+		return !!doorSecret && typeof cookie === "string"
+			&& cookie.split(";").some((part) => part.trim() === `${DOOR_COOKIE}=${doorSecret}`);
 	}
 
 	/**
@@ -1112,8 +1285,10 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		const origin = req.headers.origin;
 		if (typeof origin !== "string" || origin === "") { cb(true); return; } // native client
 		if (isTrustedTauriOrigin(origin)) { cb(true); return; }
-		if (!!webToken && token === webToken) { cb(true); return; } // explicit bearer
-		if (hasAccordionCookie(req) && isExactServedOrigin(req, origin)) { cb(true); return; }
+		if (isBearer(token)) { cb(true); return; } // explicit bearer (webToken OR the shared door secret)
+		// A page served by us (webToken cookie) OR by the door (door-secret cookie) — both still gated
+		// by an exact-served-Origin check so an ambient host-scoped cookie can't authorize cross-port.
+		if ((hasAccordionCookie(req) || hasDoorCookie(req)) && isExactServedOrigin(req, origin)) { cb(true); return; }
 
 		// A browser page served by another live Accordion session is the one intentional
 		// cross-origin path. verifyClient supports an asynchronous callback.
@@ -1123,12 +1298,640 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		);
 	}
 
+	// -- door secret: the shared browser bearer (ADR 0024 §8) --
+	// One value, written EXACTLY once, stable for as long as any extension has it cached. Creation is
+	// atomic-WITH-CONTENT: write the full secret to a same-dir tmp file (0600), then
+	// fs.linkSync(tmp, DOOR_SECRET_PATH) -- the destination appears with COMPLETE bytes or not at all,
+	// and EEXIST means a racer won (adopt theirs). This replaces the earlier "wx" open-then-write,
+	// whose open->write gap let a racer read empty/partial bytes and cache "" with NO retry, and whose
+	// crash window (creator dies between open and write) left a permanently invalid file on disk.
+	// (Still deliberately NOT write-rename like controller.json: a rename would clobber an in-use
+	// secret out from under every extension that already cached + handed it out. link/EEXIST keeps
+	// first-writer-wins; the tmp step just guarantees the winner's bytes are complete.)
+	// Reader side: an absent/invalid read schedules a BOUNDED re-attempt on an unref'd timer (never a
+	// one-shot give-up), and an invalid file whose mtime is older than DOOR_SECRET_STALE_MS is a
+	// crashed creator's artifact -- unlinked and re-created (two extensions both recovering converge
+	// via the link/EEXIST primitive rather than fighting). The retry budget (~22s of linear backoff)
+	// deliberately exceeds the staleness threshold (10s), so a young invalid file always ages into
+	// reapability within the budget. The door itself is GATED on a valid secret: tryBindDoor refuses
+	// to bind while doorSecret is "", and the retry timer re-kicks it the moment the secret resolves,
+	// so the door is never up (nor its URL printable) while the bearer it would serve is empty.
+	// Retries exhausted => doorSecret stays "" (no door; the per-session webToken path is unaffected,
+	// and every bearer/cookie comparison pre-checks doorSecret so "" can never match).
+	const DOOR_SECRET_RE = /^[0-9a-f]{64}$/i;
+
+	/** The on-disk secret iff present AND well-formed (64 hex chars), else null. */
+	function readValidDoorSecret(): string | null {
+		try {
+			const existing = fs.readFileSync(DOOR_SECRET_PATH, "utf8").trim();
+			return DOOR_SECRET_RE.test(existing) ? existing : null;
+		} catch {
+			return null; // absent / unreadable
+		}
+	}
+
+	/** Attempt the atomic create (tmp + linkSync). Sets doorSecret iff WE created the file. On a
+	 *  filesystem without hard links (EPERM/ENOSYS/EXDEV/ENOTSUP -- non-NTFS edge) falls back to the
+	 *  old exclusive "wx" create-then-write; its open->write window is exactly what the reader-side
+	 *  retry exists to cover. EEXIST (either path) = a racer won -- the caller re-reads. The tmp file
+	 *  is always unlinked, success or failure. */
+	function tryCreateDoorSecret(): void {
+		const secret = crypto.randomBytes(32).toString("hex");
+		const tmp = `${DOOR_SECRET_PATH}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+		try {
+			fs.mkdirSync(REGISTRY_ROOT, { recursive: true });
+			fs.writeFileSync(tmp, secret, { mode: 0o600 });
+			try {
+				fs.linkSync(tmp, DOOR_SECRET_PATH); // appears with COMPLETE bytes or not at all
+				doorSecret = secret;
+			} catch (e) {
+				const code = (e as NodeJS.ErrnoException)?.code;
+				if (code === "EPERM" || code === "ENOSYS" || code === "EXDEV" || code === "ENOTSUP") {
+					const fd = fs.openSync(DOOR_SECRET_PATH, "wx", 0o600); // fallback; EEXIST if a racer won
+					try { fs.writeSync(fd, secret); } finally { fs.closeSync(fd); }
+					doorSecret = secret;
+				}
+				// EEXIST or anything else: a racer won / creation failed -- caller re-reads + retries.
+			}
+		} catch {
+			/* best-effort: mkdir / tmp write / wx fallback failed -- the bounded retry re-attempts */
+		} finally {
+			try { fs.unlinkSync(tmp); } catch { /* never created / already gone */ }
+		}
+	}
+
+	/** Crash recovery: an INVALID secret file whose mtime is older than DOOR_SECRET_STALE_MS has no
+	 *  live writer (a tmp+link create is sub-millisecond; even the wx fallback's window is micro-
+	 *  seconds) -- unlink it so the atomic create can re-run. Never touches a VALID file, and leaves
+	 *  a YOUNG invalid file alone (possibly a legacy-path writer mid-write; it either completes or
+	 *  ages into reapability within the retry budget). */
+	function reapStaleInvalidDoorSecret(): void {
+		try {
+			const st = fs.statSync(DOOR_SECRET_PATH);
+			if (Date.now() - st.mtimeMs <= DOOR_SECRET_STALE_MS) return;
+			if (readValidDoorSecret() !== null) return; // valid -- never reap a good secret
+			// Decision made: stale + invalid. Re-stat + re-validate IMMEDIATELY before the unlink to
+			// shrink the TOCTOU against a racer that reaped + re-created a VALID file inside our gap --
+			// a fresh mtime or now-valid content means a racer just acted, so stand down. The residual
+			// window is now just validate->unlink (microseconds) and remains accepted (ADR 0024 par. 8).
+			const again = fs.statSync(DOOR_SECRET_PATH);
+			if (Date.now() - again.mtimeMs <= DOOR_SECRET_STALE_MS) return;
+			if (readValidDoorSecret() !== null) return;
+			fs.unlinkSync(DOOR_SECRET_PATH);
+		} catch {
+			/* absent or unreadable -- nothing to reap */
+		}
+	}
+
+	/**
+	 * Ensure the shared door secret exists on disk, is valid, and is cached in `doorSecret` -- with
+	 * bounded retry instead of the old one-shot. Synchronous happy path (valid file, or we win the
+	 * create). Otherwise: reap a stale-invalid file, attempt the atomic create, re-read (a racer may
+	 * have won), and if STILL unresolved schedule a bounded, linearly backed-off, unref'd re-attempt
+	 * that re-kicks the (secret-gated) door bind when the secret finally resolves. Idempotent; a
+	 * session swap re-arms it via startServer. Never on the context hook path.
+	 */
+	function ensureDoorSecret(): void {
+		if (doorSecret) return;
+		const existing = readValidDoorSecret();
+		if (existing !== null) { doorSecret = existing; doorSecretTries = 0; return; }
+		reapStaleInvalidDoorSecret();
+		tryCreateDoorSecret();
+		if (!doorSecret) {
+			const again = readValidDoorSecret(); // a racer may have completed while we tried
+			if (again !== null) doorSecret = again;
+		}
+		if (doorSecret) { doorSecretTries = 0; return; }
+		if (doorSecretRetryTimer) return;
+		if (doorSecretTries >= DOOR_SECRET_MAX_TRIES) {
+			// P3: exhaustion must not be silent (parity with the foreign-occupant warn). One line, once:
+			// e.g. a persistently-invalid file we may not unlink, or EACCES on every create attempt.
+			if (!doorSecretGaveUp) {
+				doorSecretGaveUp = true;
+				console.warn(`[accordion] door secret could not be created or read after ${DOOR_SECRET_MAX_TRIES} attempts (${DOOR_SECRET_PATH}); the stable door URL is unavailable this run`);
+			}
+			return;
+		}
+		doorSecretTries++;
+		doorSecretRetryTimer = setTimeout(() => {
+			doorSecretRetryTimer = null;
+			ensureDoorSecret();
+			if (doorSecret) tryBindDoor(); // the secret just resolved -- the gated door bind may proceed
+		}, currentDoorSecretRetryMs() * doorSecretTries); // linear backoff: n * base
+		doorSecretRetryTimer.unref?.();
+	}
+
+	// -- the door: an ADDITIONAL fixed-port listener, one extension at a time (ADR 0024) --
+	/**
+	 * Probe the door port's /__accordion/meta and CLASSIFY the occupant (C2/S3, DoorProbe above). This
+	 * is deliberately STRICTER than the old served:true-only trust: a completed response that only sets
+	 * served:true is not enough to print the secret door URL at it — it must also match this protocol
+	 * version and name a session in the registry. And, critically, a timeout / connection error / a
+	 * mismatched-version Accordion is "transient", NOT foreign: a busy or momentarily-unavailable peer
+	 * must never trigger a PERMANENT door stand-down. Bounded (DOOR_PROBE_MS); never on the hook path.
+	 */
+	function probeDoor(): Promise<DoorProbe> {
+		const dp = currentDoorPort();
+		if (dp === null) return Promise.resolve("transient");
+		return new Promise((resolve) => {
+			let settled = false;
+			let request: http.ClientRequest | null = null;
+			const finish = (result: DoorProbe): void => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(deadline);
+				resolve(result);
+			};
+			// A timeout means we never got a completed response — AMBIGUOUS (a busy/slow peer), not foreign.
+			const deadline = setTimeout(() => { request?.destroy(); finish("transient"); }, DOOR_PROBE_MS);
+			request = http.get({ hostname: "127.0.0.1", port: dp, path: "/__accordion/meta" }, (response) => {
+				if (!isLoopbackPeer(response.socket.remoteAddress)) { response.destroy(); finish("transient"); return; }
+				// A COMPLETED non-200 HTTP response is a live server that isn't our (ungated, always-200)
+				// /meta contract — definitive foreign software.
+				if (response.statusCode !== 200) { response.destroy(); finish("foreign"); return; }
+				const chunks: Buffer[] = [];
+				let bodyBytes = 0;
+				response.on("data", (chunk: Buffer) => {
+					bodyBytes += chunk.length;
+					if (bodyBytes > SIBLING_ORIGIN_META_MAX_BYTES) { response.destroy(); finish("foreign"); return; }
+					chunks.push(chunk);
+				});
+				response.on("end", () => {
+					if (settled) return;
+					let meta: { served?: unknown; sessionId?: unknown; protocolVersion?: unknown };
+					try {
+						meta = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+					} catch { finish("foreign"); return; } // completed response, unparseable body → foreign
+					// Fails the served/shape check → foreign (a completed response from non-Accordion software).
+					if (meta.served !== true || typeof meta.sessionId !== "string") { finish("foreign"); return; }
+					// An Accordion of a DIFFERENT protocol version — do NOT trust it with the secret URL, but
+					// do NOT permanently stand down either (it's still Accordion). Keep retrying.
+					if (meta.protocolVersion !== PROTOCOL_VERSION) { finish("transient"); return; }
+					// Best-effort registry confirmation: a matching sessionId in the live registry proves this
+					// really is our peer. If we can't confirm it (registry read fails, or the session isn't
+					// listed yet — a startup race), treat it as ambiguous rather than trusting the secret URL.
+					const sid = meta.sessionId;
+					void listLiveSessions().then(
+						(sessions) => finish(sessions.some((s) => s.sessionId === sid) ? "accordion" : "transient"),
+						() => finish("transient"),
+					);
+				});
+				response.on("aborted", () => finish("transient"));
+				response.on("error", () => finish("transient"));
+			});
+			// A connection error (ECONNREFUSED, ECONNRESET from a peer that exited mid-probe, …) is
+			// AMBIGUOUS — never a permanent foreign stand-down.
+			request.on("error", () => finish("transient"));
+		});
+	}
+
+	/** Schedule a slow re-attempt to bind the door (only while a LIVE Accordion door holds it). */
+	function scheduleDoorRetry(): void {
+		if (doorHeld || doorForeign || doorRetryTimer) return;
+		doorRetryTimer = setTimeout(() => { doorRetryTimer = null; tryBindDoor(); }, currentDoorRetryMs());
+		doorRetryTimer.unref?.();
+	}
+
+	/**
+	 * Try to become the door holder: bind the fixed door port as an ADDITIONAL listener serving the
+	 * SAME handlers (static UI, /__accordion/*, WS upgrade) as this session's ephemeral server. On
+	 * EADDRINUSE, probe + classify the occupant (probeDoor): a matching live Accordion door -> stand by
+	 * and re-check on a slow timer; definitive foreign software -> log once and stand down PERMANENTLY;
+	 * anything ambiguous (timeout / connection error / other-version Accordion) -> keep retrying, never
+	 * permanent. Idempotent (no-op once held / stood down / a bind is already in flight). NEVER on the
+	 * context hook.
+	 */
+	function tryBindDoor(): void {
+		if (doorHeld || doorForeign || doorBinding) return;
+		const dp = currentDoorPort();
+		if (dp === null) return; // door disabled (test isolation)
+		// GATED on a valid shared secret (ADR 0024 §8): never bind/advertise the door while doorSecret
+		// is "" -- a door with no bearer to serve is a door nobody can be authorized through, and the
+		// /accordion print path must never see doorHeld=true with an empty secret. ensureDoorSecret's
+		// bounded retry re-invokes this the moment the secret resolves.
+		if (!doorSecret) { ensureDoorSecret(); if (!doorSecret) return; }
+		doorBinding = true;
+		let server: http.Server;
+		let dwss: WebSocketServer;
+		try {
+			server = http.createServer(handleHttp);
+			dwss = new WebSocketServer({ server, verifyClient: verifyWsUpgrade, maxPayload: MAX_WS_PAYLOAD_BYTES });
+		} catch {
+			doorBinding = false;
+			scheduleDoorRetry();
+			return;
+		}
+		dwss.on("connection", onWsConnection);
+		dwss.on("error", () => { /* best-effort: a door WS error runs headless, like the ephemeral one */ });
+		server.once("error", (err: NodeJS.ErrnoException) => {
+			doorBinding = false;
+			try { dwss.close(); } catch { /* ignore */ }
+			try { server.close(); } catch { /* ignore */ }
+			if (err?.code === "EADDRINUSE") {
+				void probeDoor().then((result) => {
+					if (result === "accordion") {
+						scheduleDoorRetry(); // a matching live Accordion door holds it -> stand by, re-check
+					} else if (result === "foreign") {
+						if (!doorForeign) {
+							doorForeign = true; // definitive non-Accordion software -> permanent stand-down (log once)
+							console.warn(`[accordion] door port ${dp} is held by non-Accordion software; the stable door URL is unavailable this run`);
+						}
+					} else {
+						// transient/ambiguous (timeout / connection error / other-version Accordion / unconfirmed
+						// session) -> NEVER a permanent stand-down; keep retrying so a busy or momentarily-gone
+						// Accordion peer, or one still mid-startup, doesn't disable the door for this whole run.
+						scheduleDoorRetry();
+					}
+				});
+			} else {
+				scheduleDoorRetry(); // transient -> try again later
+			}
+		});
+		// C3: verified on Windows 11 (2026-07-23) that two SEPARATE node processes racing this exact
+		// listen(PORT, "127.0.0.1") do NOT both bind — the loser cleanly gets EADDRINUSE (no SO_REUSEADDR
+		// hijack). So the EADDRINUSE probe path above is the sole arbitration; no lockfile is needed.
+		server.listen(dp, "127.0.0.1", () => {
+			doorBinding = false;
+			doorServer = server;
+			doorWss = dwss;
+			doorHeld = true;
+			// A post-listen server error (rare) drops the door -> reset + let the retry timer reclaim it.
+			server.on("error", () => {
+				try { dwss.close(); } catch { /* ignore */ }
+				try { server.close(); } catch { /* ignore */ }
+				doorServer = null; doorWss = null; doorHeld = false;
+				scheduleDoorRetry();
+			});
+		});
+	}
+
+	/** Close the door listener if we hold it (releases the port for a standing-by extension). Also
+	 *  stops any pending secret-ensure retry and resets its budget (a session swap re-arms both via
+	 *  startServer). The cached doorSecret itself is kept -- it is stable for the process lifetime. */
+	function closeDoor(): void {
+		if (doorRetryTimer) { clearTimeout(doorRetryTimer); doorRetryTimer = null; }
+		if (doorSecretRetryTimer) { clearTimeout(doorSecretRetryTimer); doorSecretRetryTimer = null; }
+		doorSecretTries = 0;
+		doorSecretGaveUp = false;
+		try { doorWss?.close(); } catch { /* ignore */ }
+		try { doorServer?.close(); } catch { /* ignore */ }
+		doorServer = null; doorWss = null; doorHeld = false; doorBinding = false;
+	}
+
+	// -- the controller lease: the GLOBAL single-controller blackboard (ADR 0024) --
+	/** Read + parse controller.json (best-effort). Returns the lease or null (absent/corrupt/old-proto).
+	 *  S2: controller.json is a shared, ANY-extension-writable (or hand-editable) blackboard, so the
+	 *  fields read off it are re-validated through the SAME ingress sanitizers a live `?surface`/`?label`
+	 *  dial goes through — a corrupt/hostile file must not ride a malformed id or an unbounded label into
+	 *  the lease cache or a `controller` broadcast. A field that fails sanitization ⇒ treat as no lease. */
+	function readControllerLease(): ControllerLease | null {
+		try {
+			const raw = JSON.parse(fs.readFileSync(CONTROLLER_PATH, "utf8"));
+			if (!isControllerLease(raw)) return null;
+			const surfaceId = sanitizeSurfaceId(raw.surfaceId);
+			const label = sanitizeSurfaceLabel(raw.label);
+			if (!surfaceId || !label) return null; // reject: same charset/length gate as the dial ingress
+			return { ...raw, surfaceId, label };
+		} catch {
+			return null;
+		}
+	}
+
+	/** Structural equality on the fields that decide "did the lease change" — content-level so a
+	 *  same-mtime foreign rewrite is caught (C4). Compares holder + timestamps, not the file's mtime. */
+	function leaseEq(a: ControllerLease | null, b: ControllerLease | null): boolean {
+		if (a === b) return true;               // both null (or the same object)
+		if (!a || !b) return false;
+		return a.surfaceId === b.surfaceId
+			&& a.label === b.label
+			&& a.claimedAt === b.claimedAt
+			&& a.heartbeatAt === b.heartbeatAt;
+	}
+
+	/** Read controller.json FRESH into the in-memory cache (content-level, NOT mtime-gated — C4/C1) and
+	 *  report whether the lease changed since our cached copy. Never broadcasts (each caller decides). */
+	function reloadControllerLease(): { lease: ControllerLease | null; changed: boolean } {
+		const next = readControllerLease();
+		const changed = !leaseEq(controllerLease, next);
+		controllerLease = next;
+		return { lease: next, changed };
+	}
+
+	/** Atomic write-rename of controller.json (same pattern as a registry entry). Updates the in-memory
+	 *  cache so a following poll does not re-read our own write as an external change (the content compare
+	 *  in reloadControllerLease sees it as unchanged). */
+	function writeControllerLease(lease: ControllerLease): void {
+		try {
+			fs.mkdirSync(REGISTRY_ROOT, { recursive: true });
+			const tmp = `${CONTROLLER_PATH}.${process.pid}.tmp`;
+			fs.writeFileSync(tmp, JSON.stringify(lease));
+			fs.renameSync(tmp, CONTROLLER_PATH);
+			controllerLease = lease;
+		} catch {
+			/* best-effort: a lease write never breaks a session */
+		}
+	}
+
+	/** The controller field for a `hello`: the current lease + whether its heartbeat is fresh. */
+	function controllerInfo(): ControllerInfo | null {
+		const l = controllerLease;
+		if (!l) return null;
+		return { surfaceId: l.surfaceId, label: l.label, fresh: isFreshLease(l, Date.now()) };
+	}
+
+	/** Broadcast a `controller` frame IFF the lease-holder changed since our last broadcast (dedupe). */
+	function maybeBroadcastController(): void {
+		const holder = controllerLease ? controllerLease.surfaceId : null;
+		if (holder === lastBroadcastHolder) return;
+		lastBroadcastHolder = holder;
+		// No wire "cleared" frame exists (a stale lease surfaces via hello.fresh:false); only a real
+		// holder is broadcast.
+		if (controllerLease) broadcast({ type: "controller", surfaceId: controllerLease.surfaceId, label: controllerLease.label });
+	}
+
+	/** Read controller.json fresh into the cache + broadcast any change (used at connect time). */
+	function refreshControllerNow(): void {
+		reloadControllerLease();
+		maybeBroadcastController();
+	}
+
+	/** ~1s poll: adopt an EXTERNAL controller.json change (another extension's claim) + broadcast it.
+	 *  C4: a CONTENT compare (not the old mtime early-return) so a same-mtime foreign rewrite is never
+	 *  missed. The file read is tiny, so reading it every tick is cheap. */
+	function pollControllerFile(): void {
+		const { changed } = reloadControllerLease();
+		// maybeBroadcastController dedupes on holder, so a pure heartbeat bump (holder unchanged) is a
+		// no-op; an absent file resolves to null and is never broadcast as a "cleared" frame.
+		if (changed) maybeBroadcastController();
+	}
+
+	/** ~2s heartbeat: refresh the lease's heartbeatAt IFF a connected socket IS the current holder.
+	 *  C1: re-read the lease FRESH FROM DISK first (not the possibly-stale in-memory cache). At a
+	 *  coincident tick the heartbeat can fire before the poll, so writing from the cache would let this
+	 *  extension re-assert an OLD holder and clobber another extension's just-written fresh claim. By
+	 *  reading fresh and only ever writing back the SAME surfaceId that is on disk, we can never write a
+	 *  surfaceId that differs from the current file, and we adopt+broadcast a foreign change as the poll
+	 *  would. */
+	function heartbeatController(): void {
+		const { lease, changed } = reloadControllerLease();
+		if (changed) maybeBroadcastController(); // a foreign claim we observed this tick — adopt + broadcast it
+		if (!lease) return;
+		// Only refresh the heartbeat if the FRESH on-disk holder is a surface connected to THIS
+		// extension; we write back that exact holder (never a different surfaceId than the file's).
+		let holderConnected = false;
+		for (const info of clients.values()) if (info.surfaceId && info.surfaceId === lease.surfaceId) { holderConnected = true; break; }
+		if (!holderConnected) return;
+		writeControllerLease({ ...lease, heartbeatAt: Date.now() });
+	}
+
+	/** Start the controller poll + heartbeat timers once (idempotent). Both are unref'd, best-effort. */
+	function startControllerTimers(): void {
+		if (!controllerPollTimer) {
+			controllerPollTimer = setInterval(pollControllerFile, currentControllerPollMs());
+			controllerPollTimer.unref?.();
+		}
+		if (!controllerHeartbeatTimer) {
+			controllerHeartbeatTimer = setInterval(heartbeatController, currentControllerHeartbeatMs());
+			controllerHeartbeatTimer.unref?.();
+		}
+	}
+
+	/** Stop the controller timers (session teardown). The lease itself is global and left on disk. */
+	function stopControllerTimers(): void {
+		if (controllerPollTimer) { clearInterval(controllerPollTimer); controllerPollTimer = null; }
+		if (controllerHeartbeatTimer) { clearInterval(controllerHeartbeatTimer); controllerHeartbeatTimer = null; }
+	}
+
+	/** Parse + sanitize a gui socket's surface identity (`?surface`/`?label`) from its connect URL. */
+	function surfaceFromUrl(url: string | undefined): { surfaceId: string | null; label: string | null } {
+		try {
+			const p = new URL(url || "/", "http://accordion.local").searchParams;
+			return { surfaceId: sanitizeSurfaceId(p.get("surface")), label: sanitizeSurfaceLabel(p.get("label")) };
+		} catch {
+			return { surfaceId: null, label: null };
+		}
+	}
+
+	/** True iff this socket's surface is the CURRENT FRESH controller (the READ-ONLY steer gate). A
+	 *  stale/absent lease is treated as uncontrolled -> not the controller -> commands are refused
+	 *  (the client claims first; auto-claim makes this invisible in practice). */
+	function isControllerSocket(ws: WebSocket): boolean {
+		const info = clients.get(ws);
+		const lease = controllerLease;
+		if (!lease || !info || !info.surfaceId) return false;
+		if (!isFreshLease(lease, Date.now())) return false;
+		return lease.surfaceId === info.surfaceId;
+	}
+
+	/** Build the READ-ONLY refusal reply for a mutating command from a non-controller surface. For an
+	 *  `ops` command, mirror one `read-only` clamp per op so per-tile clamp UX still works; the
+	 *  top-level `refused` is the uniform signal for the dial commands that carry no ops. Truth is
+	 *  never touched (rev unchanged). */
+	function refusedCommandResult(seq: number, cmd: unknown): ServerMessage {
+		const parsed = sanitizeCommand(cmd);
+		const results: OpResult[] = parsed && parsed.kind === "ops"
+			? parsed.ops.map((op) => ({ op, applied: false, clamped: "read-only" as const }))
+			: [];
+		return { type: "commandResult", seq, results, rev: truth ? truth.rev : 0, refused: "read-only" };
+	}
+
+	/** A gui socket claims the global controller lease. Never refused (the human is the authority);
+	 *  last write wins on races. Writes controller.json + broadcasts the change of hands. */
+	function handleClaimController(ws: WebSocket): void {
+		const info = clients.get(ws);
+		if (!info || !info.surfaceId) return; // a surface with no identity can never hold the lease
+		const now = Date.now();
+		// S4: read the current lease fresh, then skip the write-rename entirely when this surface ALREADY
+		// holds a fresh lease — the heartbeat timer keeps heartbeatAt current, so a redundant claim (claim
+		// spam) shouldn't amplify disk churn. A stale-but-ours or someone-else's lease still rewrites.
+		const { lease: current } = reloadControllerLease();
+		if (current && current.surfaceId === info.surfaceId && isFreshLease(current, now)) {
+			// The reload above may have just adopted a holder change this extension had not yet
+			// broadcast (cache updated ⇒ later polls see no change), so emit before skipping —
+			// otherwise TAKE CONTROL is a silent no-op in the same-surfaceId dual-tab corner.
+			// Holder-dedupe in maybeBroadcastController keeps plain claim spam emitting nothing.
+			maybeBroadcastController();
+			return; // already the fresh holder — nothing to write
+		}
+		const prior = current && current.surfaceId === info.surfaceId ? current : null;
+		writeControllerLease({
+			registryProtocol: REGISTRY_PROTOCOL,
+			surfaceId: info.surfaceId,
+			label: info.label || "Surface",
+			claimedAt: prior ? prior.claimedAt : now,
+			heartbeatAt: now,
+		});
+		maybeBroadcastController();
+	}
+
+	/**
+	 * Shared WebSocket connection handler, attached to BOTH this session's ephemeral WS server AND
+	 * (whenever we hold it) the fixed DOOR WS server (ADR 0024) — identical auth/replica behavior on
+	 * either listener. A gui socket additionally carries its sanitized surface identity and is subject
+	 * to the v16 READ-ONLY controller gate; conductor sockets are entirely unaffected.
+	 */
+	function onWsConnection(ws: WebSocket, req: http.IncomingMessage): void {
+		const role = roleFromUrl(req?.url);
+		const surface = surfaceFromUrl(req?.url); // v16: the connecting surface's sanitized identity (gui only)
+		// PHASE C: a conductor-role socket must consume its single-use attach token before it is
+		// treated as the active conductor (the token was already verified at upgrade time; consume
+		// it here so a re-dial with the same token is rejected). It STILL joins `clients` and gets
+		// the same hello/snapshot/event stream as a GUI — a remote conductor is a replica.
+		if (role === "conductor") {
+			let token: string | null = null;
+			try {
+				token = new URL(req?.url || "/", "http://accordion.local").searchParams.get("token");
+			} catch {
+				/* verifyWsUpgrade already rejected a malformed target */
+			}
+			if (!liveHost.acceptConductorSocket(ws, token)) {
+				try { ws.close(); } catch { /* ignore */ }
+				return;
+			}
+			conductorWs = ws;
+		}
+		// Bring the Truth up to date with the session's current history BEFORE snapshotting.
+		// On a resumed/loaded session no hook has fired yet, so read straight from the session
+		// manager. This runs before `ws` joins `clients`, so any resulting append events reach
+		// only the ALREADY-connected clients — the new client gets the up-to-date snapshot next.
+		//
+		// This intentionally still runs even when `truth` already exists (not gated behind
+		// `!truth`, i.e. NOT bootstrap-only): `readSessionMessages` reads pi's CURRENT
+		// `sessionManager` state, which reflects tree-nav (`session_before_tree`/`session_tree`,
+		// which this extension does not hook) the instant it happens — the only other way a
+		// tree-nav jump surfaces is the next `context`/`agent_end` hook. Gating this to
+		// bootstrap-only would leave a client that attaches right after a tree-nav (before the
+		// next model call) looking at the stale pre-nav branch. A second client attaching mid-
+		// session can still spuriously trip `ingestMessages`' divergence check against
+		// `lastMessages` here, forcing a rebuild — but `buildTruth`/`Truth.rebuildFrom` now
+		// preserves every surviving block's overlay and the host's dials across that rebuild, so
+		// the rebuild this triggers no longer wipes the first client's folds/pins/groups/dials
+		// (review finding).
+		const history = readSessionMessages(latestCtx);
+		if (history.length) ingestMessages(history);
+
+		// v16: re-read the controller lease from disk so this client's hello carries the current lease
+		// (and any external change it reveals is broadcast to already-connected clients).
+		refreshControllerNow();
+		// hello advertises the conductor catalog (thermocline only if its runner resolves on disk) plus
+		// the current controller lease (v16).
+		send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta, conductors: catalogMeta((entryFile) => resolveRunnerPath(entryFile) !== null), controller: controllerInfo() });
+		sendSnapshot(ws);
+		// P1-6: a freshly attached REMOTE conductor gets an initial turn-committed right AFTER its
+		// snapshot — by now the spawned SDK has hydrated its replica and run `conductor.attach`, so its
+		// listener is live and this drives an immediate pass over existing state instead of idling
+		// until the next real turn. (The in-process seam fires its own initial pass inside `select`.)
+		if (role === "conductor" && truth) liveHost.fireInitialTurnCommitted();
+		// After the snapshot, a (re)connecting client learns who — if anyone — is driving, plus any
+		// cached conductor status line, so it never renders from a locally tracked guess.
+		const activeMeta = liveHost.activeMeta();
+		if (activeMeta) send(ws, { type: "conductorState", active: activeMeta });
+		const cachedStatus = liveHost.cachedStatus();
+		if (cachedStatus) send(ws, cachedStatus);
+		// Seed the client's latency badge with current telemetry (blank until the first hook otherwise).
+		send(ws, telemetryMsg());
+		// Register only AFTER the snapshot so no event can precede the replica it must replay onto.
+		clients.set(ws, { role, surfaceId: surface.surfaceId, label: surface.label });
+
+		ws.on("message", (data: Buffer) => {
+			if (!clients.has(ws)) return; // ignore stray messages from a dropped socket
+			let msg: any;
+			try {
+				msg = JSON.parse(data.toString());
+			} catch {
+				return;
+			}
+			// ── ingress boundary: authorized ≠ well-formed ─────────────────────────────
+			// Clearing WS authorization proves a peer may REACH us, never that its frames are
+			// well-formed. An authorized-but-buggy client can send `setBudget:"hello"` (→ NaN budget
+			// → JSON-null on the wire → forked replicas) or `ops:[null]` (a raw `op.kind` deref that
+			// would throw). Sanitize every inbound command/ops HERE, before it can touch the
+			// authoritative Truth, and wrap the whole dispatch so an unexpected throw is caught +
+			// counted at this seam — never allowed to escape the WS callback, where an uncaught throw
+			// would tear down the live session for every other connected client.
+			try {
+				if (role === "conductor") {
+					// A conductor replica: propose / completeRequest / setConductorStatus route to the
+					// live host (which verifies this is the ACTIVE conductor socket), plus resnapshot.
+					if (msg?.type === "resnapshot") {
+						sendSnapshot(ws);
+					} else {
+						// Defense-in-depth mirror of the GUI `ops` guard: a `propose`'s ops reach
+						// `Truth.apply` inside handleConductorMessage, so scrub structurally-invalid
+						// elements (`[null]`, bad kinds) at the boundary before they get there. `null`
+						// (not an array) collapses to an empty batch — an honest no-op proposal.
+						if (msg?.type === "propose") msg.ops = sanitizeOps(msg.ops) ?? [];
+						liveHost.handleConductorMessage(ws, msg);
+					}
+					return;
+				}
+				// v16 (ADR 0024): claiming control is allowed from ANY gui socket — the human is the
+				// authority, takeover is never refused, last write wins on races. NOT gated by the
+				// READ-ONLY controller check (that would make claiming impossible for a non-controller).
+				if (msg?.type === "claimController") {
+					handleClaimController(ws);
+					return;
+				}
+				// The GUI client→server message: a remote-control command. The host applies it to the
+				// authoritative Truth (emitting events to ALL clients) and replies with the per-op
+				// results + resulting rev. There is NO optimistic apply on the client — the replica
+				// mutates only via the echoed event stream, so a command and its events can't race.
+				if (msg?.type === "command" && typeof msg.seq === "number") {
+					// v16 READ-ONLY enforcement: a mutating command from a surface that is not the current
+					// fresh controller is refused BEFORE it touches the Truth (typed "read-only" clamp). A
+					// stale/absent lease counts as uncontrolled -> still refused (the client claims first;
+					// auto-claim makes this invisible in practice). resnapshot/claimController are unaffected.
+					if (!isControllerSocket(ws)) {
+						send(ws, refusedCommandResult(msg.seq, msg.cmd));
+						return;
+					}
+					// `sanitizeCommand` returns a safe, applyable WireCommand or null (a NaN/negative
+					// dial coerced finite, malformed `ops` dropped). A null result is unusable: refuse
+					// it with an empty-results `commandResult` (the clamp-UX shape the GUI already
+					// reads) that acks the client's `seq` WITHOUT mutating the Truth (rev unchanged).
+					const cmd = sanitizeCommand(msg.cmd);
+					if (!cmd) {
+						send(ws, { type: "commandResult", seq: msg.seq, results: [], rev: truth ? truth.rev : 0 });
+					} else {
+						const { results, rev } = applyCommand(cmd);
+						send(ws, { type: "commandResult", seq: msg.seq, results, rev });
+					}
+				} else if (msg?.type === "resnapshot") {
+					// The replica diverged (rev mismatch) or saw a `reset` — hand it a fresh snapshot.
+					sendSnapshot(ws);
+				}
+			} catch {
+				// A malformed peer must never crash the process (an uncaught throw in a `ws` message
+				// listener surfaces as an uncaughtException). Count it (surfaced in /meta telemetry)
+				// and drop the frame; the session and every other client stay live.
+				ingressErrors++;
+			}
+		});
+		const drop = () => {
+			clients.delete(ws);
+			if (role === "conductor") {
+				if (conductorWs === ws) conductorWs = null;
+				liveHost.handleSocketClose(ws); // a clean detach if this was the active conductor
+			}
+		};
+		ws.on("close", drop);
+		ws.on("error", drop);
+	}
+
 	function startServer(): void {
 		if (wss || httpServer) return;
 		bindError = null; // fresh attempt — clear any failure a prior call recorded
 		// Per-session token for the HTTP surface and browser WebSocket upgrades. Native/Tauri
 		// clients and verified sibling Accordion origins are the only tokenless paths.
 		webToken = crypto.randomBytes(16).toString("hex");
+		// v16 (ADR 0024): ensure the shared door secret (accepted as a bearer everywhere the webToken
+		// is; bounded-retry, never a one-shot -- see ensureDoorSecret), start the controller lease
+		// timers, and attempt to become the door holder. tryBindDoor is gated on a valid secret; when
+		// the secret only resolves on a later retry tick, that tick re-kicks the bind. All idempotent +
+		// best-effort; re-run on a session swap after `closeDoor`/`stopControllerTimers`.
+		ensureDoorSecret();
+		startControllerTimers();
+		tryBindDoor();
 		try {
 			// One HTTP server hosts BOTH halves on the SAME ephemeral loopback port:
 			//   • HTTP GETs → handleHttp (the browser build, token-gated)
@@ -1166,133 +1969,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			wss = null;
 			return;
 		}
-		wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
-			const role = roleFromUrl(req?.url);
-			// PHASE C: a conductor-role socket must consume its single-use attach token before it is
-			// treated as the active conductor (the token was already verified at upgrade time; consume
-			// it here so a re-dial with the same token is rejected). It STILL joins `clients` and gets
-			// the same hello/snapshot/event stream as a GUI — a remote conductor is a replica.
-			if (role === "conductor") {
-				let token: string | null = null;
-				try {
-					token = new URL(req?.url || "/", "http://accordion.local").searchParams.get("token");
-				} catch {
-					/* verifyWsUpgrade already rejected a malformed target */
-				}
-				if (!liveHost.acceptConductorSocket(ws, token)) {
-					try { ws.close(); } catch { /* ignore */ }
-					return;
-				}
-				conductorWs = ws;
-			}
-			// Bring the Truth up to date with the session's current history BEFORE snapshotting.
-			// On a resumed/loaded session no hook has fired yet, so read straight from the session
-			// manager. This runs before `ws` joins `clients`, so any resulting append events reach
-			// only the ALREADY-connected clients — the new client gets the up-to-date snapshot next.
-			//
-			// This intentionally still runs even when `truth` already exists (not gated behind
-			// `!truth`, i.e. NOT bootstrap-only): `readSessionMessages` reads pi's CURRENT
-			// `sessionManager` state, which reflects tree-nav (`session_before_tree`/`session_tree`,
-			// which this extension does not hook) the instant it happens — the only other way a
-			// tree-nav jump surfaces is the next `context`/`agent_end` hook. Gating this to
-			// bootstrap-only would leave a client that attaches right after a tree-nav (before the
-			// next model call) looking at the stale pre-nav branch. A second client attaching mid-
-			// session can still spuriously trip `ingestMessages`' divergence check against
-			// `lastMessages` here, forcing a rebuild — but `buildTruth`/`Truth.rebuildFrom` now
-			// preserves every surviving block's overlay and the host's dials across that rebuild, so
-			// the rebuild this triggers no longer wipes the first client's folds/pins/groups/dials
-			// (review finding).
-			const history = readSessionMessages(latestCtx);
-			if (history.length) ingestMessages(history);
-
-			// hello advertises the conductor catalog (thermocline only if its runner resolves on disk).
-			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta, conductors: catalogMeta((entryFile) => resolveRunnerPath(entryFile) !== null) });
-			sendSnapshot(ws);
-			// P1-6: a freshly attached REMOTE conductor gets an initial turn-committed right AFTER its
-			// snapshot — by now the spawned SDK has hydrated its replica and run `conductor.attach`, so its
-			// listener is live and this drives an immediate pass over existing state instead of idling
-			// until the next real turn. (The in-process seam fires its own initial pass inside `select`.)
-			if (role === "conductor" && truth) liveHost.fireInitialTurnCommitted();
-			// After the snapshot, a (re)connecting client learns who — if anyone — is driving, plus any
-			// cached conductor status line, so it never renders from a locally tracked guess.
-			const activeMeta = liveHost.activeMeta();
-			if (activeMeta) send(ws, { type: "conductorState", active: activeMeta });
-			const cachedStatus = liveHost.cachedStatus();
-			if (cachedStatus) send(ws, cachedStatus);
-			// Seed the client's latency badge with current telemetry (blank until the first hook otherwise).
-			send(ws, telemetryMsg());
-			// Register only AFTER the snapshot so no event can precede the replica it must replay onto.
-			clients.set(ws, { role });
-
-			ws.on("message", (data: Buffer) => {
-				if (!clients.has(ws)) return; // ignore stray messages from a dropped socket
-				let msg: any;
-				try {
-					msg = JSON.parse(data.toString());
-				} catch {
-					return;
-				}
-				// ── ingress boundary: authorized ≠ well-formed ─────────────────────────────
-				// Clearing WS authorization proves a peer may REACH us, never that its frames are
-				// well-formed. An authorized-but-buggy client can send `setBudget:"hello"` (→ NaN budget
-				// → JSON-null on the wire → forked replicas) or `ops:[null]` (a raw `op.kind` deref that
-				// would throw). Sanitize every inbound command/ops HERE, before it can touch the
-				// authoritative Truth, and wrap the whole dispatch so an unexpected throw is caught +
-				// counted at this seam — never allowed to escape the WS callback, where an uncaught throw
-				// would tear down the live session for every other connected client.
-				try {
-					if (role === "conductor") {
-						// A conductor replica: propose / completeRequest / setConductorStatus route to the
-						// live host (which verifies this is the ACTIVE conductor socket), plus resnapshot.
-						if (msg?.type === "resnapshot") {
-							sendSnapshot(ws);
-						} else {
-							// Defense-in-depth mirror of the GUI `ops` guard: a `propose`'s ops reach
-							// `Truth.apply` inside handleConductorMessage, so scrub structurally-invalid
-							// elements (`[null]`, bad kinds) at the boundary before they get there. `null`
-							// (not an array) collapses to an empty batch — an honest no-op proposal.
-							if (msg?.type === "propose") msg.ops = sanitizeOps(msg.ops) ?? [];
-							liveHost.handleConductorMessage(ws, msg);
-						}
-						return;
-					}
-					// The GUI client→server message: a remote-control command. The host applies it to the
-					// authoritative Truth (emitting events to ALL clients) and replies with the per-op
-					// results + resulting rev. There is NO optimistic apply on the client — the replica
-					// mutates only via the echoed event stream, so a command and its events can't race.
-					if (msg?.type === "command" && typeof msg.seq === "number") {
-						// `sanitizeCommand` returns a safe, applyable WireCommand or null (a NaN/negative
-						// dial coerced finite, malformed `ops` dropped). A null result is unusable: refuse
-						// it with an empty-results `commandResult` (the clamp-UX shape the GUI already
-						// reads) that acks the client's `seq` WITHOUT mutating the Truth (rev unchanged).
-						const cmd = sanitizeCommand(msg.cmd);
-						if (!cmd) {
-							send(ws, { type: "commandResult", seq: msg.seq, results: [], rev: truth ? truth.rev : 0 });
-						} else {
-							const { results, rev } = applyCommand(cmd);
-							send(ws, { type: "commandResult", seq: msg.seq, results, rev });
-						}
-					} else if (msg?.type === "resnapshot") {
-						// The replica diverged (rev mismatch) or saw a `reset` — hand it a fresh snapshot.
-						sendSnapshot(ws);
-					}
-				} catch {
-					// A malformed peer must never crash the process (an uncaught throw in a `ws` message
-					// listener surfaces as an uncaughtException). Count it (surfaced in /meta telemetry)
-					// and drop the frame; the session and every other client stay live.
-					ingressErrors++;
-				}
-			});
-			const drop = () => {
-				clients.delete(ws);
-				if (role === "conductor") {
-					if (conductorWs === ws) conductorWs = null;
-					liveHost.handleSocketClose(ws); // a clean detach if this was the active conductor
-				}
-			};
-			ws.on("close", drop);
-			ws.on("error", drop);
-		});
+		wss.on("connection", onWsConnection);
 		wss.on("error", () => {
 			/* e.g. unexpected WS error — run headless (passthrough). Tear down the shared
 			   HTTP server too so we don't leave an orphaned listener serving files. */
@@ -1722,6 +2399,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			clearInterval(heartbeat);
 			heartbeat = null;
 		}
+		// v16 (ADR 0024): stop the controller timers and RELEASE the door (close its listener) so a
+		// standing-by extension's retry claims it — this also models release-on-exit explicitly rather
+		// than relying on the OS to free the fixed port. The global controller.json lease is left on
+		// disk; the holder's heartbeat simply stops, so it goes stale and any surface may re-claim.
+		stopControllerTimers();
+		closeDoor();
 		deleteEntry(); // stop advertising — the app drops our row immediately
 		// Tear down the Truth + its event forwarder, and close every client.
 		if (unsubTruth) {
@@ -1775,10 +2458,19 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				action.text,
 				`Live link: ${clients.size} client(s) · port ${portStatus} · ${blockCount} blocks · folding ${foldingEnabled ? "on" : "off"}`,
 			];
-			// Browser entry point: the extension also serves the web build of Accordion on
-			// the same ephemeral loopback port, gated by a per-session token. Surface the
-			// tokenized URL so the user can open the UI in a browser instead of the desktop app.
-			if (port && webToken) {
+			// Browser entry point (v16, ADR 0024): prefer the STABLE door URL. If a live Accordion door
+			// is up — us or any other extension — print `http://127.0.0.1:<door>/?token=<door-secret>`
+			// (a single well-known link that survives any one session's death). Otherwise fall back to
+			// this session's own ephemeral token URL as before (the door-occupied-by-foreign case).
+			const dp = currentDoorPort();
+			// Only print the secret-bearing door URL when WE hold the door, or a probe confirms a MATCHING
+			// live Accordion door holds it ("accordion"). A "transient" (busy/other-version peer) or
+			// "foreign" occupant falls back to this session's own ephemeral URL — never leak the secret
+			// URL at software we could not positively identify as a compatible Accordion (C2/S3).
+			const doorUp = dp !== null && doorSecret !== "" && (doorHeld || (await probeDoor()) === "accordion");
+			if (doorUp) {
+				lines.push(`Browser: http://127.0.0.1:${dp}/?token=${doorSecret}`);
+			} else if (port && webToken) {
 				lines.push(`Browser: http://127.0.0.1:${port}/?token=${webToken}`);
 			} else if (bindError) {
 				lines.push(`Browser: unavailable — ${bindError}`);
