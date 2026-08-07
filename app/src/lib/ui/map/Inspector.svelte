@@ -4,6 +4,7 @@
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block, Group } from "../../engine/types";
 	import { isBolted } from "$core/digest";
+	import { isTauriEnv } from "$lib/session.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 
 	let {
@@ -49,6 +50,28 @@
 	const lockTip = $derived(
 		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
 	);
+
+	let busy = $state(false);
+
+	async function openAsMd() {
+		if (!block || busy) return;
+		busy = true;
+		try {
+			const { tempDir } = await import("@tauri-apps/api/path");
+			const { writeTextFile } = await import("@tauri-apps/plugin-fs");
+			const { openPath } = await import("@tauri-apps/plugin-opener");
+			const safeId = block.id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 32);
+			const name = `accordion-block-${block.kind}-${safeId}.md`;
+			const dir = await tempDir();
+			const filePath = `${dir}${name}`;
+			await writeTextFile(filePath, block.text);
+			await openPath(filePath);
+		} catch (e) {
+			console.error("Failed to open block as .md:", e);
+		} finally {
+			busy = false;
+		}
+	}
 
 	// the call/result partner — they're separate blocks sharing a callId
 	const partner = $derived.by<Block | null>(() => {
@@ -360,8 +383,20 @@
 					title={steerLocked ? lockTip : pinned ? "Unpin block" : "Pin block (keeps it live)"}
 				>
 					<Icon name={pinned ? "pin-off" : "pin"} size={14} />
-					{pinned ? "Unpin" : "Pin"}
-				</button>
+				{pinned ? "Unpin" : "Pin"}
+			</button>
+			{#if isTauriEnv}
+			<button
+				class="action-btn action-outline"
+				class:action-disabled={busy}
+				disabled={busy}
+				title="Open block as .md file in your default editor"
+				onclick={openAsMd}
+			>
+				<Icon name="file-text" size={14} />
+				Open as .md
+			</button>
+			{/if}
 			</div>
 			{/if}
 		</div>
