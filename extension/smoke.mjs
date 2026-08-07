@@ -30,8 +30,14 @@ const HOME = path.join(os.tmpdir(), `accordion-smoke-${process.pid}`);
 process.env.ACCORDION_HOME = HOME;
 // Prevent the /accordion command smoke assertion from launching a real developer build.
 process.env.ACCORDION_APP_PATH = path.join(HOME, "missing-accordion-app.exe");
+// v16 (ADR 0024): DISABLE the door for the MAIN extension so the existing HTTP/token/cookie/URL
+// assertions stay byte-identical (the /accordion line then prints the ephemeral webToken URL, not the
+// door URL). The door itself is exercised by a dedicated, self-contained section at the end that flips
+// this env to a free port and races two fresh extension instances. `0` = door disabled.
+process.env.ACCORDION_DOOR_PORT = "0";
 const SESSIONS_DIR = path.join(HOME, ".accordion", "sessions");
 const FOCUS_PATH = path.join(HOME, ".accordion", "focus.json");
+const CONTROLLER_PATH = path.join(HOME, ".accordion", "controller.json");
 
 const jiti = createJiti(import.meta.url);
 const mod = await jiti.import("./accordion.ts");
@@ -90,7 +96,7 @@ const entry = readOnlyEntry();
 if (!(entry.port > 0)) fails.push(`registry port not assigned (got ${entry.port})`);
 if (entry.registryProtocol !== 1) fails.push(`registry protocol mismatch (${entry.registryProtocol})`);
 if (entry.model !== "test/model") fails.push(`model not captured (${entry.model})`);
-if (entry.protocolVersion !== 15) fails.push(`protocol version expected 15, got ${entry.protocolVersion}`);
+if (entry.protocolVersion !== 16) fails.push(`protocol version expected 16, got ${entry.protocolVersion}`);
 const PORT = entry.port;
 
 // Durable-id messages (a:/u: prefixes) the whole protocol flow builds on.
@@ -225,9 +231,14 @@ if (!TOKEN) fails.push("/accordion did not surface a Browser URL carrying a toke
 
 // ── the Phase B protocol: hello / snapshot / event / command / commandResult ─────
 // A native (no-Origin) WS client is tokenless-authorized. It collects every server frame by type.
-function connectClient() {
-	const ws = new WebSocket(`ws://127.0.0.1:${PORT}`);
-	const inbox = { hello: [], snapshot: [], event: [], telemetry: [], commandResult: [], folding: [], recall: [], stream: [] };
+// v16 (ADR 0024): each client dials with a distinct surface identity (?surface&?label) so the
+// single-controller lease has someone to attribute steering to; `claim()` sends `claimController`.
+const SURFACE_A = "surface-aaaa-1111";
+const SURFACE_B = "surface-bbbb-2222";
+function connectClient(surfaceId = SURFACE_A, label = "Test surface") {
+	const qs = `/?surface=${encodeURIComponent(surfaceId)}&label=${encodeURIComponent(label)}`;
+	const ws = new WebSocket(`ws://127.0.0.1:${PORT}${qs}`);
+	const inbox = { hello: [], snapshot: [], event: [], telemetry: [], commandResult: [], folding: [], recall: [], stream: [], controller: [] };
 	ws.on("message", (d) => {
 		let m;
 		try { m = JSON.parse(d.toString()); } catch { return; }
@@ -235,16 +246,27 @@ function connectClient() {
 	});
 	let seq = 0;
 	const sendCmd = (cmd) => ws.send(JSON.stringify({ type: "command", seq: ++seq, cmd }));
-	return { ws, inbox, sendCmd };
+	const claim = () => ws.send(JSON.stringify({ type: "claimController" }));
+	return { ws, inbox, sendCmd, claim, surfaceId };
 }
 
 // Client A connects to the session that now has history → hello + snapshot(with the 2 blocks).
-const a = connectClient();
+const a = connectClient(SURFACE_A, "Desktop app");
 await waitFor(() => a.inbox.hello.length > 0, 2000, "client A hello").catch(() => fails.push("client A never received hello"));
 await waitFor(() => a.inbox.snapshot.length > 0, 2000, "client A snapshot").catch(() => fails.push("client A never received a snapshot"));
+// v16: A's hello arrives BEFORE anyone has claimed → controller is null. Then A claims control so
+// that every steering command in the sections below (all issued by A) passes the READ-ONLY gate.
+{
+	const helloA = a.inbox.hello[0];
+	if (helloA && helloA.controller != null) fails.push(`client A hello.controller should be null before any claim (got ${JSON.stringify(helloA.controller)})`);
+}
+a.claim();
+await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2000, "client A becomes controller").catch(
+	() => fails.push("client A's claimController did not broadcast a controller frame naming its surface"),
+);
 {
 	const hello = a.inbox.hello[0];
-	if (hello && hello.protocolVersion !== 15) fails.push(`hello.protocolVersion expected 15, got ${hello?.protocolVersion}`);
+	if (hello && hello.protocolVersion !== 16) fails.push(`hello.protocolVersion expected 16, got ${hello?.protocolVersion}`);
 	if (hello && hello.role !== "gui") fails.push(`hello.role expected "gui", got ${hello?.role}`);
 	// Phase C: hello advertises the available-conductor catalog (the GUI picker renders from this).
 	if (hello && (!Array.isArray(hello.conductors) || !hello.conductors.some((c) => c.id === "doorman")))
@@ -419,14 +441,20 @@ await waitFor(() => a.inbox.snapshot.length > 0, 2000, "client A snapshot").catc
 	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
 }
 
-// Client B connects AFTER more history → its snapshot carries all 3 blocks (hydration path).
-const b = connectClient();
+// Client B connects AFTER more history → its snapshot carries all 3 blocks (hydration path). B is a
+// DIFFERENT surface, and A already holds the lease, so B connects as a live READ-ONLY mirror.
+const b = connectClient(SURFACE_B, "Browser tab");
 await waitFor(() => b.inbox.snapshot.length > 0, 2000, "client B snapshot").catch(() => fails.push("client B never received a snapshot"));
 {
 	const snap = b.inbox.snapshot[0];
 	const ids = snap ? snap.state.blocks.map((x) => x.id) : [];
 	if (!ids.includes(USER_ID) || !ids.includes(ASST_ID) || !ids.includes(FOLLOWUP_ID))
 		fails.push(`with-history snapshot missing block ids (got ${JSON.stringify(ids)})`);
+	// v16: B connects while A holds a FRESH lease → hello.controller names A and is fresh (the shape
+	// a GUI reads to decide "someone else steers" → show the takeover popup rather than auto-claim).
+	const helloB = b.inbox.hello[0];
+	if (!helloB || !helloB.controller || helloB.controller.surfaceId !== SURFACE_A || helloB.controller.fresh !== true)
+		fails.push(`client B hello.controller should name surface A as the fresh controller (got ${JSON.stringify(helloB?.controller)})`);
 }
 
 // Commands: setProtect 0 (so the block is foldable), setFolding true, then fold the assistant text.
@@ -797,6 +825,71 @@ if (unfoldTool && foldCodeStr) {
 	process.off("uncaughtException", onExc);
 }
 
+// ── v16 single-controller: READ-ONLY enforcement + takeover (ADR 0024) ──────────
+// A holds the lease (claimed at connect). B is a different surface, so it is a live READ-ONLY mirror:
+// its mutating commands must be refused with the typed "read-only" clamp WITHOUT touching the Truth.
+// Then B claims control → A is demoted (receives a `controller` broadcast naming B) and A's own next
+// command is refused. The human is always the authority, so B's takeover is never blocked.
+{
+	// (1) A NON-controller surface (B) cannot steer: a fold command comes back refused "read-only".
+	b.inbox.commandResult.length = 0;
+	b.sendCmd({ kind: "ops", ops: [{ kind: "fold", ids: [ASST_ID] }] });
+	await waitFor(() => b.inbox.commandResult.length > 0, 2000, "B fold commandResult").catch(
+		() => fails.push("client B's fold command received no commandResult"),
+	);
+	{
+		const r = b.inbox.commandResult.at(-1);
+		if (!r || r.refused !== "read-only") fails.push(`client B (non-controller) fold was not refused read-only (got ${JSON.stringify(r)})`);
+		if (r && !(r.results || []).every((o) => o.clamped === "read-only"))
+			fails.push(`client B's refused ops did not carry per-op read-only clamps (got ${JSON.stringify(r?.results)})`);
+	}
+	// A dial command from B (no ops) is ALSO refused, via the top-level flag (empty results).
+	b.inbox.commandResult.length = 0;
+	b.sendCmd({ kind: "setProtect", value: 12345 });
+	await waitFor(() => b.inbox.commandResult.length > 0, 2000, "B setProtect commandResult").catch(
+		() => fails.push("client B's setProtect command received no commandResult"),
+	);
+	{
+		const r = b.inbox.commandResult.at(-1);
+		if (!r || r.refused !== "read-only" || (r.results || []).length !== 0)
+			fails.push(`client B (non-controller) setProtect was not refused read-only with empty results (got ${JSON.stringify(r)})`);
+	}
+
+	// (2) The human is the authority — B claims and takes over immediately. A (the prior controller)
+	//     receives a `controller` broadcast naming B, and its own next command is now refused.
+	a.inbox.controller.length = 0;
+	b.inbox.controller.length = 0;
+	b.claim();
+	await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_B), 2000, "A observes B's takeover").catch(
+		() => fails.push("after B claimed, client A did not receive a controller broadcast naming surface B"),
+	);
+	if (!b.inbox.controller.some((c) => c.surfaceId === SURFACE_B))
+		fails.push("client B did not receive its own controller broadcast after claiming");
+
+	a.inbox.commandResult.length = 0;
+	a.sendCmd({ kind: "ops", ops: [{ kind: "fold", ids: [ASST_ID] }] });
+	await waitFor(() => a.inbox.commandResult.length > 0, 2000, "A fold commandResult after demotion").catch(
+		() => fails.push("demoted client A's fold command received no commandResult"),
+	);
+	{
+		const r = a.inbox.commandResult.at(-1);
+		if (!r || r.refused !== "read-only") fails.push(`demoted client A's fold was not refused read-only (got ${JSON.stringify(r)})`);
+	}
+
+	// (3) The lease file on disk reflects B as the holder (the global blackboard, not just in-memory).
+	try {
+		const lease = JSON.parse(fs.readFileSync(CONTROLLER_PATH, "utf8"));
+		if (lease.surfaceId !== SURFACE_B) fails.push(`controller.json holder should be surface B (got ${JSON.stringify(lease.surfaceId)})`);
+	} catch (e) {
+		fails.push(`could not read controller.json after B's claim (${e.message})`);
+	}
+
+	// Restore A as the controller so nothing downstream (only shutdown follows) is surprised.
+	a.inbox.controller.length = 0;
+	a.claim();
+	await waitFor(() => a.inbox.controller.some((c) => c.surfaceId === SURFACE_A), 2000, "A reclaims control").catch(() => {});
+}
+
 a.ws.close();
 b.ws.close();
 await new Promise((r) => setTimeout(r, 50));
@@ -939,9 +1032,123 @@ await new Promise((r) => setTimeout(r, 50));
 	if (oversized.code !== 1009) fails.push(`ws-hardening: oversized frame did not close with 1009 (${JSON.stringify(oversized)})`);
 }
 
+// ── v16 the stable door: bind / stand-down / takeover / foreign occupant (ADR 0024) ──
+// Self-contained: flips ACCORDION_DOOR_PORT to a free port (the MAIN extension's door stayed disabled
+// via "0" at the top) and races FRESH extension instances for it, in-process. Covers: (a) one
+// extension binds the door and answers /__accordion/meta on it; (b) a second Accordion extension
+// stands down (does NOT double-bind) and its /accordion offers the SHARED door URL; (c) when the
+// holder exits, the standing-by extension claims the door within a few retry ticks; (d) a foreign
+// (non-Accordion) occupant makes an extension stand down permanently and fall back to its ephemeral URL.
+{
+	const freePort = () =>
+		new Promise((resolve, reject) => {
+			const srv = net.createServer();
+			srv.once("error", reject);
+			srv.listen(0, "127.0.0.1", () => { const p = srv.address().port; srv.close(() => resolve(p)); });
+		});
+	const doorMeta = (doorPort) =>
+		new Promise((resolve) => {
+			const r = http.get({ host: "127.0.0.1", port: doorPort, path: "/__accordion/meta" }, (res) => {
+				let buf = ""; res.on("data", (d) => (buf += d));
+				res.on("end", () => { try { resolve(JSON.parse(buf)); } catch { resolve(null); } });
+			});
+			r.on("error", () => resolve(null));
+			r.setTimeout(1000, () => { r.destroy(); resolve(null); });
+		});
+	// waitFor above calls its predicate SYNCHRONOUSLY (a returned Promise is always truthy); the door
+	// checks need to await an async probe, so use this async-aware poller instead. Returns true/false.
+	const waitForAsync = async (pred, ms) => {
+		const start = Date.now();
+		while (Date.now() - start < ms) {
+			if (await pred()) return true;
+			await new Promise((r) => setTimeout(r, 50));
+		}
+		return false;
+	};
+	const makeCtx = (notes) => ({
+		ui: { setStatus() {}, notify(message, type) { notes.push({ message, type }); }, theme: { fg: (_c, s) => s } },
+		model: { id: "door/model", contextWindow: 1000 },
+		getContextUsage: () => ({ tokens: 0, contextWindow: 1000 }),
+	});
+	const makeExtension = () => {
+		const h = {};
+		const notes = [];
+		let cmd = null;
+		const flg = new Map();
+		const mpi = {
+			on: (name, fn) => (h[name] = fn),
+			registerFlag: (name, def) => flg.set(name, def?.default),
+			getFlag: (name) => flg.get(name),
+			registerCommand: (name, def) => { if (name === "accordion") cmd = def.handler; },
+			registerTool: () => {},
+			appendEntry: () => {},
+		};
+		accordionLive(mpi);
+		return { h, notes, ctx: makeCtx(notes), get cmd() { return cmd; } };
+	};
+
+	const DOOR = await freePort();
+	process.env.ACCORDION_DOOR_PORT = String(DOOR);
+	process.env.ACCORDION_DOOR_RETRY_MS = "150"; // fast takeover for the test
+
+	// (a) Extension X starts and becomes the door holder.
+	const X = makeExtension();
+	X.h.session_start({ type: "session_start", reason: "startup" }, X.ctx);
+	let doorSid1 = null;
+	if (!(await waitForAsync(async () => { const m = await doorMeta(DOOR); if (m?.served === true) { doorSid1 = m.sessionId; return true; } return false; }, 4000)))
+		fails.push("no extension bound the door port after startup");
+	if (doorSid1 && typeof doorSid1 !== "string") fails.push("door /__accordion/meta returned a non-string sessionId");
+
+	// (b) Extension Y starts against the SAME door: it must stand down (X keeps the door), and Y's
+	//     /accordion must still offer the stable door URL (proving it detected the live door + shares the secret).
+	const Y = makeExtension();
+	Y.h.session_start({ type: "session_start", reason: "startup" }, Y.ctx);
+	await new Promise((r) => setTimeout(r, 400)); // let Y's EADDRINUSE probe + stand-down resolve
+	{
+		const m = await doorMeta(DOOR);
+		if (!m || m.sessionId !== doorSid1) fails.push(`a second extension did not stand down — the door holder changed unexpectedly (was ${doorSid1}, now ${m?.sessionId})`);
+	}
+	await Promise.resolve(Y.cmd?.("", Y.ctx));
+	{
+		const line = Y.notes.map((n) => n.message).reverse().find((msg) => msg.includes("Browser: http"));
+		if (!line || !line.includes(`http://127.0.0.1:${DOOR}/?token=`))
+			fails.push(`standing-by extension Y's /accordion did not offer the stable door URL (got ${JSON.stringify(line)})`);
+	}
+
+	// (c) X exits → it releases the door → Y's retry claims it within a few ticks (holder changes).
+	X.h.session_shutdown({}, X.ctx);
+	if (!(await waitForAsync(async () => { const m = await doorMeta(DOOR); return m?.served === true && m.sessionId && m.sessionId !== doorSid1; }, 4000)))
+		fails.push("after the door holder exited, the standing-by extension did not take over the door");
+
+	// (d) A FOREIGN (non-Accordion) occupant → a fresh extension stands down permanently and falls
+	//     back to its OWN ephemeral URL (never advertises the foreign port as the door).
+	const foreignPort = await freePort();
+	const foreign = http.createServer((_req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("not accordion"); });
+	await new Promise((resolve, reject) => { foreign.once("error", reject); foreign.listen(foreignPort, "127.0.0.1", resolve); });
+	process.env.ACCORDION_DOOR_PORT = String(foreignPort);
+	const Z = makeExtension();
+	Z.h.session_start({ type: "session_start", reason: "startup" }, Z.ctx);
+	await new Promise((r) => setTimeout(r, 500)); // let Z's probe classify the occupant as foreign
+	await Promise.resolve(Z.cmd?.("", Z.ctx));
+	{
+		const line = Z.notes.map((n) => n.message).reverse().find((msg) => msg.includes("Browser: http"));
+		if (!line) fails.push("extension Z (foreign door occupant) printed no Browser URL");
+		else if (line.includes(`127.0.0.1:${foreignPort}/`)) fails.push("extension Z advertised the FOREIGN-occupied port as the door URL");
+		else if (!line.includes("Browser: http://127.0.0.1:")) fails.push(`extension Z did not fall back to an ephemeral Browser URL (got ${JSON.stringify(line)})`);
+	}
+
+	// Cleanup: shut down the door-test extensions (deletes their registry entries) + the foreign server,
+	// and disable the door again so the main shutdown/cleanup below sees a quiet, empty sessions dir.
+	Y.h.session_shutdown({}, Y.ctx);
+	Z.h.session_shutdown({}, Z.ctx);
+	await new Promise((resolve) => foreign.close(resolve));
+	process.env.ACCORDION_DOOR_PORT = "0";
+	await new Promise((r) => setTimeout(r, 200));
+}
+
 // shutdown must stop advertising (delete the registry entry)
 handlers.session_shutdown({}, ctx);
-await waitFor(() => !fs.existsSync(SESSIONS_DIR) || fs.readdirSync(SESSIONS_DIR).length === 0, 1000, "registry cleanup").catch(
+await waitFor(() => !fs.existsSync(SESSIONS_DIR) || fs.readdirSync(SESSIONS_DIR).length === 0, 1500, "registry cleanup").catch(
 	() => fails.push("session_shutdown did not delete the registry entry"),
 );
 
