@@ -1,14 +1,10 @@
 <script lang="ts">
 	import { onMount } from "svelte";
 	import { session, isTauriEnv, loadSample, openFile, loadFilePath } from "$lib/session.svelte.ts";
-	import { settings } from "$lib/settings.svelte.ts";
 	import { connectLive, disconnectLive, live } from "$lib/live/liveClient.svelte";
 	import { discovery, startDiscovery, stopDiscovery, DEMO_ID } from "$lib/live/discovery.svelte";
 	import { startBrowserDiscovery, stopBrowserDiscovery } from "$lib/live/browserDiscovery.svelte";
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery } from "$lib/live/claudeDiscovery.svelte";
-	import { conductorState } from "$lib/live/conductor.svelte";
-	import { startConductorDiscovery, stopConductorDiscovery, allConductors, isLaunching } from "$lib/live/conductorDiscovery.svelte";
-	import { attachConductor, conductorRetry } from "$lib/live/conductorClient.svelte";
 	import { folding } from "$lib/live/folding.svelte";
 	import { foldAlarm, runFoldCheck } from "$lib/live/foldAlarm.svelte";
 	import { DEFAULT_PORT } from "$lib/live/protocol";
@@ -18,13 +14,11 @@
 	import MapHeader from "$lib/ui/map/MapHeader.svelte";
 	import ContextMap from "$lib/ui/map/ContextMap.svelte";
 	import Inspector from "$lib/ui/map/Inspector.svelte";
-	import ConductorActivity from "$lib/ui/map/ConductorActivity.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import Logo from "$lib/ui/Logo.svelte";
 
 	let selectedId = $state<string | null>(null);
 	let manualPort = $state(DEFAULT_PORT);
-	let activityOpen = $state(false);
 	let browserServed = $state(false);
 
 	// Which session source the sidebar lists: live pi vs read-only Claude Code.
@@ -40,59 +34,6 @@
 	$effect(() => {
 		if (isTauriEnv && source === "claude") startClaudeDiscovery();
 		else stopClaudeDiscovery();
-	});
-
-	// ── Conductors (ADR 0007) ──────────────────────────────────────────────
-	// External conductors to offer in the switcher (discovered + configured). The built-in
-	// and "Raw" entries are added by the sidebar itself. Reactive so newly-found conductors
-	// appear without a reload.
-	const conductors = $derived(allConductors());
-
-	// Attach the selected conductor to the active session's store. Tracks the store, the
-	// selection, AND the available list — so a conductor selected before discovery found it
-	// (e.g. a remote id restored from localStorage on launch) gets attached once it appears.
-	// `attachConductor` is idempotent, so a poll refreshing the list when we're already
-	// correctly attached is a no-op (no reconnect churn).
-	//
-	// Flash suppression: if the active id is a launchable that is still launching (started
-	// but not yet discovered), hold — do NOT fall back to built-in while the process is
-	// booting. Once discovery sees the heartbeat, isLaunching clears, conductors changes,
-	// and this effect re-runs to attach the real RemoteRunner.
-	$effect(() => {
-		void conductorRetry.tick; // re-fire on a remote-drop retry tick (recover a same-process socket drop)
-		const store = session.store;
-		const activeId = conductorState.activeId;
-		const list = conductors;
-		if (!store) return;
-		// Suppress the built-in fallback while the process is still starting up.
-		if (isLaunching(activeId) && !list.some((c) => c.id === activeId)) return;
-		attachConductor(store, activeId, list);
-	});
-
-	// Wire the host's `compress` capability (Bear-2 via The Token Company) onto the active
-	// store. Unlike `completer` (a live-pi-only model link set by the WS client), compression
-	// is a standalone app-side HTTP call — so it's wired here at the route level and works for
-	// EVERY session source (demo, read-only Claude Code, live pi). It tracks `session.store`,
-	// `isTauriEnv`, and the reactive `settings.bear2ApiKey`, so `can("compress")` flips to
-	// false the instant the key is cleared or in browser dev (no Tauri) — letting a conductor
-	// show a "set your key" prompt instead of failing mid-fold. Aggressiveness is fixed at 0.2
-	// here (the single place it's specified); the host contract keeps it off the call surface.
-	$effect(() => {
-		const store = session.store;
-		if (!store) return;
-		const key = settings.bear2ApiKey;
-		if (isTauriEnv && key.trim() !== "") {
-			store.compressor = async (text: string) => {
-				const { invoke } = await import("@tauri-apps/api/core");
-				return await invoke<string>("compress_text", {
-					text,
-					apiKey: key,
-					aggressiveness: 0.2,
-				});
-			};
-		} else {
-			store.compressor = null;
-		}
 	});
 
 	const selectedBlock = $derived(
@@ -165,7 +106,6 @@
 
 	onMount(() => {
 		startDiscovery(onFocusRequest);
-		startConductorDiscovery();
 
 		// Browser-served auto-connect: if this page was served by the pi extension on a
 		// loopback port, /__accordion/meta returns { served: true, sessionId, protocolVersion }.
@@ -197,7 +137,6 @@
 			stopDiscovery();
 			stopBrowserDiscovery();
 			stopClaudeDiscovery();
-			stopConductorDiscovery();
 			disconnectLive();
 		};
 	});
@@ -216,8 +155,8 @@
 	});
 
 	// View↔wire fold alarm (indicator-only): re-run the divergence check on every settled
-	// store change. `st.version` is the settled-change signal (manual fold, conductor pass,
-	// budget/protect change, append — all route through refold()→runConductor()→version++).
+	// store change. `st.version` is the settled-change signal (manual fold, budget/protect
+	// change, append — all route through refold()→version++).
 	$effect(() => {
 		const st = session.store;
 		if (!st) {
@@ -295,16 +234,6 @@
 					</div>
 					<!-- Nav actions -->
 					<div class="nav-row">
-						<button
-							class="nav-btn"
-							class:active={activityOpen}
-							onclick={() => (activityOpen = !activityOpen)}
-							aria-pressed={activityOpen}
-							title="Show conductor activity"
-						>
-							<Icon name="activity" size={13} />
-							Activity
-						</button>
 						{#if live.status === "connected"}
 							<button class="nav-btn" onclick={disconnectLive}>
 								<Icon name="x" size={12} />
@@ -321,13 +250,10 @@
 
 				<MapHeader store={s} readOnly={session.readOnly} />
 
-				<div class="main" class:open={!!selectedBlock || !!selectedGroup} class:activity={activityOpen}>
+				<div class="main" class:open={!!selectedBlock || !!selectedGroup}>
 					<div class="canvas">
 						<ContextMap store={s} {selectedId} onselect={(id) => (selectedId = selectedId === id ? null : id)} />
 					</div>
-					{#if activityOpen}
-						<ConductorActivity store={s} onclose={() => (activityOpen = false)} />
-					{/if}
 					{#if selectedBlock || selectedGroup}
 						<Inspector
 							store={s}
@@ -632,11 +558,6 @@
 		background: var(--accent-soft);
 		border-color: var(--accent);
 	}
-	.nav-btn.active {
-		color: var(--accent);
-		background: var(--accent-soft);
-		border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
-	}
 
 	/* ── Main grid (canvas + inspector) ──────────────────────── */
 	.main {
@@ -648,12 +569,6 @@
 	}
 	.main.open {
 		grid-template-columns: minmax(0, 1fr) minmax(360px, 30vw);
-	}
-	.main.activity {
-		grid-template-columns: minmax(0, 1fr) minmax(280px, 320px);
-	}
-	.main.open.activity {
-		grid-template-columns: minmax(0, 1fr) minmax(200px, 260px) minmax(360px, 30vw);
 	}
 	.canvas {
 		min-width: 0;
@@ -669,9 +584,7 @@
 			order: 5;
 			flex-basis: 100%;
 		}
-		.main.open,
-		.main.activity,
-		.main.open.activity {
+		.main.open {
 			grid-template-columns: minmax(0, 1fr);
 		}
 	}

@@ -61,8 +61,11 @@
  *        `PassthroughMessage.recalls` are gone. The plan-applied ack (`passthrough`) and its
  *        cause taxonomy STAY — only their birth-fold/recall-specific fields and roles are
  *        removed. Bumped (never renumbered downward) so a stale client can't pair silently.
+ *  - v10: conductor completion relay removed. `completeRequest` / `completeResult` (the
+ *        out-of-band model-completion side channel) are gone along with the conductor
+ *        subsystem. Everything else (sync/plan, unfold/recall, armed, passthrough) is unchanged.
  */
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi
@@ -226,30 +229,6 @@ export interface RecallRequestMessage {
 }
 
 /**
- * Extension → GUI: the result of a `completeRequest` (protocol v5).
- *
- * `reqId` correlates 1-to-1 with the `completeRequest` that triggered this. `ok:false`
- * means the completion failed (no model available, key resolution error, the model itself
- * errored, etc.) — `error` describes what went wrong and `text`/`model` are absent.
- *
- * On success (`ok:true`):
- *  - `text` is the model's full text output.
- *  - `model` is the model id that actually ran.
- *  - `inputTokens` / `outputTokens` are usage counts, when the extension can supply them.
- */
-export interface CompleteResultMessage {
-	type: "completeResult";
-	reqId: number;
-	ok: boolean;
-	text?: string;
-	model?: string;
-	inputTokens?: number;
-	outputTokens?: number;
-	/** Present when ok:false — a human-readable description of the failure. */
-	error?: string;
-}
-
-/**
  * Sent by the extension whenever it processes an `armed` message from the attached client
  * (additive on protocol v5 — see the PROTOCOL_VERSION history note). It echoes the armed
  * state the extension now holds. Its whole purpose is capability detection for a headless
@@ -301,7 +280,7 @@ export interface PassthroughMessage {
 	groups: number;
 }
 
-export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage | CompleteResultMessage | ArmedAckMessage | PassthroughMessage;
+export type ServerMessage = HelloMessage | SyncMessage | StreamMessage | UnfoldRequestMessage | RecallRequestMessage | ArmedAckMessage | PassthroughMessage;
 
 // ── Client → server (GUI → extension) ────────────────────────────────────────
 
@@ -312,38 +291,6 @@ export interface PlanMessage {
 	ops: FoldOp[];
 	/** Group-collapse ops (ADR 0006). Optional/additive — omitted ⇒ no group collapse. */
 	groups?: GroupOp[];
-}
-
-/**
- * GUI → extension: ask the extension to run an out-of-band model completion (protocol v5).
- *
- * This is a SEPARATE model invocation — independent of the agent's own turn. It is
- * designed for a conductor that needs the host's model link (e.g. to summarize aged
- * context blocks). Hard invariants:
- *
- *  - This call MUST NEVER block or alter the agent's own model call or the `context`
- *    hook. The extension fulfils it on a side channel, completely outside the
- *    sync→plan→apply loop.
- *  - "Extension is thin" — the extension makes NO folding decision. It runs exactly the
- *    completion it is handed and returns the raw result. Strategy lives in the GUI.
- *  - `reqId` is GUI-assigned (monotonic integer). The extension echoes it in
- *    `completeResult` so the GUI can match responses even if multiple requests overlap.
- */
-export interface CompleteRequestMessage {
-	type: "completeRequest";
-	reqId: number;
-	/** Optional system instruction (e.g. a compaction persona or template). */
-	system?: string;
-	/** The user-role content to operate on (e.g. aged context blocks to summarize). */
-	prompt: string;
-	/**
-	 * Requested cap on output tokens. The extension clamps this to the model's own
-	 * max-output ceiling before forwarding — so a conductor can safely pass any positive
-	 * number without risking a provider rejection. The model enforces the (clamped) value
-	 * as a hard cap; over-long output is truncated, not rejected. Omit to use the model
-	 * default.
-	 */
-	maxOutputTokens?: number;
 }
 
 /** One block restored by an `unfoldResult`. */
@@ -414,14 +361,14 @@ export interface ArmedMessage {
 	armed: boolean;
 }
 
-export type ClientMessage = PlanMessage | UnfoldResultMessage | RecallResultMessage | CompleteRequestMessage | ArmedMessage;
+export type ClientMessage = PlanMessage | UnfoldResultMessage | RecallResultMessage | ArmedMessage;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 export function isServerMessage(v: unknown): v is ServerMessage {
 	if (!v || typeof v !== "object" || !("type" in v)) return false;
 	const t = (v as any).type;
-	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "completeResult" || t === "armedAck" || t === "passthrough";
+	return t === "hello" || t === "sync" || t === "stream" || t === "unfoldRequest" || t === "recallRequest" || t === "armedAck" || t === "passthrough";
 }
 
 const WIRE_KINDS = new Set(["user", "text", "thinking", "tool_call", "tool_result"]);

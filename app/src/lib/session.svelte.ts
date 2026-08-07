@@ -47,7 +47,6 @@ export async function loadSample() {
 		// Parse BEFORE disposing (same as _load): the SPA fallback can serve index.html with
 		// res.ok for a missing sample, and parse() must not leave a disposed store rendered.
 		const parsed = parse(text);
-		session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 		session.store = new AccordionStore(parsed);
 		session.filePath = null;
 		session.readOnly = false;
@@ -137,7 +136,6 @@ async function _load(path: string, readFn: (p: string) => Promise<string>, token
 	const parsed = parse(text);
 	const prevBudget = session.store?.budget;
 	const prevProtect = session.store?.protectTokens;
-	session.store?.dispose(); // abort the outgoing store's conductor (in-flight host.complete) before discarding it
 	session.store = new AccordionStore(parsed);
 	if (prevBudget !== undefined) session.store.setBudget(prevBudget);
 	if (prevProtect !== undefined) session.store.setProtect(prevProtect);
