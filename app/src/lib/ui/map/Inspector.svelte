@@ -20,6 +20,7 @@
 	} = $props();
 
 	const KIND_LABEL: Record<Block["kind"], string> = {
+		system: "System",
 		user: "User",
 		text: "Reply",
 		thinking: "Thinking",

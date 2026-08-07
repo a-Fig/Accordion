@@ -72,6 +72,18 @@ export type ClampReason =
 	| "protected"
 	/** The block's KIND is not foldable on the wire (user / tool_call). */
 	| "not-foldable"
+	/**
+	 * The block is BOLTED (`core/digest.ts`'s `isBolted` — today the `system` prompt block): no actor
+	 * may fold, group, pin, unpin, replace, or otherwise steer it, ever. Checked FIRST in every
+	 * relevant op handler, ahead of `not-foldable`/`protected`/`grouped`/`noop`, because those all
+	 * read as CONDITIONAL refusals a strategy should retry differently ("wrong kind, try another
+	 * block" / "already in that state, come back later") while this one is permanent. A conductor that
+	 * sees `"bolted"` should drop the target from its plan for good, not re-propose next turn. A
+	 * GROUP op whose snapped range CONTAINS a bolted block is refused WHOLE with this reason — never
+	 * trimmed to exclude it, and never reported as `invalid-group` (which would suggest a different
+	 * range might work).
+	 */
+	| "bolted"
 	/** The block's id is a POSITIONAL fallback (`m<i>:…`), not a durable content anchor, so the
 	 *  wire (`computeFoldOps`) would silently drop the fold and ship full content — accepting it
 	 *  would fork UI/accounting from what the model actually receives. Only enforced with a live

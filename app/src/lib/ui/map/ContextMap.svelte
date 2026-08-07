@@ -29,6 +29,7 @@
 	let view = $state<"map" | "transcript">("map");
 	// Human-readable role label for a transcript message header.
 	const ROLE: Record<Block["kind"], string> = {
+		system: "System",
 		user: "You",
 		text: "Assistant",
 		thinking: "Thinking",

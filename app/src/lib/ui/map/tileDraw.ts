@@ -81,6 +81,9 @@ export function readPalette(): Palette {
   const v = (name: string) => s.getPropertyValue(name).trim();
   return {
     kindColors: {
+      // Brand Spectrum indigo — the bolted `system` kind (v21). Fill color for the bolt-head
+      // tile drawn by `drawTile`/`drawBoltHead` below; see CLAUDE.md "Visual grammar".
+      system: v("--k-system") || "#7D6EE6",
       user: v("--k-user") || "#044EFF",
       text: v("--k-text") || "#1AA6E8",
       thinking: v("--k-thinking") || "#B480DF",
@@ -512,22 +515,33 @@ export function drawTile(
     ctx.stroke();
   }
 
-  // ---- dice pips (blitted from sprite) ----
-  // Folded tiles KEEP their dice face (the old DOM showed pips at the cell's
-  // .36 opacity). Drawing them dimmed-but-visible keeps a folded block reading
-  // as "a recessed version of the colored tile," not a blank square.
-  const spriteCanvas = sprites.get(spec.face);
-  if (spriteCanvas) {
-    if (spec.folded) {
-      // Drained tiles read as near-black recessed squares — keep the pips a faint
-      // ghost (the weight is still legible up close) so the tile doesn't sprout
-      // loud white dots that fight the drain. Hover relights toward full.
-      ctx.save();
-      ctx.globalAlpha = opts.hovered ? 0.7 : 0.22;
-      ctx.drawImage(spriteCanvas, x, y, w, h);
-      ctx.restore();
-    } else {
-      ctx.drawImage(spriteCanvas, x, y, w, h);
+  // ---- bolt head (BOLTED kinds) INSTEAD OF dice pips, or dice pips (blitted from sprite) ----
+  // The `system` kind draws a hex bolt head in place of its dice face — never on top of it.
+  // Dice faces 4/5/6 place pips in the tile's corners, so a corner rivet motif would collide,
+  // and a centre-only overlay would just fight the existing centre pip on faces 1/3/5. A bolted
+  // block also never folds (`isBolted` in core/digest.ts), so there is no drained/dimmed variant
+  // to handle here — the glyph is always drawn at full strength. Below ~9px the stroked hexagon
+  // degrades to an indistinct smudge, so it's skipped there; the indigo fill alone still marks
+  // the tile as different from its neighbours at that size.
+  if (spec.kind === "system") {
+    if (Math.min(w, h) >= 9) drawBoltHead(ctx, x + w / 2, y + h / 2, Math.min(w, h) * BOLT_RADIUS_RATIO);
+  } else {
+    // Folded tiles KEEP their dice face (the old DOM showed pips at the cell's
+    // .36 opacity). Drawing them dimmed-but-visible keeps a folded block reading
+    // as "a recessed version of the colored tile," not a blank square.
+    const spriteCanvas = sprites.get(spec.face);
+    if (spriteCanvas) {
+      if (spec.folded) {
+        // Drained tiles read as near-black recessed squares — keep the pips a faint
+        // ghost (the weight is still legible up close) so the tile doesn't sprout
+        // loud white dots that fight the drain. Hover relights toward full.
+        ctx.save();
+        ctx.globalAlpha = opts.hovered ? 0.7 : 0.22;
+        ctx.drawImage(spriteCanvas, x, y, w, h);
+        ctx.restore();
+      } else {
+        ctx.drawImage(spriteCanvas, x, y, w, h);
+      }
     }
   }
 
@@ -581,6 +595,43 @@ export function drawTile(
     ctx.stroke();
   }
 
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
+// Bolt head — the BOLTED-kind mark (see CLAUDE.md "Visual grammar")
+// ---------------------------------------------------------------------------
+
+/** Hex radius as a fraction of the tile's short side — leaves a margin so the glyph
+ *  never touches the tile's edge/rings (pinned, in-range, selected all stroke inset). */
+const BOLT_RADIUS_RATIO = 0.3;
+
+/**
+ * Draw a hex "bolt head" glyph centered at (cx, cy): a stroked hexagon, flat edge
+ * top/bottom (per the settled design), plus a small filled centre dot. SAME geometry
+ * as the `bolt` icon in `Icon.svelte` (six vertices at 0/60/120/180/240/300°, radius r)
+ * so the map tile, the transcript row flag, and the Inspector pill read as one metaphor
+ * rather than three unrelated marks. No gradient, no ctx.filter — a plain stroke + a
+ * plain fill, safe to run per-tile because there is exactly ONE system tile per session.
+ */
+function drawBoltHead(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number): void {
+  ctx.save();
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const a = (Math.PI / 180) * (i * 60);
+    const px = cx + r * Math.cos(a);
+    const py = cy - r * Math.sin(a); // canvas y grows down; negate to keep flat top/bottom
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+  ctx.strokeStyle = "rgba(255,255,255,0.82)";
+  ctx.lineWidth = Math.max(1, r * 0.16);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx, cy, Math.max(1, r * 0.16), 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.fill();
   ctx.restore();
 }
 

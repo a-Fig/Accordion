@@ -2178,7 +2178,13 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	function appendSuffix(messages: PiMessage[], from: number): void {
 		if (!truth) return;
 		const lastB = truth.blocks[truth.blocks.length - 1];
-		const orderStart = truth.blocks.length; // orders are contiguous from 0 → next order = count
+		// The next order is the LAST BLOCK'S ORDER + 1, not the block COUNT. Those agreed while every
+		// block came from `linearize` (orders contiguous from 0, one per array slot), but the block log
+		// can now also hold the BOLTED `system` block at index 0 with order -1 (issue #93's redesign) —
+		// it is a member of the log but not of the conversation numbering. Counting it would skip an
+		// order value on every append; deriving from the last block's own order is correct either way,
+		// and still yields 0 for an empty log and 0 for a log holding only the system block.
+		const orderStart = lastB ? lastB.order + 1 : 0;
 		const turnStart = lastB ? lastB.turn : 0;
 		const fresh = linearize(messages.slice(from), orderStart, turnStart).map(wireToBlock);
 		truth.append(fresh); // idempotent by id; emits `appended` → forwarded to clients
