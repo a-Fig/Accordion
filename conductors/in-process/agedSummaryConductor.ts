@@ -355,7 +355,9 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// drift. The gate re-opens on genuine REFILL: newly-aged content exceeding everything the
 		// unproductive pass was already handed, which is the point at which the region has plausibly
 		// grown a collapsible run it did not have before. A productive pass leaves this wide open, so
-		// the healthy path is unchanged.
+		// the healthy path is unchanged. The gate is deliberately blind to content FREED without
+		// refill (e.g. a pin lifted mid-latch): it stays shut until new tokens age in, trading a
+		// missed compaction opportunity for never re-billing on a region that already failed once.
 		const productive = this.lastPassSaving === null || this.lastPassSaving > MIN_PASS_SAVING;
 		const refilled = sumTokens(newlyAged) > this.lastPassAgedTokens;
 
