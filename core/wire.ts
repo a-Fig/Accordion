@@ -16,11 +16,9 @@
  * Fallback (missing anchor): `m<i>:u`, `m<i>:p<j>`, `m<i>:r`, `m<i>:s` (position-based,
  * same as the old scheme) — so nothing crashes on malformed messages.
  *
- * NOTE ON THE PROTOCOL IMPORT: `WireBlock`/`FoldOp`/`GroupOp` are wire-message shapes that
- * still live in `app/src/lib/live/protocol.ts` (untouched this phase — the old WS plan
- * protocol is Phase B's to relocate). We import them TYPE-ONLY, so the reference is erased at
- * compile time and `core/` carries no runtime dependency on the app. Relocating these wire
- * types into `core/` is a scoped Phase-B follow-up.
+ * NOTE ON THE PROTOCOL IMPORT: `WireBlock`/`FoldOp`/`GroupOp` are wire-message shapes that now
+ * live in `core/protocol.ts` (relocated in Phase B; `app/src/lib/live/protocol.ts` is a re-export
+ * shim). We import them TYPE-ONLY, so the reference is erased at compile time.
  */
 import type { WireBlock, FoldOp, GroupOp } from "./protocol";
 import type { Block } from "./types";
