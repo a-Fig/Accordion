@@ -29,25 +29,14 @@
  * matching `liveClient.svelte.ts`'s own `tokenQs` convention (never an `Authorization` header;
  * the token-gated WS upgrade reads it off the URL for every role, GUI or conductor).
  *
- * ── PROTOCOL/CONTRACT GAP (reported, not fixed — contract.ts is frozen; see the task report) ───
- * `ConductorHost.propose(txn): TxnResult` (`./contract`) is declared SYNCHRONOUS. Every shipped
- * conductor calls it that way — `conductors/thermocline/thermocline.ts:604,662`,
- * `core/conductors/doorman/doorman.ts:161`, and `./view.ts:213` all do
- * `const res = this.host.propose({ baseRev, ops }); ... for (const r of res.results)` with NO
- * `await`. An out-of-process host has no synchronous escape hatch: `propose` must cross the wire
- * (send `propose`, await the matching `proposeResult`) — there is no way to block Node's event
- * loop for a network round trip and hand back a real `TxnResult` in the same tick. This module
- * implements the ONLY honest option — an async round trip that returns the host's actual
- * `proposeResult` verbatim — which means `RemoteConductorHost.propose` returns a `Promise`, not a
- * `TxnResult`. See `RemoteConductorHost` below: it is NOT literally a `ConductorHost` at the type
- * level, and is cast at the single boundary where `conductor.attach()` needs one. Running an
- * existing synchronous-propose conductor against this SDK as built WILL throw where it reads
- * `res.results` (`res` is a `Promise`, which has no such property). This needs the coordinator's
- * sign-off: either `ConductorHost.propose` becomes `Promise<TxnResult>` (and every existing call
- * site gains an `await`), or the SDK needs a different design (e.g. a synchronous LOCAL dry-run
- * against a cloned replica `Truth`, firing the real `propose` over the wire independently and
- * reconciling via the ordinary echoed `event` — deliberately NOT implemented here without
- * sign-off, since it would silently paper over the exact mismatch this comment exists to surface).
+ * ── Async `propose` (contract v2, async-by-default) ────────────────────────────────────────────
+ * `ConductorHost.propose(txn): Promise<TxnResult>` (`./contract`) is async by contract — precisely
+ * so an out-of-process host like this one can honor it directly. `propose` here crosses the wire
+ * (send `propose`, await the matching `proposeResult`) and resolves the host's actual `proposeResult`
+ * verbatim; every conductor `await`s it (`./view.ts`, `core/conductors/doorman/doorman.ts`,
+ * `conductors/thermocline/thermocline.ts`). No cast is needed — the host built below IS a
+ * `ConductorHost`. (An in-process host resolves the same Promise on a microtask after applying the
+ * ops synchronously; a conductor cannot tell the two hosts apart, which is the whole portability point.)
  */
 import type { Truth } from "../truth";
 import { hydrateSnapshot, applyWireEvent } from "../replica";
@@ -105,14 +94,6 @@ export interface RemoteConductorOptions {
 	host?: string;
 	/** WebSocket client constructor. Default: `globalThis.WebSocket` (see the module doc above). */
 	wsFactory?: WSFactory;
-}
-
-/**
- * See the module-level "PROTOCOL/CONTRACT GAP" doc above: structurally identical to
- * `ConductorHost` except `propose`, which an out-of-process host cannot make synchronous.
- */
-export interface RemoteConductorHost extends Omit<ConductorHost, "propose"> {
-	propose(txn: { baseRev: number; ops: Op[] }): Promise<TxnResult>;
 }
 
 /**
@@ -216,7 +197,7 @@ export function runRemoteConductor(conductor: Conductor, opts: RemoteConductorOp
 			});
 		}
 
-		function buildHost(): RemoteConductorHost {
+		function buildHost(): ConductorHost {
 			return {
 				on(fn) {
 					listeners.add(fn);
@@ -349,10 +330,9 @@ export function runRemoteConductor(conductor: Conductor, opts: RemoteConductorOp
 						sawFirstSnapshot = true;
 						installReplica(t);
 						attached = true;
-						const hostImpl = buildHost();
-						// See the module-doc "PROTOCOL/CONTRACT GAP" note: `hostImpl.propose` is async,
-						// which the frozen `ConductorHost` type does not express. Cast at this one boundary.
-						conductor.attach(hostImpl as unknown as ConductorHost);
+						// `buildHost()` is a full `ConductorHost` — its async `propose` satisfies the
+						// contract directly (see the module-doc "Async `propose`" note); no cast needed.
+						conductor.attach(buildHost());
 					} else {
 						installReplica(t);
 						awaitingResnapshot = false;

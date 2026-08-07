@@ -49,9 +49,11 @@ built under. Nothing outside `core/conductors/doorman/` imports it.
      with no custom digest. The engine's own per-kind digest applies — still tagged
      (`{#code FOLDED}`), still recallable/unfoldable, exactly like a human fold.
 3. **One transaction**: every decision for this pass is proposed together
-   (`host.propose({ baseRev: <rev at pass start>, ops })`), and clamps are treated as final —
-   no retry loop inside the hold (everything here is synchronous CPU, so the hold never needs
-   more than one pass).
+   (`await host.propose({ baseRev: <rev at pass start>, ops })`), and clamps are treated as final —
+   no retry loop inside the hold. Every decision here is synchronous CPU and the ops are *invoked*
+   synchronously (so the fold lands before the sent cursor advances); the handler is `async` only
+   to `await` the async-by-contract propose result for its `handled`/status bookkeeping, which
+   settles on a microtask, far inside the hold window.
 4. **`setStatus`**: a concise summary + metrics, e.g. `"skeletonized 1 (−12.4k), folded 2
    (−9.1k)"`. Silent (no call) when nothing was acted on this pass.
 5. **Never nags**: doorman tracks every id it has successfully replaced/folded in an in-memory

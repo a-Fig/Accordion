@@ -25,9 +25,11 @@
 // graduation gate ②. `recall` is never lockable (ADR 0011 floor).
 //
 // wire-departing: we declare a SMALL `holdWireUpToMs` and use the pre-model-call `wire-departing`
-// event as the last-line HARD-CAP guarantee, running the SAME deterministic emergency synchronously
-// (no LLM, no async, no inline disk I/O — persistence is deferred off every hook path). The
-// expensive PREPARE/LLM machinery runs on `turn-committed`, never inside the hold window.
+// event as the last-line HARD-CAP guarantee, running the SAME deterministic emergency (no LLM, no
+// inline disk I/O — persistence is deferred off every hook path). The emergency's ops are INVOKED
+// synchronously (so the fold rides the departing wire), and the only `await` is the async-by-contract
+// (v2) `propose` itself, which settles on a microtask inside the hold window. The expensive
+// PREPARE/LLM machinery runs on `turn-committed`, never inside the hold window.
 import { mkdirSync, writeFileSync, renameSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -196,22 +198,22 @@ export class ThermoclineConductor implements Conductor {
 	}
 
 	// ── event routing ───────────────────────────────────────────────────────────
-	private onEvent(e: HostEvent): void {
+	private onEvent(e: HostEvent): void | Promise<void> {
 		if (!this.attached) return;
 		switch (e.type) {
 			case "blocks-appended":
 			case "turn-committed":
-				this.tick();
-				break;
+				// Return the promise so the host can await the tick (its proposes are async by
+				// contract v2) — e.g. the in-process host's wire-departing hold, or a test driver.
+				return this.tick();
 			case "state-changed":
 				this.onStateChanged(e.changes);
-				break;
+				return;
 			case "wire-departing":
-				this.onWireDeparting();
-				break;
+				return this.onWireDeparting();
 			case "resync":
 				this.onResync();
-				break;
+				return;
 		}
 	}
 
@@ -256,12 +258,14 @@ export class ThermoclineConductor implements Conductor {
 	}
 
 	/** LAST-LINE HARD-CAP guarantee, right before the wire departs to the model. Strictly
-	 *  deterministic (no LLM, no async, no inline disk I/O), so it fits the declared hold window. */
-	private onWireDeparting(): void {
+	 *  deterministic (no LLM, no inline disk I/O); the only `await` is the async-by-contract (v2)
+	 *  `propose` inside `runEmergency`, whose ops are INVOKED synchronously so the emergency fold
+	 *  rides this wire — the awaited tail settles on a microtask, inside the declared hold window. */
+	private async onWireDeparting(): Promise<void> {
 		const view = this.materialize();
 		this.lastView = view;
 		if (project(view, this.appliedForProject()) > capOf(view)) {
-			this.runEmergency(view);
+			await this.runEmergency(view);
 		}
 	}
 
@@ -302,7 +306,7 @@ export class ThermoclineConductor implements Conductor {
 	}
 
 	// ── the main steady-state tick ─────────────────────────────────────────────────
-	private tick(): void {
+	private async tick(): Promise<void> {
 		const view = this.materialize();
 		this.lastView = view;
 		this.gradAdvanced = false;
@@ -322,9 +326,11 @@ export class ThermoclineConductor implements Conductor {
 
 		this.pruneMaps(view, units);
 
-		// EMERGENCY: already over budget — deterministic, immediate, no LLM.
+		// EMERGENCY: already over budget — deterministic, immediate, no LLM. Awaited so the
+		// re-measure below reads the reconciled applied-state (the async-by-contract propose has
+		// settled), exactly as the pre-migration synchronous propose gave it same-tick.
 		if (fill > 1.0) {
-			this.runEmergency(view);
+			await this.runEmergency(view);
 			// Re-measure AFTER the emergency compressed. (Refinement over the .mjs port, which used the
 			// stale pre-emergency fill and thus kicked a redundant LLM epoch after every emergency — the
 			// "two cache misses in quick succession" the ADR flagged.) A PREPARE fires below only if the
@@ -344,7 +350,7 @@ export class ThermoclineConductor implements Conductor {
 		}
 
 		// HOLD: re-derive from the committed plan and propose the delta if anything shifted.
-		this.holdOrResend(view);
+		await this.holdOrResend(view);
 
 		// Background scoring: warm up scores for the next epoch (async, off this path).
 		this.maybeScore(view);
@@ -370,7 +376,7 @@ export class ThermoclineConductor implements Conductor {
 	}
 
 	// ── EMERGENCY: deterministic plan, no LLM, immediate ─────────────────────────────
-	private runEmergency(view: ConductorView): void {
+	private async runEmergency(view: ConductorView): Promise<void> {
 		++this.prepareToken; // discard any in-flight prepare — the emergency commit is ground truth
 		this.preparing = false;
 		this.advanceGraduationOnce(view);
@@ -378,7 +384,7 @@ export class ThermoclineConductor implements Conductor {
 			deterministic: true,
 			graduated: this.grad.graduated,
 		});
-		this.commit(view, plan, undefined); // undefined digests → deterministic fallbacks everywhere
+		await this.commit(view, plan, undefined); // undefined digests → deterministic fallbacks everywhere
 		this.lastAction = "emergency";
 	}
 
@@ -437,13 +443,13 @@ export class ThermoclineConductor implements Conductor {
 		// Re-plan on the LAST view (not the stale one) so the ops are fresh, then COMMIT atomically.
 		const lv = this.lastView ?? view;
 		const freshPlan = planEpoch(lv, this.scores, this.gradState(), this.cfg, { graduated: this.grad.graduated });
-		if (this.attached) this.commit(lv, freshPlan, this.digestCache);
+		if (this.attached) await this.commit(lv, freshPlan, this.digestCache);
 		this.preparing = false;
 		this.sendStatus();
 	}
 
 	// ── COMMIT: reconcile + real tokens + top-up, then propose ONE transaction ─────────
-	private commit(view: ConductorView, plan: Plan, digests: Map<string, string> | undefined): void {
+	private async commit(view: ConductorView, plan: Plan, digests: Map<string, string> | undefined): Promise<void> {
 		// (1) reconcile against reality: drop any fold/stratum the agent touched during PREPARE.
 		const touched = unionSet(this.agentTouched, this.recalledThisEpoch);
 		let working = reconcilePlan(plan, touched);
@@ -457,7 +463,7 @@ export class ThermoclineConductor implements Conductor {
 
 		// Diff the desired state against what we currently have applied and propose the delta.
 		const desired = this.desiredFromPlan(working, digests, view);
-		this.applyDesired(desired);
+		await this.applyDesired(desired);
 		this.appliedPlan = working;
 
 		// Persist the deep zone AFTER commit, deferred off every hook path (never inline disk I/O).
@@ -532,10 +538,10 @@ export class ThermoclineConductor implements Conductor {
 	/** HOLD — re-derive the desired state from the committed plan against the CURRENT view and
 	 *  propose only the delta. An unchanged desired state yields an empty transaction (the diff IS
 	 *  the signature-dedup). Also the seam that first applies a restored deep zone to the engine. */
-	private holdOrResend(view: ConductorView): void {
+	private async holdOrResend(view: ConductorView): Promise<void> {
 		if (!this.appliedPlan) return;
 		const desired = this.desiredFromPlan(this.appliedPlan, this.digestCache, view);
-		this.applyDesired(desired);
+		await this.applyDesired(desired);
 	}
 
 	// ── desired state + diff ────────────────────────────────────────────────────────
@@ -568,7 +574,7 @@ export class ThermoclineConductor implements Conductor {
 
 	/** Diff `desired` against the applied state and propose ONE transaction (undo removed folds/
 	 *  strata, then apply new/changed ones). Update the applied state from what actually applied. */
-	private applyDesired(desired: Desired): void {
+	private async applyDesired(desired: Desired): Promise<void> {
 		const stratumKey = (firstId: string, lastId: string) => `${firstId}|${lastId}`;
 		const desiredStrataByKey = new Map(desired.strata.map((s) => [stratumKey(s.firstId, s.lastId), s]));
 		const desiredStratumMembers = new Set(desired.strata.flatMap((s) => s.memberIds));
@@ -601,7 +607,7 @@ export class ThermoclineConductor implements Conductor {
 		if (!ops.length) return;
 
 		const baseRev = this.host.stats().rev;
-		const res = this.host.propose({ baseRev, ops });
+		const res = await this.host.propose({ baseRev, ops });
 
 		// Snapshot the groups AFTER the transaction so the belt-and-braces below reads the REAL member
 		// set Truth applied, not the plan's intent (one query — the loop reuses it).
@@ -659,7 +665,9 @@ export class ThermoclineConductor implements Conductor {
 
 		// Apply any belt-and-braces repairs (ungroup a mismatched stratum) so no unresolvable tag rides
 		// the wire. Rare-by-construction — the run-boundary snap makes a mismatch a should-never-happen.
-		if (repairs.length) this.host.propose({ baseRev: this.host.stats().rev, ops: repairs });
+		// `stats().rev` is read as the baseRev arg (synchronously, before the propose is invoked), so it
+		// anchors to the post-first-propose rev exactly as the pre-migration synchronous call did.
+		if (repairs.length) await this.host.propose({ baseRev: this.host.stats().rev, ops: repairs });
 	}
 
 	// ── background scoring ──────────────────────────────────────────────────────────

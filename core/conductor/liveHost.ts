@@ -200,8 +200,12 @@ export class LiveConductorHost implements ConductorHost {
 	setStatus(text: string | null, metrics?: Record<string, number | string | boolean>): void {
 		this.setAndBroadcastStatus(text, metrics);
 	}
-	propose(txn: { baseRev: number; ops: Op[] }): TxnResult {
-		return this.applyPropose(txn.baseRev, txn.ops);
+	propose(txn: { baseRev: number; ops: Op[] }): Promise<TxnResult> {
+		// The contract's `propose` is async; an in-process conductor awaits it. The ops apply to the
+		// live Truth SYNCHRONOUSLY on invocation (via `applyPropose`) — only the return wraps in a
+		// resolved Promise. The remote-conductor wire path calls `applyPropose` directly instead
+		// (`handleConductorMessage`), returning a `TxnResult` synchronously to echo over the socket.
+		return Promise.resolve(this.applyPropose(txn.baseRev, txn.ops));
 	}
 
 	// ── select / attach / detach ──────────────────────────────────────────────────

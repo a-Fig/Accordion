@@ -77,8 +77,11 @@ export class TestHost implements ConductorHost {
 	setStatus(text: string | null, metrics?: Record<string, number | string | boolean>): void {
 		this.statusLog.push({ text, metrics });
 	}
-	propose(txn: { baseRev: number; ops: Op[] }): TxnResult {
-		return this.truth.apply(txn.ops, "auto", txn.baseRev);
+	propose(txn: { baseRev: number; ops: Op[] }): Promise<TxnResult> {
+		// In-process: the ops apply to Truth SYNCHRONOUSLY the instant this is invoked (so a fold
+		// still lands before `departWire` advances the sent cursor); only the `TxnResult` return
+		// wraps in a resolved Promise, per the async-by-contract `ConductorHost.propose`.
+		return Promise.resolve(this.truth.apply(txn.ops, "auto", txn.baseRev));
 	}
 
 	// ── test helpers ──────────────────────────────────────────────────────────
@@ -86,24 +89,28 @@ export class TestHost implements ConductorHost {
 	appendBlocks(blocks: Block[]): void {
 		this.truth.append(blocks);
 	}
-	/** Settle a turn — the canonical re-plan trigger for turn-based conductors. */
-	commitTurn(turn?: number): void {
+	/** Settle a turn — the canonical re-plan trigger for turn-based conductors. Awaitable: it
+	 *  resolves once every (now possibly async, per `ConductorHost.propose`) handler has settled,
+	 *  so a test's assertions observe the conductor's fully-reconciled state. */
+	async commitTurn(turn?: number): Promise<void> {
 		this.turn = turn ?? this.turn + 1;
-		this.fire({ type: "turn-committed", turn: this.turn, rev: this.truth.rev });
+		await this.fireAwaitable({ type: "turn-committed", turn: this.turn, rev: this.truth.rev });
 	}
 	/**
-	 * Fire `wire-departing` (honoring `holdWireUpToMs`: synchronous handlers get to propose a
-	 * last-moment fold before we commit), then mark everything sent through the newest block —
-	 * exactly the point at which the wire has departed to the model.
+	 * Fire `wire-departing` (honoring `holdWireUpToMs`: a handler gets to propose a last-moment
+	 * fold — its propose applies synchronously on invocation), await the handler settling, then
+	 * mark everything sent through the newest block — exactly the point at which the wire has
+	 * departed to the model. Awaited so a birth-fold has fully reconciled before the sent cursor
+	 * advances and before the caller's assertions run.
 	 */
-	departWire(): void {
+	async departWire(): Promise<void> {
 		const { event, lastOrder } = wireDepartingEvent(this.truth);
-		this.fire(event);
+		await this.fireAwaitable(event);
 		if (lastOrder !== null) this.truth.markSent(lastOrder);
 	}
 	/** Signal a structural rebuild — subscribed conductors rebuild their tracked desired state. */
-	resync(): void {
-		this.fire({ type: "resync", rev: this.truth.rev });
+	async resync(): Promise<void> {
+		await this.fireAwaitable({ type: "resync", rev: this.truth.rev });
 	}
 
 	humanFold(id: string): TxnResult {
@@ -145,13 +152,28 @@ export class TestHost implements ConductorHost {
 	 * does not mutate fold state — so Truth cannot emit it; the host layer does, so a strategy that
 	 * treats "the agent reached back into this block" as a signal can observe it.
 	 */
-	agentRecall(id: string): void {
-		this.fire(recallHostEvent([id], "agent", this.truth.rev));
+	async agentRecall(id: string): Promise<void> {
+		await this.fireAwaitable(recallHostEvent([id], "agent", this.truth.rev));
 	}
 
 	// ── internals ─────────────────────────────────────────────────────────────
+	/** Fire-and-forget dispatch — used by the Truth event subscription, which cannot be awaited. */
 	private fire(e: HostEvent): void {
 		for (const fn of this.listeners) void fn(e);
+	}
+	/** Dispatch and resolve once every returned handler promise settles (a throwing/rejecting
+	 *  handler never crashes the pump). The awaitable seam the driver methods above use. */
+	private async fireAwaitable(e: HostEvent): Promise<void> {
+		const pending: Promise<void>[] = [];
+		for (const fn of this.listeners) {
+			try {
+				const r = fn(e);
+				if (r && typeof (r as Promise<void>).then === "function") pending.push(r as Promise<void>);
+			} catch {
+				/* a listener must not crash the pump */
+			}
+		}
+		if (pending.length) await Promise.allSettled(pending);
 	}
 	private onTruthEvent(e: TruthEvent): void {
 		for (const he of hostEventsFromTruthEvent(this.truth, e)) this.fire(he);

@@ -84,7 +84,7 @@ function bigDtsSource(nInterfaces = 80): string {
 // ── (1) birth-fold: skeletonize ──────────────────────────────────────────────────────────
 
 describe("DoormanConductor — birth-fold skeletonizes a big fresh code read", () => {
-	it("Python file read from a prior turn: replaced with header+skeleton while still inside the protected tail", () => {
+	it("Python file read from a prior turn: replaced with header+skeleton while still inside the protected tail", async () => {
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
@@ -104,7 +104,7 @@ describe("DoormanConductor — birth-fold skeletonizes a big fresh code read", (
 		expect(before.protected).toBe(true);
 		expect(before.sent).toBe(false);
 
-		host.departWire();
+		await host.departWire();
 
 		const after = host.truth.get("r:1")!;
 		expect(after.autoFolded).toBe(true);
@@ -131,7 +131,7 @@ describe("DoormanConductor — birth-fold skeletonizes a big fresh code read", (
 // ── (2) birth-fold: generic engine digest for a non-code giant dump ─────────────────────
 
 describe("DoormanConductor — birth-folds a non-code giant dump to the engine digest", () => {
-	it("a big fresh grep dump folds despite being protected+fresh, tagged with the engine's own digest", () => {
+	it("a big fresh grep dump folds despite being protected+fresh, tagged with the engine's own digest", async () => {
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
@@ -147,7 +147,7 @@ describe("DoormanConductor — birth-folds a non-code giant dump to the engine d
 		expect(host.get("r:1")!.protected).toBe(true);
 		expect(host.get("r:1")!.sent).toBe(false);
 
-		host.departWire();
+		await host.departWire();
 
 		const after = host.truth.get("r:1")!;
 		expect(after.autoFolded).toBe(true);
@@ -165,7 +165,7 @@ describe("DoormanConductor — birth-folds a non-code giant dump to the engine d
 // ── (3) leaves untouched ─────────────────────────────────────────────────────────────────
 
 describe("DoormanConductor — leaves untouched", () => {
-	it("a small result (below MIN_SKELETON_TOKENS) stays live", () => {
+	it("a small result (below MIN_SKELETON_TOKENS) stays live", async () => {
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
@@ -175,11 +175,11 @@ describe("DoormanConductor — leaves untouched", () => {
 			toolResult("r:1", 1, 2, "c:1", "Read", "def f():\n    return 1\n"),
 			userBlock("u:2", 2, 3),
 		]);
-		host.departWire();
+		await host.departWire();
 		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(false);
 	});
 
-	it("an isError result stays live even though it is huge and fresh", () => {
+	it("an isError result stays live even though it is huge and fresh", async () => {
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
@@ -190,21 +190,21 @@ describe("DoormanConductor — leaves untouched", () => {
 			toolResult("r:1", 1, 2, "c:1", "Read", py, { isError: true }),
 			userBlock("u:2", 2, 3),
 		]);
-		host.departWire();
+		await host.departWire();
 		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(false);
 	});
 
-	it("a huge result in the CURRENT (newest) turn stays live — the user may have just asked for it", () => {
+	it("a huge result in the CURRENT (newest) turn stays live — the user may have just asked for it", async () => {
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
 		const py = bigPythonSource(15);
 		host.appendBlocks([userBlock("u:1", 1, 0), toolCall("c:1", 2, 1, "Read", { file_path: "src/util.py" }), toolResult("r:1", 2, 2, "c:1", "Read", py)]);
-		host.departWire();
+		await host.departWire();
 		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(false);
 	});
 
-	it("a pinned (held) huge result stays live", () => {
+	it("a pinned (held) huge result stays live", async () => {
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
@@ -216,7 +216,7 @@ describe("DoormanConductor — leaves untouched", () => {
 			userBlock("u:2", 2, 3),
 		]);
 		host.humanPin("r:1");
-		host.departWire();
+		await host.departWire();
 		const after = host.truth.get("r:1")!;
 		expect(after.override).toBe("pinned");
 		expect(host.truth.isFolded(after)).toBe(false);
@@ -226,7 +226,7 @@ describe("DoormanConductor — leaves untouched", () => {
 // ── (4) respects overrides forever — no nagging ──────────────────────────────────────────
 
 describe("DoormanConductor — respects overrides forever", () => {
-	it("after the agent unfolds a doorman fold, a later wire-departing does not re-fold it", () => {
+	it("after the agent unfolds a doorman fold, a later wire-departing does not re-fold it", async () => {
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
@@ -238,7 +238,7 @@ describe("DoormanConductor — respects overrides forever", () => {
 			toolResult("r:1", 1, 2, "c:1", "Bash", grep),
 			userBlock("u:2", 2, 3),
 		]);
-		host.departWire(); // doorman birth-folds r:1
+		await host.departWire(); // doorman birth-folds r:1
 		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(true);
 
 		host.agentUnfold("r:1"); // the agent calls `unfold` on it
@@ -262,7 +262,7 @@ describe("DoormanConductor — respects overrides forever", () => {
 
 		// More conversation happens; a later wire-departing must not re-fold r:1 or nag about it.
 		host.appendBlocks([toolCall("c:2", 2, 4, "Read", { file_path: "src/other.py" }), toolResult("r:2", 2, 5, "c:2", "Read", "def g():\n    return 2\n"), userBlock("u:3", 3, 6)]);
-		host.departWire();
+		await host.departWire();
 
 		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(false);
 		expect(host.truth.get("r:1")!.override).toBe("unfolded"); // untouched — still the agent's override
@@ -276,7 +276,7 @@ describe("DoormanConductor — respects overrides forever", () => {
 	 * reported as fresh, proving doorman's OWN "never revisit an acted-on id" tracking — not
 	 * just Truth's independent protection — is what stops the second proposal.
 	 */
-	it("never re-proposes an id it has already acted on, even if the host still reports it as fresh", () => {
+	it("never re-proposes an id it has already acted on, even if the host still reports it as fresh", async () => {
 		const grep = bigGrepDump(200);
 		const tokens = Math.ceil(grep.length / 4);
 		const callBlock: ViewBlock = {
@@ -317,12 +317,15 @@ describe("DoormanConductor — respects overrides forever", () => {
 		const d = new DoormanConductor();
 		d.attach(host);
 
-		fire({ type: "wire-departing", rev: 0, liveTokens: 0, budget: 70_000, freshIds: ["r:1"] });
+		// `await fire` settles doorman's async handler (its `handled` bookkeeping lands after the
+		// awaited async-by-contract propose) before the second dispatch — so the second wire-departing
+		// genuinely tests the "already acted on" guard, not a race against unreconciled bookkeeping.
+		await fire({ type: "wire-departing", rev: 0, liveTokens: 0, budget: 70_000, freshIds: ["r:1"] });
 		expect(proposals.length).toBe(1);
 		expect(proposals[0].ops).toEqual([{ kind: "fold", ids: ["r:1"] }]);
 
 		// Same id presented as fresh AGAIN — doorman must not propose a second time.
-		fire({ type: "wire-departing", rev: 0, liveTokens: 0, budget: 70_000, freshIds: ["r:1"] });
+		await fire({ type: "wire-departing", rev: 0, liveTokens: 0, budget: 70_000, freshIds: ["r:1"] });
 		expect(proposals.length).toBe(1); // unchanged
 	});
 });
@@ -330,7 +333,7 @@ describe("DoormanConductor — respects overrides forever", () => {
 // ── (5) bulk/history sessions ─────────────────────────────────────────────────────────────
 
 describe("DoormanConductor — bulk/history sessions", () => {
-	it("never touches a bulk-loaded (non-live) session — every block was born already sent", () => {
+	it("never touches a bulk-loaded (non-live) session — every block was born already sent", async () => {
 		const py = bigPythonSource(15);
 		const blocks: Block[] = [userBlock("u:1", 1, 0), toolCall("c:1", 1, 1, "Read", { file_path: "src/util.py" }), toolResult("r:1", 1, 2, "c:1", "Read", py), userBlock("u:2", 2, 3)];
 		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks, lineCount: 0, skipped: 0 };
@@ -340,7 +343,7 @@ describe("DoormanConductor — bulk/history sessions", () => {
 
 		expect(host.get("r:1")!.sent).toBe(true); // bulk-loaded: born sent (ADR 0018 §5)
 
-		host.departWire(); // freshIds will be empty — doorman never even scans candidates
+		await host.departWire(); // freshIds will be empty — doorman never even scans candidates
 		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(false);
 	});
 });
@@ -348,20 +351,20 @@ describe("DoormanConductor — bulk/history sessions", () => {
 // ── (6) worth-it rejection ────────────────────────────────────────────────────────────────
 
 describe("DoormanConductor — worth-it rejection", () => {
-	it("leaves a classified-as-code file alone when skeletonizing it wouldn't shrink it enough", () => {
+	it("leaves a classified-as-code file alone when skeletonizing it wouldn't shrink it enough", async () => {
 		const host = new TestHost();
 		const d = new DoormanConductor();
 		d.attach(host);
 		const dts = bigDtsSource(80); // all top-level interfaces — nothing to elide
 		host.appendBlocks([userBlock("u:1", 1, 0), toolCall("c:1", 1, 1, "Read", { file_path: "src/types.ts" }), toolResult("r:1", 1, 2, "c:1", "Read", dts), userBlock("u:2", 2, 3)]);
-		host.departWire();
+		await host.departWire();
 		expect(host.truth.isFolded(host.truth.get("r:1")!)).toBe(false);
 	});
 });
 
 // ── fake host used only by the surgical "handled" test above ────────────────────────────
 
-function makeFakeHost(blocksList: ViewBlock[]): { host: ConductorHost; fire: (e: HostEvent) => void; proposals: Array<{ baseRev: number; ops: Op[] }> } {
+function makeFakeHost(blocksList: ViewBlock[]): { host: ConductorHost; fire: (e: HostEvent) => Promise<void>; proposals: Array<{ baseRev: number; ops: Op[] }> } {
 	const byId = new Map(blocksList.map((b) => [b.id, b]));
 	const proposals: Array<{ baseRev: number; ops: Op[] }> = [];
 	let listener: ((e: HostEvent) => void | Promise<void>) | null = null;
@@ -398,9 +401,11 @@ function makeFakeHost(blocksList: ViewBlock[]): { host: ConductorHost; fire: (e:
 		},
 		setStatus() {},
 		propose(txn) {
+			// Apply synchronously on invocation (record the proposal), resolve the TxnResult on a
+			// microtask — the async-by-contract (v2) `ConductorHost.propose` shape.
 			proposals.push(txn);
-			return { rev: 0, results: txn.ops.map((op) => ({ op, applied: true })) };
+			return Promise.resolve({ rev: 0, results: txn.ops.map((op) => ({ op, applied: true })) });
 		},
 	};
-	return { host, fire: (e) => void listener?.(e), proposals };
+	return { host, fire: (e) => Promise.resolve(listener?.(e)), proposals };
 }

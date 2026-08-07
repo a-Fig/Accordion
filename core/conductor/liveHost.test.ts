@@ -193,7 +193,7 @@ describe("conductor messages — only the active socket is honored", () => {
 
 // ── wire-departing hold ──────────────────────────────────────────────────────────
 describe("hold — in-process", () => {
-	it("a synchronous handler (doorman folds the giant) resolves immediately, no timeout", async () => {
+	it("doorman folds the giant on the departing wire; the hold settles on a microtask, no timeout", async () => {
 		const t = giantTruth();
 		const host = new LiveConductorHost(makeDeps(t).deps);
 		host.select("doorman");
@@ -344,12 +344,12 @@ describe("completion — aborted on detach", () => {
 });
 
 describe("propose — human override clamps a conductor op (pin mid-completion)", () => {
-	it("a conductor fold of a human-pinned block is clamped human-override and the pin stands", () => {
+	it("a conductor fold of a human-pinned block is clamped human-override and the pin stands", async () => {
 		const t = bulk(textSeq(3));
 		t.setProtect(0);
 		const host = new LiveConductorHost(makeDeps(t).deps);
 		t.apply([{ kind: "pin", ids: ["a:b0:p0"] }], "you"); // human pins mid-run
-		const r = host.propose({ baseRev: t.rev, ops: [{ kind: "fold", ids: ["a:b0:p0"] }] });
+		const r = await host.propose({ baseRev: t.rev, ops: [{ kind: "fold", ids: ["a:b0:p0"] }] });
 		expect(r.results[0].applied).toBe(false);
 		expect(r.results[0].clamped).toBe("human-override");
 		expect(t.get("a:b0:p0")!.override).toBe("pinned");

@@ -158,8 +158,14 @@ export interface ConductorHost {
 	complete(req: CompletionRequest): Promise<CompletionResult>;
 	/** Surface display-only conductor status to the human; `null`/empty clears it. */
 	setStatus(text: string | null, metrics?: Record<string, number | string | boolean>): void;
-	/** Propose a transaction against `baseRev`; the host clamps and returns per-op results. */
-	propose(txn: { baseRev: number; ops: Op[] }): TxnResult;
+	/**
+	 * Propose a transaction against `baseRev`; the host clamps and returns per-op results.
+	 * Async by contract (async-by-default is this contract's philosophy, and out-of-process
+	 * hosts are a mandate): an IN-PROCESS host applies the ops synchronously the instant `propose`
+	 * is invoked and resolves the `TxnResult` on a microtask; an OUT-OF-PROCESS host resolves it
+	 * after the `propose`→`proposeResult` wire round trip. Every caller `await`s it.
+	 */
+	propose(txn: { baseRev: number; ops: Op[] }): Promise<TxnResult>;
 }
 
 /**
