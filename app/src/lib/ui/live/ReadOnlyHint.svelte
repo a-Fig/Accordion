@@ -8,10 +8,24 @@
 	 * Purely reactive to `blockedHint` — no props, no local state.
 	 */
 	import { blockedHint } from "$lib/live/controllerUi.svelte";
+
+	// U5: clamp to the viewport so a hint flashed from a click near an edge never renders off-screen.
+	// The box is `translate(-50%, 12px)` (centered horizontally, dropped below the point), nowrap, and
+	// at most ~a few hundred px wide — keep a generous half-width margin on x and the drop clearance on
+	// y. A rough clamp is fine for a transient whisper; it only needs to stay on-screen near the edges.
+	const X_MARGIN = 150;
+	const Y_MARGIN = 44;
+	const clamped = $derived.by(() => {
+		const vw = typeof window !== "undefined" ? window.innerWidth : 0;
+		const vh = typeof window !== "undefined" ? window.innerHeight : 0;
+		const x = vw ? Math.min(Math.max(blockedHint.x, X_MARGIN), Math.max(X_MARGIN, vw - X_MARGIN)) : blockedHint.x;
+		const y = vh ? Math.min(Math.max(blockedHint.y, 8), Math.max(8, vh - Y_MARGIN)) : blockedHint.y;
+		return { x, y };
+	});
 </script>
 
 {#if blockedHint.show}
-	<div class="ro-hint" style:left="{blockedHint.x}px" style:top="{blockedHint.y}px">
+	<div class="ro-hint" role="status" aria-live="polite" style:left="{clamped.x}px" style:top="{clamped.y}px">
 		{blockedHint.text}
 	</div>
 {/if}
