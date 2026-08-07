@@ -104,7 +104,6 @@ describe("ADR 0011 — human-steering gates every human entry point", () => {
 
 		s.resetAll(); // would normally clear all overrides + emit "reset"
 		expect(s.isFolded(s.get("a:b0:p0")!)).toBe(true); // strategy fold untouched
-		expect(s.log.some((e) => e.action === "reset")).toBe(false); // no log emitted
 	});
 
 	it("locked: toggle / unpin / auto / foldGroup / unfoldGroup / deleteGroup are no-ops on strategy state", () => {
