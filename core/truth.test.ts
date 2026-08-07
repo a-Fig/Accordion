@@ -1203,3 +1203,150 @@ describe("Truth — calibration (issue #11 stage 1)", () => {
 		expect(replica.protectTokens).toBe(protect0);
 	});
 });
+
+// Issue #93: the system prompt as a scalar Truth fact — never a Block (no id, so no fold/pin/group
+// affordance can ever target it), captured/pushed via the same config-dial shape as `calibration`/
+// `contextWindow`, and folded into `liveTokens()`/`fullTokens()` (un-smearing it out of ADR 0025's
+// calibration pairing — see that ADR's issue-#93 addendum).
+describe("Truth — systemPrompt (issue #93)", () => {
+	it("defaults to null", () => {
+		const t = bulk(seq(2, 1000));
+		expect(t.systemPrompt).toBe(null);
+	});
+
+	it("setSystemPrompt sets it, bumps rev, and emits a config event", () => {
+		const t = bulk(seq(2, 1000));
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+		const rev0 = t.rev;
+
+		t.setSystemPrompt("You are a helpful assistant.", 8);
+		expect(t.systemPrompt).toEqual({ text: "You are a helpful assistant.", tokens: 8 });
+		expect(t.rev).toBe(rev0 + 1);
+		expect(events.at(-1)).toMatchObject({ type: "config", systemPrompt: { text: "You are a helpful assistant.", tokens: 8 } });
+
+		// A second call overwrites outright — no merge, no history.
+		t.setSystemPrompt("New prompt.", 3);
+		expect(t.systemPrompt).toEqual({ text: "New prompt.", tokens: 3 });
+		expect(t.rev).toBe(rev0 + 2);
+	});
+
+	it("refuses non-string text / non-finite / negative tokens — no poison, no rev bump, no event", () => {
+		const t = bulk(seq(2, 1000));
+		const rev0 = t.rev;
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+
+		t.setSystemPrompt(123 as unknown as string, 5);
+		t.setSystemPrompt("ok", NaN);
+		t.setSystemPrompt("ok", Infinity);
+		t.setSystemPrompt("ok", -1);
+		expect(t.systemPrompt).toBe(null); // unchanged, not poisoned
+		expect(t.rev).toBe(rev0);
+		expect(events.length).toBe(0);
+
+		t.setSystemPrompt("a real one", 4); // a real value still applies
+		expect(t.systemPrompt).toEqual({ text: "a real one", tokens: 4 });
+	});
+
+	it("liveTokens()/fullTokens() include the raw system-prompt estimate (un-smearing); blockCount is unaffected", () => {
+		const t = bulk(seq(4, 1000));
+		t.setProtect(0);
+		const before = t.stats();
+		expect(before.fullTokens).toBe(4000);
+		expect(before.liveTokens).toBe(4000);
+
+		t.setSystemPrompt("x".repeat(2000), 500);
+		const after = t.stats();
+		expect(after.fullTokens).toBe(4500);
+		expect(after.liveTokens).toBe(4500);
+		expect(after.blockCount).toBe(4); // block-only — untouched
+	});
+
+	it("is a no-op contribution when uncaptured (every CC/demo/file session)", () => {
+		const t = bulk(seq(3, 1000));
+		expect(t.systemPrompt).toBe(null);
+		expect(t.stats().liveTokens).toBe(3000);
+		expect(t.stats().fullTokens).toBe(3000);
+	});
+
+	it("computeProtectedFromIndex is unaffected — it walks raw block tokens directly, never through liveTokens()/fullTokens()", () => {
+		const withSp = bulk(seq(5, 1000));
+		withSp.setProtect(2500);
+		const pfiBefore = withSp.protectedFromIndex();
+		withSp.setSystemPrompt("x".repeat(40_000), 10_000); // a huge system prompt
+		expect(withSp.protectedFromIndex()).toBe(pfiBefore); // the tail boundary did not move
+	});
+
+	it("survives rebuildFrom (carried like calibration/budget), and a fresh build (prev === null) stays null", () => {
+		const host = live();
+		host.append(seq(3, 1000));
+		host.setSystemPrompt("captured prompt", 4);
+
+		const fresh = seq(3, 1000);
+		const next = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(next.systemPrompt).toEqual({ text: "captured prompt", tokens: 4 });
+
+		const firstBuild = Truth.rebuildFrom(null, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(firstBuild.systemPrompt).toBe(null); // not polluted by ANY prior state
+	});
+
+	it("round-trips through serializeSnapshot → hydrateSnapshot (replica replay parity)", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		host.setSystemPrompt("a prompt", 3);
+
+		const state = serializeSnapshot(host, false);
+		expect(state.systemPrompt).toEqual({ text: "a prompt", tokens: 3 });
+
+		const replica = hydrateSnapshot(META, state);
+		expect(replica.systemPrompt).toEqual({ text: "a prompt", tokens: 3 });
+		expect(replica.rev).toBe(host.rev);
+
+		// A stale-format peer that omits `systemPrompt` (pre-v19) falls back to null rather than
+		// forking on `undefined` — never a decision-affecting divergence.
+		const stale = hydrateSnapshot(META, { ...state, systemPrompt: undefined });
+		expect(stale.systemPrompt).toBe(null);
+	});
+
+	it("adoptSnapshot self-validates a malformed shape (bad text/tokens type) to null, same guard shape as calibration", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		const state = serializeSnapshot(host, false);
+
+		const badTokens = hydrateSnapshot(META, { ...state, systemPrompt: { text: "ok", tokens: NaN } });
+		expect(badTokens.systemPrompt).toBe(null);
+
+		const badText = hydrateSnapshot(META, { ...state, systemPrompt: { text: 5 as unknown as string, tokens: 3 } });
+		expect(badText.systemPrompt).toBe(null);
+
+		const negativeTokens = hydrateSnapshot(META, { ...state, systemPrompt: { text: "ok", tokens: -1 } });
+		expect(negativeTokens.systemPrompt).toBe(null);
+	});
+
+	it("a config event carrying ONLY systemPrompt replays via applyWireEvent without touching the other dials", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		const budget0 = host.budget;
+		const protect0 = host.protectTokens;
+
+		const events: WireEvent[] = [];
+		const off = host.onEvent((e) => {
+			const w = wireEventFromTruthEvent(e);
+			if (w) events.push(w);
+		});
+		host.setSystemPrompt("a prompt", 3);
+		off();
+		const cfgEv = events.find((e) => e.kind === "config");
+		expect(cfgEv).toMatchObject({ kind: "config", systemPrompt: { text: "a prompt", tokens: 3 } });
+		expect((cfgEv as any).budget).toBeUndefined();
+		expect((cfgEv as any).protectTokens).toBeUndefined();
+
+		const replica = live();
+		replica.append(seq(2, 1000));
+		applyWireEvent(replica, cfgEv!);
+		expect(replica.systemPrompt).toEqual({ text: "a prompt", tokens: 3 });
+		expect(replica.budget).toBe(budget0);
+		expect(replica.protectTokens).toBe(protect0);
+	});
+});

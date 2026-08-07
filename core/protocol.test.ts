@@ -35,8 +35,8 @@ import type {
 } from "./protocol";
 
 describe("PROTOCOL_VERSION", () => {
-	it("is bumped to 18 for provider-anchored token calibration (issue #11 stage 1, ADR 0025)", () => {
-		expect(PROTOCOL_VERSION).toBe(18);
+	it("is bumped to 19 for system prompt visibility (issue #93)", () => {
+		expect(PROTOCOL_VERSION).toBe(19);
 	});
 });
 
@@ -239,6 +239,41 @@ describe("v17 — notice message guard", () => {
 
 	it("rejects an unrecognized type (guards don't merely check for a `text` field)", () => {
 		expect(isServerMessage({ type: "notic", text: "typo'd type" })).toBe(false);
+	});
+});
+
+// ── v19: system prompt visibility (issue #93) ─────────────────────────────────
+describe("v19 — systemPrompt on SnapshotState / config WireEvent", () => {
+	const baseState = {
+		blocks: [],
+		overlay: [],
+		groups: [],
+		budget: 70_000,
+		contextWindow: null,
+		protectTokens: 20_000,
+		locks: [],
+		lockHolder: null,
+		tailTokens: 0,
+		sentThroughOrder: -1,
+		wireAttached: false,
+		foldingEnabled: false,
+		birthFolded: [],
+		rev: 0,
+	};
+
+	it("accepts a snapshot whose state carries a captured systemPrompt", () => {
+		const msg = { type: "snapshot" as const, state: { ...baseState, systemPrompt: { text: "You are helpful.", tokens: 4 } } };
+		expect(isServerMessage(msg)).toBe(true);
+	});
+
+	it("accepts a snapshot whose state carries systemPrompt: null (not yet captured)", () => {
+		const msg = { type: "snapshot" as const, state: { ...baseState, systemPrompt: null } };
+		expect(isServerMessage(msg)).toBe(true);
+	});
+
+	it("accepts a snapshot whose state OMITS systemPrompt entirely (pre-v19 literal, backward-compatible shape)", () => {
+		const msg = { type: "snapshot" as const, state: baseState };
+		expect(isServerMessage(msg)).toBe(true);
 	});
 });
 
