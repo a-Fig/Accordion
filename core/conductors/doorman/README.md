@@ -29,12 +29,15 @@ conductor. It declares no locks, so attaching it is fully collaborative — no c
 ## What doorman decides, on every `wire-departing`
 
 1. **Candidates**: fresh `tool_result` blocks (`payload.freshIds`) that are not `isError`, not
-   `held` (no pin / prior manual fold-unfold), `tokens >= 1500` (`MIN_SKELETON_TOKENS`, ported
-   from the code-skeleton reference), and **not in the newest turn** (`block.turn < latest
-   turn` over all blocks). That last carve-out is a judgment call: a huge result born in the
-   turn the user is *currently* mid-conversation with may be exactly what they just asked for,
-   so doorman leaves the current turn alone and only acts once a giant result is at least one
-   turn old — while still fresh (never sent whole).
+   `held` (no pin / prior manual fold-unfold), not inside a folded group, and `tokens >= 1500`
+   (`MIN_SKELETON_TOKENS`, ported from the code-skeleton reference). Freshness — `!sent`, i.e.
+   the block has never crossed the wire whole — is the ONLY age gate. Doorman acts **regardless
+   of turn**: in a real live loop the `wire-departing` hold fires at the *continuation hook*,
+   where a just-arrived giant `tool_result` is always still in the current (newest) turn AND
+   still unsent. That continuation hook **is** the birth-fold moment; a "leave the newest turn
+   alone" guard would mean doorman never fires in a live session at all (the block is marked
+   sent the instant the wire departs, so it is never both old-enough and still-fresh). Doorman
+   therefore intercepts on first appearance, before the sent cursor advances.
 2. **Classify**: `classifyCodeRead(block, callById)` (verbatim) decides code vs. not-code.
    - **Code AND worth it** → `skeletonize(source, lang)` (verbatim). "Worth it" is ported
      exactly from the reference: the skeleton must actually elide something
@@ -94,14 +97,14 @@ steering path couldn't also produce.
 
 ## Tests
 
-- `doorman.test.ts` — the 7 scenarios from the conductor spec: skeletonize a big fresh
-  prior-turn Python read while it is provably still `protected` (birth-fold proof); fold a
-  non-code prior-turn dump the same way; four "leaves untouched" gates (too small / error /
-  current turn / held); the agent-unfold-then-never-refold guarantee (both an integration
-  test through `TestHost` and a surgical test against a hand-rolled `ConductorHost` that pins
-  down doorman's own `handled`-set bookkeeping specifically); a bulk/history session (nothing
-  ever fresh, so doorman never touches it); and a worth-it rejection (an all-signatures file
-  left alone).
+- `doorman.test.ts` — driven through `TestHost` on the REAL live sequence (append
+  user+tool_call+tool_result in the current turn → `departWire()` in that same turn): skeletonize
+  a big fresh current-turn Python read while it is provably still `protected` (birth-fold proof);
+  fold a non-code current-turn dump the same way; "leaves untouched" gates (too small / error /
+  held); the agent-unfold-then-never-refold guarantee (both an integration test through
+  `TestHost` and a surgical test against a hand-rolled `ConductorHost` that pins down doorman's
+  own `handled`-set bookkeeping specifically); a bulk/history session (nothing ever fresh, so
+  doorman never touches it); and a worth-it rejection (an all-signatures file left alone).
 - `skeletonize.test.ts` / `classify.test.ts` — a pinning subset (not the full matrix) of the
   deleted `app/src/lib/engine/{skeletonize,classify}.test.ts` at `dc037bc`: a TS file and a
   Python file each keep their interface while eliding bodies and skeletonize deterministically;
