@@ -5,7 +5,8 @@
 	import EditableNumber from "$lib/ui/EditableNumber.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import { folding } from "$lib/live/folding.svelte";
-	import { live, setArmed } from "$lib/live/liveClient.svelte";
+	import { live, setArmed, conductorState, conductorStatus } from "$lib/live/liveClient.svelte";
+	import ConductorMenu from "./ConductorMenu.svelte";
 
 	let { store, readOnly = false }: { store: AccordionStore; readOnly?: boolean } = $props();
 
@@ -71,19 +72,43 @@
 	// show its DURATION, not a plan round-trip outcome. Neutral/green under 250ms (the old plan
 	// timeout — a local hook should be far below it), amber ≥250ms, red ≥1000ms. The tooltip
 	// carries max / p95 / structural-rebuild counts. Monochrome per the visual grammar.
+	//
+	// Phase C (v13): an attached conductor can legitimately spend up to `holdWireUpToMs` of that
+	// same hook holding the departing wire for a last-moment proposal (`telemetry.lastHoldMs`).
+	// That hold is DECLARED, wanted latency, not a slow hook — so the amber/red thresholds are
+	// re-keyed off `lastHookMs - lastHoldMs` (the hook's own work, hold excluded). The displayed
+	// number stays the honest total; only the COLOR ignores a conductor spending its own budget.
 	const LAT_AMBER = 250;
 	const LAT_RED = 1000;
 	const hookMs = $derived(live.telemetry.lastHookMs);
 	const hookCount = $derived(live.telemetry.hookCount);
-	const latClass = $derived(hookMs >= LAT_RED ? "lat-red" : hookMs >= LAT_AMBER ? "lat-amber" : "lat-ok");
+	const holdMs = $derived(live.telemetry.lastHoldMs);
+	const netHookMs = $derived(Math.max(0, hookMs - holdMs));
+	const latClass = $derived(netHookMs >= LAT_RED ? "lat-red" : netHookMs >= LAT_AMBER ? "lat-amber" : "lat-ok");
 	const latTip = $derived(
 		`Local context-hook latency (no plan round trip in Phase B)\n` +
-			`last: ${hookMs} ms\n` +
+			`last: ${hookMs} ms` +
+			(holdMs > 0 ? ` (of which ${holdMs} ms was a conductor's wire-departing hold — net ${netHookMs} ms)\n` : `\n`) +
 			`max: ${live.telemetry.maxHookMs} ms\n` +
 			`p95: ${live.telemetry.p95HookMs} ms\n` +
 			`hooks this connection: ${hookCount}\n` +
 			`structural rebuilds: ${live.telemetry.rebuilds}`,
 	);
+
+	// ── HOLD chip (Phase C): the host's most recent wire-departing hold for the attached
+	// conductor's last-moment proposal — its own neutral chip, distinct from LATENCY, so a
+	// conductor legitimately using its declared hold budget reads as informational, never a
+	// warning. Hidden until a hold has actually happened this connection.
+	const holdTip = $derived(
+		`Wire-departing hold for the attached conductor's last-moment proposal\n` +
+			`last: ${holdMs} ms\n` +
+			`timeouts this connection: ${live.telemetry.holdTimeouts} (passed through unchanged when the hold ran out)`,
+	);
+
+	// ── Conductor status readout (Phase C): the attached conductor's own display-only status
+	// line (`conductorStatus.text`), shown only while a conductor is actually attached and has
+	// published non-empty text — mirrors the PROTECT/BUDGET ctl-field visual pattern.
+	const showCondStatus = $derived(live.status === "connected" && !!conductorState.active && !!conductorStatus.text);
 
 	// ── Involvement locks (ADR 0011) — the honest mirror of the engine's gating. A locked
 	// control LOOKS locked in every mode (preview/demo/read-only included), driven purely off
@@ -189,10 +214,28 @@
 				</button>
 			{/if}
 
+			<!-- Conductor picker (Phase C): hidden entirely when not connected live or the host's
+			     catalog is empty (see ConductorMenu's own gate). -->
+			<ConductorMenu />
+
+			<!-- Attached conductor's own display-only status line (Phase C) — same ctl-field
+			     visual pattern as PROTECT/BUDGET below. Shown only while a conductor is actually
+			     attached and has published non-empty text. -->
+			{#if showCondStatus}
+				<div class="ctl-field cond-status-read" title={conductorStatus.text ?? ""}>
+					<span class="ctl-eyebrow mono">
+						<Icon name="activity" size={10} />
+						STATUS
+					</span>
+					<span class="ctl-value mono">{conductorStatus.text}</span>
+				</div>
+			{/if}
+
 			<!-- Latency badge (Phase B): the local context-hook duration. Hidden until this
 			     connection has seen at least one hook — browsing/read-only/demo sessions have no
 			     wire, so they show nothing. Monochrome; amber/red only tint the value on a slow
-			     hook (#044EFF stays reserved for the user block kind, never UI chrome). -->
+			     hook (#044EFF stays reserved for the user block kind, never UI chrome). Phase C:
+			     the amber/red thresholds are re-keyed off (lastHookMs - lastHoldMs) — see latClass. -->
 			{#if live.status === "connected" && hookCount > 0}
 				<div class="ctl-field lat-read" title={latTip}>
 					<span class="ctl-eyebrow mono">
@@ -201,6 +244,22 @@
 					</span>
 					<span class="ctl-value mono tnum {latClass}">
 						{hookMs}ms
+					</span>
+				</div>
+			{/if}
+
+			<!-- HOLD chip (Phase C): the host's last wire-departing hold for the attached
+			     conductor's proposal. Its OWN neutral chip, visually distinct from LATENCY (no
+			     amber/red tinting — using the declared hold budget is expected, not a warning).
+			     Hidden until a hold has actually happened this connection. -->
+			{#if live.status === "connected" && holdMs > 0}
+				<div class="ctl-field hold-read" title={holdTip}>
+					<span class="ctl-eyebrow mono">
+						<Icon name="square" size={10} />
+						HOLD
+					</span>
+					<span class="ctl-value mono tnum">
+						{holdMs}ms
 					</span>
 				</div>
 			{/if}
@@ -635,6 +694,27 @@
 	}
 	.lat-read .lat-red {
 		color: var(--bad, #d9534f);
+	}
+
+	/* Conductor status readout — same ctl-field shape as PROTECT/BUDGET; the value truncates
+	   rather than wrapping/pushing the header (the conductor's status text has no length limit). */
+	.cond-status-read {
+		cursor: default;
+		max-width: 220px;
+	}
+	.cond-status-read .ctl-value {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		display: block;
+	}
+
+	/* HOLD chip — its own neutral chip, deliberately DISTINCT from LATENCY: no amber/red tint (no
+	   override rule at all — it keeps the plain `.ctl-value` --text color in every case). A
+	   conductor spending its declared wire-departing hold budget is expected behavior, not a
+	   warning. */
+	.hold-read {
+		cursor: default;
 	}
 
 	/* ── Composition bar area: bar + on-bar protected control + underline ── */
