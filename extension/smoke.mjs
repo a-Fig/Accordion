@@ -90,7 +90,7 @@ const entry = readOnlyEntry();
 if (!(entry.port > 0)) fails.push(`registry port not assigned (got ${entry.port})`);
 if (entry.registryProtocol !== 1) fails.push(`registry protocol mismatch (${entry.registryProtocol})`);
 if (entry.model !== "test/model") fails.push(`model not captured (${entry.model})`);
-if (entry.protocolVersion !== 14) fails.push(`protocol version expected 14, got ${entry.protocolVersion}`);
+if (entry.protocolVersion !== 15) fails.push(`protocol version expected 15, got ${entry.protocolVersion}`);
 const PORT = entry.port;
 
 // Durable-id messages (a:/u: prefixes) the whole protocol flow builds on.
@@ -244,7 +244,7 @@ await waitFor(() => a.inbox.hello.length > 0, 2000, "client A hello").catch(() =
 await waitFor(() => a.inbox.snapshot.length > 0, 2000, "client A snapshot").catch(() => fails.push("client A never received a snapshot"));
 {
 	const hello = a.inbox.hello[0];
-	if (hello && hello.protocolVersion !== 14) fails.push(`hello.protocolVersion expected 14, got ${hello?.protocolVersion}`);
+	if (hello && hello.protocolVersion !== 15) fails.push(`hello.protocolVersion expected 15, got ${hello?.protocolVersion}`);
 	if (hello && hello.role !== "gui") fails.push(`hello.role expected "gui", got ${hello?.role}`);
 	// Phase C: hello advertises the available-conductor catalog (the GUI picker renders from this).
 	if (hello && (!Array.isArray(hello.conductors) || !hello.conductors.some((c) => c.id === "doorman")))
@@ -326,6 +326,96 @@ await waitFor(() => a.inbox.snapshot.length > 0, 2000, "client A snapshot").catc
 	// Restore the pristine content (itself another same-id rewrite, exercising the path a second time
 	// in reverse) so everything below that depends on ASST_TEXT (recall / unfold / the fold-digest
 	// checks) sees the ORIGINAL text again, as if the rewrite above never happened.
+	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
+
+	// sol P1 gap #1: a SAME-LENGTH in-place rewrite (fixed-width redaction) must ALSO be caught — the
+	// OLD length-sum fingerprint was blind to it. With ASST_TEXT restored just above, swap it for an
+	// EQUAL-LENGTH mask (identical char count, different bytes) and assert the reconcile still rebuilds.
+	{
+		const MASK = "*".repeat(ASST_TEXT.length); // same length as ASST_TEXT, different content
+		const masked = [messagesPlus[0], { ...messagesPlus[1], content: [{ type: "text", text: MASK }] }, messagesPlus[2]];
+		const beforeMask = await fetchMeta();
+		a.inbox.snapshot.length = 0;
+		await Promise.resolve(handlers.context({ messages: masked }, ctx));
+		await waitFor(() => a.inbox.snapshot.length > 0, 2000, "rebuild after same-length rewrite").catch(
+			() => fails.push("a SAME-LENGTH content rewrite did not trigger a rebuild (length-sum blind spot)"),
+		);
+		const afterMask = await fetchMeta();
+		if (!(afterMask.telemetry.rebuilds > beforeMask.telemetry.rebuilds))
+			fails.push(`same-length rewrite did not increment telemetry.rebuilds (before=${beforeMask.telemetry.rebuilds}, after=${afterMask.telemetry.rebuilds})`);
+		const maskedBlock = a.inbox.snapshot.at(-1)?.state?.blocks?.find((b) => b.id === ASST_ID);
+		if (!maskedBlock || maskedBlock.text !== MASK)
+			fails.push(`Truth did not adopt the same-length masked content (got ${JSON.stringify(maskedBlock?.text)})`);
+		// Restore ASST_TEXT once more so the fold/recall/unfold sections below resume from the original.
+		await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
+	}
+}
+
+// ── E1 (cont.): tool-call ARGUMENT + tool_result isError rewrites (sol P1 gaps #2, #3) ──
+// These gaps live in fields the OLD length-sum fingerprint never hashed: a tool_call's `arguments` (a
+// structured value, excluded entirely) and a tool_result's `isError` flag (metadata). Build a baseline
+// that CONTAINS a tool pair, ingest it (append — no rebuild), then mutate ONLY those fields under
+// identical durable ids + identical visible text — each must still force a divergence rebuild. Restores
+// messagesPlus at the end so the sections below resume from the pristine 3-message baseline.
+{
+	const fetchMeta = () =>
+		new Promise((resolve, reject) => {
+			http.get({ host: "127.0.0.1", port: PORT, path: "/__accordion/meta" }, (res) => {
+				let buf = "";
+				res.on("data", (d) => (buf += d));
+				res.on("end", () => { try { resolve(JSON.parse(buf)); } catch (e) { reject(e); } });
+			}).on("error", reject);
+		});
+	const TCALL_ID = "a:resp-e1tool:p0";
+	const TRESULT_ID = "r:call-e1";
+	const withTool = [
+		...messagesPlus,
+		{ role: "assistant", content: [{ type: "toolCall", id: "call-e1", name: "shell", arguments: { cmd: "ls" } }], responseId: "resp-e1tool", timestamp: T0 + 10 },
+		{ role: "toolResult", toolCallId: "call-e1", toolName: "shell", content: "IDENTICAL RESULT TEXT", isError: false, timestamp: T0 + 11 },
+	];
+	// Baseline: append the tool pair as a suffix over messagesPlus (no rebuild — pure O(Δ) append).
+	await Promise.resolve(handlers.context({ messages: withTool }, ctx));
+
+	// gap #2: rewrite ONLY the tool_call arguments — same id, same name, same downstream result.
+	const argRewrite = withTool.map((m) =>
+		m.responseId === "resp-e1tool"
+			? { ...m, content: [{ type: "toolCall", id: "call-e1", name: "shell", arguments: { cmd: "rm -rf /" } }] }
+			: m,
+	);
+	{
+		const before = await fetchMeta();
+		a.inbox.snapshot.length = 0;
+		await Promise.resolve(handlers.context({ messages: argRewrite }, ctx));
+		await waitFor(() => a.inbox.snapshot.length > 0, 2000, "rebuild after tool-call arg rewrite").catch(
+			() => fails.push("a tool-call ARGUMENT rewrite (same id) did not trigger a rebuild — arguments were unhashed"),
+		);
+		const after = await fetchMeta();
+		if (!(after.telemetry.rebuilds > before.telemetry.rebuilds))
+			fails.push(`tool-call arg rewrite did not increment telemetry.rebuilds (before=${before.telemetry.rebuilds}, after=${after.telemetry.rebuilds})`);
+		const blk = a.inbox.snapshot.at(-1)?.state?.blocks?.find((x) => x.id === TCALL_ID);
+		if (!blk || !String(blk.text).includes("rm -rf /"))
+			fails.push(`Truth did not adopt the rewritten tool-call arguments (got ${JSON.stringify(blk?.text)})`);
+	}
+
+	// gap #3: flip ONLY isError on the tool_result — identical text, same id. `argRewrite` is now the
+	// baseline (last ingested), so `errFlip` differs from it in EXACTLY the isError bit — nothing else.
+	{
+		const errFlip = argRewrite.map((m) => (m.toolCallId === "call-e1" ? { ...m, isError: true } : m));
+		const before = await fetchMeta();
+		a.inbox.snapshot.length = 0;
+		await Promise.resolve(handlers.context({ messages: errFlip }, ctx));
+		await waitFor(() => a.inbox.snapshot.length > 0, 2000, "rebuild after isError flip").catch(
+			() => fails.push("a tool_result isError flip (identical text) did not trigger a rebuild — metadata was ignored"),
+		);
+		const after = await fetchMeta();
+		if (!(after.telemetry.rebuilds > before.telemetry.rebuilds))
+			fails.push(`isError flip did not increment telemetry.rebuilds (before=${before.telemetry.rebuilds}, after=${after.telemetry.rebuilds})`);
+		const blk = a.inbox.snapshot.at(-1)?.state?.blocks?.find((x) => x.id === TRESULT_ID);
+		if (blk && blk.isError !== true)
+			fails.push(`Truth did not adopt the flipped isError for ${TRESULT_ID} (got ${JSON.stringify(blk?.isError)})`);
+	}
+
+	// Restore the pristine 3-message baseline (shorter → divergence rebuild) for the sections below.
 	await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { linearize, applyPlan, blockId, isDurableId, messageInfo, wireToBlock, type PiMessage } from "./wire";
+import { linearize, applyPlan, blockId, isDurableId, messageInfo, contentFingerprint, wireToBlock, type PiMessage } from "./wire";
 
 /*
  * core/wire.ts is the moved live/mapping.ts. Its provider-safety behavior is exhaustively covered
@@ -61,6 +61,48 @@ describe("core/wire — messageInfo (now exported)", () => {
 		expect(messageInfo(ms[1], 1).calls).toEqual(["c1"]);
 		expect(messageInfo(ms[2], 2).results).toEqual(["c1"]);
 		expect(messageInfo(ms[0], 0).hasNonDurable).toBe(false);
+	});
+});
+
+describe("core/wire — contentFingerprint (E1, sol P1)", () => {
+	it("is stable for identical messages (a fresh deep copy hashes the same)", () => {
+		const ms = session();
+		const copy = JSON.parse(JSON.stringify(ms)) as PiMessage[];
+		for (let i = 0; i < ms.length; i++) expect(contentFingerprint(copy[i])).toBe(contentFingerprint(ms[i]));
+	});
+
+	it("gap #1: a SAME-LENGTH in-place text rewrite changes the fingerprint (redaction is no longer invisible)", () => {
+		// "secret" → "******": identical length, so the old length-sum scheme saw no change.
+		const a: PiMessage = { role: "assistant", responseId: "r1", timestamp: 2, content: [{ type: "text", text: "secret" }] as any };
+		const b: PiMessage = { ...a, content: [{ type: "text", text: "******" }] as any };
+		expect(blockId(a, 0, 0)).toBe(blockId(b, 0, 0)); // same durable id — shape identity holds
+		expect(contentFingerprint(a)).not.toBe(contentFingerprint(b)); // …but content identity does not
+	});
+
+	it("gap #2: a tool_call ARGUMENT rewrite under the same id changes the fingerprint", () => {
+		const a: PiMessage = {
+			role: "assistant", responseId: "r1", timestamp: 2,
+			content: [{ type: "toolCall", id: "c1", name: "shell", arguments: { cmd: "ls" } }] as any,
+		};
+		const b: PiMessage = { ...a, content: [{ type: "toolCall", id: "c1", name: "shell", arguments: { cmd: "rm -rf /" } }] as any };
+		expect(messageInfo(a, 0).ids).toEqual(messageInfo(b, 0).ids); // same emitted id
+		expect(contentFingerprint(a)).not.toBe(contentFingerprint(b));
+	});
+
+	it("gap #3: a tool_result isError flip with IDENTICAL text changes the fingerprint", () => {
+		const a: PiMessage = { role: "toolResult", toolCallId: "c1", toolName: "shell", content: "boom", isError: false, timestamp: 3 };
+		const b: PiMessage = { ...a, isError: true };
+		expect(blockId(a, 0)).toBe(blockId(b, 0)); // same durable id
+		expect(contentFingerprint(a)).not.toBe(contentFingerprint(b));
+	});
+
+	it("distinguishes cross-part text shuffles (tag bytes prevent 'ab' == 'a'+'b')", () => {
+		const one: PiMessage = { role: "assistant", responseId: "r1", timestamp: 2, content: [{ type: "text", text: "ab" }] as any };
+		const two: PiMessage = {
+			role: "assistant", responseId: "r1", timestamp: 2,
+			content: [{ type: "text", text: "a" }, { type: "thinking", thinking: "b" }] as any,
+		};
+		expect(contentFingerprint(one)).not.toBe(contentFingerprint(two));
 	});
 });
 

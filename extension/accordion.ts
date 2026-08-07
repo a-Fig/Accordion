@@ -55,7 +55,7 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 import { Truth } from "../core/truth";
-import { linearize, messageInfo, wireToBlock, type PiMessage } from "../core/wire";
+import { linearize, messageInfo, contentFingerprint, wireToBlock, type PiMessage } from "../core/wire";
 import { serializeSnapshot, wireEventFromTruthEvent } from "../core/replica";
 import { resolveUnfold, resolveRecall } from "../core/agentView";
 import type { SessionMeta } from "../core/types";
@@ -333,6 +333,18 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// context/agent_end snapshot, extended by message_end). pi's next `event.messages` is compared
 	// against it by a cheap durable-id walk to decide append-a-suffix vs. rebuild.
 	let lastMessages: PiMessage[] = [];
+	// Index-aligned content fingerprints for `lastMessages` (E1 hardening, sol P1). Computed once at
+	// INGEST time so the per-hook identity walk hashes only the fresh INCOMING copy and reads the prev
+	// side straight from this cache — never re-hashing already-ingested history on every `context` hook
+	// (see `contentFingerprint`'s doc comment for the cost analysis). INVARIANT: `lastFps` is written
+	// ONLY through `setLastMessages`, in the SAME statement as `lastMessages`, so the two can never
+	// drift out of alignment — a stale/misaligned fingerprint here would silently defeat E1 (a false
+	// "same identity" on a real rewrite), the exact failure this cache must never introduce.
+	let lastFps: number[] = [];
+	function setLastMessages(messages: PiMessage[], fps?: number[]): void {
+		lastMessages = messages;
+		lastFps = fps ?? messages.map((m) => contentFingerprint(m));
+	}
 
 	// ── hook telemetry (replaces the plan-outcome ack) ──────────────────────────
 	let hookCount = 0; // total `context` hook invocations this extension lifetime
@@ -1311,7 +1323,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			liveHost.dispatchTruthEvent(e);
 		});
 		truth = t;
-		lastMessages = messages;
+		setLastMessages(messages); // fingerprints the full array once (rare rebuild path) — see lastFps
 	}
 
 	/**
@@ -1332,79 +1344,21 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	}
 
 	/**
-	 * Cheap CONTENT fingerprint for one message, compared alongside `messageInfo`'s durable ids in
-	 * `sameMessageIdentity` (E1, external review round). Durable ids alone prove only the SHAPE
-	 * (which blocks exist, in what order) is unchanged — they say nothing about whether pi or a peer
-	 * extension rewrote a block's TEXT in place while keeping the same anchor (same timestamp /
-	 * responseId / toolCallId). Without this, `Truth.append`'s id-based idempotency keeps the OLD
-	 * text forever: the GUI, `recall`, and a folded block's wire digest would all silently keep
-	 * serving stale content even though the model itself now sees something new.
-	 *
-	 * Deliberately sums `string.length`, never hashes bytes. Every JS string already carries its
-	 * length precomputed, so this is one property read per text-bearing part — the SAME O(parts)
-	 * walk `messageInfo` already does to build `ids`, not an O(text size) pass over the actual
-	 * characters. A length MISMATCH is conclusive proof of a content change and short-circuits the
-	 * whole per-hook reconcile immediately, at the same cost class as the existing id comparison.
-	 *
-	 * A length MATCH is not conclusive: a same-length in-place rewrite (e.g. a fixed-width redaction
-	 * placeholder swapped in for the original text) would slip through undetected. That gap is
-	 * accepted deliberately rather than hashing full text on every hook: hashing would require
-	 * reading every character of every already-ingested message on every single `context` call, even
-	 * for the overwhelming common case where NOTHING changed — reintroducing exactly the
-	 * O(total-context-size) hot-path cost ADR 0021 eliminated (the hook must stay local, synchronous,
-	 * and sub-ms, independent of how large the session has grown). Length alone already catches every
-	 * rewrite this finding's own scenario describes — in-place redaction/summarization/truncation
-	 * changes size in virtually every real case. See smoke.mjs's "content mutation, same ids"
-	 * scenario, which also measures that the hook stays well under 100ms with this check in place.
-	 *
-	 * Deliberately EXCLUDES a `toolCall` part's `arguments` object from the sum: arguments are a
-	 * structured value, not a string, and only `JSON.stringify` would yield a length — paid on every
-	 * hook, that reintroduces the very O(size) cost this function exists to avoid, for a narrower
-	 * rewrite class (mutated tool-call arguments with an unchanged position) than the
-	 * tool_result/text/thinking rewrites the finding calls out.
-	 */
-	function contentFingerprint(m: PiMessage): number {
-		let n = 0;
-		const add = (s: unknown): void => {
-			if (typeof s === "string") n += s.length;
-		};
-		const addContent = (content: unknown): void => {
-			if (typeof content === "string") add(content);
-			else if (Array.isArray(content)) for (const p of content) add((p as { text?: unknown } | null)?.text);
-		};
-		switch (m.role) {
-			case "user":
-				addContent(m.content);
-				break;
-			case "assistant": {
-				const parts = Array.isArray(m.content) ? m.content : [];
-				for (const b of parts as Array<{ type?: string; text?: unknown; thinking?: unknown }>) {
-					if (b?.type === "text") add(b.text);
-					else if (b?.type === "thinking") add(b.thinking);
-					// toolCall arguments intentionally excluded — see the doc comment above.
-				}
-				break;
-			}
-			case "toolResult":
-				addContent(m.content);
-				break;
-			default:
-				add(m.summary);
-		}
-		return n;
-	}
-
-	/**
 	 * Two messages share identity iff they emit the same durable block ids (cheap; no token work) AND
 	 * the same content fingerprint (E1: catches a same-id in-place rewrite — see `contentFingerprint`).
+	 * The two fingerprints are passed in, not recomputed: `fpA` is the cached `lastFps[i]` for the
+	 * prev side, `fpB` the incoming hash the caller computed once this hook — so the prev side is never
+	 * re-hashed on the hot path. The int compare goes FIRST as the cheapest short-circuit for the
+	 * common content-changed case; the id walk still runs to catch an anchor-only change (same text,
+	 * new responseId/timestamp) that leaves the fingerprint untouched.
 	 */
-	function sameMessageIdentity(a: PiMessage, b: PiMessage, i: number): boolean {
+	function sameMessageIdentity(a: PiMessage, b: PiMessage, i: number, fpA: number, fpB: number): boolean {
 		if (a.role !== b.role) return false;
+		if (fpA !== fpB) return false;
 		const ia = messageInfo(a, i).ids;
 		const ib = messageInfo(b, i).ids;
 		if (ia.length !== ib.length) return false;
 		for (let k = 0; k < ia.length; k++) if (ia[k] !== ib[k]) return false;
-		if (contentFingerprint(a) !== contentFingerprint(b)) return false;
 		return true;
 	}
 
@@ -1430,9 +1384,16 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		}
 		const prev = lastMessages;
 		let diverged = messages.length < prev.length;
+		// Incoming content fingerprints, hashed once (prev side comes from the `lastFps` cache). Only the
+		// prefix is needed to decide divergence; the suffix is filled below so an append can hand the
+		// whole array to `setLastMessages` without a second hashing pass. Left null when we already know
+		// we diverge (shorter array) — the rebuild path re-hashes from scratch anyway.
+		const incomingFps = diverged ? null : new Array<number>(messages.length);
 		if (!diverged) {
 			for (let i = 0; i < prev.length; i++) {
-				if (!sameMessageIdentity(prev[i], messages[i], i)) {
+				const fp = contentFingerprint(messages[i]);
+				incomingFps![i] = fp;
+				if (!sameMessageIdentity(prev[i], messages[i], i, lastFps[i], fp)) {
 					diverged = true;
 					break;
 				}
@@ -1442,8 +1403,9 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			rebuildTruth(messages);
 			return;
 		}
+		for (let i = prev.length; i < messages.length; i++) incomingFps![i] = contentFingerprint(messages[i]);
 		if (messages.length > prev.length) appendSuffix(messages, prev.length);
-		lastMessages = messages;
+		setLastMessages(messages, incomingFps!);
 	}
 
 	/**
@@ -1457,7 +1419,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (!ids.length) return;
 		if (ids.every((id) => truth!.get(id))) return; // already represented → nothing to do
 		appendSuffix([...lastMessages, msg], lastMessages.length);
-		lastMessages = [...lastMessages, msg];
+		setLastMessages([...lastMessages, msg], [...lastFps, contentFingerprint(msg)]);
 	}
 
 	/** Apply a client command to the authoritative Truth; returns the per-op results + resulting rev. */
@@ -1504,7 +1466,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			unsubTruth = null;
 		}
 		truth = null;
-		lastMessages = [];
+		setLastMessages([]); // clears lastMessages + lastFps together (invariant: never one without the other)
 		// E2 (external review round): folding is OPT-IN and OFF by default PER SESSION — reset the
 		// arm on every `session_start`, regardless of `_event.reason` ("startup"/"reload"/"new"/
 		// "resume"/"fork"). Everything else this handler touches (Truth, `lastMessages`, `meta`, the

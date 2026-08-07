@@ -262,6 +262,119 @@ export function messageInfo(m: PiMessage, i: number): MsgInfo {
 	return { ids, calls, results, hasNonDurable };
 }
 
+// ── content fingerprint (E1 reconciliation, sol P1 hardening) ────────────────
+//
+// `messageInfo` proves SHAPE identity (which durable blocks a message emits, in what order).
+// `contentFingerprint` is its sibling: it proves CONTENT identity (did any block's payload change
+// under a stable anchor). The extension's per-hook reconcile compares BOTH — same shape + same
+// fingerprint ⇒ append-a-suffix; either differs ⇒ divergence rebuild. Lives here, dependency-free,
+// next to `messageInfo` so the wire semantics it mirrors stay in one place.
+
+/**
+ * FNV-1a 32-bit rolling hash primitives (no deps, deterministic, non-crypto). Each 16-bit code unit
+ * is folded LOW byte then HIGH byte so the hash depends on the full unit — a same-low-byte non-ASCII
+ * swap (e.g. U+3042 vs U+3142) still moves the hash. `Math.imul` keeps every step in 32-bit; callers
+ * finish with `h >>> 0` for an unsigned result.
+ */
+const FNV_PRIME = 0x01000193;
+function fnvStr(h: number, s: string): number {
+	for (let k = 0; k < s.length; k++) {
+		const c = s.charCodeAt(k);
+		h = Math.imul(h ^ (c & 0xff), FNV_PRIME);
+		h = Math.imul(h ^ (c >>> 8), FNV_PRIME);
+	}
+	return h;
+}
+function fnvByte(h: number, b: number): number {
+	return Math.imul(h ^ (b & 0xff), FNV_PRIME);
+}
+function fnvContent(h: number, content: unknown): number {
+	if (typeof content === "string") return fnvStr(h, content);
+	if (Array.isArray(content))
+		for (const p of content) {
+			const t = (p as { text?: unknown } | null)?.text;
+			if (typeof t === "string") h = fnvStr(h, t);
+		}
+	return h;
+}
+
+/**
+ * Real CONTENT fingerprint for one message — the counterpart to `messageInfo`'s durable ids, compared
+ * alongside them by the extension's `sameMessageIdentity` (E1, external review round; hardened per sol
+ * P1). Durable ids alone prove only the SHAPE (which blocks exist, in what order) is unchanged — they
+ * say nothing about whether pi or a peer extension rewrote a block's payload IN PLACE while keeping the
+ * same anchor (same timestamp / responseId / toolCallId). Without this, `Truth.append`'s id-based
+ * idempotency keeps the OLD payload forever: the GUI, `recall`, and a folded block's wire digest all
+ * silently keep serving stale content even though the model itself now sees something new — and a stale
+ * strategy subst could put the old text back on the wire.
+ *
+ * WHAT IT COVERS (every mutable field `linearize`/`wireToBlock` bake into a Block that the durable id
+ * does NOT already pin — i.e. everything a same-id rewrite could flip):
+ *   • text / thinking / user / tool_result / summary TEXT;
+ *   • tool_call `name` + serialized `arguments` (sol P1 gap #2 — a same-id argument rewrite was
+ *     previously invisible; serialized with the SAME `JSON.stringify(arguments ?? {})` `linearize`
+ *     uses to build the block text, so the two agree). Assumes pi's per-hook deep copy preserves key
+ *     order for an UNCHANGED message, so a stable arguments object re-serializes identically; if it
+ *     ever did not, the only cost is a spurious rebuild (safe — never a MISSED change);
+ *   • tool_result `isError` (gap #3 — a success→error flip with identical text kept a stale flag that
+ *     the doorman conductor then classified from) and `toolName`; assistant `model`.
+ * A per-field tag byte separates parts so "text 'ab'" ≠ "text 'a' + thinking 'b'".
+ *
+ * COST (the ADR 0021 hot-path promise: the `context` hook stays local + fast). This is O(chars in the
+ * message) — a real pass over the text, unlike the length-sum it replaces. The extension CACHES each
+ * message's fingerprint at ingest, so a hook re-hashes only the fresh INCOMING copy pi hands it (object
+ * identity never survives the deep copy). Measured on the ~130k-token dev sample
+ * (`app/static/sample-session.jsonl`, ~585KB of text): a full two-byte FNV pass over the WHOLE context
+ * is ~3.2ms — comfortably under the ~10ms budget at which a sampled/strided hybrid would be needed, and
+ * well under the LATENCY badge's 250ms amber. Full fidelity is worth it for the redaction cases here.
+ *
+ * RESIDUAL GAP: a same-length in-place rewrite (fixed-width redaction) is NO LONGER an accepted gap —
+ * it now moves the hash and forces a rebuild. What remains is the FNV-1a 32-bit collision floor: two
+ * genuinely different messages hash-collide with probability ~2^-32, in which case a real rewrite would
+ * be missed. Accepted over a crypto hash (orders of magnitude slower on this hot path) for a vanishingly
+ * rare, non-adversarial-by-construction event — a peer extension is first-party; no attacker is choosing
+ * colliding rewrites.
+ */
+export function contentFingerprint(m: PiMessage): number {
+	let h = 0x811c9dc5; // FNV offset basis
+	switch (m.role) {
+		case "user":
+			h = fnvByte(h, 1);
+			h = fnvContent(h, m.content);
+			break;
+		case "assistant": {
+			h = fnvByte(h, 2);
+			if (typeof m.model === "string") h = fnvStr(h, m.model);
+			const parts = Array.isArray(m.content) ? (m.content as PiPart[]) : [];
+			for (const b of parts) {
+				if (b?.type === "text") {
+					h = fnvByte(h, 0x10);
+					h = fnvStr(h, (b as PiTextPart).text || "");
+				} else if (b?.type === "thinking") {
+					h = fnvByte(h, 0x11);
+					h = fnvStr(h, (b as PiThinkingPart).thinking || "");
+				} else if (b?.type === "toolCall") {
+					const c = b as PiToolCallPart;
+					h = fnvByte(h, 0x12);
+					h = fnvStr(h, c.name || "");
+					h = fnvStr(h, JSON.stringify(c.arguments ?? {})); // args covered — sol P1 gap #2
+				}
+			}
+			break;
+		}
+		case "toolResult":
+			h = fnvByte(h, 3);
+			h = fnvByte(h, m.isError ? 1 : 0); // metadata covered — sol P1 gap #3
+			if (typeof m.toolName === "string") h = fnvStr(h, m.toolName);
+			h = fnvContent(h, m.content);
+			break;
+		default:
+			h = fnvByte(h, 4);
+			if (typeof m.summary === "string") h = fnvStr(h, m.summary);
+	}
+	return h >>> 0;
+}
+
 /** Apply one message's in-place FoldOps (the original substitution path). Returns the same
  *  message by reference when nothing folds; clones lazily otherwise. `mark()` flags a change.
  *  `onApplied(id)` is called for each op ACTUALLY substituted (not merely present in `byId`) —
