@@ -183,6 +183,16 @@ export class ThermoclineConductor implements Conductor {
 	private lastStatusText = "";
 	private abort = new AbortController();
 
+	// ── IRREDUCIBLE OVERFLOW (P1-4) ── re-derived fresh every epoch from `Plan.irreducible` (never
+	// cached across a config change) by `commit()`, the ONE place both the deterministic emergency
+	// path and the LLM-prepared path converge. Gates PREPARE in `runTick` so an un-winnable plan
+	// doesn't burn a `host.complete` call every event; cleared the instant `commit()` (or a
+	// still-under-cap tick) observes the projection fits again. See `setOverflowState`/`sendStatus`.
+	private irreducibleOverflow = false;
+	private overflowTokens = 0;
+	private overflowCapTokens = 0;
+	private overflowProtectedTokens = 0;
+
 	constructor(opts: ThermoclineOptions = {}) {
 		this.cfg = { ...DEFAULT_CFG, ...(opts.cfg ?? {}) };
 		this.scorer = opts.scorer ?? scoreCandidates;
@@ -377,11 +387,22 @@ export class ThermoclineConductor implements Conductor {
 			// "two cache misses in quick succession" the ADR flagged.) A PREPARE fires below only if the
 			// deterministic emergency could NOT bring us under warmWater (e.g. an oversized protected tail).
 			fill = cap > 0 ? project(view, this.appliedForProject()) / cap : fill;
+		} else {
+			// Under cap on the RAW baseline — a stale irreducible-overflow flag from an earlier tick no
+			// longer applies. Clear it here too (not just in commit()) so a config change that drops fill
+			// straight under 1.0 self-heals without waiting for another emergency to re-check.
+			this.irreducibleOverflow = false;
+			this.overflowTokens = 0;
 		}
 		this.lastFill = fill;
 
-		// ANTICIPATE: approaching warmWater and no prepare in flight → start one.
-		if (fill >= this.cfg.warmWater && !this.preparing && this.needNewEpoch(fill)) {
+		// ANTICIPATE: approaching warmWater and no prepare in flight → start one. Gated on
+		// `!irreducibleOverflow`: PREPARE fires real `host.complete` (LLM) calls, and once the ladder has
+		// told us THIS configuration cannot reach cap no matter what we compress (the protected tail
+		// alone exceeds it — see Plan.irreducible), re-running PREPARE every tick would burn an LLM call
+		// on an UN-WINNABLE plan for nothing. Park like HOLD instead; `runEmergency`/`commit` re-check
+		// fresh every tick (deterministic, no LLM) and clear the flag the instant it becomes winnable.
+		if (fill >= this.cfg.warmWater && !this.preparing && !this.irreducibleOverflow && this.needNewEpoch(fill)) {
 			this.preparing = true;
 			this.advanceGraduationOnce(view);
 			const token = ++this.prepareToken;
@@ -500,7 +521,15 @@ export class ThermoclineConductor implements Conductor {
 		working = this.topUpToCap(working, view, working.cap || capOf(view));
 
 		const finalProjected = project(view, appliedShapeOf(working));
+		const finalCap = working.cap || capOf(view);
 		working = { ...working, projected: finalProjected };
+
+		// IRREDUCIBLE OVERFLOW (P1-4) — the ONE place both the deterministic emergency path and the
+		// LLM-prepared path converge, so this is the single canonical detection site for both. Never
+		// silent: `working.irreducible` was just re-stamped by topUpToCap from the REAL post-commit
+		// projection (real summary tokens, every top-up move already tried), so a `true` here means the
+		// hard-budget invariant genuinely cannot be met by this configuration — see setOverflowState.
+		this.setOverflowState(working.irreducible === true, finalProjected, finalCap, view);
 
 		// Diff the desired state against what we currently have applied and propose the delta.
 		const desired = this.desiredFromPlan(working, digests, view);
@@ -519,6 +548,18 @@ export class ThermoclineConductor implements Conductor {
 		this.sendStatus();
 	}
 
+	/** Record (or clear) the irreducible-overflow signal so `sendStatus` can surface it with the exact
+	 *  numbers and `runTick` can gate PREPARE off an un-winnable plan. Always overwrites — there is no
+	 *  latching to a stale `true`, so a config change that makes the projection fit again clears it on
+	 *  the very next `commit()` (see also the `runTick` `fill <= 1.0` reset for the case where a change
+	 *  drops fill under 1.0 before an emergency/commit even runs). */
+	private setOverflowState(irreducible: boolean, projected: number, cap: number, view: ConductorView): void {
+		this.irreducibleOverflow = irreducible;
+		this.overflowTokens = irreducible ? Math.max(0, projected - cap) : 0;
+		this.overflowCapTokens = cap;
+		if (irreducible) this.overflowProtectedTokens = protectedTailTokens(view);
+	}
+
 	/**
 	 * BLOCKER 1 — guarantee the agent NEVER receives a batch whose projected live exceeds cap, using
 	 * the REAL summary token counts. Deterministically merges extra folds/age-strata into the plan
@@ -527,7 +568,17 @@ export class ThermoclineConductor implements Conductor {
 	 * hard-cap guarantee. Mutates + returns `plan`.
 	 */
 	private topUpToCap(plan: Plan, view: ConductorView, cap: number): Plan {
-		if (project(view, appliedShapeOf(plan)) <= cap) return plan;
+		// settle() is the ONE exit path: it (re-)stamps `plan.irreducible` from the ACTUAL final
+		// projection every time topUpToCap returns, superseding whatever planEpoch guessed before real
+		// summary tokens/merges were known. This is the authoritative post-commit-math irreducibility
+		// check `commit()` reads (see setOverflowState) — it runs AFTER every deterministic top-up move
+		// this epoch could make, so a "true" here means genuinely un-winnable, not merely pending a move.
+		const settle = (): Plan => {
+			plan.irreducible = project(view, appliedShapeOf(plan)) > cap;
+			return plan;
+		};
+
+		if (project(view, appliedShapeOf(plan)) <= cap) return settle();
 
 		const liveUnits = buildUnits(view.blocks);
 		const memberIdsOfUnit = new Map(liveUnits.map((u) => [u.id, u.ids]));
@@ -536,7 +587,7 @@ export class ThermoclineConductor implements Conductor {
 
 		const MAX_PASSES = 3;
 		for (let pass = 0; pass < MAX_PASSES; pass++) {
-			if (project(view, appliedShapeOf(plan)) <= cap) return plan;
+			if (project(view, appliedShapeOf(plan)) <= cap) return settle();
 			const det = planEpoch(view, this.scores, this.gradState(), this.cfg, { deterministic: true, graduated: this.grad.graduated });
 			let added = false;
 
@@ -567,13 +618,13 @@ export class ThermoclineConductor implements Conductor {
 				added = true;
 			}
 
-			if (project(view, appliedShapeOf(plan)) <= cap) return plan;
+			if (project(view, appliedShapeOf(plan)) <= cap) return settle();
 			if (!added) break; // no NEW moves — fall through to dropping our own strata
 		}
 
 		// Last resort: drop our OWN strata oldest-first (frees real tokens) until ≤ cap.
 		dropOwnStrataOldestFirst(plan, view, cap);
-		return plan;
+		return settle();
 	}
 
 	/** HOLD — re-derive the desired state from the committed plan against the CURRENT view and
@@ -870,9 +921,24 @@ export class ThermoclineConductor implements Conductor {
 		const pct = Math.round((Number.isFinite(this.lastFill) ? this.lastFill : 0) * 100);
 		const folded = this.appliedFolds.size;
 		const strata = this.appliedStrata.length;
-		const action = this.preparing ? "PREPARE" : this.lastAction === "emergency" ? "EMERGENCY" : "HOLD";
 		const scoring = this.scoringInFlight ? " · scoring…" : "";
-		const text = `${action} ${pct}% · ${folded} folded · ${strata} strata${scoring}`;
+
+		// IRREDUCIBLE OVERFLOW (P1-4) — a DISTINCT state from a transient over-100%-fill reading a
+		// COMMIT is about to fix: this fires only once the ladder has already exhausted every rung
+		// (see Plan.irreducible / setOverflowState) and names the numbers rather than just showing
+		// fill% > 100 with no explanation. `irreducibleOverflow`/`overflowTokens` are ALWAYS present in
+		// metrics (not only while true) so a GUI/telemetry consumer can rely on the key existing.
+		const action = this.irreducibleOverflow
+			? "OVERFLOW"
+			: this.preparing
+				? "PREPARE"
+				: this.lastAction === "emergency"
+					? "EMERGENCY"
+					: "HOLD";
+		const text = this.irreducibleOverflow
+			? `over budget and irreducible: protected tail ≈ ${fmtK(this.overflowProtectedTokens)}k > cap ${fmtK(this.overflowCapTokens)}k — raise the budget or shrink the protected tail`
+			: `${action} ${pct}% · ${folded} folded · ${strata} strata${scoring}`;
+
 		if (text === this.lastStatusText) return;
 		this.lastStatusText = text;
 		this.host.setStatus(text, {
@@ -883,8 +949,25 @@ export class ThermoclineConductor implements Conductor {
 			scoring: this.scoringInFlight,
 			lowWater: Math.round(this.cfg.lowWater * 100),
 			highWater: Math.round(this.cfg.highWater * 100),
+			irreducibleOverflow: this.irreducibleOverflow,
+			overflowTokens: this.overflowTokens,
 		});
 	}
+}
+
+/** Σ tokens of every block from the protected tail boundary to the end — the RAW cost the ladder can
+ *  never shrink (Truth refuses to fold inside the protected tail; a conductor may never override a
+ *  human pin either). Used only to name the numbers in the irreducible-overflow status message. */
+function protectedTailTokens(view: ConductorView): number {
+	const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
+	let t = 0;
+	for (let i = pfi; i < view.blocks.length; i++) t += view.blocks[i].tokens;
+	return t;
+}
+
+/** Format a token count as whole thousands for a human-readable status message (e.g. `22000` → `22`). */
+function fmtK(tokens: number): string {
+	return String(Math.round(tokens / 1000));
 }
 
 // ── commit helpers (pure — ported from thermocline.mjs) ─────────────────────────────

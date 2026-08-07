@@ -472,6 +472,112 @@ test("wire-departing runs its emergency promptly even while a tick is suspended 
 	expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(5_000);
 });
 
+// ── IRREDUCIBLE OVERFLOW (P1-4) ────────────────────────────────────────────────────────────────
+//
+// budget (12k) < protected tail (~21k, default protectTokens=20k walking back over 3k-token
+// blocks) is fully reachable via the GUI's 12k budget floor + the default protect target — see the
+// finding. Every mover on the Rung-5 hard-cap floor excludes protected units by construction, so
+// the ladder can NEVER bring the live context under a cap smaller than the protected tail alone.
+// Thermocline must surface this explicitly (status text + machine metric), never just show a
+// silently-stuck fill% > 100, and must NOT keep re-firing PREPARE (host.complete/LLM calls) once
+// it knows the current configuration is un-winnable.
+describe("IRREDUCIBLE OVERFLOW (P1-4)", () => {
+	/** budget 12k, protectTokens 20k, 10×3k-token blocks (30k total) → protected tail walks back to
+	 *  ~21k (7 blocks), comfortably over the 12k cap — irreducible by construction. */
+	function irreducibleSetup() {
+		const host = new TestHost();
+		const cond = new ThermoclineConductor({ scorer: emptyScorer, sessionKey: null });
+		cond.attach(host);
+		host.setBudget(12_000);
+		host.setProtect(20_000);
+		host.appendBlocks(Array.from({ length: 10 }, (_, i) => block({ id: `b${i}`, order: i, tokens: 3_000 })));
+		return { host, cond };
+	}
+
+	function lastMetrics(host: TestHost) {
+		return [...host.statusLog].reverse().find((s) => s.metrics)?.metrics;
+	}
+
+	test("(a) budget < protected tail: status names the numbers, metric set, and PREPARE never fires (flat over several ticks)", async () => {
+		const { host } = irreducibleSetup();
+		await flush();
+
+		// Never satisfiable by ANY combination of folds/groups/drops — the protected tail alone (~21k)
+		// exceeds the 12k cap, so the ladder gave up with projected still over cap.
+		expect(host.truth.stats().liveTokens).toBeGreaterThan(12_000);
+
+		const m = lastMetrics(host);
+		expect(m?.irreducibleOverflow).toBe(true);
+		expect(typeof m?.overflowTokens).toBe("number");
+		expect(m!.overflowTokens as number).toBeGreaterThan(0);
+		const statusText = [...host.statusLog].reverse().find((s) => s.metrics)?.text ?? "";
+		expect(statusText).toMatch(/irreducible/i);
+		expect(statusText).toMatch(/protected tail/i);
+		expect(statusText).toMatch(/cap/i);
+
+		// NEVER silent: it happened without any LLM activity (deterministic emergency only).
+		const completesAtStuck = host.completeLog.length;
+		expect(completesAtStuck).toBe(0);
+
+		// CALM / IDEMPOTENT: several more ticks under the SAME un-winnable config must not fire any
+		// MORE host.complete calls — no hot-looping PREPARE on a plan that can never commit.
+		for (let i = 0; i < 5; i++) {
+			host.appendBlocks([block({ id: `noise${i}`, order: 20 + i, tokens: 10 })]); // tiny, changes nothing
+			await flush();
+		}
+		expect(host.completeLog.length).toBe(completesAtStuck); // flat — still 0
+		expect(lastMetrics(host)?.irreducibleOverflow).toBe(true); // still surfaced, not dropped
+	});
+
+	test("(b) raising the budget clears the state on the next tick; normal planning resumes", async () => {
+		const { host } = irreducibleSetup();
+		await flush();
+		expect(lastMetrics(host)?.irreducibleOverflow).toBe(true);
+
+		host.setBudget(200_000); // now comfortably winnable — the ladder isn't even needed
+		await host.commitTurn(); // the next tick re-checks fresh (config changes alone don't retick)
+		await flush();
+
+		const m = lastMetrics(host);
+		expect(m?.irreducibleOverflow).toBe(false);
+		expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(200_000);
+		// Still no LLM calls were ever needed for this scenario.
+		expect(host.completeLog.length).toBe(0);
+	});
+
+	test("(b-alt) shrinking the protected tail to 0 also clears the state", async () => {
+		const { host } = irreducibleSetup();
+		await flush();
+		expect(lastMetrics(host)?.irreducibleOverflow).toBe(true);
+
+		host.setProtect(0); // nothing protected anymore — everything foldable/groupable/droppable
+		await host.commitTurn();
+		await flush();
+
+		expect(lastMetrics(host)?.irreducibleOverflow).toBe(false);
+		expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(12_000);
+	});
+
+	test("(c) wire-departing emergency under the same irreducible config: no crash, resolves promptly, overflow still surfaced", async () => {
+		const { host } = irreducibleSetup();
+		await flush();
+		expect(lastMetrics(host)?.irreducibleOverflow).toBe(true);
+
+		// Fresh unsent content lands, then the wire departs — onWireDeparting's emergency path
+		// (NOT queued behind the tick chain) must run cleanly under the SAME un-winnable config.
+		host.appendBlocks([block({ id: "fresh0", order: 30, tokens: 500 })]);
+		await flush();
+
+		const start = Date.now();
+		await expect(host.departWire()).resolves.toBeUndefined(); // no throw
+		expect(Date.now() - start).toBeLessThan(1_000); // resolves promptly — no stall introduced
+
+		expect(lastMetrics(host)?.irreducibleOverflow).toBe(true); // still surfaced, never silently dropped
+		expect(host.truth.blocks.some((b) => host.truth.isFolded(b))).toBe(true); // still compressed what it could
+		expect(host.completeLog.length).toBe(0); // the emergency path is deterministic — no LLM here either
+	});
+});
+
 // ── restore validation drops strata whose members vanished ───────────────────────────────────
 test("restore validation: a stratum with a vanished member is dropped (never grouped)", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "thermo-stale-"));
