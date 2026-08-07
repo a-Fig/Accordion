@@ -115,19 +115,19 @@ implemented on this branch.
 
 Every conductor is written only against `ConductorHost`'s abstract surface (`on`/`get`/`blocks`/
 `groups`/`textOf`/`stats`/`countTokens`/`digestOf`/`complete`/`setStatus`/`propose`) — never against
-a concrete Truth or transport. Today, `core/conductor/testhost.ts`'s `TestHost` (a `ConductorHost`
-backed by a real, local `Truth`) is the only host that exists, and it is what every conductor's
-test suite runs against. The intent — recorded in `conductors/thermocline/runner.mjs`'s banner
-comment and its README — is that a **remote SDK** (`core/conductor/remote`, referenced but not
-implemented anywhere in this repository) will eventually mirror a live session's Truth into a local
+a concrete Truth or transport. When this ADR was first written, `core/conductor/testhost.ts`'s
+`TestHost` (a `ConductorHost` backed by a real, local `Truth`) was the only host that existed, and
+it is what every conductor's test suite runs against. The design intent — recorded in
+`conductors/thermocline/runner.mjs`'s banner comment and its README — is that a **remote SDK**
+(`core/conductor/remote.ts`) mirrors a live session's Truth into a local
 `ConductorHost` inside an out-of-process runner, so the exact same `Conductor` class runs whether
 it is compiled into the extension or spawned as a separate program the extension launches and talks
-to over a token-gated WebSocket. `ThermoclineConductor` is written today with no knowledge of which
-host it will get — that is the portability property this ADR names, not something the remote path
-has yet exercised end to end. **Concretely, as of this branch: no code path attaches any conductor
-to a live pi session** — there is no Phase-C host, `runner.mjs` exits immediately if the remote SDK
-import fails to resolve (which it always does today), and the four conductors below are validated
-purely against `TestHost`.
+to over a token-gated WebSocket. `ThermoclineConductor` is written with no knowledge of which
+host it will get — that is the portability property this ADR names. *(Update, later on this same
+branch: the Phase-C wave shipped exactly this — `core/conductor/remote.ts` implements
+`runRemoteConductor`, `runner.mjs` imports it via the committed `remote-sdk.mjs` bundle, and
+`extension/smoke-conductor.mjs` exercises the full spawn → attach → propose → detach path end to
+end against a real child process.)*
 
 ### 7. Bounded wire-hold for last-moment shrinkage
 
@@ -176,11 +176,13 @@ any conductor-selection UI on this branch.
   the simple `conduct(view) → Command[]` shape still gets it, on top of the richer contract.
 - **Human overrides winning is now an engine invariant, not a per-host convention** — every
   `propose` is clamped by the same `Truth.apply` a human action goes through.
-- **The contract is validated, but unattached.** Four conductors and their test suites prove the
-  shape is sufficient for a real strategy; none of them run against a live pi session yet, because
-  the host that would attach one — apply its locks, spawn it out-of-process where declared,
-  mediate `complete()` against the live model — does not exist on this branch. This is the main
-  scope boundary to carry into any follow-up work.
+- **The contract is validated and attached.** Four conductors and their test suites prove the
+  shape is sufficient for a real strategy. At the time this ADR was first written the host did not
+  yet exist; the Phase-C wave on this same branch then shipped it — `LiveConductorHost`
+  (`core/conductor/liveHost.ts`) attaches conductors to live pi sessions, applies their declared
+  locks eagerly on attach, converts their folds to human-owned via the `freeze` op on detach,
+  spawns out-of-process conductors where declared, and mediates `complete()` against the live
+  model through the extension's completion executor.
 
 ## Rejected alternatives
 
