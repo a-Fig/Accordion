@@ -692,6 +692,111 @@ if (unfoldTool && foldCodeStr) {
 		fails.push(`the messages-less context call did not increment hookErrors (before=${metaBefore.telemetry.hookErrors}, after=${metaAfter.telemetry.hookErrors})`);
 }
 
+// ── malformed ingress: authorized ≠ well-formed (sol P1/P2 #3) ──────────────────
+// Client A is an AUTHORIZED GUI socket. An authorized peer is still allowed to be BUGGY: it can send
+// a `setBudget:"hello"`/`"NaN"`/negative dial (which used to write `Truth.budget = NaN` → JSON-null →
+// forked replicas) and an `ops:[null]` (which used to deref `op.kind` and THROW out of the WS message
+// callback, killing the extension for every other connected client). Fire the whole barrage at the
+// live session and assert the process stays up, nothing corrupts the Truth, the host-only `freeze` op
+// is still stripped, and a normal command right after the garbage still applies — then restore the
+// pristine budget so nothing downstream sees drift.
+{
+	const fetchMetaMal = () =>
+		new Promise((resolve, reject) => {
+			http.get({ host: "127.0.0.1", port: PORT, path: "/__accordion/meta" }, (res) => {
+				let buf = "";
+				res.on("data", (d) => (buf += d));
+				res.on("end", () => { try { resolve(JSON.parse(buf)); } catch (e) { reject(e); } });
+			}).on("error", reject);
+		});
+	// A resnapshot is the honest read of authoritative Truth state (budget/protectTokens/rev) — the
+	// GUI resnapshot path never mutates, so before/after diffs isolate exactly what the garbage did.
+	const resnap = async (label) => {
+		a.inbox.snapshot.length = 0;
+		a.ws.send(JSON.stringify({ type: "resnapshot" }));
+		await waitFor(() => a.inbox.snapshot.length > 0, 2000, label);
+		return a.inbox.snapshot.at(-1).state;
+	};
+
+	// An escaping throw in a `ws` message listener surfaces as a process uncaughtException, not a
+	// rejection — capture BOTH so a regression (a boundary that stops catching) fails loudly here
+	// instead of taking down the whole smoke run.
+	const asyncErrors = [];
+	const onRej = (r) => asyncErrors.push(`unhandledRejection: ${r?.message ?? r}`);
+	const onExc = (e) => asyncErrors.push(`uncaughtException: ${e?.message ?? e}`);
+	process.on("unhandledRejection", onRej);
+	process.on("uncaughtException", onExc);
+
+	const pristine = await resnap("malformed-ingress pristine snapshot").catch((e) => { fails.push(`malformed-ingress: could not read a pristine snapshot (${e.message})`); return null; });
+	if (pristine) {
+		a.inbox.commandResult.length = 0;
+		// Seqs well above client A's own ++seq counter so each reply is matchable unambiguously.
+		const G = 9000;
+		const garbage = [
+			{ seq: G + 1, cmd: null },                                   // cmd is not an object → refused
+			{ seq: G + 2, cmd: { kind: "setBudget", value: "hello" } },  // non-numeric dial → refused
+			{ seq: G + 3, cmd: { kind: "setBudget", value: "NaN" } },    // JSON can't carry NaN; the string is still non-numeric → refused
+			{ seq: G + 4, cmd: { kind: "setBudget", value: "3.5" } },    // numeric-looking STRING is still not a number → refused
+			{ seq: G + 5, cmd: { kind: "setBudget", value: -5 } },       // negative → coerced finite (0, then Truth floors) — safe, NOT a fork
+			{ seq: G + 6, cmd: { kind: "ops", ops: [null] } },           // structurally-invalid op dropped → empty no-op batch
+			{ seq: G + 7, cmd: { kind: "ops", ops: [{ kind: "freeze" }] } }, // host-only op → still stripped as a `locked` clamp
+		];
+		for (const g of garbage) a.ws.send(JSON.stringify({ type: "command", ...g }));
+
+		// (1) Process alive + no throw escaped the callback: EVERY garbage frame is acked with a
+		//     commandResult (a dropped/hung handler or a crash would leave one unanswered).
+		await waitFor(() => garbage.every((g) => a.inbox.commandResult.some((r) => r.seq === g.seq)), 2000, "malformed-ingress acks").catch(
+			() => fails.push("a malformed command did not receive a commandResult ack — the ingress handler dropped, hung, or crashed on it"),
+		);
+		if (a.ws.readyState !== 1) fails.push("client A socket died during the malformed ingress barrage (a throw escaped the WS callback)");
+
+		// (2) The garbage did NOT corrupt the Truth: budget stays a real finite number and neither dial moved.
+		const afterGarbage = await resnap("malformed-ingress post-garbage snapshot").catch(() => null);
+		if (afterGarbage) {
+			if (!Number.isFinite(afterGarbage.budget)) fails.push(`malformed ingress poisoned the budget to a non-finite value (${afterGarbage.budget}) — NaN reached Truth`);
+			if (afterGarbage.budget !== pristine.budget) fails.push(`malformed ingress moved the budget (${pristine.budget} → ${afterGarbage.budget})`);
+			if (afterGarbage.protectTokens !== pristine.protectTokens) fails.push(`malformed ingress moved protectTokens (${pristine.protectTokens} → ${afterGarbage.protectTokens})`);
+		}
+
+		// (3) Refusals match the clamp-UX shape: the four unusable commands come back with an
+		//     empty-results commandResult at the UNCHANGED rev (Truth was never touched).
+		for (const seq of [G + 1, G + 2, G + 3, G + 4]) {
+			const r = a.inbox.commandResult.find((x) => x.seq === seq);
+			if (!r || r.results.length !== 0 || r.rev !== pristine.rev)
+				fails.push(`malformed command seq ${seq} was not refused cleanly (expected empty results at rev ${pristine.rev}, got ${JSON.stringify(r)})`);
+		}
+
+		// (4) The host-only `freeze` smuggled through an `ops` command is still stripped and reported
+		//     as a `locked` clamp — sanitize must not open the ungated kill switch to a wire client.
+		const freezeRes = a.inbox.commandResult.find((x) => x.seq === G + 7);
+		if (!freezeRes || !freezeRes.results.some((o) => o.clamped === "locked" && o.op?.kind === "freeze"))
+			fails.push(`the host-only freeze op was not stripped as a locked clamp (got ${JSON.stringify(freezeRes)})`);
+
+		// (5) A NORMAL command right after the barrage still applies — the session is fully functional.
+		a.ws.send(JSON.stringify({ type: "command", seq: G + 8, cmd: { kind: "setBudget", value: pristine.budget + 4000 } }));
+		await waitFor(() => a.inbox.commandResult.some((r) => r.seq === G + 8), 2000, "valid command after barrage").catch(
+			() => fails.push("the valid command after the garbage barrage received no commandResult"),
+		);
+		const afterValid = await resnap("malformed-ingress post-valid snapshot").catch(() => null);
+		if (afterValid && afterValid.budget !== pristine.budget + 4000)
+			fails.push(`the valid command after the barrage did not apply (budget ${afterValid?.budget}, expected ${pristine.budget + 4000})`);
+
+		// (6) No throw was merely swallowed elsewhere: the ingress error counter stayed 0 (sanitize
+		//     handled every case) and no async error fired during the barrage.
+		const metaMal = await fetchMetaMal().catch(() => null);
+		if (metaMal && metaMal.telemetry.ingressErrors !== 0)
+			fails.push(`the malformed ingress barrage was caught as ${metaMal.telemetry.ingressErrors} throw(s) — sanitize should handle every case without throwing`);
+		if (asyncErrors.length) fails.push(`the malformed ingress barrage produced ${asyncErrors.length} unhandled async error(s): ${asyncErrors.join("; ")}`);
+
+		// Restore the pristine budget so nothing downstream sees drift (pristine-baseline restore).
+		a.ws.send(JSON.stringify({ type: "command", seq: G + 9, cmd: { kind: "setBudget", value: pristine.budget } }));
+		await waitFor(() => a.inbox.commandResult.some((r) => r.seq === G + 9), 2000, "budget restore").catch(() => {});
+	}
+
+	process.off("unhandledRejection", onRej);
+	process.off("uncaughtException", onExc);
+}
+
 a.ws.close();
 b.ws.close();
 await new Promise((r) => setTimeout(r, 50));
