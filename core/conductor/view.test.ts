@@ -109,6 +109,22 @@ describe("ViewConductor — resync rebuild", () => {
 		host.commitTurn();
 		expect(host.truth.isFolded(host.truth.get("a:b0:p0")!)).toBe(false); // undone via the rebuild
 	});
+
+	// S4 — a resync must not strand a group the conductor still owns: it has to be re-claimed into
+	// `appliedGroups` so a later []-desire diffs it away with `ungroup` instead of leaving it stuck
+	// in Truth forever.
+	it("re-claims a strategy-owned group across a resync, so a later []-desire ungroups it instead of stranding it", () => {
+		const host = liveHostWith(5);
+		const c = new ScriptedConductor();
+		c.attach(host);
+		c.desired = [{ kind: "group", ids: ["a:b1:p0", "a:b2:p0"] }];
+		host.commitTurn();
+		expect(host.truth.groups.length).toBe(1);
+		host.resync(); // structural resync — WITHOUT a truth state reset; the group is still there
+		c.desired = []; // now wants no group at all
+		host.commitTurn();
+		expect(host.truth.groups.length).toBe(0); // ungrouped via the rebuild, not stranded
+	});
 });
 
 describe("ViewConductor — group diffing", () => {
@@ -123,6 +139,21 @@ describe("ViewConductor — group diffing", () => {
 		c.desired = [];
 		host.commitTurn();
 		expect(host.truth.groups.length).toBe(0); // ungrouped
+	});
+});
+
+describe("ViewConductor — replace recoverable default (S1)", () => {
+	it("a ReplaceCommand with no `recoverable` substitutes VERBATIM (no {#... FOLDED} tag); recoverable:true tags it", () => {
+		const host = liveHostWith(3);
+		const c = new ScriptedConductor();
+		c.attach(host);
+		c.desired = [{ kind: "replace", id: "a:b0:p0", content: "plain summary" }]; // recoverable omitted
+		host.commitTurn();
+		expect(host.truth.digestOf(host.truth.get("a:b0:p0")!)).toBe("plain summary"); // verbatim, no tag
+
+		c.desired = [{ kind: "replace", id: "a:b1:p0", content: "tagged summary", recoverable: true }];
+		host.commitTurn();
+		expect(host.truth.digestOf(host.truth.get("a:b1:p0")!)).toMatch(/^\{#[0-9a-z]{6} FOLDED\} tagged summary$/);
 	});
 });
 

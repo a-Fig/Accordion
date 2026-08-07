@@ -198,6 +198,39 @@ describe("Truth — groups", () => {
 	});
 });
 
+describe("Truth — strategy unpin cannot clear a human pin (S2)", () => {
+	it("a strategy/agent unpin on a HUMAN-owned pin clamps human-override; the pin stays", () => {
+		const t = bulk(seq(3));
+		t.setProtect(0);
+		t.apply([{ kind: "pin", ids: ["a:b0:p0"] }], "you");
+		const r = t.apply([{ kind: "unpin", ids: ["a:b0:p0"] }], "auto");
+		expect(r.results[0].clamped).toBe("human-override");
+		expect(t.get("a:b0:p0")!.override).toBe("pinned"); // pin intact
+	});
+	it("a strategy unpin on a STRATEGY-owned pin applies", () => {
+		const t = bulk([blk("a:b0:p0", "text", 0, 1000, { override: "pinned", by: "auto" })]);
+		t.setProtect(0);
+		const r = t.apply([{ kind: "unpin", ids: ["a:b0:p0"] }], "auto");
+		expect(r.results[0].applied).toBe(true);
+		expect(t.get("a:b0:p0")!.override).toBe(null);
+	});
+});
+
+describe("Truth — resetAll batched with other ops (N6)", () => {
+	it("emits an ops-applied event for the non-reset op AND a reset event, instead of swallowing the fold", () => {
+		const t = bulk(seq(3));
+		t.setProtect(0);
+		const events: any[] = [];
+		t.onEvent((e) => events.push(e));
+		const r = t.apply([{ kind: "fold", ids: ["a:b0:p0"] }, { kind: "resetAll" }], "you");
+		expect(r.results[0].applied).toBe(true); // the fold applied
+		expect(r.results[1].applied).toBe(true); // the reset applied
+		expect(events.map((e) => e.type)).toEqual(["ops-applied", "reset"]);
+		expect(events[0].results.length).toBe(1);
+		expect(events[0].results[0].op.kind).toBe("fold");
+	});
+});
+
 describe("Truth — locks (ADR 0011)", () => {
 	it("human-steering clamps human ops as `locked`; a strategy op still applies", () => {
 		const t = bulk(seq(3));

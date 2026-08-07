@@ -12,9 +12,10 @@ const __dirname = fileURLToPath(new URL(".", import.meta.url));
 //
 // Because the SvelteKit plugin is absent, kit's `$core` alias never gets injected here — so we
 // mirror it explicitly (the framework-free `core/` package lives at the repo root, one level above
-// this SvelteKit root). Both the bare alias (`$core` → core/index...) and subpaths (`$core/truth`)
-// must resolve. `server.fs.allow: [".."]` lets vitest read the parent dir, and the `../core`
-// include glob runs the core package's own tests inside `npm run test`.
+// this SvelteKit root). Both the bare alias (`$core` → the `core/` directory itself, matching
+// vite.config.js / svelte.config.js — there is no `core/index.ts` barrel) and subpaths
+// (`$core/truth`) must resolve. `server.fs.allow: [".."]` lets vitest read the parent dir, and the
+// `../core` include glob runs the core package's own tests inside `npm run test`.
 const coreDir = path.resolve(__dirname, "../core");
 export default defineConfig({
 	plugins: [svelte({ compilerOptions: { runes: true } })],

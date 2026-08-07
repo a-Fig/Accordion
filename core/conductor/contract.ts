@@ -73,6 +73,20 @@ export interface StateChange {
 }
 
 /**
+ * One folded/foldable multiblock group as every conductor sees it — the group-enumeration
+ * counterpart of `ViewBlock`/`blocks()`. `by` is provenance (who created the group); `summary`
+ * mirrors the group op's own digest-override contract (`undefined` → default recap, `null`/`""` →
+ * dropped from the wire, a non-empty string → verbatim).
+ */
+export interface GroupInfo {
+	id: string;
+	memberIds: readonly string[];
+	folded: boolean;
+	by: Actor | null;
+	summary?: string | null;
+}
+
+/**
  * Events the host pushes to a subscribed conductor. A conductor reacts asynchronously and proposes
  * transactions; it never blocks a model call.
  */
@@ -130,6 +144,8 @@ export interface ConductorHost {
 	get(id: string): ViewBlock | undefined;
 	/** Every block, in conversation order. */
 	blocks(): readonly ViewBlock[];
+	/** Every group, in creation order. The group-enumeration counterpart of `blocks()`. */
+	groups(): readonly GroupInfo[];
 	/** The full original text of a block (never the folded substitution), or null if unknown. */
 	textOf(id: string): string | null;
 	/** Aggregate readout of the current state. */

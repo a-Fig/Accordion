@@ -14,6 +14,7 @@ import type {
 	ConductorHost,
 	HostEvent,
 	ViewBlock,
+	GroupInfo,
 	StateChange,
 	CompletionRequest,
 	CompletionResult,
@@ -59,6 +60,9 @@ export class TestHost implements ConductorHost {
 	}
 	blocks(): readonly ViewBlock[] {
 		return this.truth.blocks.map((b) => this.view(b));
+	}
+	groups(): readonly GroupInfo[] {
+		return this.truth.groups.map((g) => ({ id: g.id, memberIds: g.memberIds.slice(), folded: g.folded, by: g.by ?? null, summary: g.digest }));
 	}
 	textOf(id: string): string | null {
 		return this.truth.get(id)?.text ?? null;
