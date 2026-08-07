@@ -246,6 +246,9 @@ await waitFor(() => a.inbox.snapshot.length > 0, 2000, "client A snapshot").catc
 	const hello = a.inbox.hello[0];
 	if (hello && hello.protocolVersion !== 13) fails.push(`hello.protocolVersion expected 13, got ${hello?.protocolVersion}`);
 	if (hello && hello.role !== "gui") fails.push(`hello.role expected "gui", got ${hello?.role}`);
+	// Phase C: hello advertises the available-conductor catalog (the GUI picker renders from this).
+	if (hello && (!Array.isArray(hello.conductors) || !hello.conductors.some((c) => c.id === "doorman")))
+		fails.push(`hello did not advertise the conductor catalog (got ${JSON.stringify(hello?.conductors)})`);
 	const snap = a.inbox.snapshot[0];
 	const ids = snap ? snap.state.blocks.map((x) => x.id) : [];
 	if (!ids.includes(USER_ID) || !ids.includes(ASST_ID)) fails.push(`snapshot missing block ids (got ${JSON.stringify(ids)})`);
@@ -271,6 +274,10 @@ await waitFor(() => a.inbox.snapshot.length > 0, 2000, "client A snapshot").catc
 	if (!a.inbox.telemetry.length) fails.push("context hook did not stream telemetry");
 	const tel = a.inbox.telemetry.at(-1);
 	if (tel && (typeof tel.lastHookMs !== "number" || tel.hookCount < 1)) fails.push(`telemetry frame malformed (${JSON.stringify(tel)})`);
+	// Phase C DEFAULT PATH: with no conductor attached, NO wire-departing hold is ever paid — the
+	// telemetry's hold fields stay pinned at 0 and the hook stays sync-fast (identical to pre-Phase-C).
+	if (tel && (tel.lastHoldMs !== 0 || tel.holdTimeouts !== 0))
+		fails.push(`default path paid a hold with no conductor (lastHoldMs=${tel.lastHoldMs}, holdTimeouts=${tel.holdTimeouts})`);
 }
 
 // Client B connects AFTER more history → its snapshot carries all 3 blocks (hydration path).
@@ -371,6 +378,95 @@ if (unfoldTool && foldCodeStr) {
 	console.log(`  hook timing: last=${meta.telemetry.lastHookMs}ms max=${meta.telemetry.maxHookMs}ms p95=${meta.telemetry.p95HookMs}ms hooks=${meta.telemetry.hookCount} rebuilds=${meta.telemetry.rebuilds}`);
 }
 
+// ── Phase C: conductor host — select/detach, eager locks, wire-departing birth-fold ──
+// Folding is ON from the earlier section and protect is 0 (so a fold is a normal, non-birth fold).
+{
+	// (0) folding OFF + a conductor attached → the wire is UNTOUCHED and NO hold is paid (the gate is
+	//     foldingEnabled && holdWireUpToMs). Verify, then restore folding ON for the rest of the section.
+	a.inbox.folding.length = 0;
+	a.sendCmd({ kind: "setFolding", value: false });
+	await waitFor(() => a.inbox.folding.some((f) => f.enabled === false), 1500, "folding off").catch(() => fails.push("setFolding(false) was not echoed"));
+	a.inbox.conductorState = [];
+	a.sendCmd({ kind: "selectConductor", id: "doorman" });
+	await waitFor(() => (a.inbox.conductorState || []).some((m) => m.active?.id === "doorman"), 2000, "doorman attach (folding off)").catch(
+		() => fails.push("selectConductor(doorman) did not attach while folding off"),
+	);
+	a.inbox.telemetry.length = 0;
+	{
+		const ret = await Promise.resolve(handlers.context({ messages: messagesPlus }, ctx));
+		if (ret !== undefined) fails.push("folding OFF + conductor attached altered the wire (should pass through)");
+		const tel = a.inbox.telemetry.at(-1);
+		if (tel && tel.lastHoldMs !== 0) fails.push(`folding OFF + conductor attached paid a wire-departing hold (lastHoldMs=${tel.lastHoldMs})`);
+	}
+	a.sendCmd({ kind: "selectConductor", id: null });
+	await waitFor(() => (a.inbox.conductorState || []).some((m) => m.active === null), 1500, "detach after folding-off check").catch(() => {});
+	a.inbox.folding.length = 0;
+	a.sendCmd({ kind: "setFolding", value: true });
+	await waitFor(() => a.inbox.folding.some((f) => f.enabled === true), 1500, "folding on").catch(() => fails.push("setFolding(true) restore was not echoed"));
+
+	// (1) Attach an in-process conductor that declares locks → eager setLocks broadcasts a `locks`
+	//     event AND a conductorState. compaction-naive claims human-steering + agent-unfold.
+	a.inbox.event.length = 0;
+	a.inbox.conductorState = [];
+	a.sendCmd({ kind: "selectConductor", id: "compaction-naive" });
+	await waitFor(() => (a.inbox.conductorState || []).some((m) => m.active?.id === "compaction-naive"), 2000, "conductorState attach").catch(
+		() => fails.push("selectConductor(compaction-naive) did not broadcast a conductorState"),
+	);
+	await waitFor(() => a.inbox.event.some((e) => e.event?.kind === "locks" && (e.event.locks || []).includes("human-steering")), 2000, "eager locks").catch(
+		() => fails.push("selectConductor(compaction-naive) did not eager-acquire its declared locks"),
+	);
+
+	// (2) Detach (select none) → freeze + clearLocks → conductorState:null + a locks-cleared event.
+	a.inbox.event.length = 0;
+	a.inbox.conductorState = [];
+	a.sendCmd({ kind: "selectConductor", id: null });
+	await waitFor(() => (a.inbox.conductorState || []).some((m) => m.active === null), 2000, "conductorState detach").catch(
+		() => fails.push("selectConductor(null) did not broadcast conductorState:null"),
+	);
+	await waitFor(() => a.inbox.event.some((e) => e.event?.kind === "locks" && (e.event.locks || []).length === 0), 2000, "locks cleared").catch(
+		() => fails.push("selectConductor(null) did not clear the conductor's locks"),
+	);
+
+	// (3) Attach doorman (in-process, holdWireUpToMs) and append a GIANT prior-turn tool_result as a
+	//     fresh suffix. The next context hook HOLDS the departing wire; doorman folds the giant, so it
+	//     rides the wire as the short {#code FOLDED} digest — a strategy fold produced through the hold.
+	const GIANT = "network request trace line — repeated many times to exceed the fold threshold. ".repeat(170);
+	const toolMessages = [
+		{ role: "assistant", content: [{ type: "toolCall", id: "call-giant", name: "shell", arguments: {} }], responseId: "resp-tool", timestamp: T0 + 3 },
+		{ role: "toolResult", toolCallId: "call-giant", toolName: "shell", content: GIANT, isError: false, timestamp: T0 + 4 },
+		{ role: "user", content: "third turn", timestamp: T0 + 5 },
+		{ role: "assistant", content: [{ type: "text", text: "done" }], responseId: "resp-done", timestamp: T0 + 6 },
+	];
+	const doormanMessages = [...messagesPlus, ...toolMessages];
+
+	a.inbox.conductorState = [];
+	a.sendCmd({ kind: "selectConductor", id: "doorman" });
+	await waitFor(() => (a.inbox.conductorState || []).some((m) => m.active?.id === "doorman"), 2000, "doorman attach").catch(
+		() => fails.push("selectConductor(doorman) did not attach"),
+	);
+	{
+		const ret = await Promise.resolve(handlers.context({ messages: doormanMessages }, ctx));
+		const foldedResult = ret?.messages?.[4]?.content?.[0]?.text; // index 4 = the giant tool_result
+		if (typeof foldedResult !== "string") fails.push("context hook (doorman) did not return replacement messages for the giant");
+		else if (foldedResult.length >= GIANT.length) fails.push(`doorman did not fold the giant on the wire (len ${foldedResult.length} vs ${GIANT.length})`);
+		else if (!foldedResult.startsWith("{#") && !foldedResult.startsWith("⟨")) fails.push(`doorman fold produced an unexpected wire body: ${JSON.stringify(foldedResult.slice(0, 40))}`);
+	}
+
+	// (4) Detach doorman → the freeze kill switch transfers the strategy fold to the human, so the
+	//     NEXT hook (no conductor attached) STILL folds the giant on the wire (fold survived detach).
+	a.inbox.conductorState = [];
+	a.sendCmd({ kind: "selectConductor", id: null });
+	await waitFor(() => (a.inbox.conductorState || []).some((m) => m.active === null), 2000, "doorman detach").catch(
+		() => fails.push("selectConductor(null) after doorman did not detach"),
+	);
+	{
+		const afterDetach = await Promise.resolve(handlers.context({ messages: doormanMessages }, ctx));
+		const stillFolded = afterDetach?.messages?.[4]?.content?.[0]?.text;
+		if (typeof stillFolded !== "string" || stillFolded.length >= GIANT.length)
+			fails.push("after detach the freeze did not preserve doorman's fold as a human fold");
+	}
+}
+
 a.ws.close();
 b.ws.close();
 await new Promise((r) => setTimeout(r, 50));
@@ -437,6 +533,20 @@ await new Promise((r) => setTimeout(r, 50));
 	const tauriDevDefault = await dialWs({ origin: "http://localhost:1420" });
 	if (tauriDevDefault.open || tauriDevDefault.status !== 403)
 		fails.push(`ws-hardening: Tauri dev Origin was trusted without explicit opt-in (${JSON.stringify(tauriDevDefault)})`);
+
+	// PHASE C: a `?role=conductor` socket is authorized SOLELY by the single-use pending attach token
+	// — role confers NO privilege. No conductor is selected here, so there is no pending token, and
+	// EVERY conductor dial must be rejected 403: no token, a wrong/stale token, the old native
+	// no-Origin path (byte-open for GUI), and even the GUI web token.
+	const condNoToken = await dialWs({}, "/?role=conductor");
+	if (condNoToken.open || condNoToken.status !== 403) fails.push(`ws-hardening: conductor role without a token was not rejected (${JSON.stringify(condNoToken)})`);
+	const condWrongToken = await dialWs({}, "/?role=conductor&token=deadbeefdeadbeef00000000");
+	if (condWrongToken.open || condWrongToken.status !== 403) fails.push(`ws-hardening: conductor role with a wrong/stale token was not rejected (${JSON.stringify(condWrongToken)})`);
+	if (TOKEN) {
+		const condGuiToken = await dialWs({}, `/?role=conductor&token=${TOKEN}`);
+		if (condGuiToken.open || condGuiToken.status !== 403)
+			fails.push(`ws-hardening: the GUI web token authorized a conductor socket (token confers no conductor privilege) (${JSON.stringify(condGuiToken)})`);
+	}
 
 	if (TOKEN) {
 		const rebound = await rawUpgrade("/", { host: `evil.example:${PORT}`, origin: `http://evil.example:${PORT}` });

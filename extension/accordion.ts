@@ -69,6 +69,9 @@ import {
 	type StreamMessage,
 	type WireCommand,
 } from "../core/protocol";
+import { LiveConductorHost, type SpawnedRunner } from "../core/conductor/liveHost";
+import { catalogMeta } from "../core/conductor/registry";
+import type { CompletionRequest, CompletionResult } from "../core/conductor/contract";
 import {
 	REGISTRY_PROTOCOL,
 	REGISTRY_DIR,
@@ -93,6 +96,27 @@ const MAX_WS_PAYLOAD_BYTES = 8 * 1024 * 1024;
 const SIBLING_ORIGIN_PROBE_MS = 750;
 const SIBLING_ORIGIN_META_MAX_BYTES = 16 * 1024;
 const MAX_PENDING_SIBLING_ORIGIN_PROBES = 8;
+// Phase C: an attached conductor's out-of-band `complete()` launches real provider work. Keep the
+// spend bound process-wide (across in-process + spawned conductors) and finish before the wire's own
+// safety timeout. `envPositiveInt` keeps smoke/CI fast; invalid values retain the production default.
+const MAX_CONCURRENT_COMPLETIONS = 4;
+function envPositiveInt(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (typeof raw !== "string") return fallback;
+	const n = Number(raw.trim());
+	return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+const COMPLETION_TIMEOUT_MS = envPositiveInt("ACCORDION_COMPLETION_TIMEOUT_MS", 110_000);
+
+/** Test seam mirroring dc037bc: production resolves pi-ai lazily through pi's package alias. */
+type CompletionFunction = (
+	model: any,
+	context: { systemPrompt?: string; messages: Array<{ role: "user"; content: string; timestamp: number }> },
+	options: { apiKey: string; headers?: Record<string, string>; signal?: AbortSignal; maxTokens?: number },
+) => Promise<any>;
+interface RuntimeDependencies {
+	complete?: CompletionFunction;
+}
 // Vite's fixed localhost:1420 Origin is browser-obtainable, unlike Tauri's production custom
 // origins. Trust it only for an explicit local development session; shipped installs stay closed.
 const ALLOW_TAURI_DEV_ORIGIN = process.env.ACCORDION_ALLOW_TAURI_DEV_ORIGIN === "1";
@@ -263,7 +287,7 @@ function launchResultLine(result: LaunchResult | null): { text: string; type: "i
 	};
 }
 
-export default function accordionLive(pi: ExtensionAPI): void {
+export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDependencies = {}): void {
 	pi.registerFlag(ACCORDION_APP_FLAG, {
 		description: "Path to the Accordion desktop app executable for /accordion launch/focus",
 		type: "string",
@@ -285,6 +309,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	let sessionId = "";
 	let meta = { title: "pi session", cwd: "", model: "", contextWindow: null as number | null, format: "pi" as const };
 	let pendingSiblingOriginProbes = 0;
+	// Phase C: the socket of the currently-attached spawn conductor (null for none / in-process).
+	// `sendToConductor` routes to it; the connection handler sets it on accept, clears it on close.
+	let conductorWs: WebSocket | null = null;
+	// Most recent full model object (dc037bc's `latestModel`) — a completion needs the whole object
+	// (apiKey resolution + maxTokens ceiling), not just the id string kept in `model`.
+	let latestModelObj: any = null;
+	// Process-wide in-flight completion count, bounded by MAX_CONCURRENT_COMPLETIONS.
+	let activeCompletions = 0;
 
 	// ── the authoritative Truth (Phase B) ──────────────────────────────────────
 	// The single source of context state for this live session. Built at session_start, rebuilt on
@@ -355,6 +387,131 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		broadcast(frame);
 	}
 
+	// ── Phase C: the live conductor host (registry, locks, wire-departing hold, completion relay) ─
+	// Fully dependency-injected; every capability it needs — the live Truth, client fan-out, the
+	// conductor socket, token minting, the spawn bridge, the completion executor — is a closure over
+	// this session's state. It makes NO folding decisions of its own on the hook path.
+	const liveHost = new LiveConductorHost({
+		truth: () => truth,
+		broadcast: (m) => broadcast(m),
+		sendToConductor: (m) => {
+			if (conductorWs && conductorWs.readyState === 1) send(conductorWs, m);
+		},
+		mintToken: () => crypto.randomBytes(16).toString("hex"),
+		spawnRunner: (entryFile, env) => spawnRunner(entryFile, env),
+		runCompletion: (req, signal) => runCompletion(req, signal),
+		spawnEnv: () => ({ port, sessionKey: sessionId, home: HOME }),
+		now: () => Date.now(),
+	});
+
+	/** Resolve a thermocline-style runner file on disk (repo checkout only this phase), or null. */
+	function resolveRunnerPath(entryFile: string): string | null {
+		try {
+			const here = path.dirname(fileURLToPath(import.meta.url));
+			const p = path.resolve(here, "..", "conductors", "thermocline", entryFile);
+			return fs.existsSync(p) ? p : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Launch a spawn conductor's runner in its own Node process (NOT detached, so it dies with pi),
+	 * piping stderr into a bounded buffer surfaced via `conductorStatus` on an unexpected exit. The
+	 * returned handle's `kill()` sends SIGTERM first, SIGKILL on a second call — the grace loop lives
+	 * in `LiveConductorHost`. Returns null when the runner file is absent (thermocline then simply
+	 * doesn't appear in the catalog, and a defensive `select` of it undoes cleanly).
+	 */
+	function spawnRunner(entryFile: string, env: Record<string, string>): SpawnedRunner | null {
+		const runnerPath = resolveRunnerPath(entryFile);
+		if (!runnerPath) return null;
+		let child: ReturnType<typeof spawn>;
+		try {
+			child = spawn(process.execPath, [runnerPath], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+		} catch {
+			return null;
+		}
+		let stderrBuf = "";
+		const STDERR_CAP = 8 * 1024;
+		child.stderr?.on("data", (d: Buffer) => {
+			stderrBuf = (stderrBuf + d.toString()).slice(-STDERR_CAP);
+		});
+		let sigterm = false;
+		return {
+			kill(): void {
+				try {
+					child.kill(sigterm ? "SIGKILL" : "SIGTERM");
+					sigterm = true;
+				} catch {
+					/* already dead */
+				}
+			},
+			onExit(cb): void {
+				child.on("exit", (code) => cb({ code, stderr: stderrBuf }));
+				child.on("error", () => cb({ code: null, stderr: stderrBuf }));
+			},
+		};
+	}
+
+	/**
+	 * The out-of-band completion executor (ported from dc037bc's completeRequest handler): resolve
+	 * the live model's API key, lazily import pi-ai, clamp `maxOutputTokens` to the model's ceiling,
+	 * and race the provider call against an abortable timeout. NEVER on the `context` hook path — the
+	 * conductor awaits it off to the side. A process-wide semaphore bounds concurrent spend.
+	 */
+	async function runCompletion(req: CompletionRequest, signal: AbortSignal): Promise<CompletionResult> {
+		if (typeof req.prompt !== "string" || req.prompt.length === 0) throw new Error("missing or empty prompt");
+		if (req.maxOutputTokens !== undefined && (!Number.isSafeInteger(req.maxOutputTokens) || req.maxOutputTokens <= 0))
+			throw new Error("maxOutputTokens must be a positive safe integer");
+		if (activeCompletions >= MAX_CONCURRENT_COMPLETIONS) throw new Error(`too many concurrent completions in flight (max ${MAX_CONCURRENT_COMPLETIONS})`);
+		activeCompletions++;
+		const abort = new AbortController();
+		const onAbort = () => abort.abort();
+		if (signal.aborted) abort.abort();
+		else signal.addEventListener("abort", onAbort, { once: true });
+		const timeoutError = new Error(`completion timed out after ${COMPLETION_TIMEOUT_MS}ms`);
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		const deadline = new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(() => {
+				abort.abort(timeoutError);
+				reject(timeoutError);
+			}, COMPLETION_TIMEOUT_MS);
+			(timer as { unref?: () => void }).unref?.();
+		});
+		try {
+			const ctx = latestCtx;
+			const m = latestModelObj ?? (ctx?.model as any);
+			if (!ctx || !m) throw new Error("no model available");
+			const auth = await Promise.race([(ctx as any).modelRegistry.getApiKeyAndHeaders(m), deadline]);
+			if (!auth?.ok) throw new Error(`could not resolve API key: ${auth?.error ?? "unknown"}`);
+			const complete: CompletionFunction = dependencies.complete ?? (await Promise.race([import("@earendil-works/pi-ai" as any), deadline])).complete;
+			const context = {
+				...(typeof req.system === "string" ? { systemPrompt: req.system } : {}),
+				messages: [{ role: "user" as const, content: req.prompt, timestamp: Date.now() }],
+			};
+			let maxTokens: number | undefined;
+			if (typeof req.maxOutputTokens === "number") {
+				const ceiling = Number.isSafeInteger(m.maxTokens) && m.maxTokens > 0 ? m.maxTokens : undefined;
+				maxTokens = ceiling !== undefined ? Math.min(req.maxOutputTokens, ceiling) : req.maxOutputTokens;
+			}
+			const providerCall = complete(m, context, { apiKey: auth.apiKey, headers: auth.headers, signal: abort.signal, ...(maxTokens !== undefined ? { maxTokens } : {}) });
+			const result = await Promise.race([providerCall, deadline]);
+			let text = "";
+			if (Array.isArray(result.content))
+				text = result.content.filter((p: any) => p?.type === "text").map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("");
+			return {
+				text,
+				model: result.model,
+				inputTokens: typeof result.usage?.input === "number" ? result.usage.input : undefined,
+				outputTokens: typeof result.usage?.output === "number" ? result.usage.output : undefined,
+			};
+		} finally {
+			if (timer) clearTimeout(timer);
+			signal.removeEventListener("abort", onAbort);
+			activeCompletions--;
+		}
+	}
+
 	// ── hook telemetry ──────────────────────────────────────────────────────────
 	function recordHook(ms: number): void {
 		hookCount++;
@@ -369,10 +526,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
 	}
 	function broadcastTelemetry(): void {
-		// lastHoldMs/holdTimeouts (protocol v13) cover the wire-departing hold window for an attached
-		// conductor's last-moment proposal; no conductor is attached on this branch yet, so both are
-		// fixed at 0 until the Phase C host wires the hold itself.
-		broadcast({ type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: 0, holdTimeouts: 0 });
+		// lastHoldMs/holdTimeouts (protocol v13) are the REAL wire-departing hold telemetry now: how
+		// long the host held the departing wire for the attached conductor's last-moment proposal on
+		// the most recent hook, and how many holds have timed out over the session. Both stay 0 while
+		// no conductor is attached (no hold is ever fired), so a no-conductor session is unchanged.
+		broadcast({ type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: liveHost.lastHoldMs, holdTimeouts: liveHost.holdTimeouts });
 	}
 
 	// ── registry file: advertise this session for the app to discover ───────────
@@ -548,6 +706,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	/** Adopt a model's id + context window into the live + meta state (best-effort). */
 	function applyModel(m: { id?: string; contextWindow?: number } | undefined): void {
 		if (!m) return;
+		// Keep the FULL model object — an out-of-band completion needs it (apiKey resolution, the
+		// maxTokens ceiling), not just the id string. `model: "current"` then follows a just-selected
+		// model immediately instead of waiting for the next `context` hook to refresh `latestCtx`.
+		latestModelObj = m;
 		if (m.id) {
 			model = m.id;
 			meta.model = m.id;
@@ -894,6 +1056,19 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			return;
 		}
 
+		// PHASE C: a conductor-role socket is authorized SOLELY by the single-use pending attach token
+		// the host minted when it spawned this runner — role confers NO privilege on its own. It skips
+		// EVERY GUI trust branch (native no-Origin, Tauri origin, cookie, sibling probe): a hostile
+		// page (or a stray native client) that guesses `?role=conductor` still needs the unguessable
+		// token, and the token is valid only for the exact spawn currently awaiting its runner. The
+		// GUI path below is byte-identical to before (PR #72 hardening must not regress).
+		if (roleFromUrl(req.url) === "conductor") {
+			const pending = liveHost.pendingAttachToken;
+			const ok = !!pending && token === pending;
+			cb(ok, ok ? undefined : 403, ok ? undefined : "conductor attach token required");
+			return;
+		}
+
 		const origin = req.headers.origin;
 		if (typeof origin !== "string" || origin === "") { cb(true); return; } // native client
 		if (isTrustedTauriOrigin(origin)) { cb(true); return; }
@@ -953,6 +1128,23 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		}
 		wss.on("connection", (ws: WebSocket, req: http.IncomingMessage) => {
 			const role = roleFromUrl(req?.url);
+			// PHASE C: a conductor-role socket must consume its single-use attach token before it is
+			// treated as the active conductor (the token was already verified at upgrade time; consume
+			// it here so a re-dial with the same token is rejected). It STILL joins `clients` and gets
+			// the same hello/snapshot/event stream as a GUI — a remote conductor is a replica.
+			if (role === "conductor") {
+				let token: string | null = null;
+				try {
+					token = new URL(req?.url || "/", "http://accordion.local").searchParams.get("token");
+				} catch {
+					/* verifyWsUpgrade already rejected a malformed target */
+				}
+				if (!liveHost.acceptConductorSocket(ws, token)) {
+					try { ws.close(); } catch { /* ignore */ }
+					return;
+				}
+				conductorWs = ws;
+			}
 			// Bring the Truth up to date with the session's current history BEFORE snapshotting.
 			// On a resumed/loaded session no hook has fired yet, so read straight from the session
 			// manager. This runs before `ws` joins `clients`, so any resulting append events reach
@@ -973,10 +1165,17 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			const history = readSessionMessages(latestCtx);
 			if (history.length) ingestMessages(history);
 
-			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta });
+			// hello advertises the conductor catalog (thermocline only if its runner resolves on disk).
+			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta, conductors: catalogMeta((entryFile) => resolveRunnerPath(entryFile) !== null) });
 			if (truth) send(ws, { type: "snapshot", state: serializeSnapshot(truth, foldingEnabled) });
+			// After the snapshot, a (re)connecting client learns who — if anyone — is driving, plus any
+			// cached conductor status line, so it never renders from a locally tracked guess.
+			const activeMeta = liveHost.activeMeta();
+			if (activeMeta) send(ws, { type: "conductorState", active: activeMeta });
+			const cachedStatus = liveHost.cachedStatus();
+			if (cachedStatus) send(ws, cachedStatus);
 			// Seed the client's latency badge with current telemetry (blank until the first hook otherwise).
-			send(ws, { type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: 0, holdTimeouts: 0 });
+			send(ws, { type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: liveHost.lastHoldMs, holdTimeouts: liveHost.holdTimeouts });
 			// Register only AFTER the snapshot so no event can precede the replica it must replay onto.
 			clients.set(ws, { role });
 
@@ -988,7 +1187,17 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				} catch {
 					return;
 				}
-				// The one client→server message: a remote-control command. The host applies it to the
+				if (role === "conductor") {
+					// A conductor replica: propose / completeRequest / setConductorStatus route to the
+					// live host (which verifies this is the ACTIVE conductor socket), plus resnapshot.
+					if (msg?.type === "resnapshot") {
+						if (truth) send(ws, { type: "snapshot", state: serializeSnapshot(truth, foldingEnabled) });
+					} else {
+						liveHost.handleConductorMessage(ws, msg);
+					}
+					return;
+				}
+				// The GUI client→server message: a remote-control command. The host applies it to the
 				// authoritative Truth (emitting events to ALL clients) and replies with the per-op
 				// results + resulting rev. There is NO optimistic apply on the client — the replica
 				// mutates only via the echoed event stream, so a command and its events can't race.
@@ -1002,6 +1211,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			});
 			const drop = () => {
 				clients.delete(ws);
+				if (role === "conductor") {
+					if (conductorWs === ws) conductorWs = null;
+					liveHost.handleSocketClose(ws); // a clean detach if this was the active conductor
+				}
 			};
 			ws.on("close", drop);
 			ws.on("error", drop);
@@ -1067,7 +1280,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// finding: a rebuild must preserve the human's dials, not just per-block overlay).
 			if (!prev) t.setBudget(contextWindow);
 		}
-		unsubTruth = t.onEvent(forwardTruthEvent);
+		// One subscription drives BOTH the client fan-out (replayable events) and the in-process
+		// conductor's HostEvent stream — the same TruthEvent, projected two ways.
+		unsubTruth = t.onEvent((e) => {
+			forwardTruthEvent(e);
+			liveHost.dispatchTruthEvent(e);
+		});
 		truth = t;
 		lastMessages = messages;
 	}
@@ -1083,6 +1301,9 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		if (isDivergence) {
 			rebuilds++;
 			broadcast({ type: "snapshot", state: serializeSnapshot(truth!, foldingEnabled) });
+			// The Truth object was replaced — an in-process conductor rebuilds its tracked desired
+			// state from resync; a remote replica gets the forced resnapshot broadcast above.
+			liveHost.dispatchResync();
 		}
 	}
 
@@ -1165,6 +1386,12 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			case "setFolding":
 				setFolding(!!cmd.value);
 				return { results: [], rev: truth.rev };
+			case "selectConductor":
+				// GUI-only (a conductor socket never reaches applyCommand — its messages route to
+				// handleConductorMessage). Drives the host's attach/detach; state arrives via events +
+				// the conductorState broadcast, so nothing to return here beyond the current rev.
+				liveHost.select(cmd.id);
+				return { results: [], rev: truth.rev };
 			default:
 				return { results: [], rev: truth.rev };
 		}
@@ -1172,7 +1399,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// ── lifecycle ──────────────────────────────────────────────────────────────
 	pi.on("session_start", (_event, ctx: ExtensionContext) => {
 		// Tear down the OLD session's Truth + event forwarder before building the new one; a
-		// session swap invalidates the whole context state (a fresh Truth is authoritative).
+		// session swap invalidates the whole context state (a fresh Truth is authoritative). Detach
+		// any attached conductor first (kills a spawned runner, clears its locks off the old Truth,
+		// aborts in-flight completions) — a conductor is per-session and never carries across a swap.
+		liveHost.shutdown();
+		conductorWs = null;
 		if (unsubTruth) {
 			unsubTruth();
 			unsubTruth = null;
@@ -1254,7 +1485,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	// Phase B: pi's `context` hook is a LOCAL operation against the in-process Truth. No client
 	// round trip, no await, no disk I/O. Returning `undefined` passes pi's messages through
 	// unchanged (the default when folding is disabled); an explicit `{ messages }` replaces them.
-	pi.on("context", (event, ctx: ExtensionContext) => {
+	pi.on("context", async (event, ctx: ExtensionContext) => {
 		const t0 = Date.now();
 		// Invariant: this hook must NEVER break a model call. Everything that can throw (a bad
 		// parse, an unexpected message shape, a Truth bug) is guarded — on any throw we fall back to
@@ -1269,8 +1500,16 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			// (a) Reconcile pi's messages against the Truth: append a new suffix, or rebuild on
 			//     structural divergence (both broadcast to clients via the Truth subscription).
 			ingestMessages(messages);
-			// (b) PHASE C: wire-departing hold — a conductor's last-moment fold plugs in here (no-op today).
 			if (truth) {
+				// (b) PHASE C: the wire-departing hold. ONLY paid when folding is armed AND the attached
+				//     conductor declares a hold window — the sync fast path (no conductor / no hold /
+				//     folding off) never awaits anything, keeping a no-conductor session byte-identical
+				//     to pre-Phase-C. This is where a conductor's last-moment (birth-)fold lands before
+				//     the wire is serialized. No disk I/O; the spawn/kill bridge is never on this path.
+				const holdMeta = liveHost.activeMeta();
+				if (foldingEnabled && holdMeta && holdMeta.holdWireUpToMs > 0) {
+					await liveHost.fireWireDepartingAndAwaitHold();
+				}
 				// (c) If folding is armed, serialize the wire from the Truth and replace; else passthrough.
 				if (foldingEnabled) {
 					ret = { messages: truth.serializeWire(messages) as unknown as AgentMessage[] };
@@ -1284,8 +1523,8 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			console.error("[accordion] context hook failed; passing messages through unmodified:", err);
 			ret = undefined;
 		}
-		// (e) Measure the whole hook (guarded body included) and stream it as telemetry (proves the
-		// local path is fast, and that a caught failure doesn't leave telemetry stale either).
+		// (e) Measure the whole hook (guarded body included, hold window and all) and stream it as
+		// telemetry — lastHoldMs/holdTimeouts (from the live host) ride alongside the hook duration.
 		recordHook(Date.now() - t0);
 		broadcastTelemetry();
 		return ret;
@@ -1298,6 +1537,17 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	pi.on("model_select", (event) => {
 		applyModel(event?.model as { id?: string; contextWindow?: number } | undefined);
 		if (truth && contextWindow != null) truth.setContextWindow(contextWindow);
+	});
+
+	// ── turn settled: the canonical re-plan trigger for a turn-based conductor ───
+	// `turn_end` fires after each LLM turn. It is the host-lifecycle equivalent of
+	// `TestHost.commitTurn` — an attached conductor (in-process) or the remote replica (over the
+	// wire) treats it as the moment to re-run its pass. Purely a notification; folding still happens
+	// only at `context`, and there is no conductor attached ⇒ this is a no-op.
+	pi.on("turn_end", () => {
+		if (!truth) return;
+		const last = truth.blocks[truth.blocks.length - 1];
+		liveHost.fireTurnCommitted(last ? last.turn : 0, truth.rev);
 	});
 
 	// ── committed streaming: append finished messages to the Truth immediately ──
@@ -1338,6 +1588,11 @@ export default function accordionLive(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", () => {
+		// Tear the attached conductor down FIRST (while the Truth still exists): SIGTERM→grace→SIGKILL
+		// any spawned runner, abort in-flight completions, release any pending hold. The freeze kill
+		// switch runs against the live Truth before we null it below.
+		liveHost.shutdown();
+		conductorWs = null;
 		if (heartbeat) {
 			clearInterval(heartbeat);
 			heartbeat = null;
@@ -1484,8 +1739,14 @@ export default function accordionLive(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: "Accordion isn't attached, so nothing in your context is folded right now — it is already full." }] };
 			}
 			const res = resolveRecall(truth, codes); // LOCAL, pure read — never mutates fold state
-			// Surface the read so clients/conductors can observe it (no Truth state changed).
-			if (res.restored.length) broadcast({ type: "recall", ids: res.restored.flatMap((r) => r.ids), by: "agent" });
+			// Surface the read so clients/conductors can observe it (no Truth state changed). The
+			// broadcast reaches conductor-role sockets too (a remote conductor derives its recall
+			// observation from it); an in-process conductor gets the derived HostEvent via dispatchRecall.
+			if (res.restored.length) {
+				const ids = res.restored.flatMap((r) => r.ids);
+				broadcast({ type: "recall", ids, by: "agent" });
+				liveHost.dispatchRecall(ids, "agent");
+			}
 			// The defining difference from `unfold`: echo the FULL original content back THIS turn,
 			// one text block per recalled item, each prefixed with its label + code so the agent
 			// knows what it is reading. A short note lists any codes that resolved to nothing.
