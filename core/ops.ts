@@ -93,6 +93,18 @@ export interface OpResult {
 	clamped?: ClampReason;
 	/** Human-readable detail for logs; for an applied `group` op, the created group's id. */
 	detail?: string;
+	/**
+	 * Per-id outcomes for a MULTI-ID op (`fold`/`unfold`/`pin`/`unpin`/`auto`). Absent for the
+	 * single-id / global ops (`replace`/`group`/`ungroup`/`foldGroup`/`unfoldGroup`/`resetAll`/
+	 * `freeze`), which are all-or-nothing and keep single-outcome semantics. The batch-level
+	 * `applied`/`clamped` stay exactly what existing callers (conductors, clamp-UX) read: `applied`
+	 * is "did ANY id apply". `perId` exists so the replica-facing event forwards ONLY the ids that
+	 * actually applied on the host — a batch like `fold [A,B]` where B clamped `stale` used to
+	 * forward the WHOLE op to a baseRev-less replica, which then applied B (the host refused it) and
+	 * folded a block the model got whole; both sides still bump `rev` by exactly one, so the rev
+	 * assertion never catches it. See `wireEventFromTruthEvent`.
+	 */
+	perId?: { id: string; applied: boolean; reason?: ClampReason }[];
 }
 
 /** The result of one `apply` transaction: the post-transaction rev + per-op outcomes. */
@@ -119,9 +131,76 @@ export function anyApplied(r: TxnResult): boolean {
  */
 export const HOST_ONLY_OP_KINDS: ReadonlySet<Op["kind"]> = new Set<Op["kind"]>(["freeze"]);
 
-/** True iff `op` is host-only and must be refused when it arrives from a wire client. */
-export function isHostOnlyOp(op: Op): boolean {
-	return HOST_ONLY_OP_KINDS.has(op.kind);
+/**
+ * True iff `op` is host-only and must be refused when it arrives from a wire client. Shape-safe:
+ * an authorized-but-buggy client can send `ops:[null]` / a non-object, and this runs on the wire
+ * ingress path — a raw `op.kind` deref would throw out of the WS callback and can kill the
+ * extension process (a non-object is simply "not host-only", and gets caught by `isValidOp` next).
+ */
+export function isHostOnlyOp(op: unknown): boolean {
+	return !!op && typeof op === "object" && HOST_ONLY_OP_KINDS.has((op as { kind?: unknown }).kind as Op["kind"]);
+}
+
+/** Every valid `Op` kind — the structural gate below vets an unknown value against exactly these. */
+const OP_KINDS: ReadonlySet<string> = new Set<Op["kind"]>([
+	"fold", "unfold", "pin", "unpin", "auto", "replace", "group", "ungroup", "foldGroup", "unfoldGroup", "resetAll", "freeze",
+]);
+
+function isStringArray(v: unknown): v is string[] {
+	return Array.isArray(v) && v.every((x) => typeof x === "string");
+}
+
+/**
+ * Structural validity of ONE op arriving from a WIRE CLIENT (a GUI `ops` command or a conductor
+ * `propose`). `isServerMessage`/`isClientMessage` vet only the message `type` tag — an authorized
+ * peer may still send a malformed `ops` array (`[null]`, a bad `kind`, non-string ids). Handing
+ * that to `Truth.apply` dereferences `op.kind` inside `applyOne`'s switch and THROWS out of the WS
+ * callback, which can take down the extension process. This is the shape gate the extension's
+ * ingress runs FIRST, before `applyGuardingHostOnly`/`Truth.apply`, so a malformed op is dropped,
+ * never thrown on.
+ *
+ * Ops carry NO numeric fields (only ids / content / kind), so there is nothing to range-check here;
+ * the finite-number checks live in `sanitizeCommand` (protocol.ts), which guards the `setBudget`/
+ * `setProtect` dial values.
+ */
+export function isValidOp(op: unknown): op is Op {
+	if (!op || typeof op !== "object") return false;
+	const o = op as Record<string, unknown>;
+	if (typeof o.kind !== "string" || !OP_KINDS.has(o.kind)) return false;
+	switch (o.kind) {
+		case "fold":
+			return isStringArray(o.ids) && (o.digest === undefined || typeof o.digest === "string");
+		case "unfold":
+		case "pin":
+		case "unpin":
+		case "auto":
+			return isStringArray(o.ids);
+		case "group":
+			return isStringArray(o.ids) && (o.summary === undefined || o.summary === null || typeof o.summary === "string");
+		case "replace":
+			return typeof o.id === "string" && typeof o.content === "string" && (o.recoverable === undefined || typeof o.recoverable === "boolean");
+		case "ungroup":
+		case "foldGroup":
+		case "unfoldGroup":
+			return typeof o.groupId === "string";
+		case "resetAll":
+		case "freeze":
+			return true;
+		default:
+			return false;
+	}
+}
+
+/**
+ * Sanitize an `ops` payload of unknown shape into a well-formed `Op[]`, dropping any structurally
+ * invalid element (`isValidOp`). Returns `null` when the payload is not even an array (the caller
+ * should ignore the whole command). An empty array back means "every element was invalid" —
+ * distinct from `null` (not an array at all). Additive primitive for the extension's WS ingress;
+ * nothing on this branch wires it yet (Wave 2).
+ */
+export function sanitizeOps(ops: unknown): Op[] | null {
+	if (!Array.isArray(ops)) return null;
+	return ops.filter(isValidOp);
 }
 
 /**

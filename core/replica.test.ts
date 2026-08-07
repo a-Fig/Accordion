@@ -9,7 +9,8 @@
 import { describe, it, expect } from "vitest";
 import { Truth } from "./truth";
 import type { Block, SessionMeta } from "./types";
-import { serializeSnapshot, hydrateSnapshot } from "./replica";
+import type { WireEvent } from "./protocol";
+import { serializeSnapshot, hydrateSnapshot, wireEventFromTruthEvent } from "./replica";
 
 const META: SessionMeta = { format: "pi", title: "t", cwd: "", model: "" };
 
@@ -52,5 +53,54 @@ describe("replica — birthFolded round trip (protocol v12)", () => {
 		const staleReplica = hydrateSnapshot(META, { ...state, birthFolded: [] });
 		staleReplica.setProtect(1_000_000);
 		expect(staleReplica.isFolded(staleReplica.get(newest.id)!)).toBe(false); // healed — the bug
+	});
+});
+
+// Fix #1: the replica-facing event must forward ONLY the ids that actually applied on the host, so
+// a per-id clamp (one `stale` id in a multi-id batch) never re-applies on a baseRev-less replica.
+describe("replica — wireEventFromTruthEvent forwards only applied ids (fix #1)", () => {
+	it("rewrites a partially-clamped multi-id fold to carry only the applied id", () => {
+		const t = live();
+		t.append(seq(3, 1000));
+		t.setProtect(0);
+		const base = t.rev;
+		t.apply([{ kind: "pin", ids: ["a:b1:p0"] }], "you"); // B touched → stale vs base
+		const events: WireEvent[] = [];
+		const off = t.onEvent((e) => {
+			const w = wireEventFromTruthEvent(e);
+			if (w) events.push(w);
+		});
+		t.apply([{ kind: "fold", ids: ["a:b0:p0", "a:b1:p0"] }], "you", base); // A applies, B stale
+		off();
+		const opsEv = events.find((w): w is Extract<WireEvent, { kind: "ops" }> => w.kind === "ops");
+		expect(opsEv?.ops).toEqual([{ kind: "fold", ids: ["a:b0:p0"] }]); // B (stale) dropped from the wire op
+	});
+});
+
+// Fix #2: `carriedSent` must round-trip a snapshot or a replica reclassifies a sent block as fresh
+// (birth-fold-eligible / back in freshIds) — the same invisible-divergence class as v12's birthFolded.
+describe("replica — carriedSent round trip (protocol v15)", () => {
+	it("serializeSnapshot → hydrateSnapshot preserves per-id carried sent-ness across an insert-before rebuild", () => {
+		const host = live();
+		host.append(seq(2, 1000)); // A(order0), B(order1)
+		host.markSent(1); // both sent
+		const fresh: Block[] = [
+			blk("a:new:p0", 0, 1000), // X — new, unsent, inserted before A/B
+			blk("a:b0:p0", 1, 1000),
+			blk("a:b1:p0", 2, 1000),
+		];
+		const rebuilt = Truth.rebuildFrom(host, { meta: META, blocks: fresh, lineCount: 0, skipped: 0 });
+		expect(rebuilt.carriedSentIds).toEqual(expect.arrayContaining(["a:b0:p0", "a:b1:p0"]));
+
+		const state = serializeSnapshot(rebuilt, false);
+		expect(state.carriedSent).toEqual(expect.arrayContaining(["a:b0:p0", "a:b1:p0"]));
+
+		const replica = hydrateSnapshot(META, state);
+		expect(replica.sent(replica.get("a:b0:p0")!)).toBe(true); // carried across the wire
+		expect(replica.sent(replica.get("a:new:p0")!)).toBe(false);
+
+		// A stale-format peer that lost carriedSent reclassifies the sent block as fresh — the bug this closes.
+		const stale = hydrateSnapshot(META, { ...state, carriedSent: [] });
+		expect(stale.sent(stale.get("a:b0:p0")!)).toBe(false);
 	});
 });

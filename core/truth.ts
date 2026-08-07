@@ -106,6 +106,16 @@ export class Truth {
 	 * block is NOT here, so it heals when the tail grows over it, exactly as a human fold does.
 	 */
 	private birthFolded = new Set<string>();
+	/**
+	 * Ids of surviving blocks that were ALREADY sent whole but a divergence rebuild pushed ABOVE the
+	 * scalar `sentThroughOrder` frontier — a fresh block inserted BEFORE them drags the frontier back
+	 * (the frontier is a prefix by `order`, so ONE early unsent block reclassifies every later block
+	 * never-sent). Without this set a rebuild makes blocks the model already saw whole look fresh
+	 * again: birth-fold-eligible, re-listed in `freshIds`. The effective "is this block sent?"
+	 * predicate (`sent`) is therefore the UNION `(order <= sentThroughOrder) OR (id in carriedSent)`.
+	 * Populated only by `rebuildFrom`; rides the snapshot so replicas agree (v15).
+	 */
+	private carriedSent = new Set<string>();
 
 	/** Monotonic; bumps on every state change. Every event carries the post-change value. */
 	private revCounter = 0;
@@ -140,10 +150,13 @@ export class Truth {
 	 * The GUI builds a replica Truth this way so replayed events stay rev-aligned with the
 	 * authoritative extension-side Truth: after adopting, `rev === snapshot.rev`, and each
 	 * subsequent replayed input bumps rev in lockstep — a mismatch after replay ⇒ resnapshot.
-	 * `blocks` arrive with overlay already applied; groups/locks/config/sent/`birthFolded` are set
-	 * verbatim — `birthFolded` MUST round-trip (v12) or `healProtected` diverges from the host: a
-	 * replica that lost the set heals a block on its next housekeep that the host still keeps
-	 * folded, and both sides bump `rev` by exactly one, so the mismatch is otherwise invisible.
+	 * `blocks` arrive with overlay already applied; groups/locks/config/sent/`birthFolded`/
+	 * `carriedSent` are set verbatim — `birthFolded` MUST round-trip (v12) or `healProtected`
+	 * diverges from the host: a replica that lost the set heals a block on its next housekeep that
+	 * the host still keeps folded, and both sides bump `rev` by exactly one, so the mismatch is
+	 * otherwise invisible. `carriedSent` MUST round-trip (v15) for the same silent-divergence reason:
+	 * a replica that lost it reclassifies a block the host recorded as already-sent back to fresh
+	 * (birth-fold-eligible / re-listed in `freshIds`), again with both revs still advancing in step.
 	 */
 	adoptSnapshot(s: {
 		blocks: Block[];
@@ -157,6 +170,7 @@ export class Truth {
 		sentThroughOrder: number;
 		wireAttached: boolean;
 		birthFolded: readonly string[];
+		carriedSent: readonly string[];
 		rev: number;
 	}): void {
 		this.blockLog = s.blocks.slice();
@@ -171,6 +185,7 @@ export class Truth {
 		this.wireAttachedFlag = s.wireAttached;
 		this.sentThroughOrderValue = s.sentThroughOrder;
 		this.birthFolded = new Set(s.birthFolded);
+		this.carriedSent = new Set(s.carriedSent);
 		this.lastChangedRev.clear();
 		this.revCounter = s.rev;
 		// Rev-keyed read caches are stamped stale so they recompute against the adopted rev.
@@ -210,7 +225,12 @@ export class Truth {
 			b.override = old.override;
 			b.autoFolded = old.autoFolded;
 			b.by = old.by;
-			b.subst = old.subst;
+			// A same-id CONTENT rewrite (pi replaced this block's text under a stable id — the E1
+			// fingerprint-divergence path) makes the carried `subst` a summary of the OLD text, so the
+			// wire would keep emitting a stale digest. Drop it on a text change; a strategy fold keeps
+			// `autoFolded` and re-digests from the fresh text (the engine per-kind digest recomputes) —
+			// only the custom replace-`subst` is discarded, never the fold itself.
+			b.subst = b.text === old.text ? old.subst : undefined;
 			if (prev.birthFolded.has(b.id)) next.birthFolded.add(b.id);
 		}
 		// Carry the SENT FRONTIER. `new Truth(parsed)` marked every block sent (bulk-born, ADR 0018
@@ -226,6 +246,18 @@ export class Truth {
 			if (!wasSent) frontier = Math.min(frontier, b.order - 1);
 		}
 		next.sentThroughOrderValue = frontier;
+		// A surviving block that WAS sent (per prev's UNION predicate) but now sits ABOVE the frontier
+		// — a freshly-inserted-earlier UNSENT block dragged the `order`-prefix frontier back before it
+		// — would be silently reclassified never-sent by the scalar alone. Carry those ids so `sent`
+		// stays true for them: the model already saw them whole, so they must NOT become birth-fold-
+		// eligible or re-enter `freshIds`. `prev.sent` is the union, so a prev-carried id re-carries —
+		// the set is transitive across successive rebuilds. Only blocks above the frontier are carried
+		// (below it the scalar already covers them), keeping the set — and the snapshot — minimal.
+		for (const b of next.blockLog) {
+			if (b.order <= frontier) continue;
+			const old = prev.get(b.id);
+			if (old && prev.sent(old)) next.carriedSent.add(b.id);
+		}
 		const survivors = next.index;
 		next.groupList = prev.groupList
 			.filter((g) => {
@@ -238,7 +270,12 @@ export class Truth {
 				const idxs = g.memberIds.map((id) => survivors.get(id)!).sort((a, b) => a - b);
 				return idxs.every((v, k) => k === 0 || v === idxs[k - 1] + 1);
 			})
-			.map((g) => ({ ...g, memberIds: g.memberIds.slice() }));
+			// Re-derive `memberIds` in the NEW block order: a rebuild can keep a group CONTIGUOUS while
+			// reordering its members, and `memberIds` is documented "in conversation order" (the wire's
+			// per-run summary emission and `classifyGroup`'s run detection both iterate it in order).
+			// Sort surviving members by their new index to restore that invariant; the group's `id`
+			// stays its original handle (an opaque `foldCode` anchor, not re-derived from members).
+			.map((g) => ({ ...g, memberIds: g.memberIds.slice().sort((a, b) => survivors.get(a)! - survivors.get(b)!) }));
 		next.housekeep(new Set<string>());
 		return next;
 	}
@@ -285,6 +322,10 @@ export class Truth {
 	get birthFoldedIds(): readonly string[] {
 		return [...this.birthFolded];
 	}
+	/** Ids in the carried-sent set (see `carriedSent`). A snapshot must carry this verbatim (v15). */
+	get carriedSentIds(): readonly string[] {
+		return [...this.carriedSent];
+	}
 	/** The tail target the holder enforces while holding `tail-size` (0 when not held). */
 	get activeTailTokens(): number {
 		return this.isLocked("tail-size") ? this.activeTailTok : 0;
@@ -293,13 +334,27 @@ export class Truth {
 		return hasLock(this.activeLocks, name);
 	}
 
-	/** The highest block `order` whose content has reached the model (serialized wire). */
+	/** The highest block `order` whose content has reached the model (serialized wire). The scalar
+	 *  frontier ONLY — `carriedSent` (a rebuild's per-id preserved sent-ness) is separate; use
+	 *  `sent(b)`/`isSent(id)` for the effective predicate. */
 	get sentThroughOrder(): number {
 		return this.sentThroughOrderValue;
 	}
-	/** Has this block's content reached the model in an applied plan? */
+	/**
+	 * Has this block's content reached the model in an applied plan? The UNION of the scalar
+	 * `order`-prefix frontier and the per-id `carriedSent` set a divergence rebuild preserves (see
+	 * `carriedSent`) — so a block the model saw whole stays "sent" even after a fresh earlier block
+	 * drags the frontier back below it. Every consumer of sent-ness (birth-fold eligibility,
+	 * `canFold`'s wire guard, the host adapter's `freshIds`) reads this predicate, so they all agree.
+	 */
 	sent(b: Block): boolean {
-		return b.order <= this.sentThroughOrderValue;
+		return b.order <= this.sentThroughOrderValue || this.carriedSent.has(b.id);
+	}
+	/** Id form of `sent` — for a caller holding an id but not the `Block` (the extension ingress
+	 *  will switch to this). Unknown id ⇒ false (a block we don't hold was never sent from here). */
+	isSent(id: string): boolean {
+		const b = this.get(id);
+		return b ? this.sent(b) : false;
 	}
 	/** A human override owns this block (pin / manual fold / manual unfold). */
 	held(b: Block): boolean {
@@ -615,6 +670,10 @@ export class Truth {
 
 	// ── config dials ────────────────────────────────────────────────────────
 	setBudget(n: number): void {
+		// Refuse non-finite input rather than poison the dial: NaN survives `Math.max`/`Math.round`
+		// (`Math.max(1000, NaN) === NaN`), then JSON serializes NaN/Infinity as `null` on the wire —
+		// forking every replica. A malformed value is a no-op (no rev bump, no event), not a fork.
+		if (!Number.isFinite(n)) return;
 		this.budgetTok = Math.max(1000, Math.round(n));
 		const touched = new Set<string>();
 		this.housekeep(touched);
@@ -623,6 +682,7 @@ export class Truth {
 		this.emit({ type: "config", budget: this.budgetTok, rev });
 	}
 	setContextWindow(n: number): void {
+		if (!Number.isFinite(n)) return; // same non-finite refusal as setBudget — a NaN would fork replicas via JSON null
 		this.contextWindowTok = n;
 		const rev = ++this.revCounter;
 		this.emit({ type: "config", contextWindow: this.contextWindowTok, rev });
@@ -630,6 +690,7 @@ export class Truth {
 	setProtect(n: number): void {
 		// The human can no longer resize the tail under the `tail-size` lock (the holder owns it).
 		if (this.isLocked("tail-size")) return;
+		if (!Number.isFinite(n)) return; // refuse NaN/Infinity — poisons the protected-tail dial + forks replicas
 		this.protectTokensTarget = Math.max(0, Math.round(n));
 		const touched = new Set<string>();
 		this.housekeep(touched);
@@ -833,8 +894,13 @@ export class Truth {
 		return { op, applied: false, clamped: reason, detail };
 	}
 
-	// Multi-id ops fold their per-id outcome into one result (applied iff ANY id applied).
+	// Multi-id ops fold their per-id outcome into one result (applied iff ANY id applied). The batch
+	// `applied`/`clamped` stay what existing callers read; `perId` records EACH id's outcome so the
+	// replica-facing event can forward only the ids that actually applied (see the `perId` doc in
+	// ops.ts and `wireEventFromTruthEvent`) — a per-id clamp must never replay on a baseRev-less
+	// replica and diverge it while both revs still advance in lockstep.
 	private eachId(op: Op & { ids: string[] }, touched: Set<string>, fn: (id: string) => ClampReason | null): OpResult {
+		const perId: { id: string; applied: boolean; reason?: ClampReason }[] = [];
 		let applied = false;
 		let lastClamp: ClampReason | undefined;
 		for (const id of op.ids) {
@@ -842,11 +908,13 @@ export class Truth {
 			if (c === null) {
 				applied = true;
 				touched.add(id);
+				perId.push({ id, applied: true });
 			} else {
 				lastClamp = c;
+				perId.push({ id, applied: false, reason: c });
 			}
 		}
-		return applied ? { op, applied: true } : { op, applied: false, clamped: lastClamp ?? "noop" };
+		return applied ? { op, applied: true, perId } : { op, applied: false, clamped: lastClamp ?? "noop", perId };
 	}
 
 	private opFold(op: Extract<Op, { kind: "fold" }>, by: Actor, baseRev: number | undefined, touched: Set<string>): OpResult {
