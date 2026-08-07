@@ -37,13 +37,23 @@
  *    block locally while the host kept it folded — a silent divergence `rev` bookkeeping alone
  *    couldn't catch (both sides still bump by exactly one). Bumped so a pre-v12 peer (which
  *    would silently drop the field) cannot pair with a v12 host/client that assumes it's there.
+ *  - v13: Phase C groundwork. A second client `Role` — `"conductor"` — can now attach as a
+ *    RESIDENT strategy (in-extension live host or an out-of-process remote SDK) instead of a
+ *    passive GUI replica: `hello` advertises the catalog of available conductors
+ *    (`HelloMessage.conductors`); `conductorState`/`conductorStatus` broadcast to every client;
+ *    `wireDeparting`/`turnCommitted` notify the attached conductor of the same host-lifecycle
+ *    moments `TestHost.departWire`/`commitTurn` fire in-process; `propose`/`proposeResult` and
+ *    `completeRequest`/`completeResult` carry the conductor's `ConductorHost.propose`/`complete`
+ *    calls over the wire; `setConductorStatus` carries `ConductorHost.setStatus`; `WireCommand`
+ *    gains `selectConductor` (GUI picker → host attach/detach). Bumped so a pre-v13 peer (which
+ *    has none of this vocabulary) cannot pair with a v13 host/client that assumes it's there.
  */
 import type { Actor, Group, Override } from "./types";
 import type { LockName } from "./locks";
 import type { Op, OpResult } from "./ops";
 
 /** Bump on any breaking change to the message shapes below. */
-export const PROTOCOL_VERSION = 12;
+export const PROTOCOL_VERSION = 13;
 
 /**
  * Browser dev-loop fallback port only. In the desktop ("pull") model each pi session binds an
@@ -107,6 +117,22 @@ export interface SessionMetaWire {
 	model: string;
 	contextWindow: number | null;
 	format: "pi";
+}
+
+/**
+ * One entry in the available-conductor catalog the host advertises (Phase C). This is the SINGLE
+ * source of truth for the GUI's conductor picker — the host, not the GUI, knows what conductors
+ * exist (in-process built-ins, an attached remote SDK) and what each one claims.
+ */
+export interface ActiveConductorMeta {
+	id: string;
+	label: string;
+	description?: string;
+	locks: LockName[];
+	tailTokens: number;
+	holdWireUpToMs: number;
+	/** True iff this conductor runs out-of-process over the wire (a remote SDK), not in-extension. */
+	remote: boolean;
 }
 
 /** One block's overlay in a snapshot (only blocks whose overlay differs from the fresh default). */
@@ -177,6 +203,9 @@ export interface HelloMessage {
 	sessionId?: string;
 	role: Role;
 	meta: SessionMetaWire;
+	/** The available-conductor catalog (Phase C) — omitted/undefined on a host with none attached
+	 *  or not yet advertising one; the GUI picker renders from this, never from local knowledge. */
+	conductors?: ActiveConductorMeta[];
 }
 
 /** Full state to (re)build a replica Truth. Sent right after hello and on any forced resnapshot. */
@@ -208,7 +237,13 @@ export interface RecallObservationMessage {
 	by: Actor;
 }
 
-/** Streamed after every `context` hook — the local-path timing that replaced the plan round trip. */
+/**
+ * Streamed after every `context` hook — the local-path timing that replaced the plan round trip.
+ * `lastHoldMs`/`holdTimeouts` (v13) cover the NEW `wire-departing` hold window (`holdWireUpToMs`):
+ * how long the host held the departing wire for the attached conductor's last-moment proposal on
+ * the most recent hook, and how many times that hold has hit its timeout and passed through
+ * without one, over the session's lifetime.
+ */
 export interface TelemetryMessage {
 	type: "telemetry";
 	lastHookMs: number;
@@ -216,6 +251,8 @@ export interface TelemetryMessage {
 	p95HookMs: number;
 	rebuilds: number;
 	hookCount: number;
+	lastHoldMs: number;
+	holdTimeouts: number;
 }
 
 /** The host's reply to a `command`. The client uses it for clamp UX only; state arrives via events. */
@@ -238,6 +275,72 @@ export interface StreamMessage {
 	contentIndex: number;
 }
 
+/**
+ * Broadcast to EVERY client (not just the conductor role) whenever the host's attached conductor
+ * changes — attach, detach, or a swap. `active: null` means no conductor is attached (context is
+ * raw / human-only). The GUI's status strip and picker both render from this, never from a locally
+ * tracked guess, so every client agrees on who (if anyone) is driving.
+ */
+export interface ConductorStateMessage {
+	type: "conductorState";
+	active: ActiveConductorMeta | null;
+}
+
+/**
+ * Broadcast to EVERY client: the attached conductor's display-only status line/metrics changed
+ * (`ConductorHost.setStatus`, echoed from the conductor's `setConductorStatus` command). `text:
+ * null` clears it. Purely presentational — carries no Truth state.
+ */
+export interface ConductorStatusMessage {
+	type: "conductorStatus";
+	text: string | null;
+	metrics?: Record<string, number | string | boolean>;
+}
+
+/**
+ * Sent ONLY to the client holding the `"conductor"` role: the wire is about to depart to the
+ * model. The wire host-adapter equivalent (`hostAdapter.ts → wireDepartingEvent`) already computes
+ * the same `rev`/`liveTokens`/`budget`/`freshIds`; `holdMs` is this attached conductor's own
+ * `holdWireUpToMs` — how long the host will wait for a `propose` before letting the wire depart
+ * unchanged. A GUI-role client never receives this (it has no last-moment proposal to make).
+ */
+export interface WireDepartingMessage {
+	type: "wireDeparting";
+	rev: number;
+	liveTokens: number;
+	budget: number;
+	freshIds: string[];
+	holdMs: number;
+}
+
+/** Sent ONLY to the conductor-role client: a turn settled — the canonical re-plan trigger. */
+export interface TurnCommittedMessage {
+	type: "turnCommitted";
+	turn: number;
+	rev: number;
+}
+
+/** Sent ONLY to the conductor-role client: the reply to its `propose` command. */
+export interface ProposeResultMessage {
+	type: "proposeResult";
+	seq: number;
+	rev: number;
+	results: OpResult[];
+}
+
+/** Sent ONLY to the conductor-role client: the reply to its `completeRequest` (out-of-band model
+ *  completion). `ok:false` means the call was unavailable/failed — `error` carries why. */
+export interface CompleteResultMessage {
+	type: "completeResult";
+	reqId: number;
+	ok: boolean;
+	text?: string;
+	model?: string;
+	inputTokens?: number;
+	outputTokens?: number;
+	error?: string;
+}
+
 export type ServerMessage =
 	| HelloMessage
 	| SnapshotMessage
@@ -246,7 +349,13 @@ export type ServerMessage =
 	| RecallObservationMessage
 	| TelemetryMessage
 	| CommandResultMessage
-	| StreamMessage;
+	| StreamMessage
+	| ConductorStateMessage
+	| ConductorStatusMessage
+	| WireDepartingMessage
+	| TurnCommittedMessage
+	| ProposeResultMessage
+	| CompleteResultMessage;
 
 // ── Client → server ──────────────────────────────────────────────────────────
 
@@ -254,17 +363,54 @@ export type ServerMessage =
  * A remote-control command. `ops` always carry `by:"you"` server-side (a client is a human hand).
  * Config dials are their own kinds. The host applies against the current rev and replies
  * `commandResult`; there is NO optimistic apply — the replica mutates only via the echoed events.
+ * `selectConductor` (v13) drives the host's attach/detach — `id: null` detaches whatever is
+ * currently attached, `id: "<conductorId>"` attaches (swapping out any prior attach first).
  */
 export type WireCommand =
 	| { kind: "ops"; ops: Op[] }
 	| { kind: "setBudget"; value: number }
 	| { kind: "setProtect"; value: number }
-	| { kind: "setFolding"; value: boolean };
+	| { kind: "setFolding"; value: boolean }
+	| { kind: "selectConductor"; id: string | null };
 
 export interface CommandMessage {
 	type: "command";
 	seq: number;
 	cmd: WireCommand;
+}
+
+/**
+ * A conductor-role client's transaction proposal (v13) — the wire form of `ConductorHost.propose`.
+ * The host applies against `baseRev` and replies `proposeResult` (never a `commandResult`; a
+ * conductor's ops are attributed `by:"auto"`/the conductor's own actor, never `"you"`).
+ */
+export interface ProposeMessage {
+	type: "propose";
+	seq: number;
+	baseRev: number;
+	ops: Op[];
+}
+
+/**
+ * A conductor-role client's out-of-band completion request (v13) — the wire form of
+ * `ConductorHost.complete`. The host resolves it against the live session's model and replies
+ * `completeResult` tagged with the same `reqId`.
+ */
+export interface CompleteRequestMessage {
+	type: "completeRequest";
+	reqId: number;
+	system?: string;
+	prompt: string;
+	maxOutputTokens?: number;
+	model?: string;
+}
+
+/** A conductor-role client's display-only status update (v13) — the wire form of
+ *  `ConductorHost.setStatus`. The host echoes it to every client as `conductorStatus`. */
+export interface SetConductorStatusMessage {
+	type: "setConductorStatus";
+	text: string | null;
+	metrics?: Record<string, number | string | boolean>;
 }
 
 /**
@@ -276,21 +422,37 @@ export interface ResnapshotMessage {
 	type: "resnapshot";
 }
 
-export type ClientMessage = CommandMessage | ResnapshotMessage;
+export type ClientMessage = CommandMessage | ResnapshotMessage | ProposeMessage | CompleteRequestMessage | SetConductorStatusMessage;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-const SERVER_TYPES = new Set(["hello", "snapshot", "event", "folding", "recall", "telemetry", "commandResult", "stream"]);
+const SERVER_TYPES = new Set([
+	"hello",
+	"snapshot",
+	"event",
+	"folding",
+	"recall",
+	"telemetry",
+	"commandResult",
+	"stream",
+	"conductorState",
+	"conductorStatus",
+	"wireDeparting",
+	"turnCommitted",
+	"proposeResult",
+	"completeResult",
+]);
 
 export function isServerMessage(v: unknown): v is ServerMessage {
 	if (!v || typeof v !== "object" || !("type" in v)) return false;
 	return SERVER_TYPES.has((v as { type: unknown }).type as string);
 }
 
+const CLIENT_TYPES = new Set(["command", "resnapshot", "propose", "completeRequest", "setConductorStatus"]);
+
 export function isClientMessage(v: unknown): v is ClientMessage {
-	if (!v || typeof v !== "object") return false;
-	const t = (v as { type?: unknown }).type;
-	return t === "command" || t === "resnapshot";
+	if (!v || typeof v !== "object" || !("type" in v)) return false;
+	return CLIENT_TYPES.has((v as { type: unknown }).type as string);
 }
 
 const WIRE_KINDS = new Set(["user", "text", "thinking", "tool_call", "tool_result"]);

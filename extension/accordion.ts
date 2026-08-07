@@ -369,7 +369,10 @@ export default function accordionLive(pi: ExtensionAPI): void {
 		return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
 	}
 	function broadcastTelemetry(): void {
-		broadcast({ type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount });
+		// lastHoldMs/holdTimeouts (protocol v13) cover the wire-departing hold window for an attached
+		// conductor's last-moment proposal; no conductor is attached on this branch yet, so both are
+		// fixed at 0 until the Phase C host wires the hold itself.
+		broadcast({ type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: 0, holdTimeouts: 0 });
 	}
 
 	// ── registry file: advertise this session for the app to discover ───────────
@@ -973,7 +976,7 @@ export default function accordionLive(pi: ExtensionAPI): void {
 			send(ws, { type: "hello", protocolVersion: PROTOCOL_VERSION, sessionId, role, meta });
 			if (truth) send(ws, { type: "snapshot", state: serializeSnapshot(truth, foldingEnabled) });
 			// Seed the client's latency badge with current telemetry (blank until the first hook otherwise).
-			send(ws, { type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount });
+			send(ws, { type: "telemetry", lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookCount, lastHoldMs: 0, holdTimeouts: 0 });
 			// Register only AFTER the snapshot so no event can precede the replica it must replay onto.
 			clients.set(ws, { role });
 

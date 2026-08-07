@@ -3,6 +3,8 @@ import { Truth } from "./truth";
 import type { Block, ParsedSession } from "./types";
 import { linearize, wireToBlock, type PiMessage } from "./wire";
 import { foldCode } from "./digest";
+import { wireEventFromTruthEvent, applyWireEvent } from "./replica";
+import type { WireEvent } from "./protocol";
 
 const META = { format: "pi" as const, title: "t", cwd: "", model: "" };
 
@@ -267,6 +269,102 @@ describe("Truth — locks (ADR 0011)", () => {
 		expect(t.get("a:b0:p0")!.override).toBe(null); // released
 		t.clearLocks();
 		expect(t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "you").results[0].applied).toBe(true);
+	});
+});
+
+describe("Truth — freeze (conductor-detach kill switch, Phase C)", () => {
+	it("converts a strategy fold with a custom subst into a human-owned fold, subst preserved byte-identical", () => {
+		const t = bulk(seq(3));
+		t.setProtect(0);
+		t.apply([{ kind: "replace", id: "a:b0:p0", content: "custom recap", recoverable: false }], "auto");
+		const substBefore = t.get("a:b0:p0")!.subst;
+		expect(substBefore).toBe("custom recap");
+		const r = t.apply([{ kind: "freeze" }], "you");
+		expect(r.results[0].applied).toBe(true);
+		const b = t.get("a:b0:p0")!;
+		expect(b.override).toBe("folded");
+		expect(b.by).toBe("you");
+		expect(b.subst).toBe(substBefore); // byte-identical — never cleared like a normal human fold
+		expect(t.isFolded(b)).toBe(true);
+	});
+
+	it("reassigns an auto-owned FOLDED group to \"you\"; an open (unfolded) auto group is left alone", () => {
+		const t = bulk(seq(6));
+		t.setProtect(0);
+		const gr = t.apply([{ kind: "group", ids: ["a:b1:p0", "a:b2:p0"] }], "auto");
+		const gid = gr.results[0].detail!;
+		const gr2 = t.apply([{ kind: "group", ids: ["a:b4:p0", "a:b5:p0"] }], "auto");
+		const gid2 = gr2.results[0].detail!;
+		t.apply([{ kind: "unfoldGroup", groupId: gid2 }], "auto"); // opened — not currently folded
+		expect(t.groupById(gid)!.by).toBe("auto");
+		expect(t.groupById(gid2)!.by).toBe("auto");
+
+		t.apply([{ kind: "freeze" }], "you");
+		expect(t.groupById(gid)!.by).toBe("you"); // folded auto group → reassigned
+		expect(t.groupById(gid2)!.by).toBe("auto"); // unfolded — freeze doesn't touch it
+	});
+
+	it("leaves existing human folds and pins untouched", () => {
+		const t = bulk(seq(3));
+		t.setProtect(0);
+		t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "you");
+		t.apply([{ kind: "pin", ids: ["a:b1:p0"] }], "you");
+		const r = t.apply([{ kind: "freeze" }], "you");
+		expect(r.results[0].applied).toBe(false); // nothing strategy-owned to convert
+		expect(t.get("a:b0:p0")!.override).toBe("folded");
+		expect(t.get("a:b0:p0")!.by).toBe("you");
+		expect(t.get("a:b1:p0")!.override).toBe("pinned");
+		expect(t.get("a:b1:p0")!.by).toBe("you");
+	});
+
+	it("is idempotent — a second freeze is a no-op and does not bump rev", () => {
+		const t = bulk(seq(3));
+		t.setProtect(0);
+		t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "auto");
+		t.apply([{ kind: "freeze" }], "you");
+		const rev = t.rev;
+		const r = t.apply([{ kind: "freeze" }], "you");
+		expect(r.results[0].applied).toBe(false);
+		expect(r.results[0].clamped).toBe("noop");
+		expect(t.rev).toBe(rev);
+	});
+
+	it("succeeds while the human-steering lock is HELD — must NOT clamp (it runs immediately before clearLocks)", () => {
+		const t = bulk(seq(3));
+		t.setProtect(0);
+		t.apply([{ kind: "fold", ids: ["a:b0:p0"] }], "auto");
+		t.setLocks(["human-steering"], "conductor-x");
+		const r = t.apply([{ kind: "freeze" }], "you");
+		expect(r.results[0].applied).toBe(true);
+		expect(r.results[0].clamped).toBeUndefined();
+		expect(t.get("a:b0:p0")!.override).toBe("folded");
+		expect(t.get("a:b0:p0")!.by).toBe("you");
+	});
+
+	it("replays identically on a second Truth via the ops-applied event stream (replica replay)", () => {
+		const host = live();
+		const events: WireEvent[] = [];
+		host.onEvent((e) => {
+			const w = wireEventFromTruthEvent(e);
+			if (w) events.push(w);
+		});
+		host.append(seq(4));
+		host.setProtect(0);
+		host.apply([{ kind: "replace", id: "a:b0:p0", content: "recap", recoverable: false }], "auto");
+		host.apply([{ kind: "group", ids: ["a:b1:p0", "a:b2:p0"] }], "auto");
+		const r = host.apply([{ kind: "freeze" }], "you");
+		expect(r.results[0].applied).toBe(true);
+
+		const replica = live();
+		for (const w of events) applyWireEvent(replica, w);
+
+		expect(replica.rev).toBe(host.rev);
+		expect(replica.get("a:b0:p0")!.override).toBe(host.get("a:b0:p0")!.override);
+		expect(replica.get("a:b0:p0")!.by).toBe(host.get("a:b0:p0")!.by);
+		expect(replica.get("a:b0:p0")!.subst).toBe(host.get("a:b0:p0")!.subst);
+		expect(replica.get("a:b1:p0")!.override).toBe(host.get("a:b1:p0")!.override);
+		expect(replica.groups.length).toBe(host.groups.length);
+		expect(replica.groups[0]?.by).toBe(host.groups[0]?.by);
 	});
 });
 
