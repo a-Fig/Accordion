@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { connectLive, disconnectLive, setArmed, live, conductors, conductorState, conductorStatus, selectConductor } from "./liveClient.svelte";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { connectLive, disconnectLive, setArmed, live, conductors, conductorState, conductorStatus, selectConductor, mySurfaceId } from "./liveClient.svelte";
+import { _resetSurfaceIdForTests } from "./surfaceId";
 import { folding } from "./folding.svelte";
 import { session } from "../session.svelte";
 import { AccordionStore } from "../engine/store.svelte";
@@ -370,5 +371,87 @@ describe("liveClient — read-only badge on wire loss (P3: an orphaned replica m
 		ws.close(); // dies before hello/snapshot ever arrive
 
 		expect(session.readOnly).toBe(false);
+	});
+});
+
+describe("liveClient — deferred first dial while the surface-id dedupe window is open (F1, ADR 0024 §5)", () => {
+	// The auto-connect ordering end-to-end at the connectLive level: onMount → connectLive is the
+	// FIRST entry into surfaceId.ts, so the dedupe window is still open at dial time. connectLive
+	// must HOLD the dial through the window (no socket yet), let an in-use reply re-mint the copied
+	// id, and only then open the socket — carrying the RE-MINTED id on `?surface=`. Freezing the id
+	// in the same synchronous frame as init (the pre-fix behavior) put the copied id on the wire.
+	class TestBC {
+		static last: TestBC | null = null;
+		onmessage: ((ev: { data: unknown }) => void) | null = null;
+		constructor(public name: string) {
+			TestBC.last = this;
+		}
+		postMessage(_m: unknown): void {}
+		close(): void {}
+		deliver(m: unknown): void {
+			this.onmessage?.({ data: m });
+		}
+	}
+	function storageWith(seed: Record<string, string>): Storage {
+		const m = new Map<string, string>(Object.entries(seed));
+		return {
+			getItem: (k: string) => (m.has(k) ? m.get(k)! : null),
+			setItem: (k: string, v: string) => void m.set(k, v),
+			removeItem: (k: string) => void m.delete(k),
+			clear: () => m.clear(),
+			key: () => null,
+			get length() {
+				return m.size;
+			},
+		} as Storage;
+	}
+
+	let savedBC: unknown;
+	let hadBC: boolean;
+
+	beforeEach(() => {
+		hadBC = "BroadcastChannel" in globalThis;
+		savedBC = (globalThis as any).BroadcastChannel;
+		(globalThis as any).BroadcastChannel = TestBC;
+		TestBC.last = null;
+		_resetSurfaceIdForTests();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		if (hadBC) (globalThis as any).BroadcastChannel = savedBC;
+		else delete (globalThis as any).BroadcastChannel;
+		_resetSurfaceIdForTests();
+	});
+
+	it("holds the dial through the window; an in-use reply re-mints the id BEFORE it rides the wire", async () => {
+		vi.useFakeTimers();
+		(globalThis as any).window = { sessionStorage: storageWith({ accordion_surface_id: "copied-id" }) };
+
+		connectLive(1234); // same frame as the module's first init — the auto-connect ordering
+		expect(FakeWebSocket.last).toBeNull(); // dial HELD — no socket while the window is open
+		expect(live.status).toBe("connecting"); // but the UI already shows the connect intent
+
+		// The original tab (owner of "copied-id") replies a few ms later, inside the held window.
+		TestBC.last!.deliver({ kind: "in-use", id: "copied-id", nonce: "original-tab" });
+		await vi.advanceTimersByTimeAsync(300); // window elapses → deferred dial re-enters
+
+		const ws = FakeWebSocket.last!;
+		expect(ws).not.toBeNull(); // the socket opened only after the window settled
+		const surface = new URL(ws.url).searchParams.get("surface");
+		expect(surface).not.toBe("copied-id"); // the wire carries the RE-MINTED id
+		expect(surface).toBe(mySurfaceId()); // and it matches this surface's settled identity
+	});
+
+	it("a disconnect during the held window aborts the deferred dial (no zombie socket)", async () => {
+		vi.useFakeTimers();
+		(globalThis as any).window = { sessionStorage: storageWith({ accordion_surface_id: "some-id" }) };
+
+		connectLive(1234);
+		expect(FakeWebSocket.last).toBeNull(); // held
+		disconnectLive(); // user navigates away / closes the session during the ≤150ms hold
+		await vi.advanceTimersByTimeAsync(300);
+
+		expect(FakeWebSocket.last).toBeNull(); // the superseded deferred dial never opened a socket
 	});
 });

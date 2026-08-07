@@ -1,15 +1,26 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mySurfaceId, markSurfaceDialed, _resetSurfaceIdForTests } from "./surfaceId";
+import {
+	mySurfaceId,
+	markSurfaceDialed,
+	primeSurfaceId,
+	surfaceIdIfSettled,
+	surfaceIdReady,
+	_resetSurfaceIdForTests,
+} from "./surfaceId";
 
 /*
  * surfaceId.test.ts — the per-tab surface identity + duplicate-tab dedupe (v16, ADR 0024 §5, F1).
  *
- * Two properties are load-bearing and both are unit-testable without a real browser:
+ * Three properties are load-bearing and all are unit-testable without a real browser:
  *   1. The id is read/written through `window.sessionStorage` — NEVER localStorage (the whole reason
  *      per-tab identity survives the door putting every surface on one origin).
- *   2. The BroadcastChannel dedupe: a not-yet-dialed newcomer re-mints when a peer announces its id
- *      is taken; an established/dialed context defends its id and never re-mints; failure-open when
- *      BroadcastChannel is unavailable.
+ *   2. The BroadcastChannel dedupe: an UNDIALED context re-mints when a peer says its id is taken
+ *      (no matter how late the reply lands); a DIALED context defends its id and never re-mints;
+ *      failure-open when BroadcastChannel is unavailable.
+ *   3. THE DIAL ORDERING: surfaceIdReady() waits out the dedupe window before freezing/handing out
+ *      the id — even when called in the same synchronous frame as init (the browser-served
+ *      auto-connect flow), so an in-use reply landing inside the window re-mints BEFORE the id
+ *      rides a wire. Freezing in the init frame was the inert-dedupe P2.
  *
  * A REAL two-browser-tab end-to-end (open a duplicate, watch its sessionStorage diverge) is NOT
  * feasible in a headless vitest process — there is only one JS realm here. Instead we drive the
@@ -116,7 +127,7 @@ describe("mySurfaceId — sessionStorage, never localStorage", () => {
 		expect(mySurfaceId()).toBe("ephemeral");
 	});
 
-	it("returns 'ephemeral' when storage throws (private mode)", () => {
+	it("falls back to a VOLATILE per-context id when storage throws (private mode) — never the shared 'ephemeral' constant", () => {
 		const throwing = {
 			getItem() {
 				throw new Error("blocked");
@@ -127,7 +138,17 @@ describe("mySurfaceId — sessionStorage, never localStorage", () => {
 		} as unknown as Storage;
 		installWindow(throwing);
 		delete (globalThis as any).BroadcastChannel;
-		expect(mySurfaceId()).toBe("ephemeral");
+
+		const idA = mySurfaceId();
+		expect(idA).not.toBe("ephemeral"); // P3: a literal constant would collide across private tabs
+		expect(mySurfaceId()).toBe(idA); // stable within this context
+
+		// A SECOND private-mode context (fresh module state) gets a DIFFERENT volatile id.
+		_resetSurfaceIdForTests();
+		installWindow(throwing);
+		const idB = mySurfaceId();
+		expect(idB).not.toBe("ephemeral");
+		expect(idB).not.toBe(idA);
 	});
 
 	it("two distinct storage contexts mint DISTINCT ids", () => {
@@ -160,7 +181,7 @@ describe("BroadcastChannel duplicate-tab dedupe", () => {
 		expect(ch.posted).toContainEqual(expect.objectContaining({ kind: "id-check", id: "shared-id" }));
 	});
 
-	it("newcomer re-mints a fresh id when a peer replies in-use (the duplicated-tab case)", () => {
+	it("undialed context re-mints a fresh id when a peer replies in-use (the duplicated-tab case)", () => {
 		const ss = fakeStorage({ [KEY]: "shared-id" });
 		installWindow(ss);
 		expect(mySurfaceId()).toBe("shared-id"); // starts on the copied id
@@ -173,7 +194,7 @@ describe("BroadcastChannel duplicate-tab dedupe", () => {
 		expect(ss.getItem(KEY)).toBe(after); // and persisted to OUR sessionStorage
 	});
 
-	it("newcomer re-mints when it sees another context's id-check for our id (both freshly duplicated)", () => {
+	it("undialed context re-mints when it sees another context's id-check for our id (both freshly duplicated)", () => {
 		const ss = fakeStorage({ [KEY]: "shared-id" });
 		installWindow(ss);
 		mySurfaceId();
@@ -189,16 +210,26 @@ describe("BroadcastChannel duplicate-tab dedupe", () => {
 		expect(mySurfaceId()).toBe("solo-id");
 	});
 
-	it("does NOT re-mint on an in-use that arrives AFTER the newcomer window closed (defends its id)", () => {
+	it("UNDIALED + late in-use (after the window closed) → still re-mints (the window never gates reply handling)", () => {
 		vi.useFakeTimers();
-		installWindow(fakeStorage({ [KEY]: "older-id" }));
+		installWindow(fakeStorage({ [KEY]: "copied-id" }));
 		mySurfaceId();
-		vi.advanceTimersByTime(500); // newcomer window closes → we now defend the id
-		FakeBroadcastChannel.last!.deliver({ kind: "in-use", id: "older-id", nonce: "late-peer" });
-		expect(mySurfaceId()).toBe("older-id");
+		vi.advanceTimersByTime(500); // window long over, but this context never dialed
+		FakeBroadcastChannel.last!.deliver({ kind: "in-use", id: "copied-id", nonce: "late-owner" });
+		expect(mySurfaceId()).not.toBe("copied-id"); // an undialed id is never worth defending over the owner's
 	});
 
-	it("an established (dialed) context replies in-use to a peer id-check and NEVER re-mints", () => {
+	it("DIALED + late in-use → keeps its id (a live connection's identity is frozen)", () => {
+		vi.useFakeTimers();
+		installWindow(fakeStorage({ [KEY]: "held-id" }));
+		mySurfaceId();
+		vi.advanceTimersByTime(500);
+		markSurfaceDialed(); // this surface is connected — id frozen
+		FakeBroadcastChannel.last!.deliver({ kind: "in-use", id: "held-id", nonce: "late-peer" });
+		expect(mySurfaceId()).toBe("held-id");
+	});
+
+	it("a dialed context replies in-use to a peer id-check and NEVER re-mints", () => {
 		installWindow(fakeStorage({ [KEY]: "held-id" }));
 		mySurfaceId();
 		markSurfaceDialed(); // this surface is now connected/established
@@ -219,6 +250,61 @@ describe("BroadcastChannel duplicate-tab dedupe", () => {
 		ch.deliver({ kind: "in-use", id: "someone-elses-id", nonce: "x" }); // different id → ignored
 		ch.deliver({ kind: "in-use", id: "my-id", nonce: startPost }); // our own nonce → ignored
 		expect(mySurfaceId()).toBe("my-id");
+	});
+});
+
+describe("surfaceIdReady / surfaceIdIfSettled — the dial ordering (the inert-dedupe P2)", () => {
+	beforeEach(() => {
+		(globalThis as any).BroadcastChannel = FakeBroadcastChannel;
+	});
+
+	it("AUTO-CONNECT ORDERING: a dial requested in the same frame as init still waits the window, and an in-use reply within it re-mints BEFORE the id is handed out", async () => {
+		vi.useFakeTimers();
+		const ss = fakeStorage({ [KEY]: "shared-id" }); // sessionStorage copied by a tab-duplicate
+		installWindow(ss);
+
+		// onMount → connectLive: the FIRST module entry is the dial itself. No prior priming.
+		const p = surfaceIdReady();
+		expect(surfaceIdIfSettled()).toBeNull(); // window open — a sync dial is refused, it must wait
+
+		// The original tab's in-use reply lands a few ms later — INSIDE the held window.
+		FakeBroadcastChannel.last!.deliver({ kind: "in-use", id: "shared-id", nonce: "original-tab" });
+
+		await vi.advanceTimersByTimeAsync(200); // the dedupe window elapses
+		const id = await p;
+		expect(id).not.toBe("shared-id"); // the dial got the RE-MINTED id, not the copied one
+		expect(mySurfaceId()).toBe(id); // and it is this surface's id from here on
+		expect(ss.getItem(KEY)).toBe(id); // persisted per-tab
+
+		// The id is now frozen: a later in-use can't move it out from under the live dial.
+		FakeBroadcastChannel.last!.deliver({ kind: "in-use", id, nonce: "too-late" });
+		expect(mySurfaceId()).toBe(id);
+	});
+
+	it("resolves with the unchanged id when nobody contests within the window", async () => {
+		vi.useFakeTimers();
+		installWindow(fakeStorage({ [KEY]: "solo-id" }));
+		const p = surfaceIdReady();
+		await vi.advanceTimersByTimeAsync(200);
+		expect(await p).toBe("solo-id");
+	});
+
+	it("settles synchronously once the primed window has elapsed (the bootstrap fast path)", async () => {
+		vi.useFakeTimers();
+		installWindow(fakeStorage({ [KEY]: "primed-id" }));
+		primeSurfaceId(); // bootstrap priming (+layout.svelte) — init WITHOUT freeze
+		expect(surfaceIdIfSettled()).toBeNull(); // still inside the window: primed, not settled
+		await vi.advanceTimersByTimeAsync(200); // window elapses in the background
+		expect(surfaceIdIfSettled()).toBe("primed-id"); // a dial now settles synchronously
+		expect(await surfaceIdReady()).toBe("primed-id"); // and the promise path is immediate too
+	});
+
+	it("resolves immediately with no BroadcastChannel (failure-open — no pointless wait)", async () => {
+		vi.useFakeTimers();
+		installWindow(fakeStorage({ [KEY]: "no-bc-id" }));
+		delete (globalThis as any).BroadcastChannel;
+		expect(surfaceIdIfSettled()).toBe("no-bc-id"); // nothing to dedupe against → settled at once
+		expect(await surfaceIdReady()).toBe("no-bc-id"); // no timer advance needed
 	});
 });
 
