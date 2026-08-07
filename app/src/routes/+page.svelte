@@ -7,6 +7,7 @@
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery } from "$lib/live/claudeDiscovery.svelte";
 	import { folding } from "$lib/live/folding.svelte";
 	import { foldAlarm, runFoldCheck } from "$lib/live/foldAlarm.svelte";
+	import { servedToken } from "$lib/live/servedToken";
 	import { takeoverPopup, demotionToast, dismissTakeoverPopup, dismissDemotionToast } from "$lib/live/controllerUi.svelte";
 	import { DEFAULT_PORT } from "$core/protocol";
 	import type { SessionEntry } from "$lib/live/registry";
@@ -65,9 +66,11 @@
 
 	// The per-session bearer carried in the page URL (?token=…). Browser WebSocket upgrades
 	// are Origin/token-gated even on loopback; forwarding this authorizes the serving session.
+	// Read via the shared `servedToken()` (S1b): it captures the token ONCE and scrubs it from the
+	// address bar (history.replaceState), so the token no longer rides a bookmarkable URL while every
+	// consumer — this WS dial and the /__accordion/sessions poll — still forwards the memoized value.
 	function readServedToken(): string | null {
-		if (typeof window === "undefined") return null;
-		return new URLSearchParams(window.location.search).get("token");
+		return servedToken();
 	}
 
 	function selectAndConnect(s: SessionEntry): void {

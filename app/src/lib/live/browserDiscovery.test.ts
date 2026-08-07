@@ -24,6 +24,7 @@ import { PROTOCOL_VERSION } from "$core/protocol";
 import { poll, __resetPollFailureStreakForTest } from "./browserDiscovery.svelte";
 import { discovery, publishSessions, DEMO_ID } from "./discovery.svelte";
 import { live } from "./liveClient.svelte";
+import { _resetServedTokenForTests } from "./servedToken";
 
 // Fixed heartbeatAt (not Date.now()) so two separately-constructed "identical" entries always
 // compare equal with toEqual — sameSessions() ignores heartbeatAt, but toEqual does not.
@@ -63,6 +64,9 @@ beforeEach(() => {
 	hadWindow = "window" in globalThis;
 	savedWindow = (globalThis as any).window;
 	(globalThis as any).window = { location: { search: "" } };
+	// servedToken() memoizes the URL token once per module lifetime + strips it from the address bar;
+	// reset it so each case reads the `window.location.search` it sets up (S1b).
+	_resetServedTokenForTests();
 	fetchImpl = async () => jsonResponse({ sessions: [] });
 	(globalThis as any).fetch = (url: string, opts?: RequestInit) => fetchImpl(url, opts);
 
