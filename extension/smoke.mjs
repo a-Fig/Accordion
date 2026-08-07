@@ -1183,7 +1183,7 @@ if (unfoldTool && foldCodeStr) {
 		() => fails.push("issue #93: resnapshot after system-prompt capture produced no snapshot"),
 	);
 	const snap = a.inbox.snapshot.at(-1);
-	// v21: the prompt rides in `state.blocks` as the BOLTED `system` block (id `sys:0`, order -1,
+	// v22: the prompt rides in `state.blocks` as the BOLTED `system` block (id `sys:0`, order -1,
 	// FIRST in the log), not as a `state.systemPrompt` scalar.
 	const sp = snap?.state?.blocks?.[0];
 	if (!sp || sp.kind !== "system" || sp.id !== "sys:0" || sp.order !== -1)
@@ -1193,7 +1193,7 @@ if (unfoldTool && foldCodeStr) {
 	if (snap?.state?.blocks?.filter((b) => b.kind === "system").length !== 1)
 		fails.push("issue #93: expected EXACTLY ONE system block in the snapshot (a changed prompt replaces, never appends)");
 	if (snap?.state?.systemPrompt !== undefined)
-		fails.push("v21: snapshot.state.systemPrompt should be gone — the prompt is a block now");
+		fails.push("v22: snapshot.state.systemPrompt should be gone — the prompt is a block now");
 
 	const kAfter = snap?.state?.calibration;
 	if (typeof kAfter !== "number") fails.push("issue #93: expected a calibration observation on the snapshot after system-prompt capture");

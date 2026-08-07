@@ -142,7 +142,7 @@ export class AccordionStore {
 				this.syncGroups();
 				break;
 			case "config":
-				// A `systemPrompt` config event is the ONE config dial that changes the BLOCK LOG (v21:
+				// A `systemPrompt` config event is the ONE config dial that changes the BLOCK LOG (v22:
 				// `Truth.setSystemPrompt` creates-or-replaces the bolted `system` block at index 0), so the
 				// mirror has to follow before anything reads it. Skipping this would leave `store.blocks`
 				// one entry short of `truth.blocks` — and since `protectedFromIndex` is an ARRAY INDEX
@@ -176,7 +176,7 @@ export class AccordionStore {
 	}
 
 	/**
-	 * Mirror the truth's `system` block (v21). Insert it at index 0 the first time a prompt is
+	 * Mirror the truth's `system` block (v22). Insert it at index 0 the first time a prompt is
 	 * captured; on a later capture the SAME block object is content-rewritten in place (the truth
 	 * allocates a fresh block, but the mirror clone can be patched — `text`/`tokens` are the only
 	 * fields that can change, and in-place mutation is what keeps `$state` reactivity flowing to
@@ -308,16 +308,6 @@ export class AccordionStore {
 	calBlockTokens(b: Block, n: number): number {
 		void this.version;
 		return this.truth.calBlockTokens(b, n);
-	}
-	/**
-	 * Calibrated token cost of the system prompt. Since v21 the prompt is a real BOLTED `system`
-	 * BLOCK, so this is just `calBlockTokens` over that block — no separate calibration path survives.
-	 * 0 when no prompt was ever captured (the block is absent — silent absence, not a zero placeholder).
-	 */
-	calSystemPromptTokens(): number {
-		void this.version;
-		const b = this.truth.systemBlock();
-		return b ? this.truth.calBlockTokens(b, b.tokens) : 0;
 	}
 	calGroupFullTokens(g: Group): number {
 		void this.version;

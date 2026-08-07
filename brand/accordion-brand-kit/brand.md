@@ -79,7 +79,7 @@ Replace marketing language with observable facts. If a claim can't be seen in th
 
 ## Color
 
-Monochrome base carries everything; the four **spectrum** colors are semantic — each names a block
+Monochrome base carries everything; the six **spectrum** colors are semantic — each names a block
 kind in the product (and together they form the brand gradient). Never set body text in a spectrum
 hue, and never pair two spectrum hues as foreground/background. Maintain 4.5:1 contrast for body copy.
 
@@ -92,7 +92,9 @@ hue, and never pair two spectrum hues as foreground/background. Maintain 4.5:1 c
 | Cloud | `#E8E8E8` | 232, 232, 232 | 0,0,0,9 | Borders, dividers |
 | Paper | `#F6F6F6` | 246, 246, 246 | 0,0,0,4 | Background surfaces |
 | White | `#FFFFFF` | 255, 255, 255 | 0,0,0,0 | Base canvas |
+| System | `#7D6EE6` | 125, 110, 230 | 46,52,0,10 | Block kind: bolted system prompt |
 | User | `#044EFF` | 4, 78, 255 | 98,69,0,0 | Block kind: user message |
+| Reply | `#1AA6E8` | 26, 166, 232 | 89,28,0,9 | Block kind: assistant reply |
 | Thinking | `#B480DF` | 180, 128, 223 | 19,43,0,13 | Block kind: thinking |
 | Tool call | `#21D4C1` | 33, 212, 193 | 84,0,9,17 | Block kind: tool call |
 | Tool result | `#E19C7D` | 225, 156, 125 | 0,31,44,12 | Block kind: tool result |

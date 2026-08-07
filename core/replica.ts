@@ -61,7 +61,8 @@ export function serializeSnapshot(truth: Truth, foldingEnabled: boolean): Snapsh
 		carriedSent: [...truth.carriedSentIds],
 		calibration: truth.calibration,
 		calibrationThroughOrder: truth.calibrationThroughOrder,
-		// v21: no `systemPrompt` scalar. The agent's prompt is the first entry of `blocks` above (a
+		systemPromptCalibrated: truth.systemPromptCalibrated,
+		// v22: no `systemPrompt` scalar. The agent's prompt is the first entry of `blocks` above (a
 		// `system` WireBlock), so it serializes and hydrates like any other block — and a session that
 		// never captured one simply has no such block (silent absence, never a placeholder).
 		rev: truth.rev,
@@ -109,6 +110,7 @@ export function hydrateSnapshot(meta: SessionMeta, state: SnapshotState): Truth 
 		// hand-built/test literal (real peers are version-gated before hydration).
 		calibration: calibrationThroughOrder === null ? 1 : (state.calibration ?? 1),
 		calibrationThroughOrder,
+		systemPromptCalibrated: calibrationThroughOrder === null ? false : (state.systemPromptCalibrated ?? false),
 		rev: state.rev,
 	});
 	return truth;
@@ -158,6 +160,7 @@ export function wireEventFromTruthEvent(e: TruthEvent): WireEvent | null {
 				protectTokens: e.protectTokens,
 				calibration: e.calibration,
 				calibrationThroughOrder: e.calibrationThroughOrder,
+				systemPromptCalibrated: e.systemPromptCalibrated,
 				systemPrompt: e.systemPrompt,
 				rev: e.rev,
 			};
@@ -187,7 +190,7 @@ export function applyWireEvent(truth: Truth, ev: WireEvent): void {
 			if (ev.calibration !== undefined && ev.calibrationThroughOrder !== undefined) {
 				truth.setCalibration(ev.calibration, ev.calibrationThroughOrder);
 			}
-			// v21: this create-or-replaces the replica's own BOLTED `system` block at the head of its log
+			// v22: this create-or-replaces the replica's own BOLTED `system` block at the head of its log
 			// (`Truth.setSystemPrompt` → `insertSystemBlock`), reconstructing it deterministically from
 			// the event rather than receiving it as an `appended` block. Host and replica therefore bump
 			// `rev` by exactly one on the same input, keeping the replay assertion meaningful.

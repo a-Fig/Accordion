@@ -133,8 +133,8 @@
  *    input a replica turns into a create-or-replace of its own `system` block (an `appended` event
  *    could not express a REPLACE, and would land the block at the end of the log besides). A session
  *    with no sourceable prompt emits no block at all — silent absence, never a placeholder. Bumped
- *    because a pre-v21 peer would reject every `system` WireBlock at `isWireBlock` and drop the
- *    prompt (and its tokens) silently, while a pre-v21 HOST would send a scalar a v21 client no
+ *    because a pre-v22 peer would reject every `system` WireBlock at `isWireBlock` and drop the
+ *    prompt (and its tokens) silently, while a pre-v22 HOST would send a scalar a v22 client no
  *    longer reads.
  */
 import type { Actor, Group, Override } from "./types";
@@ -171,7 +171,7 @@ export const DEFAULT_PORT = DOOR_PORT;
  *   • `s:<timestamp>`                      — a summary/other message
  * Fallback (anchor absent): positional `m<i>:u|p<j>|r|s`.
  *
- * The one exception is the `system` block (v21): its id is the constant `SYSTEM_BLOCK_ID`
+ * The one exception is the `system` block (v22): its id is the constant `SYSTEM_BLOCK_ID`
  * (`"sys:0"`, `core/types.ts`) and its `order` is -1, because the agent's system prompt is not a
  * member of pi's `messages` array at all — it rides the provider request's own `system` field, so
  * there is no message to anchor an id to and nothing positional to re-identify. It is deliberately
@@ -320,11 +320,12 @@ export interface SnapshotState {
 	calibration?: number;
 	/** Last block order covered by `calibration`, or `null` before the first usable receipt (v20). */
 	calibrationThroughOrder?: number | null;
-	// NOTE (v21): the v19/v20 `systemPrompt` / `systemPromptCalibrated` fields are GONE. The agent's
-	// system prompt is now the first entry of `blocks` (a `system` WireBlock, id `"sys:0"`, order -1),
-	// so it hydrates like any other block and its calibration coverage is the ordinary
-	// `order <= calibrationThroughOrder` test. A session that never captured a prompt simply has no
-	// such block — silent absence.
+	/** Whether the current system block was present on the request covered by `calibration`. A prompt
+	 *  replacement invalidates this even though the stable block keeps order -1 (v20, retained in v22). */
+	systemPromptCalibrated?: boolean;
+	// NOTE (v22): the v19/v20 `systemPrompt` scalar is GONE. The agent's system prompt is now the first
+	// entry of `blocks` (a `system` WireBlock, id `"sys:0"`, order -1). A session that never captured a
+	// prompt simply has no such block — silent absence.
 	rev: number;
 }
 
@@ -352,8 +353,9 @@ export type WireEvent =
 			protectTokens?: number;
 			calibration?: number;
 			calibrationThroughOrder?: number;
+			systemPromptCalibrated?: boolean;
 			/**
-			 * A create-or-replace of the `system` block (v21; v19's field, kept while its scalar sibling
+			 * A create-or-replace of the `system` block (v22; v19's field, kept while its scalar sibling
 			 * in `SnapshotState` was dropped). A replica replays it through `Truth.setSystemPrompt`,
 			 * which reconstructs the block deterministically at the head of its own log. It rides
 			 * `config` rather than `appended` because `appended` can express neither a REPLACE (pi's

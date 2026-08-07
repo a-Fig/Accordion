@@ -3,7 +3,7 @@
  *
  * The truth moved into the extension: it hosts an in-process `Truth` per session (core/truth.ts —
  * the same class the app once ran). pi's `context` hook is a LOCAL operation against that Truth —
- * NO 250ms GUI plan round trip. A client (the GUI) is a REPLICA + remote control over protocol v21.
+ * NO 250ms GUI plan round trip. A client (the GUI) is a REPLICA + remote control over protocol v22.
  *
  * Per-hook loop (all local, no disk I/O, no await on any client):
  *   1. reconcile pi's `event.messages` against the Truth by a cheap durable-id walk. If it is our
