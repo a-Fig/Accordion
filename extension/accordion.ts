@@ -943,8 +943,20 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	 * True iff `token` is one this extension accepts as a bearer: the per-session `webToken` OR the
 	 * shared door secret (v16, ADR 0024). EVERY extension accepts the door secret wherever the
 	 * webToken is accepted — that is what makes the door URL session-independent and lets a
-	 * door-served page dial any sibling session's ephemeral port. Never a WEAKER path than the
-	 * webToken: both are unguessable secrets a hostile web page cannot read (they live on disk).
+	 * door-served page dial any sibling session's ephemeral port.
+	 *
+	 * Security posture (honest version — an earlier comment wrongly said "both live on disk"): the
+	 * per-session `webToken` is MEMORY-ONLY — minted with `crypto.randomBytes` per session, never
+	 * written to disk (a `SessionEntry`/`buildEntry` carries no token). Only the door secret is a file
+	 * (`~/.accordion/door-secret`). What stops a hostile WEB PAGE is unchanged and is the boundary that
+	 * matters: it can read neither files nor this process's memory, so neither secret is reachable to
+	 * it. A same-user LOCAL process is explicitly OUTSIDE the threat model — it can already read pi's
+	 * own session data on disk directly, so reading `door-secret` grants it nothing new. What the door
+	 * secret DOES newly introduce, versus the ephemeral in-memory webToken, and which is owned rather
+	 * than hand-waved: it is persisted (survives reboots), never rotated for the life of the file,
+	 * shared machine-wide, and rides a bookmarkable URL (history/bookmark-sync exposure — the address
+	 * bar is scrubbed client-side after capture, S1b, but a link the user copies/shares still carries a
+	 * live, non-expiring, machine-wide credential). Secret rotation is a NAMED FOLLOW-UP, not shipped.
 	 */
 	function isBearer(token: string | null | undefined): boolean {
 		if (typeof token !== "string" || !token) return false;
