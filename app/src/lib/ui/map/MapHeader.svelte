@@ -82,6 +82,16 @@
 			`epoch-mismatch (view superseded mid-wait): ${live.planOutcomes["epoch-mismatch"]}`,
 	);
 
+	// ── Involvement locks (ADR 0011) — the honest mirror of the engine's gating. A locked
+	// control LOOKS locked in every mode (preview/demo/read-only included), driven purely off
+	// `store.isLocked(...)`. The engine already no-ops the underlying action; this is the UI
+	// reflecting that, not the enforcement. The budget dial is NEVER gated (sacred tier).
+	const tailLocked = $derived(store.isLocked("tail-size"));
+	const steerLocked = $derived(store.isLocked("human-steering"));
+	const lockTip = $derived(
+		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
+	);
+
 	function protectFromClientX(clientX: number): number {
 		if (!barEl) return store.protectTokens;
 		const r = barEl.getBoundingClientRect();
@@ -96,6 +106,7 @@
 		if (snapped !== store.protectTokens) store.setProtect(snapped);
 	}
 	function onProtPointerDown(e: PointerEvent) {
+		if (tailLocked) return; // tail-size locked by the active strategy — the handle is inert
 		e.preventDefault();
 		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 		dragTokens = protectFromClientX(e.clientX); // visual only — no refold yet
@@ -110,6 +121,7 @@
 		dragTokens = null;
 	}
 	function onProtKeydown(e: KeyboardEvent) {
+		if (tailLocked) return; // tail-size locked — keyboard nudges are inert too
 		let v = store.protectTokens;
 		if (e.key === "ArrowLeft" || e.key === "ArrowDown") v -= PROT_STEP;
 		else if (e.key === "ArrowRight" || e.key === "ArrowUp") v += PROT_STEP;
@@ -186,22 +198,33 @@
 				</div>
 			{/if}
 
-			<!-- Protect readout: eyebrow + editable mono value (the dial lives on the bar). -->
+			<!-- Protect readout: eyebrow + editable mono value (the dial lives on the bar).
+			     Under the tail-size lock the active strategy owns the tail — the dial becomes a
+			     static readout and the field shows locked (ADR 0011 §7). -->
 			<div
 				class="ctl-field protect-read"
-				title={`Actual protected tail: ${fmt(store.protectedTokens)} tokens; target: ${fmt(store.protectTokens)} tokens — click the value or drag the handle to change it`}
+				class:ctl-locked={tailLocked}
+				aria-disabled={tailLocked}
+				title={tailLocked
+					? lockTip + " (the active strategy now owns the tail)"
+					: `Actual protected tail: ${fmt(store.protectedTokens)} tokens; target: ${fmt(store.protectTokens)} tokens — click the value or drag the handle to change it`}
 			>
 				<span class="ctl-eyebrow mono">
 					<Icon name="lock" size={10} />
 					PROTECT
 				</span>
 				<span class="ctl-value mono tnum">
-					<EditableNumber
-						value={store.protectTokens}
-						format={k}
-						label="Protected tail target in thousands of tokens"
-						oncommit={(n) => store.setProtect(Math.max(0, Math.min(PROT_MAX, n)))}
-					/>
+					{#if tailLocked}
+						<!-- tail-size locked: a static readout, not an editable dial. -->
+						<span class="kl-val">{k(store.protectTokens)}</span>
+					{:else}
+						<EditableNumber
+							value={store.protectTokens}
+							format={k}
+							label="Protected tail target in thousands of tokens"
+							oncommit={(n) => store.setProtect(Math.max(0, Math.min(PROT_MAX, n)))}
+						/>
+					{/if}
 					{#if Math.abs(store.protectedTokens - store.protectTokens) > 500}
 						<span class="kl-target tnum">({k(store.protectedTokens)})</span>
 					{/if}
@@ -237,10 +260,13 @@
 			<button
 				class="btn-secondary reset-btn"
 				onclick={() => store.resetAll()}
-				disabled={editCount === 0}
-				title={editCount === 0
-					? "No manual edits — the view is already automatic"
-					: `Clear ${editCount} manual edit${editCount === 1 ? "" : "s"} and return to the automatic fold view`}
+				disabled={editCount === 0 || steerLocked}
+				aria-disabled={steerLocked}
+				title={steerLocked
+					? lockTip
+					: editCount === 0
+						? "No manual edits — the view is already automatic"
+						: `Clear ${editCount} manual edit${editCount === 1 ? "" : "s"} and return to the automatic fold view`}
 			>
 				<Icon name="rotate-ccw" size={13} />
 				Revert to auto
@@ -273,18 +299,22 @@
 			<span class="bar-marker-cap" aria-hidden="true"></span>
 		</span>
 
-		<!-- draggable protected handle (floats above the clipped bar). -->
+		<!-- draggable protected handle (floats above the clipped bar). Inert under the
+		     tail-size lock — the active strategy owns the tail (ADR 0011 §7). -->
 		<div
 			class="prot-grip"
 			class:dragging={dragTokens != null}
+			class:locked={tailLocked}
 			style:left="{handlePct}%"
 			role="slider"
-			tabindex={0}
+			tabindex={tailLocked ? -1 : 0}
 			aria-label="Protected tail in tokens"
+			aria-disabled={tailLocked}
 			aria-valuemin="0"
 			aria-valuemax={PROT_MAX}
 			aria-valuenow={store.protectTokens}
 			aria-valuetext="{fmt(store.protectTokens)} tokens protected"
+			title={tailLocked ? lockTip : undefined}
 			onpointerdown={onProtPointerDown}
 			onpointermove={onProtPointerMove}
 			onpointerup={onProtPointerUp}
@@ -577,6 +607,13 @@
 		cursor: default;
 	}
 
+	/* A control gated by an involvement lock (ADR 0011): greyed, reduced affordance. The
+	   honest mirror of the engine's gating — looks locked in every mode. */
+	.ctl-locked {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
 	/* Wire outcome readout (issue #60) — quiet, monochrome; never the reserved user-block
 	   blue. A partial ratio (some calls fell back) dims to --muted rather than alarming red -
 	   a stale-plan fallback is a graceful degradation, not an error state. */
@@ -657,6 +694,19 @@
 	}
 	.prot-grip:focus-visible {
 		outline: none;
+	}
+
+	/* tail-size locked: the handle is inert and dimmed (the active strategy owns the tail). */
+	.prot-grip.locked {
+		cursor: not-allowed;
+		opacity: 0.4;
+	}
+	.prot-grip.locked::before {
+		background: var(--faint);
+		box-shadow: none;
+	}
+	.prot-grip.locked:hover::before {
+		box-shadow: none;
 	}
 
 	/* The slight underline echoing the protected extent */

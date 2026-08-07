@@ -547,3 +547,47 @@ describe("isDurableId", () => {
 		expect(isDurableId("m2:s")).toBe(false);
 	});
 });
+
+// ADR 0011 — the agent-unfold involvement lock refuses the agent's unfold, and resolveUnfold
+// reports the code as MISSING (not restored) because the engine no-ops the unfold under the lock.
+describe("resolveUnfold under the agent-unfold lock", () => {
+	it("reports the code as missing (the block stays folded) when agent-unfold is held", () => {
+		order = 0;
+		const blocks = [
+			blk({ id: "a:resp1:p0", kind: "text", tokens: 8000 }),
+			blk({ id: "u:1000", kind: "user", tokens: 50, text: "hi" }),
+		];
+		const s = makeStore(blocks);
+		s.setProtect(40);
+		foldAllOld(s); // human folds the old block
+		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(true);
+
+		// The future host takes the agent-unfold lock; the human fold survives (different axis).
+		s.setLocks(["agent-unfold"], "test-host");
+
+		const code = foldCode("a:resp1:p0");
+		const { restored, missing } = resolveUnfold(s, [code]);
+
+		expect(restored).toEqual([]); // nothing restored — the engine refused the agent unfold
+		expect(missing).toEqual([code]); // reported missing, not a false "restored"
+		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(true); // still folded
+	});
+
+	it("collaborative (no lock): the same agent unfold succeeds", () => {
+		order = 0;
+		const blocks = [
+			blk({ id: "a:resp1:p0", kind: "text", tokens: 8000 }),
+			blk({ id: "u:1000", kind: "user", tokens: 50, text: "hi" }),
+		];
+		const s = makeStore(blocks);
+		s.setProtect(40);
+		foldAllOld(s);
+		const code = foldCode("a:resp1:p0");
+
+		const { restored, missing } = resolveUnfold(s, [code]);
+		expect(missing).toEqual([]);
+		expect(restored.map((r) => r.code)).toEqual([code]);
+		expect(s.isFolded(s.get("a:resp1:p0")!)).toBe(false);
+		expect(s.get("a:resp1:p0")!.by).toBe("agent");
+	});
+});

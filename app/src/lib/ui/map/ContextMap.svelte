@@ -34,6 +34,16 @@
 		tool_result: "Tool result",
 	};
 
+	// Involvement locks (ADR 0011): under `human-steering` the human's fold/group controls are
+	// the holder's. Double-click-to-fold becomes a no-op and is not advertised; the inline
+	// transcript Fold button and the range→Group affordance disable. Single-click INSPECT and
+	// group PEEK stay enabled — observation is sacred, never lockable. Drive off `store.isLocked`
+	// so preview/demo/read-only mirror it exactly.
+	const steerLocked = $derived(store.isLocked("human-steering"));
+	const lockTip = $derived(
+		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
+	);
+
 	// ---- weight as dice faces: every tile is the same square; token weight is
 	//      read as a die face 1–6 (more pips = heavier block). -----------------
 	// Upper-bound labels — a face N tile holds blocks UP TO the listed token count
@@ -361,18 +371,21 @@
 		const tool = b.toolName ? ` ${b.toolName}` : "";
 		const folded = store.isFolded(b);
 		const f = folded ? ` · folded ${b.tokens}→${store.effTokens(b)}` : "";
-		// The hint mirrors what a double-click actually DOES — store.toggle gated by canFold — so
-		// the tile never advertises a fold the gate would refuse: a live user/tool_call, a pin, or
-		// the protected tail. Unfold stays for a folded block.
-		const action = folded
-			? "click to inspect · double-click to unfold"
-			: store.canFold(b)
-				? "click to inspect · double-click to fold"
-				: prot
-					? "click to inspect · protected — never folds"
-					: b.override === "pinned"
-						? "click to inspect · pinned — held live"
-						: "click to inspect · this kind never folds";
+		// The hint mirrors what a double-click actually DOES — steerLocked makes it a no-op, else
+		// store.toggle gated by canFold — so the tile never advertises a fold the gate would refuse:
+		// a human-steering lock, a live user/tool_call, a pin, or the protected tail. Unfold stays
+		// for a folded block.
+		const action = steerLocked
+			? "click to inspect · folding locked by the active strategy"
+			: folded
+				? "click to inspect · double-click to unfold"
+				: store.canFold(b)
+					? "click to inspect · double-click to fold"
+					: prot
+						? "click to inspect · protected — never folds"
+						: b.override === "pinned"
+							? "click to inspect · pinned — held live"
+							: "click to inspect · this kind never folds";
 		return `${b.kind}${tool} · ${b.tokens.toLocaleString()} tok${f}\n${action}`;
 	}
 	function groupTip(g: Group): string {
@@ -446,6 +459,14 @@
 			clearPendingClick(); // drop any deferred inspect bound to the old session
 			peeked = new Set();
 		});
+	});
+	// ADR 0011: when the human-steering lock becomes active, any pending range must be
+	// cleared immediately — a range selected just before the lock engages would otherwise
+	// linger and mislead the user into a guaranteed-to-fail "Group" attempt.
+	$effect(() => {
+		if (steerLocked) {
+			untrack(() => clearRange());
+		}
 	});
 	$effect(() => {
 		if (view !== "map")
@@ -524,8 +545,10 @@
 
 	function handleBlockClick(id: string, shiftKey: boolean) {
 		const bl = store.get(id);
-		// Range-select only exists to build a group; it is a map-only gesture.
-		if (view === "map" && shiftKey && rangeAnchorId) {
+		// Range-select only exists to build a group — a human-steering action. Under the lock
+		// it's inert; a click just inspects (observation stays). So skip all range bookkeeping.
+		// Range-select is a map-only gesture.
+		if (!steerLocked && view === "map" && shiftKey && rangeAnchorId) {
 			clearPendingClick();
 			if (!bl || store.isProtected(bl) || store.groupOf(bl)) {
 				groupErr = true;
@@ -538,7 +561,7 @@
 		deferClick(() => {
 			onselect(id);
 			rangeAnchorId =
-				view === "map" && bl && !store.isProtected(bl) && !store.groupOf(bl) ? id : null;
+				!steerLocked && view === "map" && bl && !store.isProtected(bl) && !store.groupOf(bl) ? id : null;
 			rangeEndId = null;
 			groupErr = false;
 		});
@@ -562,6 +585,7 @@
 		_ev: MouseEvent,
 	) {
 		clearPendingClick();
+		if (steerLocked) return; // double-click folds, which is locked — no-op (observation is fine)
 		if (e.kind === "group") {
 			collapseGroup(e.id);
 		} else {
@@ -620,6 +644,7 @@
 
 	function onDbl(e: MouseEvent) {
 		clearPendingClick();
+		if (steerLocked) return; // double-click folds/unfolds — locked → no-op (single-click inspect still works)
 		const hit = resolveHit(e);
 		if (hit.kind === "group") {
 			collapseGroup(hit.gid);
@@ -641,8 +666,9 @@
 			if (rangeAnchorId) { clearRange(); return; }
 		}
 		// Enter commits a pending range (≥2 blocks) into a group — the keyboard twin of the
-		// "Group N blocks" button, matching the selection chip's hint.
-		if (e.key === "Enter" && rangeCount >= 2) {
+		// "Group N blocks" button, matching the selection chip's hint. No-op under the lock
+		// (ADR 0011: group creation is a human-steering action).
+		if (e.key === "Enter" && rangeCount >= 2 && !steerLocked) {
 			e.preventDefault();
 			handleCreateGroup();
 			return;
@@ -886,22 +912,30 @@
 
 			<span class="grow"></span>
 
-			<!-- Range-select chip / hint. -->
+			<!-- Range-select chip / hint.
+			     Under human-steering lock: the Group button and Enter hint are hidden;
+			     only the clear button remains so the user can dismiss the selection.
+			     Observation stays unlocked — range visibility itself is fine; only
+			     creating a group (a steering action) is gated (ADR 0011). -->
 			{#if rangeCount >= 2}
-				<div class="range-bar" class:err={groupErr}>
+				<div class="range-bar" class:err={groupErr && !steerLocked}>
 					<span class="range-chip">
 						<Icon name="corner-down-right" size={11} />
 						<b>{rangeCount}</b> blocks → group
-						<span class="dim">· Enter</span>
+						{#if !steerLocked}<span class="dim">· Enter</span>{/if}
 					</span>
-					{#if groupErr}<span class="range-err">overlaps a group or protected tail</span>{/if}
-					<button class="group-btn" onclick={handleCreateGroup}>Group</button>
+					{#if groupErr && !steerLocked}<span class="range-err">overlaps a group or protected tail</span>{/if}
+					{#if steerLocked}
+						<span class="range-err" title={lockTip}>Locked</span>
+					{:else}
+						<button class="group-btn" onclick={handleCreateGroup}>Group</button>
+					{/if}
 					<button class="range-clear" onclick={clearRange} title="Clear selection (Esc)">
 						<Icon name="x" size={11} />
 					</button>
 				</div>
 				<div class="tb-divider"></div>
-			{:else if rangeAnchorId}
+			{:else if rangeAnchorId && !steerLocked}
 				<span class="range-hint dim">shift-click to complete range</span>
 				<div class="tb-divider"></div>
 			{/if}
@@ -939,7 +973,7 @@
 			<div class="tb-divider"></div>
 
 			<span class="dim" style="font-size:var(--fs-xs)">
-				click = inspect · dbl-click = fold
+				{steerLocked ? "click = inspect · folding locked by the active strategy" : "click = inspect · dbl-click = fold"}
 			</span>
 		{/if}
 	</div>
@@ -1150,8 +1184,11 @@
 							{#if folded || canFold}
 								<button
 									class="tr-btn"
+									class:locked={steerLocked}
+									disabled={steerLocked}
+									aria-disabled={steerLocked}
 									onclick={(e) => { e.stopPropagation(); store.toggle(b.id); }}
-									title={folded ? "Unfold to full text" : "Fold to digest"}
+									title={steerLocked ? lockTip : folded ? "Unfold to full text" : "Fold to digest"}
 								>
 									<Icon name={folded ? "chevrons-up-down" : "chevrons-down-up"} size={12} />
 									{folded ? "Unfold" : "Fold"}
@@ -2006,6 +2043,17 @@
 		opacity: 0.4;
 	}
 	.tr-btn:disabled:hover {
+		color: var(--muted);
+		background: var(--panel-2);
+		border-color: var(--line);
+	}
+	/* human-steering locked: the inline Fold control shows disabled (the honest mirror) —
+	   held dim even on row hover / selection, which otherwise force opacity back to 1. */
+	.tr-msg:hover .tr-btn.locked,
+	.tr-msg.sel .tr-btn.locked {
+		opacity: 0.4;
+	}
+	.tr-btn.locked:hover {
 		color: var(--muted);
 		background: var(--panel-2);
 		border-color: var(--line);
