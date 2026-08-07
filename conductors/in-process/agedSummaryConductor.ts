@@ -22,13 +22,13 @@
  *
  * No Svelte, no `$state`, no engine imports. Types come from `../conductor/contract` and
  * `../conductor/view`; the only VALUE imports outside those are the pure `core/` primitives that
- * decide what the wire will do with a proposed group (`hasCollapsibleCarrier` / `messageKey` /
+ * decide what the wire will do with a proposed group (`collapsibleMessageKeys` / `messageKey` /
  * `roleFloorRecap` / `BLOCK_OVERHEAD`) — imported rather than re-derived precisely so this
  * conductor's judgment can never drift from the one `Truth`/`applyPlan` actually enforce.
  */
 import { ViewConductor, type Command, type ConductorView } from "../../core/conductor/view";
 import type { ConductorHost, LockName, ViewBlock } from "../../core/conductor/contract";
-import { hasCollapsibleCarrier, messageKey } from "../../core/groupShape";
+import { collapsibleMessageKeys, messageKey } from "../../core/groupShape";
 import { roleFloorRecap } from "../../core/wire";
 import { BLOCK_OVERHEAD } from "../../core/tokens";
 
@@ -62,6 +62,15 @@ const MIN_OUTPUT_TOKENS = 1000;
  * count, so a reservation computed as "just fits" does not tip the real request over the window.
  */
 const OUTPUT_SAFETY_MARGIN = 512;
+
+/**
+ * A completed pass counts as PRODUCTIVE only if it shrank the visible wire by MORE than this many
+ * tokens. Sized at roughly one framed wire message (`BLOCK_OVERHEAD` plus a short one-line body) —
+ * the smallest unit of wire this machinery ever moves. Below it, the pass rearranged framing and
+ * nothing else, and repeating it just spends another model call for the same nothing. See the
+ * back-off in `conduct()`.
+ */
+const MIN_PASS_SAVING = 32;
 
 /**
  * Break any closing `tags` sentinel hidden in interpolated, attacker-influenceable content so it
@@ -252,6 +261,18 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	 */
 	private failureStatus: string | null = null;
 
+	/**
+	 * Wire tokens the most recently COMMITTED pass actually removed (`liveTokens` before its ops
+	 * applied minus after). Null until one completes — and a FAILED attempt never sets it, so a
+	 * provider error can never look like an unproductive pass. Read only by the back-off in
+	 * `conduct()`.
+	 */
+	private lastPassSaving: number | null = null;
+
+	/** Σ full tokens of the aged region the most recently COMMITTED pass was handed — the bar a
+	 *  refill has to clear before an unproductive conductor spends another model call. */
+	private lastPassAgedTokens = 0;
+
 	// ── lifecycle ────────────────────────────────────────────────────────────────
 
 	/** A conductor lifetime starts fresh on attach — don't let state from a prior session leak into
@@ -265,6 +286,8 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		this.coveredIds = new Set();
 		this.lastAttemptKey = "";
 		this.failureStatus = null;
+		this.lastPassSaving = null;
+		this.lastPassAgedTokens = 0;
 		super.attach(host);
 	}
 
@@ -323,10 +346,23 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 			return [];
 		}
 
+		// PAID-RETRY BACK-OFF (#90 review round 2). Honest accounting means a conductor whose aged
+		// region has nothing left worth collapsing sits permanently over the high-water mark. Every
+		// turn then adds a newly-aged block, which changes `attemptKey` and would launch another
+		// billed `host.complete()` call for the same nothing, forever. So: once a COMMITTED pass has
+		// failed to shrink the wire (`lastPassSaving <= MIN_PASS_SAVING` — measured, not guessed, from
+		// `liveTokens` either side of that pass's own ops), stop relaunching on mere attempt-key
+		// drift. The gate re-opens on genuine REFILL: newly-aged content exceeding everything the
+		// unproductive pass was already handed, which is the point at which the region has plausibly
+		// grown a collapsible run it did not have before. A productive pass leaves this wide open, so
+		// the healthy path is unchanged.
+		const productive = this.lastPassSaving === null || this.lastPassSaving > MIN_PASS_SAVING;
+		const refilled = sumTokens(newlyAged) > this.lastPassAgedTokens;
+
 		// Trigger only when the VISIBLE window is at/over the high-water mark AND there are
 		// newly-aged blocks to fold in. Below the mark, or with nothing new, HOLD: re-emit the
 		// existing group (or clear to raw if no result yet).
-		const needsRun = overThreshold && newlyAged.length > 0;
+		const needsRun = overThreshold && newlyAged.length > 0 && (productive || refilled);
 		if (!needsRun) {
 			this.surfaceIdleStatus();
 			return this.text !== null ? this.emitCoverageGroup(view) : [];
@@ -413,30 +449,40 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	 * K = 1 (the common case, no fragmentation) is unaffected: the single run still gets the full
 	 * `text` digest, byte-identical to before that fix.
 	 *
-	 * TWO RUN-LEVEL EXCLUSIONS (#90 review, sol5.6). An excluded run is simply not proposed — its
-	 * blocks stay live exactly as a held/foreign block already keeps itself out of a run — so both
-	 * exclusions are lossless, and both are re-evaluated from the live view every pass:
+	 * THREE RUN-LEVEL EXCLUSIONS (#90 review). An excluded run is simply not proposed — its blocks
+	 * stay live exactly as a held/foreign block already keeps itself out of a run — so all three are
+	 * lossless, and all three are re-evaluated from the live view every pass:
 	 *
-	 *   1. NO VIABLE CARRIER (P1 #2 — silent data loss). `Truth.opGroup` rejects a group whose run
+	 *   1. NOT A FIXED POINT OF THE HOST'S RANGE SNAP. `Truth.opGroup` does not group the ids it is
+	 *      handed: it groups `snappedRange(first, last)`, which walks each boundary OUTWARD over
+	 *      blocks sharing its `messageKey` — sibling parts of the same assistant message that this
+	 *      walk deliberately EXCLUDED. Vetting the run while Truth applies a wider set is a hole big
+	 *      enough to lose data through: a snapped-in HELD sibling trips `opGroup`'s human-override
+	 *      clamp, and a snapped-in `tool_call` whose result is outside flips the carrier verdict —
+	 *      either way the carrier is rejected while a sibling DROP commits (exclusion 2's failure
+	 *      mode, reached around the back). So each run is first trimmed INWARD to the largest
+	 *      sub-window that `snappedRange` leaves alone (`snapToMessageAtoms`, mirroring
+	 *      `conductors/ws/thermocline/policy.ts`'s `safeRunFromUnits`), and THAT window is both what
+	 *      gets vetted and what gets proposed — so the group Truth applies is byte-identical to the
+	 *      one judged here. A run that shrinks to nothing is dropped entirely.
+	 *   2. NO VIABLE CARRIER (P1 #2 — silent data loss). `Truth.opGroup` rejects a group whose run
 	 *      has nothing the wire may actually remove (`"nothing collapses (all stragglers)"` — e.g. a
 	 *      run holding a `tool_call` whose paired `tool_result` is held OUTSIDE it). `Truth.apply`
 	 *      validates each op INDEPENDENTLY and `ViewConductor.applyDesired` silently drops the
 	 *      failures, so a rejected FIRST run (the summary carrier) alongside an accepted sibling
-	 *      DROP removed content from the wire with no summary anywhere. Asking
-	 *      `hasCollapsibleCarrier` (core/groupShape.ts — the SAME fixpoint `Truth.classifyGroup`
-	 *      runs, not a re-derivation) BEFORE proposing means a doomed carrier is never proposed, so
-	 *      no sibling drop is ever built on a summary that will not commit. Note the coupling: if
-	 *      the first run is excluded, `text` moves to the first run that IS viable.
-	 *   2. A DROP THAT COSTS MORE THAN IT SAVES (P1 #1 — the wire growing). The wire's role-validity
+	 *      DROP removed content from the wire with no summary anywhere. Running the SAME fixpoint
+	 *      `Truth.classifyGroup` runs (`collapsibleMessageKeys`, core/groupShape.ts — not a
+	 *      re-derivation) BEFORE proposing means a doomed carrier is never proposed, so no sibling
+	 *      drop is ever built on a summary that will not commit. Note the coupling: if the first run
+	 *      is excluded, `text` moves to the first run that IS viable.
+	 *   3. A DROP THAT COSTS MORE THAN IT SAVES (P1 #1 — the wire growing). The wire's role-validity
 	 *      floor (`computeDegradedDropRuns`, core/wire.ts) turns a DROP run into a paid recap stub
 	 *      when removing it would weld two same-role neighbors, at a cost that is ~flat per run
 	 *      regardless of run size. Under heavy fragmentation (many tiny runs) that turned
-	 *      "compaction" into net wire GROWTH. A run whose own content is smaller than the stub it
-	 *      may be degraded into can never pay for itself, so it is not dropped at all. The check is
-	 *      deliberately LOCAL and worst-case (the floor's real verdict is a global fixpoint over
-	 *      every run at once, unavailable here): it can leave a small saving on the table, never
-	 *      cause growth. The summary CARRIER is exempt — it is this conductor's entire product, and
-	 *      a REPLACE run is never degraded — so growth stays bounded by one summary's own cost.
+	 *      "compaction" into net wire GROWTH. `dropEconomics` below compares what the drop actually
+	 *      removes against what it can actually cost; a drop that cannot pay for itself is not made.
+	 *      The summary CARRIER is exempt — it is this conductor's entire product, and a REPLACE run
+	 *      is never degraded — so growth stays bounded by one summary's own cost.
 	 *
 	 * Returns:
 	 *   - null  → no result yet (used ONLY while a first-trip completion is in-flight).
@@ -447,55 +493,112 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	private emitCoverageGroup(view: ConductorView): Command[] | null {
 		if (this.text === null) return null;
 
+		// A run is a MAXIMAL CONTIGUOUS index span of survivors — contiguous by construction, so the
+		// snap below never has to consider an interior hole.
 		const foreign = this.foreignGroupedIds();
-		const runs: ViewBlock[][] = [];
-		let run: ViewBlock[] | null = null;
+		const runs: Array<[number, number]> = [];
+		let start = -1;
 		const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
 		for (let i = 0; i < pfi; i++) {
 			const b = view.blocks[i];
 			if (this.coveredIds.has(b.id) && !b.held && !foreign.has(b.id) && this.includeInGroup(b)) {
-				if (run) run.push(b);
-				else runs.push((run = [b]));
-			} else {
-				run = null;
+				if (start === -1) start = i;
+			} else if (start !== -1) {
+				runs.push([start, i - 1]);
+				start = -1;
 			}
 		}
+		if (start !== -1) runs.push([start, pfi - 1]);
 
 		const cmds: Command[] = [];
-		for (const r of runs) {
-			// Exclusion 1 — a doomed carrier is never proposed. `requireDurable: true` matches the
-			// live host this conductor always runs under (`Truth.wireAttached` is set for every live
-			// pi session); it is also the STRICTER of the two verdicts, so a run judged viable here is
-			// viable under either, which is the direction that cannot lose data.
-			if (!hasCollapsibleCarrier(r, true)) continue;
-			// Exclusion 2 applies only to DROP runs — the carrier always commits (see the doc above).
-			if (cmds.length > 0 && sumTokens(r) <= this.worstCaseDropCost(r)) continue;
-			cmds.push({ kind: "group", ids: [r[0].id, r[r.length - 1].id], digest: cmds.length === 0 ? this.text : "" });
+		for (const [runStart, runEnd] of runs) {
+			const snapped = this.snapToMessageAtoms(view, runStart, runEnd); // exclusion 1
+			if (!snapped) continue;
+			const members = view.blocks.slice(snapped[0], snapped[1] + 1);
+			// Exclusion 2. `requireDurable: true` matches the live host this conductor always runs
+			// under (`Truth.wireAttached` is set for every live pi session); it is also the STRICTER
+			// of the two verdicts, so a run judged viable here is viable under either — the direction
+			// that cannot lose data. An empty removable set is exactly `!hasCollapsibleCarrier`; the
+			// set itself is what exclusion 3 needs, so it is computed once.
+			const removable = collapsibleMessageKeys(members, true);
+			if (removable.size === 0) continue;
+			// Exclusion 3 applies only to DROP runs — the carrier always commits (see the doc above).
+			if (cmds.length > 0) {
+				const { saving, cost } = this.dropEconomics(members, removable);
+				if (saving <= cost) continue;
+			}
+			cmds.push({ kind: "group", ids: [members[0].id, members[members.length - 1].id], digest: cmds.length === 0 ? this.text : "" });
 		}
 		return cmds;
 	}
 
 	/**
-	 * The most a DROP over `run` could cost the wire: the role-validity floor's recap stub, at the
-	 * EXACT text `applyPlan` would synthesize for it (`roleFloorRecap`, exported from `core/wire.ts`
-	 * so the estimate matches token-for-token rather than in shape) plus the same `BLOCK_OVERHEAD`
-	 * framing `Truth.runWireTok` charges it. Zero when the floor does not degrade this run — but
-	 * that verdict depends on every OTHER run at once, so the worst case is what is compared
-	 * against. The group id is predicted the way `Truth.opGroup` mints it (`g:<first member id>`);
-	 * only the string's LENGTH matters here, and `foldTag` is fixed-width, so a boundary the host's
-	 * range-snapping would widen cannot change the estimate.
+	 * Trim `[start..end]` INWARD to the largest sub-window that is a FIXED POINT of `Truth`'s
+	 * `snappedRange`: a window neither of whose boundary messages continues past it. A run is a
+	 * contiguous index span with no interior hole, so "no boundary straddles" is the whole condition
+	 * (`policy.ts`'s `safeRunFromUnits` additionally checks for holes because its units can skip
+	 * blocks). Shrinks the FRONT first when the front message straddles, otherwise the back — same
+	 * order as that function. Null when nothing survives.
 	 */
-	private worstCaseDropCost(run: readonly ViewBlock[]): number {
-		let messages = 0;
+	private snapToMessageAtoms(view: ConductorView, start: number, end: number): [number, number] | null {
+		const keyAt = (i: number): string => messageKey(view.blocks[i].id);
+		let lo = start;
+		let hi = end;
+		while (lo <= hi) {
+			const frontStraddles = lo > 0 && keyAt(lo - 1) === keyAt(lo);
+			const backStraddles = hi < view.blocks.length - 1 && keyAt(hi + 1) === keyAt(hi);
+			if (!frontStraddles && !backStraddles) return [lo, hi];
+			if (frontStraddles) lo++;
+			else hi--;
+		}
+		return null;
+	}
+
+	/**
+	 * What DROPPING `members` would actually save, against the most it could actually cost.
+	 *
+	 * SAVING is only the members the wire may genuinely remove (`removable`, from the shared
+	 * fixpoint). A STRAGGLER — a message the tool-pair fixpoint demoted — stays live at full cost
+	 * inside the group (`Truth.groupLiveTokens` charges it exactly that), so counting it as saved
+	 * would overstate the drop and is precisely how a "worth it" verdict could approve a group that
+	 * grows the wire.
+	 *
+	 * COST is one role-floor recap stub per COLLAPSED SUB-RUN, not one per group: an interior
+	 * straggler splits a group into several runs (`GroupShape.collapsedRuns`), and
+	 * `computeDegradedDropRuns` degrades each independently, so N sub-runs can cost N stubs. Each
+	 * stub is priced from the EXACT text `applyPlan` synthesizes (`roleFloorRecap`, exported from
+	 * `core/wire.ts` for this reason) plus the same `BLOCK_OVERHEAD` framing `Truth.runWireTok`
+	 * charges it. The floor's real verdict depends on every other run in the wire at once, so this
+	 * is deliberately the WORST case: it can leave a small saving on the table, never cause growth.
+	 * The group id is the one `Truth.opGroup` will mint (`g:<first member id>`) — exact, because the
+	 * proposed member set is now snap-stable (exclusion 1).
+	 */
+	private dropEconomics(members: readonly ViewBlock[], removable: ReadonlySet<string>): { saving: number; cost: number } {
+		const groupId = `g:${members[0].id}`;
+		let saving = 0;
+		let cost = 0;
+		let runMessages = 0; // distinct message keys in the collapsed sub-run currently open
 		let prevKey: string | null = null;
-		for (const b of run) {
+		const closeRun = (): void => {
+			if (runMessages === 0) return;
+			cost += this.host.countTokens(roleFloorRecap(groupId, runMessages)) + BLOCK_OVERHEAD;
+			runMessages = 0;
+			prevKey = null;
+		};
+		for (const b of members) {
 			const k = messageKey(b.id);
+			if (!removable.has(k)) {
+				closeRun(); // a straggler ends the run and keeps its own tokens live
+				continue;
+			}
+			saving += b.tokens;
 			if (k !== prevKey) {
-				messages++;
+				runMessages++;
 				prevKey = k;
 			}
 		}
-		return this.host.countTokens(roleFloorRecap(`g:${run[0].id}`, messages)) + BLOCK_OVERHEAD;
+		closeRun();
+		return { saving, cost };
 	}
 
 	/** Surface the sticky failure status (or clear the bar when there is none). Used in every
@@ -532,6 +635,7 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// commits the result against exactly the blocks it summarized, regardless of what the view
 		// looks like when it resolves.
 		const launchedAgedIds = new Set(agedBlocks.map((b) => b.id));
+		const launchedAgedTokens = sumTokens(agedBlocks); // the refill bar, recorded only if this pass commits
 		// The count preamble claims "N earlier messages" FOLDED — count only blocks eligible for the
 		// group. With the default `includeInGroup` (every kind) this is just `agedBlocks.length`; a
 		// subclass that excludes a kind gets the count right without any extra bookkeeping here.
@@ -602,9 +706,19 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 					// re-home across the protected boundary.
 					this.inflight = null;
 					this.failureStatus = null;
+					// The wire immediately BEFORE this pass's ops apply — half of the productivity
+					// measurement the paid-retry back-off in `conduct()` reads (see `lastPassSaving`).
+					// Measured, never estimated: `rerun()` settles once the transaction's per-op results
+					// are reconciled, so the "after" reading reflects what actually COMMITTED, clamps
+					// and all.
+					const liveBefore = this.host.stats().liveTokens;
 					this.text = this.formatText(count, text);
 					this.coveredIds = launchedAgedIds;
-					void this.rerun(); // async (v2 propose); ops apply on invocation, results reconcile on a microtask
+					// async (v2 propose); ops apply on invocation, results reconcile on a microtask
+					void this.rerun().then(() => {
+						this.lastPassSaving = liveBefore - this.host.stats().liveTokens;
+						this.lastPassAgedTokens = launchedAgedTokens;
+					});
 				},
 				(err) => {
 					// Stale-completion guard (see above): a reject from a controller that is no
