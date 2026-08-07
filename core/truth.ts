@@ -19,7 +19,7 @@ import { hasLock } from "./locks";
 import { digest, digestTokens, substTokens, groupDigest, groupDigestTokens, wireFoldable, foldTag } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { isDurableId, messageInfo, applyPlan, type PiMessage } from "./wire";
-import type { WireBlock, FoldOp, GroupOp } from "../app/src/lib/live/protocol";
+import type { WireBlock, FoldOp, GroupOp } from "./protocol";
 import type { Op, OpResult, TxnResult, ClampReason } from "./ops";
 import type { TruthEvent } from "./events";
 
@@ -98,7 +98,7 @@ export class Truth {
 	}
 
 	/** The highest block `order` that has actually reached the model in an applied plan. */
-	private sentThroughOrder = -1;
+	private sentThroughOrderValue = -1;
 	/**
 	 * Ids of blocks a strategy folded via the birth-fold exemption (folded while protected AND
 	 * not-yet-sent). `healProtected` skips these: the model never saw them whole, so the tail
@@ -126,12 +126,53 @@ export class Truth {
 		// Bulk-loaded (non-live) sessions were already part of a completed conversation — none of
 		// their blocks is "fresh", so a strategy can never birth-fold history (ADR 0018 §5). A LIVE
 		// session constructs EMPTY and streams blocks in, so the cursor starts at -1.
-		this.sentThroughOrder = this.blockLog.length ? this.blockLog[this.blockLog.length - 1].order : -1;
+		this.sentThroughOrderValue = this.blockLog.length ? this.blockLog[this.blockLog.length - 1].order : -1;
 	}
 
 	private reindex(): void {
 		this.index.clear();
 		for (let i = 0; i < this.blockLog.length; i++) this.index.set(this.blockLog[i].id, i);
+	}
+
+	/**
+	 * Phase B replica hydration. Overwrite this Truth's ENTIRE state from a serialized host
+	 * snapshot and PIN `rev` to the host's, emitting NOTHING (the caller re-seeds its mirror).
+	 * The GUI builds a replica Truth this way so replayed events stay rev-aligned with the
+	 * authoritative extension-side Truth: after adopting, `rev === snapshot.rev`, and each
+	 * subsequent replayed input bumps rev in lockstep — a mismatch after replay ⇒ resnapshot.
+	 * `blocks` arrive with overlay already applied; groups/locks/config/sent are set verbatim.
+	 * `birthFolded` is reset empty (no strategy folds in Phase B; a Phase-C snapshot must carry it).
+	 */
+	adoptSnapshot(s: {
+		blocks: Block[];
+		groups: Group[];
+		budget: number;
+		contextWindow: number | null;
+		protectTokens: number;
+		locks: readonly LockName[];
+		lockHolder: string | null;
+		tailTokens: number;
+		sentThroughOrder: number;
+		wireAttached: boolean;
+		rev: number;
+	}): void {
+		this.blockLog = s.blocks.slice();
+		this.reindex();
+		this.groupList = s.groups.map((g) => ({ ...g, memberIds: g.memberIds.slice() }));
+		this.budgetTok = s.budget;
+		this.contextWindowTok = s.contextWindow;
+		this.protectTokensTarget = s.protectTokens;
+		this.activeLocks = s.locks.slice();
+		this.holderLabel = s.lockHolder;
+		this.activeTailTok = s.tailTokens;
+		this.wireAttachedFlag = s.wireAttached;
+		this.sentThroughOrderValue = s.sentThroughOrder;
+		this.birthFolded.clear();
+		this.lastChangedRev.clear();
+		this.revCounter = s.rev;
+		// Rev-keyed read caches are stamped stale so they recompute against the adopted rev.
+		this.pfiCache = { rev: -1, value: 0 };
+		this.groupWireCache = { rev: -1, map: new Map<string, { tokens: number; collapsed: boolean }>() };
 	}
 
 	// ── events ────────────────────────────────────────────────────────────────
@@ -180,9 +221,13 @@ export class Truth {
 		return hasLock(this.activeLocks, name);
 	}
 
+	/** The highest block `order` whose content has reached the model (serialized wire). */
+	get sentThroughOrder(): number {
+		return this.sentThroughOrderValue;
+	}
 	/** Has this block's content reached the model in an applied plan? */
 	sent(b: Block): boolean {
-		return b.order <= this.sentThroughOrder;
+		return b.order <= this.sentThroughOrderValue;
 	}
 	/** A human override owns this block (pin / manual fold / manual unfold). */
 	held(b: Block): boolean {
@@ -516,10 +561,10 @@ export class Truth {
 		this.emit({ type: "config", protectTokens: this.protectTokensTarget, rev });
 	}
 	markSent(order: number): void {
-		if (order <= this.sentThroughOrder) return;
-		this.sentThroughOrder = order;
+		if (order <= this.sentThroughOrderValue) return;
+		this.sentThroughOrderValue = order;
 		const rev = ++this.revCounter;
-		this.emit({ type: "sent", throughOrder: this.sentThroughOrder, rev });
+		this.emit({ type: "sent", throughOrder: this.sentThroughOrderValue, rev });
 	}
 
 	// ── locks (ADR 0011) ──────────────────────────────────────────────────────

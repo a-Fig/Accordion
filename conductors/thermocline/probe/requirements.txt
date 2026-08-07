@@ -1,0 +1,30 @@
+# Python sidecar for the "attn" attention probe (scorer id "attn", v1).
+# Target: Python 3.10, Windows, NVIDIA GPU (CUDA 12.1). CPU fallback works too.
+#
+# torch is the CUDA 12.1 build. Install it FIRST from the cu121 wheel index, e.g.:
+#   pip install torch==2.5.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+# then `pip install -r requirements.txt` for the rest (which come from PyPI).
+torch==2.5.1+cu121
+
+# Model loading / attention extraction.
+transformers==5.11.0
+tokenizers==0.22.2
+safetensors==0.8.0
+huggingface_hub==1.18.0
+hf-xet==1.5.1
+
+# Tokenizer + numerics.
+numpy==2.2.6
+sentencepiece==0.2.1
+regex==2026.5.9
+
+# transformers runtime deps (pinned to what the verified venv carries).
+# Note: `accelerate` is NOT required -- the eager single-GPU path does not need it.
+Jinja2==3.1.6
+PyYAML==6.0.3
+filelock==3.29.0
+packaging==26.2
+requests
+tqdm==4.68.2
+sympy==1.13.1
+networkx==3.4.2
