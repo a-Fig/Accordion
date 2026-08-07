@@ -9,12 +9,14 @@
 	import { foldAlarm, runFoldCheck } from "$lib/live/foldAlarm.svelte";
 	import { servedToken } from "$lib/live/servedToken";
 	import { takeoverPopup, demotionToast, dismissTakeoverPopup, dismissDemotionToast } from "$lib/live/controllerUi.svelte";
+	import { notice, dismissNotice } from "$lib/live/notice.svelte";
 	import { DEFAULT_PORT } from "$core/protocol";
 	import type { SessionEntry } from "$lib/live/registry";
 	import type { ClaudeCodeSession } from "$lib/live/claude";
 	import SessionsSidebar from "$lib/ui/live/SessionsSidebar.svelte";
 	import TakeoverPopup from "$lib/ui/live/TakeoverPopup.svelte";
 	import DemotionToast from "$lib/ui/live/DemotionToast.svelte";
+	import NoticeToast from "$lib/ui/live/NoticeToast.svelte";
 	import ReadOnlyHint from "$lib/ui/live/ReadOnlyHint.svelte";
 	import MapHeader from "$lib/ui/map/MapHeader.svelte";
 	import ContextMap from "$lib/ui/map/ContextMap.svelte";
@@ -349,7 +351,10 @@
 <!-- Single-controller UX (v16, ADR 0024, spec Part 3) — global overlays, independent of which
      session view is on screen. At most one of popup/toast is ever relevant at a time (the popup
      only fires on a fresh hello; the toast only fires when we're demoted from an already-held
-     lease), but both read their own `$state` so there's nothing to coordinate here. -->
+     lease), but both read their own `$state` so there's nothing to coordinate here. The generic
+     `notice` toast (v17, e.g. native-compaction) shares the same top-right corner and could in
+     principle land at the same instant as the demotion toast — an accepted rare-overlap edge case
+     rather than added stacking logic, matching "keep it small and simple". -->
 {#if takeoverPopup.show}
 	<TakeoverPopup
 		label={takeoverPopup.label}
@@ -369,6 +374,9 @@
 			dismissDemotionToast();
 		}}
 	/>
+{/if}
+{#if notice.show}
+	<NoticeToast text={notice.text} onclose={dismissNotice} />
 {/if}
 <ReadOnlyHint />
 

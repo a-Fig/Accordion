@@ -2445,23 +2445,21 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// was off). The Truth itself catches up via the normal structural-divergence path the next time
 	// `agent_end`/`message_end`/`context` reconciles pi's rewritten history (`ingestMessages` detects
 	// the mismatch and calls `rebuildTruth`, which forces every connected client to resnapshot and
-	// resyncs an attached conductor) — nothing to force here. This handler only surfaces the
-	// human-facing note when someone is actually watching; a `notify` is the lightest existing channel
-	// that reaches the human without inventing a new protocol message or interrupting anything (no
-	// modal, no lock, purely informational — same posture as the suppression notify above). There is
-	// currently no arbitrary-text GUI toast broadcast to piggyback on instead: `conductorStatus` is
-	// display-only for an attached conductor's OWN status line and is gated in the UI on
-	// `conductorState.active`, so repurposing it here would mis-render (or not render at all) when no
-	// conductor is attached — the common case for a plain read-only viewer. If a client is connected,
-	// the map itself already visibly changes shape on the forced resnapshot, which is the visual
-	// confirmation; this note is the accompanying explanation of why.
+	// resyncs an attached conductor) — nothing to force here. This handler surfaces the human-facing
+	// note two ways: `ctx.ui.notify` for whoever is watching pi's own CLI/log, and — v17 — a `notice`
+	// broadcast (`core/protocol.ts`) to every connected GUI client, so a browser-served tab or a
+	// desktop window that isn't looking at pi's terminal still sees why the map just changed shape.
+	// If a client is connected, the map itself already visibly changes on the forced resnapshot; the
+	// notice is the accompanying explanation of why.
 	pi.on("session_compact", (_event, ctx: ExtensionContext) => {
 		if (!attached()) return;
+		const text = "pi compacted the session natively — Accordion's map has been rebuilt to match.";
 		try {
-			ctx.ui.notify("pi compacted the session natively — Accordion's map has been rebuilt to match.", "info");
+			ctx.ui.notify(text, "info");
 		} catch {
 			/* ignore */
 		}
+		broadcast({ type: "notice", text });
 	});
 
 	pi.on("session_shutdown", () => {

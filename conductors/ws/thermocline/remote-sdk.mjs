@@ -1673,7 +1673,7 @@ function recallHostEvent(ids, by, rev) {
 }
 
 // core/protocol.ts
-var PROTOCOL_VERSION = 16;
+var PROTOCOL_VERSION = 17;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
   "snapshot",
@@ -1689,7 +1689,8 @@ var SERVER_TYPES = /* @__PURE__ */ new Set([
   "turnCommitted",
   "proposeResult",
   "completeResult",
-  "controller"
+  "controller",
+  "notice"
 ]);
 function isServerMessage(v) {
   if (!v || typeof v !== "object" || !("type" in v)) return false;
