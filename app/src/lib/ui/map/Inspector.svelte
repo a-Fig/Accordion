@@ -27,7 +27,8 @@
 		tool_result: "Tool result",
 	};
 
-	const CAP = 6000;
+	const HEAD_CAP = 3000;
+	const TAIL_CAP = 3000;
 	const fmt = (n: number) => n.toLocaleString();
 
 	const folded = $derived(block ? store.isFolded(block) : false);
@@ -60,12 +61,28 @@
 	const canFoldPartner = $derived(partner ? store.canFold(partner) : false);
 	const partnerFolded = $derived(partner ? store.isFolded(partner) : false);
 
-	function body(b: Block): { text: string; clipped: number } {
+	function body(
+		b: Block,
+	): { text: string; clipped: number } | { head: string; tail: string; clipped: number; omitted: number } {
 		const t = b.text ?? "";
-		return t.length > CAP ? { text: t.slice(0, CAP) + "…", clipped: t.length } : { text: t, clipped: 0 };
+		if (t.length <= HEAD_CAP + TAIL_CAP) return { text: t, clipped: 0 };
+		return {
+			head: t.slice(0, HEAD_CAP),
+			tail: t.slice(-TAIL_CAP),
+			clipped: t.length,
+			omitted: t.length - HEAD_CAP - TAIL_CAP,
+		};
 	}
 
 	const bd = $derived(block ? body(block) : { text: "", clipped: 0 });
+
+	// flat single-slice preview for the compact partner strip (unlike the main content
+	// view, this one isn't split into head/tail — it's just a short peek)
+	function previewText(b: Block): string {
+		const t = b.text ?? "";
+		const cap = HEAD_CAP + TAIL_CAP;
+		return t.length > cap ? t.slice(0, cap) + "…" : t;
+	}
 
 	const isMono = $derived(block?.kind === "tool_call" || block?.kind === "tool_result");
 
@@ -342,14 +359,24 @@
 				<span class="eyebrow section-eyebrow">Content</span>
 			{/if}
 
-			<pre
-				class="content"
-				class:content-mono={isMono}
-			>{bd.text}</pre>
+			{#if "text" in bd}
+				<pre
+					class="content"
+					class:content-mono={isMono}
+				>{bd.text}</pre>
+			{:else}
+				<pre
+					class="content"
+					class:content-mono={isMono}
+				>{bd.head}</pre>
+				<div class="gap-note mono">⋯ {fmt(bd.omitted)} chars omitted ⋯</div>
+				<pre
+					class="content"
+					class:content-mono={isMono}
+				>{bd.tail}</pre>
 
-			{#if bd.clipped}
 				<p class="clip-note mono">
-					showing first {fmt(CAP)} of {fmt(bd.clipped)} chars
+					showing first {fmt(HEAD_CAP)} and last {fmt(TAIL_CAP)} of {fmt(bd.clipped)} chars
 				</p>
 			{/if}
 		</div>
@@ -390,7 +417,7 @@
 					{partnerFolded ? "Unfold" : canFoldPartner ? "Fold" : partnerProtected ? "Protected" : "Fold"} partner
 				</button>
 
-				<pre class="partner-preview mono">{body(partner).text}</pre>
+				<pre class="partner-preview mono">{previewText(partner)}</pre>
 			</div>
 		{/if}
 	</aside>
@@ -807,6 +834,14 @@
 
 	.clip-note {
 		margin: 0;
+		font-size: var(--fs-xs);
+		color: var(--faint);
+		letter-spacing: 0.04em;
+	}
+
+	.gap-note {
+		margin: 0.5rem 0;
+		text-align: center;
 		font-size: var(--fs-xs);
 		color: var(--faint);
 		letter-spacing: 0.04em;
