@@ -298,6 +298,8 @@ After a PR lands on `devmain` for local testing: close any open Accordion window
 
 When `devmain` is promoted to `main` for the stable registered checkout (`~/.pi/agent/settings.json → extensions`): pull `main`, run `npm install` inside `app/` if deps changed, rebuild with `npm run tauri build -- --no-bundle` (cargo must be on PATH). The next `/accordion` call picks up the new binary. If the extension changed, restart pi.
 
+**`/accordion` launches the compiled binary from the extension's OWN worktree** (`app/src-tauri/target/release/app.exe`, else `.../debug/app.exe` — see `repoAppCandidates` in `extension/accordion.ts`), NOT via `tauri dev` and NOT from any other checkout. So after updating an extension worktree you must **rebuild that worktree's release binary** — pulling the source or rebuilding `app/build` alone leaves a stale binary, and `/accordion` then opens an old-protocol app → `extension vN, app vM` mismatch. The production binary's origin (`https://tauri.localhost`) is trusted by default; `tauri dev`'s `localhost:1420` origin is not (needs `ACCORDION_ALLOW_TAURI_DEV_ORIGIN=1`), which is why the built binary is the right surface to test `/accordion` against.
+
 When publishing a new npm package version: bump `extension/package.json`, run `cd extension && npm pack --dry-run`, inspect the tarball contents, then `npm publish`. After publish, smoke-test the user path with `pi install npm:@a-fig/accordion` in a fresh pi environment.
 
 ## Data & security
