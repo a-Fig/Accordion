@@ -15,17 +15,21 @@
  * in listLiveSessions — see accordion.ts, which also does the isLiveEntry staleness/shape
  * filtering, so the response here is trusted as-is rather than re-validated).
  *
- * Known limitation: `fetch("/__accordion/sessions")` is a RELATIVE url, so it always targets
- * the origin that served this page — not whichever session the user has since switched to via
- * the sidebar (connectLive(B.port) dials a different port over the WebSocket, but there is no
- * cross-port equivalent for this HTTP poll without either a CORS change to accordion.ts,
- * currently deliberately absent everywhere, or routing discovery over the WS itself). If the
- * serving session's pi process exits, this tab's polling goes permanently silent — new sibling
- * sessions started afterward will not appear here; only a page reload from a still-live
- * session's own `/accordion` URL restores full discovery. localFallback() below at least keeps
- * the CURRENTLY connected (or actively-being-dialed) session visible/reconnectable regardless,
- * so the sidebar never lies about "no live sessions" while one is plainly connected, and a
- * session switch can never be torn down by a poll that just hasn't caught up yet.
+ * Known limitation (narrowed by the door, ADR 0024): `fetch("/__accordion/sessions")` is a
+ * RELATIVE url, so it always targets the origin that served this page — not whichever session
+ * the user has since switched to via the sidebar (connectLive(B.port) dials a different port
+ * over the WebSocket, but there is no cross-port equivalent for this HTTP poll without either a
+ * CORS change to accordion.ts, currently deliberately absent everywhere, or routing discovery
+ * over the WS itself). Since the door (`/accordion`'s printed URL, fixed DOOR_PORT), pages are
+ * normally served from a port that OUTLIVES any single session: when the door-holding extension
+ * exits, another live extension re-binds the port within seconds and this poll self-heals after
+ * a brief outage (the poll-failure handling below rides it out). The old permanent-silence
+ * failure mode still applies to a page loaded from a session's OWN ephemeral URL (the
+ * foreign-port-occupied fallback path): if that serving process exits, only a reload from the
+ * door or a still-live session's `/accordion` URL restores discovery. localFallback() below at
+ * least keeps the CURRENTLY connected (or actively-being-dialed) session visible/reconnectable
+ * regardless, so the sidebar never lies about "no live sessions" while one is plainly connected,
+ * and a session switch can never be torn down by a poll that just hasn't caught up yet.
  *
  * Poll-failure handling (PR #52 review findings #4/#5): a poll that fails outright — network
  * error, non-ok status (403/500 — the deterministic cookie-collision case fixed on another

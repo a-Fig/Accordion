@@ -226,6 +226,12 @@ Accordion's **Sessions** sidebar within ~1s. Click it (or run `/accordion` in th
 terminal) and its context populates live. Folding is preview-only by default; use the
 header's **Folding** toggle to opt in to steering the live agent's context.
 
+Only one surface steers at a time, machine-wide across every session — the rest are live
+mirrors. If you open Accordion from a second tab or window while another is already
+driving, you'll see a one-time prompt to take control; everywhere else stays
+**READ-ONLY** with a **TAKE CONTROL** button, never a silent write race between two open
+surfaces.
+
 To refresh the binary after `main` moves (close any open Accordion window first so the
 file isn't locked, then `git pull`, `npm install`, and rebuild): see
 **[CONTRIBUTING.md](CONTRIBUTING.md)**.
