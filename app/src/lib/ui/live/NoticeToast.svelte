@@ -6,30 +6,26 @@
 	 * was off, so every attached UI — not just whoever is watching pi's own CLI — sees why the map
 	 * just changed shape.
 	 *
-	 * Styled to match `DemotionToast.svelte` (same corner, panel, neutral palette, auto-dismiss feel)
-	 * since that is the app's one existing precedent for "small transient thing just happened" —
+	 * Styled to match `DemotionToast.svelte` (same panel, neutral palette, auto-dismiss feel) since
+	 * that is the app's one existing precedent for "small transient thing just happened" —
 	 * deliberately simpler: a single message line and a close button, no action button (there is
-	 * nothing to do about a notice, unlike "take back" control).
+	 * nothing to do about a notice, unlike "take back" control). Positioning/stacking is owned by
+	 * `ToastRegion.svelte` — this component renders only the card.
 	 */
+	import { toastPop } from "./toastTransition";
 	let { text, onclose }: { text: string; onclose: () => void } = $props();
 </script>
 
-<div class="notice-toast" role="status">
+<div class="notice-toast" role="status" transition:toastPop|global>
 	<div class="notice-body">{text}</div>
 	<button type="button" class="notice-close" onclick={onclose} aria-label="Dismiss">&times;</button>
 </div>
 
 <style>
 	.notice-toast {
-		position: fixed;
-		top: 18px;
-		right: 18px;
-		z-index: 210;
 		display: flex;
 		align-items: flex-start;
 		gap: var(--sp-3);
-		width: 320px;
-		max-width: calc(100vw - 36px);
 		padding: var(--sp-3);
 		background: var(--panel);
 		border: 1px solid var(--line-strong);
