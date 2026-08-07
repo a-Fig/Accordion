@@ -339,6 +339,90 @@ describe("NaiveCompactionConductor — all block kinds", () => {
 	});
 });
 
+describe("NaiveCompactionConductor — output-token reservation (external review round, P1-7)", () => {
+	// PORT FIDELITY §6 (see compaction-naive.ts banner): `launchCompletion` now reserves output room
+	// against `view.contextWindow`, mirroring `core/conductors/handoff/handoff.ts`'s identical fix
+	// (and its `handoff.test.ts` "middle branch"/"decline path" tests below, adapted to this
+	// conductor's own system prompt/prompt shape and constants — MAX_SUMMARY_TOKENS(8000),
+	// MIN_SUMMARY_TOKENS(1000), OUTPUT_SAFETY_MARGIN(512)).
+	//
+	// `mkBlock`'s existing marker text (e.g. "AGED-0") is deliberately short and NOT sized to match
+	// its declared `tokens` field — fine for the trigger-math tests above (which only need the
+	// declared token WEIGHT, not real text), but useless here: an exact `maxOutputTokens` derivation
+	// needs the ACTUAL prompt text length to line up with a chosen `tokens` value. `paddedBlock`/
+	// `paddedSession` below pad the text to `tokens * 4` chars (mirroring `handoff.test.ts`'s own
+	// `blk`/`session` helpers) so the prompt's real character count is knowable in advance.
+
+	/** One `text` block whose text is padded to exactly `tokens * 4` chars (plus the id prefix), so
+	 *  `estTokens(text) ≈ tokens`. Mirrors `handoff.test.ts`'s `blk()`. */
+	function paddedBlock(id: string, order: number, tokens: number): Block {
+		return mkBlock(id, order, "text", tokens, `${id} ` + "x".repeat(tokens * 4));
+	}
+	function paddedSession(n: number, tokensEach: number): Block[] {
+		return Array.from({ length: n }, (_, i) => paddedBlock(idOf(i), i, tokensEach));
+	}
+
+	/** Budget 1000, protect 0 (whole session ages in), 5 blocks * 200 tokens = 1000 raw tokens —
+	 *  visible (1000) >= 90% of budget (900), so the first pass triggers immediately. */
+	function setupReservationHost(): TestHost {
+		const host = new TestHost();
+		host.setBudget(1000);
+		host.setProtect(0);
+		host.appendBlocks(paddedSession(5, 200));
+		return host;
+	}
+
+	it("declines outright when the window leaves no room, WITHOUT ever calling complete() or emitting any op", () => {
+		const host = setupReservationHost();
+		host.truth.setContextWindow(200); // reserve = 200 - input - 512 is always << MIN_SUMMARY_TOKENS
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+
+		host.commitTurn();
+
+		expect(host.completeLog.length).toBe(0); // never attempted
+		expect(host.truth.groups.length).toBe(0); // no ops emitted — session stays raw
+		const last = host.statusLog[host.statusLog.length - 1];
+		expect(last.text).toMatch(/needs a bigger window/i);
+	});
+
+	// Derivation (all via the same chars/4 `estTokens` TestHost.countTokens uses):
+	//   - `paddedSession(5, 200)` gives a first-pass prompt (`<conversation>` wrapping 5
+	//     "[assistant]\n<800 x's>" blocks + the trailing instruction line) of 4205 chars → 1052 tokens.
+	//   - `COMPACTION_SYSTEM` is 2249 chars → 563 tokens (its template literal uses backslash-newline
+	//     line continuations, so the parsed string is shorter than its raw source span).
+	//   - inputTokens = 563 + 1052 = 1615.
+	//   - Choosing contextWindow = 6127 makes
+	//     reserve = contextWindow - inputTokens - OUTPUT_SAFETY_MARGIN(512) = 6127 - 1615 - 512 = 4000,
+	//     which sits strictly between MIN_SUMMARY_TOKENS(1000) and MAX_SUMMARY_TOKENS(8000) — the
+	//     untested middle branch — so `maxOutputTokens` must land EXACTLY on 4000, not clamped to
+	//     8000 (a min/max swap) and not shrunk further by a doubled margin.
+	it("reserves the exact contextWindow − input − 512 token count when it lands strictly between the 1000 floor and the 8000 cap", () => {
+		const host = setupReservationHost();
+		host.truth.setContextWindow(6127);
+		host.queueCompletion({ text: "middle-branch summary" });
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+
+		host.commitTurn();
+
+		expect(host.completeLog.length).toBe(1);
+		expect(host.completeLog[0].maxOutputTokens).toBe(4000);
+	});
+
+	it("falls back to the flat MAX_SUMMARY_TOKENS cap when the context window is unknown", () => {
+		const host = setupReservationHost(); // setContextWindow never called — Truth's default is null
+		host.queueCompletion({ text: "unknown-window summary" });
+		const conductor = new NaiveCompactionConductor();
+		conductor.attach(host);
+
+		host.commitTurn();
+
+		expect(host.completeLog.length).toBe(1);
+		expect(host.completeLog[0].maxOutputTokens).toBe(8000); // MAX_SUMMARY_TOKENS, flat behavior unchanged
+	});
+});
+
 describe("NaiveCompactionConductor — identity", () => {
 	it("declares id/label/locks (locks are data only — the Phase-C host owns applying them)", () => {
 		const conductor = new NaiveCompactionConductor();
