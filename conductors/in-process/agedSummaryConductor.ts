@@ -301,7 +301,12 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// RAW baseline: Σ full token cost over EVERY block (aged or protected).
 		const rawTotal = sumTokens(view.blocks);
 		const visible = rawTotal - savedTokens;
-		const overThreshold = visible >= view.budget * TRIGGER;
+		// Trigger on the EFFECTIVE cap, not raw budget: a mid-session swap to a smaller-window model
+		// can leave `budget` oversized relative to `contextWindow` for one hook tick (the extension
+		// clamps it back down, but defense in depth here means this conductor never depends on that
+		// happening first). Never widens the cap — a known, smaller window only ever tightens it.
+		const cap = view.contextWindow != null ? Math.min(view.budget, view.contextWindow) : view.budget;
+		const overThreshold = visible >= cap * TRIGGER;
 
 		// What is genuinely new since the last successful completion.
 		const newlyAged = aged.filter((b) => !this.coveredIds.has(b.id));

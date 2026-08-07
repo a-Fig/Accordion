@@ -10,7 +10,7 @@ import { describe, it, expect } from "vitest";
 import { Truth } from "./truth";
 import type { Block, SessionMeta } from "./types";
 import type { WireEvent } from "./protocol";
-import { serializeSnapshot, hydrateSnapshot, wireEventFromTruthEvent } from "./replica";
+import { serializeSnapshot, hydrateSnapshot, wireEventFromTruthEvent, applyWireEvent } from "./replica";
 
 const META: SessionMeta = { format: "pi", title: "t", cwd: "", model: "" };
 
@@ -102,5 +102,102 @@ describe("replica — carriedSent round trip (protocol v15)", () => {
 		// A stale-format peer that lost carriedSent reclassifies the sent block as fresh — the bug this closes.
 		const stale = hydrateSnapshot(META, { ...state, carriedSent: [] });
 		expect(stale.sent(stale.get("a:b0:p0")!)).toBe(false);
+	});
+});
+
+// Model-window budget clamp fix: a mid-session swap to a smaller-window model must shrink an
+// oversized budget, but the clamp policy lives in the extension's call sites (a plain follow-up
+// `setBudget` after `setContextWindow`), NOT inside `Truth.setContextWindow` itself — merging both
+// dial changes into `setContextWindow`'s own single emit would need the emitted `config` event to
+// carry both fields in ONE rev bump, but `applyWireEvent`'s replay independently calls the public
+// `setBudget`/`setContextWindow` setters per field present on an event; replaying a host's single
+// combined event would invoke BOTH setters (each bumping the replica's local rev on its own),
+// double-applying the clamp and leaving the replica's rev ahead of the host's after just one event.
+// Two ordinary, SEPARATE calls (as below) each emit their own single-field `config` event instead,
+// which a replica already replays 1:1 — this suite proves that lockstep property holds for the
+// clamp specifically, exercising the exact call pattern `extension/accordion.ts`'s
+// `clampBudgetToWindow` + its call sites use.
+describe("replica — model-window budget clamp policy replays to identical state/rev (fix)", () => {
+	/** Mirrors extension/accordion.ts's shared clamp policy exactly: `setContextWindow` followed by
+	 *  an ordinary, separate `setBudget` call ONLY when the new window is smaller than the current
+	 *  budget. Never raises budget. */
+	function applyWindowChange(t: Truth, window: number): void {
+		t.setContextWindow(window);
+		if (t.budget > window) t.setBudget(window);
+	}
+
+	/** A replica hydrated from `host`'s current snapshot — the same starting point a live client
+	 *  would have before the host's next mutation streams over the wire. */
+	function makeReplica(host: Truth): Truth {
+		return hydrateSnapshot(META, serializeSnapshot(host, false));
+	}
+
+	/** Record every WireEvent `host` emits during `fn`, replay them onto `replica` in order, and
+	 *  assert the replica lands on the identical rev/budget/contextWindow as the host. */
+	function changeAndReplay(host: Truth, replica: Truth, fn: () => void): void {
+		const events: WireEvent[] = [];
+		const off = host.onEvent((e) => {
+			const w = wireEventFromTruthEvent(e);
+			if (w) events.push(w);
+		});
+		fn();
+		off();
+		for (const ev of events) applyWireEvent(replica, ev);
+		expect(replica.rev).toBe(host.rev);
+		expect(replica.contextWindow).toBe(host.contextWindow);
+		expect(replica.budget).toBe(host.budget);
+	}
+
+	it("(a) window large→small clamps budget down; a replica replays the resulting config events to identical state/rev", () => {
+		const host = live();
+		host.append(seq(3, 1000));
+		host.setContextWindow(200_000);
+		host.setBudget(200_000); // e.g. the first-build snap
+		const replica = makeReplica(host);
+
+		changeAndReplay(host, replica, () => applyWindowChange(host, 32_000)); // swap to a smaller-window model
+
+		expect(host.contextWindow).toBe(32_000);
+		expect(host.budget).toBe(32_000); // clamped down, not left oversized
+	});
+
+	it("(b) window small→large does NOT raise budget", () => {
+		const host = live();
+		host.append(seq(3, 1000));
+		host.setContextWindow(32_000);
+		host.setBudget(32_000);
+		const replica = makeReplica(host);
+
+		changeAndReplay(host, replica, () => applyWindowChange(host, 200_000)); // swap to a LARGER window
+
+		expect(host.contextWindow).toBe(200_000);
+		expect(host.budget).toBe(32_000); // unchanged — the clamp only ever narrows, never widens
+	});
+
+	it("(c) a human budget set BELOW the new smaller window survives a swap untouched", () => {
+		const host = live();
+		host.append(seq(3, 1000));
+		host.setContextWindow(200_000);
+		host.setBudget(200_000);
+		host.setBudget(10_000); // the human dials budget down, well below the incoming window
+		const replica = makeReplica(host);
+
+		changeAndReplay(host, replica, () => applyWindowChange(host, 32_000)); // window shrinks, but stays above 10k
+
+		expect(host.contextWindow).toBe(32_000);
+		expect(host.budget).toBe(10_000); // the human's dial is untouched — it was never oversized
+	});
+
+	it("(d) a window learned LATE (was null) clamps an oversized default budget down", () => {
+		const host = live(); // budget defaults to 70_000; contextWindow starts null
+		host.append(seq(3, 1000));
+		expect(host.contextWindow).toBe(null);
+		expect(host.budget).toBe(70_000);
+		const replica = makeReplica(host);
+
+		changeAndReplay(host, replica, () => applyWindowChange(host, 32_000)); // the window becomes known for the first time
+
+		expect(host.contextWindow).toBe(32_000);
+		expect(host.budget).toBe(32_000); // the 70k default is clamped down against the now-known window
 	});
 });
