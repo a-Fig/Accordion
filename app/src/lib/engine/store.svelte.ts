@@ -70,10 +70,6 @@ export class AccordionStore {
 	 *  forever (no offline calibration in v1). In live mode this arrives ONLY via the wire's `config`
 	 *  event (host-set, see `commandSink`'s doc comment) — never a local action a UI can trigger. */
 	calibration = $state(1);
-	/** The current effective system prompt (issue #93) — mirrors `truth.systemPrompt`. `null` until
-	 *  a live host's first `context` hook captures one; a demo/CC/file (local-mode) session never
-	 *  calls `setSystemPrompt`, so it stays `null` forever — an honest absence, not a placeholder. */
-	systemPrompt = $state<{ text: string; tokens: number } | null>(null);
 	/** Bumped on every truth event — the reactive redraw signal the forwarded reads depend on. */
 	version = $state(0);
 
@@ -109,7 +105,6 @@ export class AccordionStore {
 		this.contextWindow = this.truth.contextWindow;
 		this.protectTokens = this.truth.protectTokens;
 		this.calibration = this.truth.calibration;
-		this.systemPrompt = this.truth.systemPrompt;
 		this._locks = this.truth.locks;
 		this._holder = this.truth.lockHolder;
 		this._activeTail = this.truth.activeTailTokens;
@@ -145,7 +140,6 @@ export class AccordionStore {
 				if (e.contextWindow !== undefined) this.contextWindow = e.contextWindow;
 				if (e.protectTokens !== undefined) this.protectTokens = e.protectTokens;
 				if (e.calibration !== undefined) this.calibration = e.calibration;
-				if (e.systemPrompt !== undefined) this.systemPrompt = e.systemPrompt;
 				break;
 			case "locks":
 				this.syncOverlay();
