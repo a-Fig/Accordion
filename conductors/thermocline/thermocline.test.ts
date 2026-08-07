@@ -388,6 +388,90 @@ test("persistence round-trip: strata persisted after commit are restored and re-
 	expect(savedMembers.some((id) => groupMembers.has(id))).toBe(true);
 });
 
+// ── finding 6: tick serialization + prompt wire-departing emergency ───────────────────────────
+//
+// Two closely-spaced events must never interleave two `runTick` bodies (they share appliedFolds/
+// appliedStrata/appliedPlan/preparing). The tick chain serializes them. The wire-departing EMERGENCY
+// is deliberately NOT on that chain — it must ride the departing wire even while a tick is suspended.
+
+/** Records concurrency of `propose` calls: a real macrotask delay keeps a call "in flight" long
+ *  enough that an interleaving tick's propose would overlap it, bumping `peak` past 1. */
+class OverlapProbeHost extends TestHost {
+	inFlight = 0;
+	peak = 0;
+	override async propose(txn: { baseRev: number; ops: Op[] }): Promise<TxnResult> {
+		this.inFlight++;
+		this.peak = Math.max(this.peak, this.inFlight);
+		const res = await super.propose(txn); // sync apply to Truth
+		await new Promise((r) => setTimeout(r, 10)); // real yield — an interleaving tick would overlap here
+		this.inFlight--;
+		return res;
+	}
+}
+
+test("tick serialization: two rapid turn-committed events never interleave (proposes stay serial)", async () => {
+	const host = new OverlapProbeHost();
+	const cond = new ThermoclineConductor({ scorer: emptyScorer, sessionKey: null });
+	cond.attach(host);
+	host.setBudget(5_000);
+	host.setProtect(300);
+
+	// Two over-budget batches, each committed immediately after append — a burst of events (2 append +
+	// 2 commit) that all enqueue ticks. Without the chain the append-tick and commit-tick overlap.
+	host.appendBlocks(Array.from({ length: 8 }, (_, i) => block({ id: `a${i}`, order: i, tokens: 1_000 })));
+	const p1 = host.commitTurn();
+	host.appendBlocks(Array.from({ length: 8 }, (_, i) => block({ id: `z${i}`, order: 8 + i, tokens: 1_000 })));
+	const p2 = host.commitTurn();
+	await Promise.all([p1, p2]);
+
+	expect(host.peak).toBe(1); // every propose completed before the next tick's began — no interleave
+	expect(host.truth.blocks.some((b) => host.truth.isFolded(b))).toBe(true); // work actually happened
+	expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(5_000);
+});
+
+/** Gates every `propose` on an external release, recording how many were ENTERED. `propose` hangs
+ *  BEFORE applying, so Truth stays un-mutated while a tick's propose is suspended — exactly the state
+ *  in which a wire-departing emergency must still run promptly. */
+class GatedProposeHost extends TestHost {
+	proposeEnters = 0;
+	private release!: () => void;
+	private gate: Promise<void> = new Promise<void>((r) => (this.release = r));
+	openGate(): void {
+		this.release();
+	}
+	override async propose(txn: { baseRev: number; ops: Op[] }): Promise<TxnResult> {
+		this.proposeEnters++;
+		await this.gate; // hang BEFORE applying → Truth un-mutated while a tick is suspended here
+		return super.propose(txn);
+	}
+}
+
+test("wire-departing runs its emergency promptly even while a tick is suspended at propose", async () => {
+	const host = new GatedProposeHost();
+	const cond = new ThermoclineConductor({ scorer: emptyScorer, sessionKey: null });
+	cond.attach(host);
+	host.setBudget(5_000);
+	host.setProtect(300);
+
+	// An over-budget append kicks a tick whose emergency reaches `propose` and hangs on the gate.
+	host.appendBlocks(Array.from({ length: 10 }, (_, i) => block({ id: `b${i}`, order: i, tokens: 1_000 })));
+	await flush();
+	expect(host.proposeEnters).toBe(1); // the tick is suspended at its gated propose
+
+	// The wire departs while that tick is still pending. onWireDeparting is NOT queued behind the tick
+	// chain — its emergency runs immediately and INITIATES its own propose (enter #2), proving prompt.
+	const departP = host.departWire();
+	await flush();
+	expect(host.proposeEnters).toBe(2); // the emergency's propose fired without waiting for the tick
+
+	// Release both — they apply against the same Truth; the engine clamps the duplicate. No crash.
+	host.openGate();
+	await departP;
+	await flush();
+	expect(host.truth.blocks.some((b) => host.truth.isFolded(b))).toBe(true);
+	expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(5_000);
+});
+
 // ── restore validation drops strata whose members vanished ───────────────────────────────────
 test("restore validation: a stratum with a vanished member is dropped (never grouped)", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "thermo-stale-"));

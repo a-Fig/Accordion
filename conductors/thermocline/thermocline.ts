@@ -162,6 +162,18 @@ export class ThermoclineConductor implements Conductor {
 	private preparing = false;
 	private prepareToken = 0;
 
+	// ── tick serialization ──
+	// Ticks (`blocks-appended` / `turn-committed`) are async — each awaits its proposes (and, on the
+	// remote host, those cross a socket). Two closely-spaced events could otherwise interleave two
+	// runTick bodies that share appliedFolds/appliedStrata/appliedPlan/preparing. Chain them so a tick
+	// never starts until the previous one has fully settled; a rejected tick is swallowed so it never
+	// poisons the chain. `null` means idle (no tick in flight or queued) — the next tick then runs its
+	// SYNCHRONOUS prefix during dispatch, preserving the pre-serialization timing (e.g. a tick firing
+	// PREPARE's `host.complete` before the dispatching event returns). The wire-departing EMERGENCY
+	// deliberately does NOT ride this chain (it must ride the departing wire promptly) — see
+	// `onWireDeparting`.
+	private tickChain: Promise<void> | null = null;
+
 	// ── per-tick / bookkeeping ──
 	private gradAdvanced = false;
 	private lastView: ConductorView | null = null;
@@ -183,6 +195,7 @@ export class ThermoclineConductor implements Conductor {
 		this.host = host;
 		this.attached = true;
 		this.abort = new AbortController();
+		this.tickChain = null;
 		this.restore();
 		this.off = host.on((e) => this.onEvent(e));
 	}
@@ -203,9 +216,10 @@ export class ThermoclineConductor implements Conductor {
 		switch (e.type) {
 			case "blocks-appended":
 			case "turn-committed":
-				// Return the promise so the host can await the tick (its proposes are async by
-				// contract v2) — e.g. the in-process host's wire-departing hold, or a test driver.
-				return this.tick();
+				// Serialize onto the tick chain so two closely-spaced events never interleave two tick
+				// bodies. Return the queued promise so the host can still await this tick settling (its
+				// proposes are async by contract v2) — e.g. a test driver, or an awaiting host.
+				return this.enqueueTick();
 			case "state-changed":
 				this.onStateChanged(e.changes);
 				return;
@@ -260,7 +274,16 @@ export class ThermoclineConductor implements Conductor {
 	/** LAST-LINE HARD-CAP guarantee, right before the wire departs to the model. Strictly
 	 *  deterministic (no LLM, no inline disk I/O); the only `await` is the async-by-contract (v2)
 	 *  `propose` inside `runEmergency`, whose ops are INVOKED synchronously so the emergency fold
-	 *  rides this wire — the awaited tail settles on a microtask, inside the declared hold window. */
+	 *  rides this wire — the awaited tail settles on a microtask, inside the declared hold window.
+	 *
+	 *  Deliberately does NOT ride the tick chain: the emergency must run the instant the wire departs,
+	 *  never queued behind a slow in-flight tick. When it DOES overlap an in-flight tick (that tick is
+	 *  suspended at its own `await host.propose`), the two are backstopped by the engine, not by luck —
+	 *  every mutation funnels through `applyDesired`, which reconciles `appliedFolds`/`appliedStrata`
+	 *  from the propose's REAL per-op results (a duplicate/stale op clamps to a no-op, never
+	 *  double-recorded), and `runEmergency` bumps `prepareToken` + clears `preparing` synchronously so
+	 *  a concurrent prepare is discarded. Any residual bookkeeping drift self-heals on the next tick's
+	 *  `holdOrResend`, which re-derives desired-from-plan against the live view. */
 	private async onWireDeparting(): Promise<void> {
 		const view = this.materialize();
 		this.lastView = view;
@@ -306,7 +329,25 @@ export class ThermoclineConductor implements Conductor {
 	}
 
 	// ── the main steady-state tick ─────────────────────────────────────────────────
-	private async tick(): Promise<void> {
+	/** Run a tick, serialized: if one is already in flight/queued, chain behind it (deferred — it must
+	 *  wait); if the chain is idle, START NOW so the tick's synchronous prefix executes during this
+	 *  dispatch (the pre-serialization timing). Either way the returned promise resolves when THIS tick
+	 *  has settled, and a rejection is swallowed on the stored chain so one failed tick never poisons
+	 *  the chain for later ticks. */
+	private enqueueTick(): Promise<void> {
+		const start = (): Promise<void> => (this.attached ? this.runTick() : Promise.resolve());
+		const prev = this.tickChain;
+		const settled = (prev ? prev.then(start) : start()).catch(() => {});
+		this.tickChain = settled;
+		// When the tail settles with nothing queued after it, return to idle so the next tick runs its
+		// synchronous prefix again. If another tick was chained on, it now owns the tail and clears it.
+		void settled.then(() => {
+			if (this.tickChain === settled) this.tickChain = null;
+		});
+		return settled;
+	}
+
+	private async runTick(): Promise<void> {
 		const view = this.materialize();
 		this.lastView = view;
 		this.gradAdvanced = false;

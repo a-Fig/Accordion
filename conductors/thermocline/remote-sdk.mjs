@@ -2454,6 +2454,17 @@ var ThermoclineConductor = class {
   // ── PREPARE state ──
   preparing = false;
   prepareToken = 0;
+  // ── tick serialization ──
+  // Ticks (`blocks-appended` / `turn-committed`) are async — each awaits its proposes (and, on the
+  // remote host, those cross a socket). Two closely-spaced events could otherwise interleave two
+  // runTick bodies that share appliedFolds/appliedStrata/appliedPlan/preparing. Chain them so a tick
+  // never starts until the previous one has fully settled; a rejected tick is swallowed so it never
+  // poisons the chain. `null` means idle (no tick in flight or queued) — the next tick then runs its
+  // SYNCHRONOUS prefix during dispatch, preserving the pre-serialization timing (e.g. a tick firing
+  // PREPARE's `host.complete` before the dispatching event returns). The wire-departing EMERGENCY
+  // deliberately does NOT ride this chain (it must ride the departing wire promptly) — see
+  // `onWireDeparting`.
+  tickChain = null;
   // ── per-tick / bookkeeping ──
   gradAdvanced = false;
   lastView = null;
@@ -2473,6 +2484,7 @@ var ThermoclineConductor = class {
     this.host = host;
     this.attached = true;
     this.abort = new AbortController();
+    this.tickChain = null;
     this.restore();
     this.off = host.on((e) => this.onEvent(e));
   }
@@ -2490,7 +2502,7 @@ var ThermoclineConductor = class {
     switch (e.type) {
       case "blocks-appended":
       case "turn-committed":
-        return this.tick();
+        return this.enqueueTick();
       case "state-changed":
         this.onStateChanged(e.changes);
         return;
@@ -2533,7 +2545,16 @@ var ThermoclineConductor = class {
   /** LAST-LINE HARD-CAP guarantee, right before the wire departs to the model. Strictly
    *  deterministic (no LLM, no inline disk I/O); the only `await` is the async-by-contract (v2)
    *  `propose` inside `runEmergency`, whose ops are INVOKED synchronously so the emergency fold
-   *  rides this wire — the awaited tail settles on a microtask, inside the declared hold window. */
+   *  rides this wire — the awaited tail settles on a microtask, inside the declared hold window.
+   *
+   *  Deliberately does NOT ride the tick chain: the emergency must run the instant the wire departs,
+   *  never queued behind a slow in-flight tick. When it DOES overlap an in-flight tick (that tick is
+   *  suspended at its own `await host.propose`), the two are backstopped by the engine, not by luck —
+   *  every mutation funnels through `applyDesired`, which reconciles `appliedFolds`/`appliedStrata`
+   *  from the propose's REAL per-op results (a duplicate/stale op clamps to a no-op, never
+   *  double-recorded), and `runEmergency` bumps `prepareToken` + clears `preparing` synchronously so
+   *  a concurrent prepare is discarded. Any residual bookkeeping drift self-heals on the next tick's
+   *  `holdOrResend`, which re-derives desired-from-plan against the live view. */
   async onWireDeparting() {
     const view = this.materialize();
     this.lastView = view;
@@ -2575,7 +2596,23 @@ var ThermoclineConductor = class {
     };
   }
   // ── the main steady-state tick ─────────────────────────────────────────────────
-  async tick() {
+  /** Run a tick, serialized: if one is already in flight/queued, chain behind it (deferred — it must
+   *  wait); if the chain is idle, START NOW so the tick's synchronous prefix executes during this
+   *  dispatch (the pre-serialization timing). Either way the returned promise resolves when THIS tick
+   *  has settled, and a rejection is swallowed on the stored chain so one failed tick never poisons
+   *  the chain for later ticks. */
+  enqueueTick() {
+    const start = () => this.attached ? this.runTick() : Promise.resolve();
+    const prev = this.tickChain;
+    const settled = (prev ? prev.then(start) : start()).catch(() => {
+    });
+    this.tickChain = settled;
+    void settled.then(() => {
+      if (this.tickChain === settled) this.tickChain = null;
+    });
+    return settled;
+  }
+  async runTick() {
     const view = this.materialize();
     this.lastView = view;
     this.gradAdvanced = false;

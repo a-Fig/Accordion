@@ -9,7 +9,7 @@
     "build:extension": "node ./build-extension.mjs",
     "build:client": "node ./build-client.mjs",
     "build:remote-sdk": "node ./build-remote-sdk.mjs",
-    "build": "npm run build:app && npm run build:client && npm run build:extension",
+    "build": "npm run build:app && npm run build:client && npm run build:extension && npm run build:remote-sdk",
     "prepack": "npm run build && npm run smoke",
     "smoke": "node smoke.mjs && node smoke-conductor.mjs"
   },
