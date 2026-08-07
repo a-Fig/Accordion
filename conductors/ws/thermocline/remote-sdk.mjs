@@ -5,6 +5,10 @@
 // Flat ESM, runnable under plain `node` (Node 22+ ships the global WebSocket the SDK dials with).
 // `ws` is intentionally NOT bundled/required. Exports: runRemoteConductor, ThermoclineConductor.
 
+// core/types.ts
+var SYSTEM_BLOCK_ID = "sys:0";
+var SYSTEM_BLOCK_ORDER = -1;
+
 // core/locks.ts
 function hasLock(locks, name) {
   return !!locks && locks.includes(name);
@@ -32,6 +36,10 @@ var FOLDABLE_KINDS = /* @__PURE__ */ new Set(["text", "thinking", "tool_result"]
 function wireFoldable(b) {
   return FOLDABLE_KINDS.has(b.kind);
 }
+var BOLTED_KINDS = /* @__PURE__ */ new Set(["system"]);
+function isBolted(b) {
+  return BOLTED_KINDS.has(b.kind);
+}
 function foldCode(id) {
   let h = 2166136261;
   for (let i = 0; i < id.length; i++) {
@@ -55,6 +63,8 @@ function digest(b) {
 }
 function digestBody(b) {
   switch (b.kind) {
+    case "system":
+      return "system prompt";
     case "user":
       return "\u201C" + clip(b.text, 100) + "\u201D";
     case "text":
@@ -89,13 +99,17 @@ function substTokens(content) {
   return estTokens(content) + BLOCK_OVERHEAD;
 }
 var GROUP_KIND_NOUN = {
+  // `system` can never actually appear in a group (`Truth.opGroup` refuses any snapped range that
+  // contains a bolted block, whole, with `"bolted"`), but the map is `Record<BlockKind, …>` so the
+  // entry has to exist. Kept honest rather than a placeholder in case the invariant is ever probed.
+  system: ["system prompt", "system prompts"],
   user: ["ask", "asks"],
   text: ["reply", "replies"],
   thinking: ["thought", "thoughts"],
   tool_call: ["call", "calls"],
   tool_result: ["result", "results"]
 };
-var GROUP_KIND_ORDER = ["tool_result", "thinking", "text", "tool_call", "user"];
+var GROUP_KIND_ORDER = ["tool_result", "thinking", "text", "tool_call", "user", "system"];
 function turnSpan(members) {
   let lo = Infinity;
   let hi = -Infinity;
@@ -426,6 +440,7 @@ function collapsibleMessageKeys(members, requireDurable) {
 var PROTECT_OVERFLOW_CAP = 1.25;
 var LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
 function wireRoleOfId(id) {
+  if (id.startsWith("sys:")) return "system";
   if (id.startsWith("u:") || /^m\d+:u$/.test(id)) return "user";
   if (id.startsWith("a:") || /^m\d+:p/.test(id)) return "assistant";
   if (id.startsWith("r:") || /^m\d+:r$/.test(id)) return "toolResult";
@@ -452,17 +467,6 @@ var Truth = class _Truth {
   contextWindowTok = null;
   protectTokensTarget = 2e4;
   /**
-   * The current effective system prompt (issue #93), captured by the HOST ONLY from
-   * `ExtensionContext.getSystemPrompt()` on every `context` hook firing (never at `session_start`,
-   * which can race pi's own `resources_discover`-driven rebuild — see `extension/accordion.ts`'s
-   * `refreshFromCtx`). `null` until the first capture — cold start, and every read-only/demo/CC/file
-   * session forever (no live host ever calls the setter). Deliberately NOT a `Block`: it has no
-   * index, so `canFold`/`isProtected`/grouping/pin never see it — structurally, not just policy,
-   * exempt from folding. See `systemPrompt` getter and `setSystemPrompt`.
-   */
-  systemPromptText = null;
-  systemPromptTokensVal = 0;
-  /**
    * Provider-anchored calibration multiplier (issue #11, ADR 0025): `k = realTokens /
    * estimatedTokens` for the same request, snapped by the HOST ONLY (`setCalibration`, called from
    * the extension after pairing an assistant reply's real usage against the wire estimate that
@@ -485,7 +489,8 @@ var Truth = class _Truth {
    * between is the issue #102 spike.
    */
   calibrationThroughOrderValue = null;
-  /** Whether the current system prompt is the one covered by the latest calibration receipt. */
+  /** Whether the CURRENT system block was on the request covered by the latest receipt. Its stable
+   *  order (-1) cannot answer this after an in-place prompt replacement. */
   systemPromptCalibratedValue = false;
   activeLocks = [];
   activeTailTok = 0;
@@ -584,10 +589,7 @@ var Truth = class _Truth {
     const maxOrder = this.blockLog.length ? this.blockLog[this.blockLog.length - 1].order : -1;
     this.calibrationThroughOrderValue = Number.isInteger(s.calibrationThroughOrder) && s.calibrationThroughOrder >= -1 ? Math.min(s.calibrationThroughOrder, maxOrder) : null;
     this.calibrationMul = this.calibrationThroughOrderValue !== null && Number.isFinite(s.calibration) && s.calibration > 0 ? s.calibration : 1;
-    const sp = s.systemPrompt;
-    this.systemPromptText = sp && typeof sp.text === "string" && Number.isFinite(sp.tokens) && sp.tokens >= 0 ? sp.text : null;
-    this.systemPromptTokensVal = this.systemPromptText === null ? 0 : Math.round(sp.tokens);
-    this.systemPromptCalibratedValue = this.calibrationThroughOrderValue !== null && s.systemPromptCalibrated === true && this.systemPromptText !== null;
+    this.systemPromptCalibratedValue = this.calibrationThroughOrderValue !== null && s.systemPromptCalibrated === true && this.systemBlock() !== void 0;
     this.lastChangedRev.clear();
     this.revCounter = s.rev;
     this.pfiCache = { rev: -1, value: 0 };
@@ -623,8 +625,8 @@ var Truth = class _Truth {
     next.calibrationMul = 1;
     next.calibrationThroughOrderValue = null;
     next.systemPromptCalibratedValue = false;
-    next.systemPromptText = prev.systemPromptText;
-    next.systemPromptTokensVal = prev.systemPromptTokensVal;
+    const prevSys = prev.get(SYSTEM_BLOCK_ID);
+    if (prevSys) next.insertSystemBlock(prevSys.text, prevSys.tokens);
     for (const b of next.blockLog) {
       const old = prev.get(b.id);
       if (!old) continue;
@@ -686,9 +688,23 @@ var Truth = class _Truth {
   get contextWindow() {
     return this.contextWindowTok;
   }
-  /** The current effective system prompt, or `null` if none has been captured yet. See the private field's doc. */
+  /**
+   * The ONE `system` block, or `undefined` when no prompt has ever been captured. SILENT ABSENCE is
+   * the contract: a session with no sourceable prompt (every read-only/demo/CC/file session, and a
+   * live session before its first `context` hook) has NO block at all — never a placeholder.
+   */
+  systemBlock() {
+    return this.get(SYSTEM_BLOCK_ID);
+  }
+  /**
+   * The current effective system prompt, or `null` if none has been captured yet. A convenience
+   * projection of `systemBlock()` kept at its original shape so `ConductorHost.systemPrompt()` (public
+   * contract surface), the app store's mirror, and every existing caller are unchanged by the move
+   * from a scalar to a real block.
+   */
   get systemPrompt() {
-    return this.systemPromptText === null ? null : { text: this.systemPromptText, tokens: this.systemPromptTokensVal };
+    const b = this.systemBlock();
+    return b ? { text: b.text, tokens: b.tokens } : null;
   }
   /** The current provider-anchored calibration multiplier (default 1). See `calibrationMul`'s doc. */
   get calibration() {
@@ -698,12 +714,13 @@ var Truth = class _Truth {
   get calibrationThroughOrder() {
     return this.calibrationThroughOrderValue;
   }
-  /** Whether the current system prompt was present on the wire covered by the latest receipt. */
+  /** Whether the current system prompt was present on the latest calibrated request. */
   get systemPromptCalibrated() {
     return this.systemPromptCalibratedValue;
   }
   /** True when this block existed on the departing wire covered by the latest receipt. */
   isCalibrated(b) {
+    if (b.id === SYSTEM_BLOCK_ID) return this.calibrationThroughOrderValue !== null && this.systemPromptCalibratedValue;
     return this.calibrationThroughOrderValue !== null && b.order <= this.calibrationThroughOrderValue;
   }
   /**
@@ -730,13 +747,15 @@ var Truth = class _Truth {
   calBlockTokens(b, n) {
     return this.isCalibrated(b) ? this.calTokens(n) : Math.round(n);
   }
-  /** Calibrate the current system prompt only when the latest receipt covered this exact prompt. */
-  calSystemPromptTokens() {
-    return this.systemPromptCalibratedValue ? this.calTokens(this.systemPromptTokensVal) : this.systemPromptTokensVal;
-  }
-  calibratedAggregate(blocks, tokensOf, includeSystemPrompt = false) {
-    let covered = includeSystemPrompt && this.systemPromptCalibratedValue ? this.systemPromptTokensVal : 0;
-    let raw = includeSystemPrompt && !this.systemPromptCalibratedValue ? this.systemPromptTokensVal : 0;
+  /**
+   * Partition an aggregate into receipt-COVERED and not-yet-covered halves and apply `k` to the
+   * former only (issue #102). Uniform over blocks — since issue #93's system prompt became a real
+   * `system` BLOCK (order `SYSTEM_BLOCK_ORDER`, i.e. -1), it flows through this loop like every
+   * other block and no longer needs the `includeSystemPrompt` side channel this used to carry.
+   */
+  calibratedAggregate(blocks, tokensOf) {
+    let covered = 0;
+    let raw = 0;
     for (const b of blocks) {
       if (this.isCalibrated(b)) covered += tokensOf(b);
       else raw += tokensOf(b);
@@ -744,10 +763,10 @@ var Truth = class _Truth {
     return Math.round(covered * this.calibrationMul + raw);
   }
   calibratedLiveTokens() {
-    return this.calibratedAggregate(this.blockLog, (b) => this.effTokens(b), true);
+    return this.calibratedAggregate(this.blockLog, (b) => this.effTokens(b));
   }
   calibratedFullTokens() {
-    return this.calibratedAggregate(this.blockLog, (b) => b.tokens, true);
+    return this.calibratedAggregate(this.blockLog, (b) => b.tokens);
   }
   calibratedProtectedTokens() {
     return this.calibratedAggregate(this.blockLog.slice(this.protectedFromIndex()), (b) => b.tokens);
@@ -829,21 +848,25 @@ var Truth = class _Truth {
     return b.subst !== void 0 ? substTokens(b.subst) : digestTokens(b);
   }
   /**
-   * Issue #93: includes the system prompt's raw token estimate (0 when uncaptured — every CC/demo/
-   * file session, and a live session before its first `context` hook). This un-smears the system
-   * prompt out of `extension/accordion.ts`'s calibration pairing (`pendingWireEst`), which reads this
-   * method directly — ADR 0025's documented "smearing caveat" previously absorbed the system prompt's
-   * real cost into `k` because `est` excluded it while `real` (provider usage) never did. Tool-schema
-   * overhead (also belonging to no block) remains smeared; only the system prompt's contribution is
-   * now a real, separately-estimated term. See the ADR's issue-#93 addendum.
+   * Issue #93: the system prompt's estimate is included — but NATURALLY, as one more term in the
+   * block loop, because it IS a block now (`SYSTEM_BLOCK_ID`, a BOLTED `system` kind). Its tokens are
+   * a fixed FLOOR, not reclaimable headroom: `effTokens` returns its full cost unconditionally
+   * (nothing can fold it), so `liveTokens` can never fall below it.
+   *
+   * This is what un-smears the system prompt out of `extension/accordion.ts`'s calibration pairing
+   * (`pendingWireEst`, which reads this method directly) — ADR 0025's documented "smearing caveat"
+   * previously absorbed the prompt's real cost into `k` because `est` excluded it while `real`
+   * (provider usage) never did. Tool-schema overhead (which belongs to no block) remains smeared.
+   * A session with no captured prompt has no `system` block at all, so the term is simply absent —
+   * silent absence, never a zero-token placeholder.
    */
   liveTokens() {
-    let n = this.systemPromptTokensVal;
+    let n = 0;
     for (const b of this.blockLog) n += this.effTokens(b);
     return n;
   }
   fullTokens() {
-    let n = this.systemPromptTokensVal;
+    let n = 0;
     for (const b of this.blockLog) n += b.tokens;
     return n;
   }
@@ -870,6 +893,7 @@ var Truth = class _Truth {
    * the block has not yet been sent (never crossed the wire live, so there is nothing to yank).
    */
   canFold(b, by = "you") {
+    if (isBolted(b)) return false;
     if (!wireFoldable(b)) return false;
     if (this.inFoldedGroup(b.id)) return false;
     if (this.wireAttached && !isDurableId(b.id)) return false;
@@ -900,19 +924,21 @@ var Truth = class _Truth {
   computeProtectedFromIndex() {
     const blocks = this.blockLog;
     if (!blocks.length) return 0;
+    const floor = isBolted(blocks[0]) ? 1 : 0;
+    if (floor === blocks.length) return blocks.length;
     const targetReal = this.isLocked("tail-size") ? this.activeTailTok : this.protectTokensTarget;
     if (targetReal === 0) return blocks.length;
     const realCost = (b) => b.tokens * (this.isCalibrated(b) ? this.calibrationMul : 1);
     const cap = targetReal * PROTECT_OVERFLOW_CAP;
     let sum = realCost(blocks[blocks.length - 1]);
     if (sum >= targetReal) return blocks.length - 1;
-    for (let i = blocks.length - 2; i >= 0; i--) {
+    for (let i = blocks.length - 2; i >= floor; i--) {
       const next = sum + realCost(blocks[i]);
       if (next > cap) return i + 1;
       sum = next;
       if (sum >= targetReal) return i;
     }
-    return 0;
+    return floor;
   }
   isProtected(b) {
     return (this.index.get(b.id) ?? -1) >= this.protectedFromIndex();
@@ -1077,6 +1103,7 @@ var Truth = class _Truth {
       keys.push(curKey);
     };
     for (const b of this.blockLog) {
+      if (isBolted(b)) continue;
       const k = messageKey(b.id);
       if (k !== curKey) {
         flush();
@@ -1190,20 +1217,88 @@ var Truth = class _Truth {
     this.emit({ type: "config", contextWindow: this.contextWindowTok, rev });
   }
   /**
+   * Structural CREATE-OR-REPLACE of the `system` block. Pure state mutation: no rev bump, no event,
+   * no housekeeping — the two callers (`setSystemPrompt` and the static `rebuildFrom` carry) own
+   * those. Returns true iff anything actually changed.
+   *
+   * REPLACEMENT, not append. `Truth.append` is idempotent BY ID, so re-appending a changed prompt
+   * under the same id would be silently DROPPED — and pi's effective prompt is genuinely not static
+   * across a session (it is why the extension diffs it on every `context` hook). So a second capture
+   * rewrites the existing block's `text`/`tokens` IN PLACE and the block keeps its identity, its
+   * position (always array index 0), and its `order` (-1).
+   *
+   * That in-place content rewrite is exactly the mutation `core/digest.ts`'s memo TRIPWIRE warns
+   * about: `digestCache`/`digestTokenCache` are `WeakMap`s keyed by the block object with no
+   * invalidation, sound only because committed blocks are never content-mutated. Rather than reach
+   * across and clear two private caches, a replacement allocates a FRESH block object — the old one
+   * becomes garbage and takes its cache entries with it, so a stale digest is structurally
+   * impossible. (Bolted blocks are never folded, so no digest is ever rendered for one today; the
+   * fresh-object discipline is what keeps that true if that ever changes.)
+   */
+  insertSystemBlock(text, tokens) {
+    const tok = Math.round(tokens);
+    const existingIdx = this.index.get(SYSTEM_BLOCK_ID);
+    if (existingIdx !== void 0) {
+      const cur = this.blockLog[existingIdx];
+      if (cur.text === text && cur.tokens === tok) return false;
+      this.blockLog[existingIdx] = { ...cur, text, tokens: tok };
+      return true;
+    }
+    const fresh = {
+      id: SYSTEM_BLOCK_ID,
+      kind: "system",
+      turn: 0,
+      // preamble — it precedes every user turn
+      order: SYSTEM_BLOCK_ORDER,
+      text,
+      tokens: tok,
+      override: null,
+      autoFolded: false,
+      by: null
+    };
+    this.blockLog.unshift(fresh);
+    this.reindex();
+    return true;
+  }
+  /**
    * HOST-ONLY (issue #93): set the current effective system prompt. Called from
    * `extension/accordion.ts`'s `refreshFromCtx` on every `context` hook firing, only when the value
    * actually changed (the caller diffs against `this.systemPrompt` first) — so in the common case
-   * this fires once near session start and never again. No `housekeep()` call: unlike `budget`/
-   * `protectTokens`/`calibration`, the system prompt occupies no block index and can never move
-   * `protectedFromIndex()`, so there is nothing to heal.
+   * this fires once near session start and never again. It is also SESSION-SCOPED: nothing here
+   * survives a session swap, because the extension nulls its captured prompt on `session_start` and
+   * a first build (`rebuildFrom(null, …)`) inherits nothing.
+   *
+   * The method name and signature are deliberately unchanged from when the prompt was a scalar: it
+   * keeps the extension's capture path, the wire `config` event, and replica replay working exactly
+   * as before. What changed is the STORAGE — it now creates-or-replaces the bolted `system` block
+   * (see `insertSystemBlock`), so the prompt's tokens land in `liveTokens()`/`fullTokens()` through
+   * the ordinary block loop instead of a special-cased scalar addend.
+   *
+   * A same-value call is a genuine NO-OP (no rev bump, no event) — the block log did not change, and
+   * a gratuitous rev bump would cost every replica a config replay for nothing. `housekeep()` DOES
+   * run on a real change, unlike the old scalar version: the block occupies array index 0, so
+   * inserting it shifts every other block's index by one and a token change can (at the extreme)
+   * move `protectedFromIndex`. The protected SET is unchanged by a front insertion (the tail walk
+   * runs from the END), so in practice this heals nothing — it is here so the boundary invariant is
+   * enforced rather than assumed.
+   *
+   * Emits the same `config` event shape as before, carrying the new prompt. That is what a replica
+   * replays (`core/replica.ts`'s `applyWireEvent`) to create-or-replace ITS system block
+   * deterministically — the block is reconstructed from the event, never shipped as an `appended`
+   * (which would land it at the END of the log, in the wrong place, and could not express a replace).
+   * It is also what wakes an attached conductor: a prompt change moves `liveTokens`/`fullTokens`, so
+   * it is DECISION-BEARING, and `hostAdapter`'s config branch turns it into a
+   * `state-changed {what:"systemPrompt"}`.
    */
   setSystemPrompt(text, tokens) {
     if (typeof text !== "string" || !Number.isFinite(tokens) || tokens < 0) return;
-    this.systemPromptText = text;
-    this.systemPromptTokensVal = Math.round(tokens);
+    if (!this.insertSystemBlock(text, tokens)) return;
     this.systemPromptCalibratedValue = false;
+    const touched = /* @__PURE__ */ new Set([SYSTEM_BLOCK_ID]);
+    this.housekeep(touched);
     const rev = ++this.revCounter;
-    this.emit({ type: "config", systemPrompt: { text: this.systemPromptText, tokens: this.systemPromptTokensVal }, rev });
+    for (const id of touched) this.lastChangedRev.set(id, rev);
+    this.emit({ type: "config", systemPrompt: { text, tokens: Math.round(tokens) }, rev });
   }
   setProtect(n) {
     if (this.isLocked("tail-size")) return;
@@ -1240,7 +1335,7 @@ var Truth = class _Truth {
     this.calibrationMul = k;
     const maxOrder = this.blockLog.length ? this.blockLog[this.blockLog.length - 1].order : -1;
     this.calibrationThroughOrderValue = Math.min(throughOrder, maxOrder);
-    this.systemPromptCalibratedValue = this.systemPromptText !== null;
+    this.systemPromptCalibratedValue = this.systemBlock() !== void 0;
     const touched = /* @__PURE__ */ new Set();
     this.housekeep(touched);
     const rev = ++this.revCounter;
@@ -1467,6 +1562,7 @@ var Truth = class _Truth {
     return this.eachId(op, touched, (id) => {
       const b = this.get(id);
       if (!b) return "unknown-id";
+      if (isBolted(b)) return "bolted";
       if (this.stale(id, baseRev)) return "stale";
       if (this.inFoldedGroup(id)) return "grouped";
       if (!wireFoldable(b)) return "not-foldable";
@@ -1495,6 +1591,7 @@ var Truth = class _Truth {
     if (by === "you") return this.clamp(op, "not-foldable", "replace is a strategy op");
     const b = this.get(op.id);
     if (!b) return this.clamp(op, "unknown-id");
+    if (isBolted(b)) return this.clamp(op, "bolted");
     if (this.stale(op.id, baseRev)) return this.clamp(op, "stale");
     if (this.inFoldedGroup(op.id)) return this.clamp(op, "grouped");
     if (b.override !== null) return this.clamp(op, "human-override");
@@ -1522,6 +1619,7 @@ var Truth = class _Truth {
     return this.eachId(op, touched, (id) => {
       const b = this.get(id);
       if (!b) return "unknown-id";
+      if (isBolted(b)) return "bolted";
       if (this.stale(id, baseRev)) return "stale";
       if (this.inFoldedGroup(id)) return "grouped";
       if (by === "agent") {
@@ -1553,6 +1651,7 @@ var Truth = class _Truth {
     return this.eachId(op, touched, (id) => {
       const b = this.get(id);
       if (!b) return "unknown-id";
+      if (isBolted(b)) return "bolted";
       if (this.stale(id, baseRev)) return "stale";
       if (this.inFoldedGroup(id)) return "grouped";
       if (by === "you") {
@@ -1576,6 +1675,7 @@ var Truth = class _Truth {
     return this.eachId(op, touched, (id) => {
       const b = this.get(id);
       if (!b) return "unknown-id";
+      if (isBolted(b)) return "bolted";
       if (this.stale(id, baseRev)) return "stale";
       if (b.override !== "pinned") return "noop";
       if (by !== "you" && b.by === "you") return "human-override";
@@ -1589,6 +1689,7 @@ var Truth = class _Truth {
     return this.eachId(op, touched, (id) => {
       const b = this.get(id);
       if (!b) return "unknown-id";
+      if (isBolted(b)) return "bolted";
       if (this.stale(id, baseRev)) return "stale";
       if (this.inFoldedGroup(id)) return "grouped";
       if (by === "you") {
@@ -1611,6 +1712,9 @@ var Truth = class _Truth {
     if (!op.ids.length) return this.clamp(op, "invalid-group", "a group needs \u22651 block");
     const memberIds = this.snappedRange(op.ids[0], op.ids[op.ids.length - 1]);
     if (!memberIds) return this.clamp(op, "unknown-id");
+    if (memberIds.some((id) => isBolted(this.get(id)))) {
+      return this.clamp(op, "bolted", "the range contains the bolted system prompt");
+    }
     if (baseRev !== void 0 && memberIds.some((id) => this.stale(id, baseRev))) return this.clamp(op, "stale");
     if ((this.index.get(memberIds[memberIds.length - 1]) ?? Infinity) >= this.protectedFromIndex()) return this.clamp(op, "protected");
     for (const id of memberIds) if (this.groupOf(this.get(id))) return this.clamp(op, "invalid-group", "overlaps an existing group");
@@ -1785,9 +1889,6 @@ function hydrateSnapshot(meta, state) {
     calibration: calibrationThroughOrder === null ? 1 : state.calibration ?? 1,
     calibrationThroughOrder,
     systemPromptCalibrated: calibrationThroughOrder === null ? false : state.systemPromptCalibrated ?? false,
-    // Optional AND nullable on the wire (v19, issue #93); default `null` for a peer/test literal
-    // that omits it — the host serializer always emits the field (as `null` before first capture).
-    systemPrompt: state.systemPrompt ?? null,
     rev: state.rev
   });
   return truth;
@@ -1903,7 +2004,7 @@ function recallHostEvent(ids, by, rev) {
 }
 
 // core/protocol.ts
-var PROTOCOL_VERSION = 21;
+var PROTOCOL_VERSION = 22;
 var SERVER_TYPES = /* @__PURE__ */ new Set([
   "hello",
   "snapshot",
@@ -2257,6 +2358,7 @@ function buildUnits(blocks) {
   }
   const units = [];
   for (const b of blocks) {
+    if (isBolted(b)) continue;
     if (b.kind === "tool_result" && pairedResultIds.has(b.id)) continue;
     let members;
     if (b.kind === "tool_call" && b.callId && resultByCall.has(b.callId)) {

@@ -59,6 +59,44 @@ export function wireFoldable(b: Block): boolean {
 }
 
 /**
+ * Kinds that NO actor — human, conductor, or agent — may fold, group, pin, or replace: the BOLTED
+ * kinds. Today exactly `system` (the harness's own prompt). A named set rather than scattered
+ * `kind === "system"` comparisons so a second bolted kind is a one-line change here, not an audit of
+ * every op handler.
+ */
+const BOLTED_KINDS: ReadonlySet<BlockKind> = new Set<BlockKind>(["system"]);
+
+/**
+ * Is this block BOLTED — permanently exempt from every steering action, by every actor?
+ *
+ * Bolted is a property of the KIND and never lifts. It is deliberately distinct from the two other
+ * "you can't touch this" states in the engine:
+ *   • HELD (`Block.override !== null`) is a human decision the human can release;
+ *   • PROTECTED (the working tail) is positional and moves as the tail resizes.
+ * Bolted is neither: the block is a fixed floor of the context, and there is no state in which it
+ * becomes steerable.
+ *
+ * WHY THIS EXISTS ALONGSIDE `wireFoldable`. Per-block content folding is already refused for free —
+ * `system` is not in `FOLDABLE_KINDS`, so `wireFoldable` returns false and `canFold`/`opFold`/
+ * `opReplace`/`computeFoldOps`/`resolveUnfold` all decline without any new code. What foldability
+ * does NOT cover is every OTHER path that can change what the model receives:
+ *   • GROUP COLLAPSE (ADR 0006) — a separate structural mechanism that legitimately swallows
+ *     non-foldable kinds (`user`, `tool_call`), so `wireFoldable` is silent about it;
+ *   • PIN / UNPIN — an override on a block, unrelated to foldability;
+ *   • the human-facing affordances that read a block's steerability directly.
+ * `isBolted` is the single predicate those paths consult, and `Truth.apply` checks it FIRST in every
+ * relevant op so a conductor learns the PERMANENT reason (`"bolted"`) rather than an incidental one
+ * — `"not-foldable"` reads as "wrong kind, try another block", `"noop"` reads as "already in that
+ * state, retry later", and both would send a strategy back around a loop it can never win.
+ *
+ * Accepts anything carrying a `kind` — a `Block` (Truth's own log) or a `ViewBlock` (what a
+ * conductor sees) — so the two sides can never diverge on a hand-rolled second copy of the rule.
+ */
+export function isBolted(b: { kind: BlockKind }): boolean {
+	return BOLTED_KINDS.has(b.kind);
+}
+
+/**
  * Short, stable handle for a block, derived purely from its durable id (FNV-1a → base36,
  * 6 chars). Stateless and deterministic so the engine, the live link, and the
  * `accordion-context-folding` skill never drift. Not collision-free by construction, but
@@ -116,6 +154,12 @@ export function digest(b: Block): string {
 /** The per-kind essence kept when a block is folded (without the tag). */
 function digestBody(b: Block): string {
 	switch (b.kind) {
+		case "system":
+			// Unreachable in practice — a bolted block is never folded, so nothing ever renders this.
+			// Present so the switch stays exhaustive over `BlockKind` and a future caller that asks for
+			// a system block's digest (an Inspector "what would this look like folded" probe, say) gets
+			// something sane rather than the `default` catch-all.
+			return "system prompt";
 		case "user":
 			return "“" + clip(b.text, 100) + "”";
 		case "text":
@@ -169,13 +213,17 @@ export function substTokens(content: string): number {
 
 /** Order kinds appear in a group recap, with singular/plural nouns. */
 const GROUP_KIND_NOUN: Record<BlockKind, [string, string]> = {
+	// `system` can never actually appear in a group (`Truth.opGroup` refuses any snapped range that
+	// contains a bolted block, whole, with `"bolted"`), but the map is `Record<BlockKind, …>` so the
+	// entry has to exist. Kept honest rather than a placeholder in case the invariant is ever probed.
+	system: ["system prompt", "system prompts"],
 	user: ["ask", "asks"],
 	text: ["reply", "replies"],
 	thinking: ["thought", "thoughts"],
 	tool_call: ["call", "calls"],
 	tool_result: ["result", "results"],
 };
-const GROUP_KIND_ORDER: BlockKind[] = ["tool_result", "thinking", "text", "tool_call", "user"];
+const GROUP_KIND_ORDER: BlockKind[] = ["tool_result", "thinking", "text", "tool_call", "user", "system"];
 
 /** Compact "turn 3" / "turns 3–5" / "preamble" label for a group's span. */
 function turnSpan(members: Block[]): string {

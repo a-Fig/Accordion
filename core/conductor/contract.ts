@@ -25,7 +25,17 @@ export type { LockName, Op, TxnResult, TruthStats, Actor };
  */
 export interface ViewBlock {
 	id: string;
-	kind: "user" | "text" | "thinking" | "tool_call" | "tool_result";
+	/**
+	 * `"system"` (v22) is the agent's own system prompt — the FIRST block, and BOLTED: no proposal a
+	 * conductor can make will ever move it. Every op targeting it (`fold`/`unfold`/`pin`/`unpin`/
+	 * `auto`/`replace`, and any `group` whose SNAPPED range contains it) is clamped `"bolted"`
+	 * (`core/ops.ts`) — a PERMANENT refusal, unlike `not-foldable`/`noop`/`protected`, so a conductor
+	 * that sees it should drop the target from its plan rather than re-propose next turn. It still
+	 * appears in `blocks()` and its tokens still count toward `stats().liveTokens`/`fullTokens`,
+	 * because it is a real, irreducible floor on the context a strategy has to plan around. A session
+	 * whose prompt could not be sourced has no such block at all — never a zero-token placeholder.
+	 */
+	kind: "system" | "user" | "text" | "thinking" | "tool_call" | "tool_result";
 	turn: number;
 	order: number;
 	/**
@@ -161,8 +171,13 @@ export interface ConductorHost {
 	stats(): TruthStats;
 	/**
 	 * The current effective system prompt, or `null` if none has been captured yet (issue #93).
-	 * Read-only — there is no `Op` kind for it, so it can never be a legal `propose()` target; it is a
-	 * scalar `Truth` fact, not a `Block`.
+	 *
+	 * KEPT at its original shape — it is public contract surface, and a conductor that only wants the
+	 * prompt should not have to know where it lives. As of v22 it is no longer a scalar `Truth` fact
+	 * but a projection of the BOLTED `system` block (`ViewBlock.kind === "system"`, always
+	 * `blocks()[0]` when present). Still READ-ONLY, now for a stronger reason than "there is no Op
+	 * kind for it": every op kind DOES apply to a block, and every one of them is refused on this one
+	 * with the permanent `"bolted"` clamp.
 	 */
 	systemPrompt(): { text: string; tokens: number } | null;
 	/**

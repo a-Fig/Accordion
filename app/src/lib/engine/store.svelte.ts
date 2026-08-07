@@ -142,6 +142,13 @@ export class AccordionStore {
 				this.syncGroups();
 				break;
 			case "config":
+				// A `systemPrompt` config event is the ONE config dial that changes the BLOCK LOG (v22:
+				// `Truth.setSystemPrompt` creates-or-replaces the bolted `system` block at index 0), so the
+				// mirror has to follow before anything reads it. Skipping this would leave `store.blocks`
+				// one entry short of `truth.blocks` — and since `protectedFromIndex` is an ARRAY INDEX
+				// forwarded straight from the truth, every index-based read (the two-box grid split,
+				// display rows, arrow-key traversal) would silently land one block off.
+				if (e.systemPrompt !== undefined) this.syncSystemBlock();
 				this.syncOverlay();
 				this.syncGroups();
 				if (e.budget !== undefined) this.budget = e.budget;
@@ -166,6 +173,28 @@ export class AccordionStore {
 				break; // no overlay change; just a redraw
 		}
 		this.version++;
+	}
+
+	/**
+	 * Mirror the truth's `system` block (v22). Insert it at index 0 the first time a prompt is
+	 * captured; on a later capture the SAME block object is content-rewritten in place (the truth
+	 * allocates a fresh block, but the mirror clone can be patched — `text`/`tokens` are the only
+	 * fields that can change, and in-place mutation is what keeps `$state` reactivity flowing to
+	 * whatever is already rendering the tile). Never removes: a prompt, once sourced, is never
+	 * un-sourced within a session.
+	 */
+	private syncSystemBlock(): void {
+		const tb = this.truth.systemBlock();
+		if (!tb) return;
+		const i = this.mirrorIndex.get(tb.id);
+		if (i === undefined) {
+			this.blocks.unshift(cloneBlock(tb));
+			this.rebuildMirrorIndex(); // every later block's mirror index shifted by one
+			return;
+		}
+		const mb = this.blocks[i];
+		if (mb.text !== tb.text) mb.text = tb.text;
+		if (mb.tokens !== tb.tokens) mb.tokens = tb.tokens;
 	}
 
 	/** Copy the truth's per-block overlay onto the mirror clones (in place → reactive). */
@@ -279,10 +308,6 @@ export class AccordionStore {
 	calBlockTokens(b: Block, n: number): number {
 		void this.version;
 		return this.truth.calBlockTokens(b, n);
-	}
-	calSystemPromptTokens(): number {
-		void this.version;
-		return this.truth.calSystemPromptTokens();
 	}
 	calGroupFullTokens(g: Group): number {
 		void this.version;

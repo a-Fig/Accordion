@@ -14,6 +14,7 @@
 	import TileCanvas from "./TileCanvas.svelte";
 	import type { TileSpec } from "./tileDraw";
 	import { faceFor as faceForLib } from "./tileDraw";
+	import { isBolted } from "$core/digest";
 
 	let {
 		store,
@@ -29,6 +30,7 @@
 	let view = $state<"map" | "transcript">("map");
 	// Human-readable role label for a transcript message header.
 	const ROLE: Record<Block["kind"], string> = {
+		system: "System",
 		user: "You",
 		text: "Assistant",
 		thinking: "Thinking",
@@ -80,6 +82,7 @@
 	// this names them so the grid's colours are self-explaining. Order follows the
 	// conversation grammar: you → reply → thinking → tool call → tool result.
 	const KINDS: { kind: BlockKind; lbl: string }[] = [
+		{ kind: "system", lbl: "system" },
 		{ kind: "user", lbl: "user" },
 		{ kind: "text", lbl: "reply" },
 		{ kind: "thinking", lbl: "thinking" },
@@ -109,10 +112,6 @@
 	// mutator and NEVER touches `group.folded`. Only the explicit "Unfold to context"
 	// button changes the wire. Mutated immutably (reassign a new Set) so `displayRows`
 	// re-derives.
-	// Issue #93: local expand/collapse for the system-prompt panel — it has no block id, so it has no
-	// Inspector route of its own; a self-contained toggle is the whole UI for it.
-	let spExpanded = $state(false);
-
 	let peeked = $state(new Set<string>());
 	function enterPeek(gid: string) {
 		const next = new Set(peeked);
@@ -402,7 +401,9 @@
 		// store.toggle gated by canFold — so the tile never advertises a fold the gate would refuse:
 		// a human-steering lock, read-only (v16, ADR 0024), a live user/tool_call, a pin, or the
 		// protected tail. Unfold stays for a folded block.
-		const action = steerLocked
+		const action = b.kind === "system"
+			? "click to inspect · bolted — permanent system context"
+			: steerLocked
 			? "click to inspect · folding locked by the active strategy"
 			: notController
 				? `click to inspect · ${readOnlyTip("fold")}`
@@ -586,7 +587,7 @@
 		// skip all range bookkeeping. Range-select is a map-only gesture.
 		if (!steerLocked && !notController && view === "map" && shiftKey && rangeAnchorId) {
 			clearPendingClick();
-			if (!bl || store.isProtected(bl) || store.groupOf(bl)) {
+			if (!bl || isBolted(bl) || store.isProtected(bl) || store.groupOf(bl)) {
 				groupErr = true;
 				return;
 			}
@@ -597,7 +598,7 @@
 		deferClick(() => {
 			onselect(id);
 			rangeAnchorId =
-				!steerLocked && !notController && view === "map" && bl && !store.isProtected(bl) && !store.groupOf(bl)
+				!steerLocked && !notController && view === "map" && bl && !isBolted(bl) && !store.isProtected(bl) && !store.groupOf(bl)
 					? id
 					: null;
 			rangeEndId = null;
@@ -1199,27 +1200,6 @@
 					</div>
 				</section>
 				{/if}
-				{#if store.systemPrompt}
-				<!-- Issue #93: the system prompt. Never a Block — no id, so nothing here can ever
-				     select/fold/pin/group it. Visually related to .box.prot (same accent-dim border
-				     language, "this box is structurally special") but deliberately distinct from it
-				     (dashed, dimmer fill) since a protected tail and the system prompt mean different
-				     things. Its tokens are already counted into the hero readout via
-				     Truth.liveTokens()/fullTokens() — no separate total shown here. -->
-				<section class="box sysprompt">
-					<header class="sp-head">
-						<Icon name="terminal" size={12} />
-						<span class="sp-label">System prompt</span>
-						<span class="sp-tok mono tnum">
-							{#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}{k(store.calSystemPromptTokens())} tok
-						</span>
-						<button class="sp-toggle" onclick={() => (spExpanded = !spExpanded)}>{spExpanded ? "Hide" : "View"}</button>
-					</header>
-					{#if spExpanded}
-						<pre class="sp-text">{store.systemPrompt.text}</pre>
-					{/if}
-				</section>
-				{/if}
 			</div>
 		{:else}
 			<!-- TRANSCRIPT: the concretion. Blocks in conversation order, full text when live,
@@ -1245,7 +1225,9 @@
 							<span class="tr-tok mono tnum">
 								{#if notAnchored}<span class="approx" aria-hidden="true">≈</span>{/if}{k(store.calBlockTokens(b, store.effTokens(b)))}{#if folded}<span class="dim">/{k(store.calBlockTokens(b, b.tokens))}</span>{/if} tok
 							</span>
-							{#if prot}
+							{#if b.kind === "system"}
+								<span class="tr-flag" title="Bolted — permanent system context"><Icon name="bolt" size={11} /></span>
+							{:else if prot}
 								<span class="tr-flag" title="protected working tail — never folds"><Icon name="lock" size={10} /></span>
 							{:else if b.override === "pinned"}
 								<span class="tr-flag" title="pinned — held full"><Icon name="pin" size={10} /></span>
@@ -1383,6 +1365,7 @@
 		box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
 	}
 	.ksw.k-user { background: var(--k-user); }
+	.ksw.k-system { background: var(--k-system); }
 	.ksw.k-text { background: var(--k-text); }
 	.ksw.k-thinking { background: var(--k-thinking); }
 	.ksw.k-tool_call { background: var(--k-tool_call); }
@@ -1666,58 +1649,6 @@
 		background: var(--panel);
 		box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent), var(--shadow-1);
 	}
-	/* the system-prompt panel (issue #93): riffs on .box.prot's "structurally special" accent-dim
-	   border language for family resemblance, but dashed + the plain .box fill (not .box.prot's
-	   brighter one) so it reads as a DIFFERENT kind of special — never confused with the protected
-	   tail. Never a Block: no fold/pin/group affordance lives here, ever. */
-	.box.sysprompt {
-		border: 2px dashed var(--accent-dim);
-		background: var(--panel-2);
-		gap: var(--sp-2);
-	}
-	.sp-head {
-		display: flex;
-		align-items: center;
-		gap: var(--sp-2);
-		color: var(--muted);
-	}
-	.sp-label {
-		font-size: var(--fs-sm);
-		font-weight: 600;
-		flex: 1;
-	}
-	.sp-tok {
-		font-size: var(--fs-xs);
-		color: var(--faint);
-	}
-	.sp-toggle {
-		font-size: var(--fs-xs);
-		color: var(--muted);
-		background: transparent;
-		border: 1px solid var(--line);
-		border-radius: var(--radius-sm);
-		padding: 2px var(--sp-2);
-		cursor: pointer;
-	}
-	.sp-toggle:hover {
-		color: var(--text);
-		border-color: var(--accent-dim);
-	}
-	.sp-text {
-		margin: 0;
-		max-height: 320px;
-		overflow: auto;
-		white-space: pre-wrap;
-		word-break: break-word;
-		font-family: var(--mono);
-		font-size: var(--fs-xs);
-		color: var(--text);
-		background: var(--panel);
-		border: 1px solid var(--line);
-		border-radius: var(--radius-sm);
-		padding: var(--sp-2);
-	}
-
 	/* canvas-fill: flex wrapper for TileCanvas inside a box (fills the space after the rail). */
 	.canvas-fill {
 		flex: 1;
@@ -1748,6 +1679,7 @@
 		box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3);
 		z-index: 2;
 	}
+	.cell.k-system { background: var(--k-system); }
 	.cell.k-user { background: var(--k-user); }
 	.cell.k-text { background: var(--k-text); }
 	.cell.k-thinking { background: var(--k-thinking); }
@@ -2084,6 +2016,7 @@
 		border-left-color: var(--kc);
 		box-shadow: 0 0 0 1px var(--accent-soft);
 	}
+	.tr-msg.k-system { --kc: var(--k-system); }
 	.tr-msg.k-user { --kc: var(--k-user); }
 	.tr-msg.k-text { --kc: var(--k-text); }
 	.tr-msg.k-thinking { --kc: var(--k-thinking); }

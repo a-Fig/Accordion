@@ -3,6 +3,7 @@
 	import { cubicOut } from "svelte/easing";
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block, Group } from "../../engine/types";
+	import { isBolted } from "$core/digest";
 	import Icon from "$lib/ui/Icon.svelte";
 
 	let {
@@ -20,6 +21,7 @@
 	} = $props();
 
 	const KIND_LABEL: Record<Block["kind"], string> = {
+		system: "System",
 		user: "User",
 		text: "Reply",
 		thinking: "Thinking",
@@ -33,6 +35,7 @@
 
 	const folded = $derived(block ? store.isFolded(block) : false);
 	const pinned = $derived(block?.override === "pinned");
+	const bolted = $derived(block ? isBolted(block) : false);
 	// Protected working tail — never folded (the safety pillar). The Fold control is
 	// disabled here so the guarantee is visible, not just enforced silently.
 	const protect = $derived(block ? store.isProtected(block) : false);
@@ -260,7 +263,7 @@
 				</button>
 			{/if}
 			<span class="grow"></span>
-			<span class="turn-badge mono">turn {block.turn}</span>
+			<span class="turn-badge mono">{bolted ? "preamble" : `turn ${block.turn}`}</span>
 			<button class="close-btn" onclick={onclose} aria-label="Close inspector" title="Close">
 				<Icon name="x" size={16} />
 			</button>
@@ -284,6 +287,12 @@
 						<span class="pill pill-accent" title="In the protected working tail — never folded">
 							<Icon name="lock" size={10} stroke={2} />
 							protected
+						</span>
+					{/if}
+					{#if bolted}
+						<span class="pill pill-bolted" title="Permanent system context">
+							<Icon name="bolt" size={10} stroke={2} />
+							bolted
 						</span>
 					{/if}
 				</div>
@@ -310,6 +319,12 @@
 			</div>
 
 			<!-- Actions -->
+			{#if bolted}
+				<div class="bolted-note">
+					<Icon name="bolt" size={15} stroke={2} />
+					<span>Permanent system context. It is always sent in full and cannot be folded, pinned, grouped, or replaced.</span>
+				</div>
+			{:else}
 			<div class="action-row">
 				<button
 					class="action-btn"
@@ -348,6 +363,7 @@
 					{pinned ? "Unpin" : "Pin"}
 				</button>
 			</div>
+			{/if}
 		</div>
 
 		<!-- ── Body ───────────────────────────────────────────────── -->
@@ -536,6 +552,7 @@
 	}
 
 	/* kind color variables */
+	.k-system     { --kc: var(--k-system); }
 	.k-user       { --kc: var(--k-user); }
 	.k-text        { --kc: var(--k-text); }
 	.k-thinking    { --kc: var(--k-thinking); }
@@ -598,6 +615,29 @@
 		color: var(--accent);
 		background: var(--accent-soft);
 		gap: 5px;
+	}
+	.pill-bolted {
+		color: var(--k-system);
+		border-color: color-mix(in srgb, var(--k-system) 50%, var(--line));
+		background: color-mix(in srgb, var(--k-system) 12%, transparent);
+	}
+
+	.bolted-note {
+		display: flex;
+		align-items: flex-start;
+		gap: var(--sp-2);
+		padding: var(--sp-3);
+		border: 1px solid color-mix(in srgb, var(--k-system) 40%, var(--line));
+		border-radius: var(--radius-sm);
+		background: color-mix(in srgb, var(--k-system) 8%, var(--panel-2));
+		color: var(--muted);
+		font-size: var(--fs-xs);
+		line-height: 1.45;
+	}
+	.bolted-note :global(svg) {
+		flex: 0 0 auto;
+		color: var(--k-system);
+		margin-top: 1px;
 	}
 
 	/* Token table: tabular mono data display */

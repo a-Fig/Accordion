@@ -1183,9 +1183,17 @@ if (unfoldTool && foldCodeStr) {
 		() => fails.push("issue #93: resnapshot after system-prompt capture produced no snapshot"),
 	);
 	const snap = a.inbox.snapshot.at(-1);
-	const sp = snap?.state?.systemPrompt;
-	if (!sp || sp.text !== SMOKE_SYSTEM_PROMPT) fails.push(`issue #93: snapshot.state.systemPrompt.text expected ${JSON.stringify(SMOKE_SYSTEM_PROMPT)}, got ${JSON.stringify(sp)}`);
-	if (!sp || typeof sp.tokens !== "number" || sp.tokens <= 0) fails.push(`issue #93: snapshot.state.systemPrompt.tokens expected a positive number, got ${JSON.stringify(sp?.tokens)}`);
+	// v22: the prompt rides in `state.blocks` as the BOLTED `system` block (id `sys:0`, order -1,
+	// FIRST in the log), not as a `state.systemPrompt` scalar.
+	const sp = snap?.state?.blocks?.[0];
+	if (!sp || sp.kind !== "system" || sp.id !== "sys:0" || sp.order !== -1)
+		fails.push(`issue #93: expected snapshot.state.blocks[0] to be the bolted system block, got ${JSON.stringify(sp)}`);
+	if (!sp || sp.text !== SMOKE_SYSTEM_PROMPT) fails.push(`issue #93: system block text expected ${JSON.stringify(SMOKE_SYSTEM_PROMPT)}, got ${JSON.stringify(sp?.text)}`);
+	if (!sp || typeof sp.tokens !== "number" || sp.tokens <= 0) fails.push(`issue #93: system block tokens expected a positive number, got ${JSON.stringify(sp?.tokens)}`);
+	if (snap?.state?.blocks?.filter((b) => b.kind === "system").length !== 1)
+		fails.push("issue #93: expected EXACTLY ONE system block in the snapshot (a changed prompt replaces, never appends)");
+	if (snap?.state?.systemPrompt !== undefined)
+		fails.push("v22: snapshot.state.systemPrompt should be gone — the prompt is a block now");
 
 	const kAfter = snap?.state?.calibration;
 	if (typeof kAfter !== "number") fails.push("issue #93: expected a calibration observation on the snapshot after system-prompt capture");
@@ -1217,8 +1225,8 @@ if (unfoldTool && foldCodeStr) {
 	await waitFor(() => a.inbox.snapshot.length > 0, 2000, "snapshot after prompt-cache reset").catch(
 		() => fails.push("issue #93 review: resnapshot after session-start prompt-cache reset produced no snapshot"),
 	);
-	const resetSp = a.inbox.snapshot.at(-1)?.state?.systemPrompt;
-	if (resetSp !== null)
+	const resetSp = (a.inbox.snapshot.at(-1)?.state?.blocks ?? []).find((b) => b.kind === "system");
+	if (resetSp !== undefined)
 		fails.push(`issue #93 review: new session inherited the prior system prompt after refresh failure (${JSON.stringify(resetSp)})`);
 	try { fs.unlinkSync(path.join(SESSIONS_DIR, `${beforeResetMeta.sessionId}.json`)); } catch { /* already gone */ }
 }

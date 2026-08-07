@@ -105,32 +105,36 @@ describe("replica — carriedSent round trip (protocol v15)", () => {
 	});
 });
 
-// Issue #93: the system prompt is a scalar Truth fact (never a Block), captured host-side and
-// pushed to every replica over the same config-dial wire shape `calibration`/`contextWindow` use.
-// Unlike birthFolded/carriedSent, losing it on a stale peer is NOT a decision-affecting divergence
-// (it never feeds canFold/protectedFromIndex) — but it must still round-trip byte-identical so a
-// replica's displayed token total and panel content agree with the host's.
-describe("replica — systemPrompt round trip (protocol v19)", () => {
-	it("serializeSnapshot → hydrateSnapshot preserves the captured system prompt", () => {
+// Issue #93, redesigned in v22: the system prompt is a BOLTED `system` BLOCK, captured host-side and
+// carried to every replica two ways — inside `SnapshotState.blocks` on a (re)snapshot, and as the
+// `config` WireEvent's `systemPrompt` create-or-replace payload on a live change. It rides `config`
+// rather than `appended` because `appended` can express neither a REPLACE (pi's effective prompt is
+// genuinely not static across a session) nor a HEAD insertion. Both paths must land the replica on
+// byte-identical state at a matching rev, or the displayed token total forks from the host's.
+describe("replica — system block round trip (protocol v22)", () => {
+	it("serializeSnapshot → hydrateSnapshot preserves the system prompt as the leading block", () => {
 		const host = live();
 		host.append(seq(2, 1000));
 		host.setSystemPrompt("You are a helpful assistant.", 8);
 
 		const state = serializeSnapshot(host, false);
-		expect(state.systemPrompt).toEqual({ text: "You are a helpful assistant.", tokens: 8 });
+		// No scalar any more — the prompt is `blocks[0]`.
+		expect((state as Record<string, unknown>).systemPrompt).toBeUndefined();
+		expect(state.blocks[0]).toMatchObject({ id: "sys:0", kind: "system", order: -1, text: "You are a helpful assistant.", tokens: 8 });
 
 		const replica = hydrateSnapshot(META, state);
 		expect(replica.systemPrompt).toEqual({ text: "You are a helpful assistant.", tokens: 8 });
 		expect(replica.stats().fullTokens).toBe(host.stats().fullTokens);
+		expect(replica.rev).toBe(host.rev);
 	});
 
-	it("a snapshot literal omitting systemPrompt (pre-v19 peer) hydrates to null, not undefined/poisoned", () => {
+	it("a snapshot with no system block hydrates to a silent absence, not undefined/poisoned", () => {
 		const host = live();
 		host.append(seq(2, 1000));
 		const state = serializeSnapshot(host, false);
-		const { systemPrompt: _drop, ...stale } = state;
-		const replica = hydrateSnapshot(META, stale as typeof state);
+		const replica = hydrateSnapshot(META, state);
 		expect(replica.systemPrompt).toBe(null);
+		expect(replica.systemBlock()).toBeUndefined();
 	});
 
 	it("a config WireEvent carrying only systemPrompt replays onto a replica without touching other dials", () => {
@@ -151,6 +155,30 @@ describe("replica — systemPrompt round trip (protocol v19)", () => {
 		applyWireEvent(replica, cfgEv!);
 		expect(replica.systemPrompt).toEqual({ text: "prompt text", tokens: 3 });
 		expect(replica.budget).toBe(budget0);
+		// The replay CREATED the block locally — same id, same head position, same rev as the host.
+		expect(replica.blocks[0]).toMatchObject({ id: "sys:0", kind: "system", order: -1 });
+		expect(replica.rev).toBe(host.rev);
+	});
+
+	it("a CHANGED prompt replays as a replace, keeping host and replica rev-aligned and block-count-equal", () => {
+		const host = live();
+		host.append(seq(2, 1000));
+		host.setSystemPrompt("first", 5);
+
+		const replica = hydrateSnapshot(META, serializeSnapshot(host, false));
+		const events: WireEvent[] = [];
+		const off = host.onEvent((e) => {
+			const w = wireEventFromTruthEvent(e);
+			if (w) events.push(w);
+		});
+		host.setSystemPrompt("second, different", 9);
+		off();
+		for (const ev of events) applyWireEvent(replica, ev);
+
+		expect(replica.rev).toBe(host.rev);
+		expect(replica.blocks.length).toBe(host.blocks.length); // replaced, not appended twice
+		expect(replica.systemPrompt).toEqual({ text: "second, different", tokens: 9 });
+		expect(replica.stats().fullTokens).toBe(host.stats().fullTokens);
 	});
 });
 
