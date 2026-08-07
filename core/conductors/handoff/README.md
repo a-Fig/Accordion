@@ -4,6 +4,13 @@ Ported from the deleted `conductors/handoff/handoff.ts` (ADR 0017, git rev `dc03
 conductor-v2 contract (`core/conductor/contract.ts` + `core/conductor/view.ts`'s `ViewConductor`
 adapter). See `handoff.ts`'s top-of-file comment for the full PORT FIDELITY notes.
 
+PR #82 factored the machinery this conductor shared near-verbatim with the sibling
+`compaction-naive` conductor into `../agedSummaryConductor.ts`'s `AgedSummaryConductor` base class
+— see that file's doc comment and "Shared base (PR #82)" below. This conductor's own file now owns
+only `HANDOFF_SYSTEM`, its two `buildPrompt` instruction strings, its count-preamble format, its
+three status messages (this one is the only one of the two that surfaces the provider's real error
+text), and the `tail-size` lock / `HANDOFF_TAIL_TOKENS = 0` declaration.
+
 This conductor automatically simulates the user's manual handoff workflow:
 
 1. Ask the current agent to write a handoff document.
@@ -49,6 +56,32 @@ aspirational. `handoff.test.ts` still drives `Truth.setLocks` directly in its ow
 setup — that exercises the conductor in isolation against `TestHost`, not the live host, but
 it is the same real enforcement path either way.
 
+## User messages are folded into the handoff too (unlike `compaction-naive`)
+
+The sibling `compaction-naive` conductor (PR #82) excludes `user`-kind blocks from its fold group —
+they stay live, full-fidelity, on the wire, and the summary may only reference them, never claim to
+preserve them. **This conductor does NOT apply the same exclusion.** That is a deliberate product
+difference, not the same bug `compaction-naive` had, for three reasons:
+
+1. **Different promise.** `compaction-naive`'s system prompt used to promise VERBATIM user
+   preservation while mechanically failing to guarantee it — that mismatch between promise and
+   mechanism was the bug. This conductor's `HANDOFF_SYSTEM` never promises verbatim preservation of
+   anything; a handoff document is explicitly a paraphrased briefing for a fresh agent, the same way
+   the human-run `handoff` skill it mirrors produces a paraphrased document, not a transcript.
+2. **Different consent.** This conductor requires ALL THREE involvement locks (`human-steering`,
+   `agent-unfold`, `tail-size`) — the strongest consent gate the codebase has — specifically because
+   its whole product is "collapse the ENTIRE prior session, including what the human asked for, to
+   near-zero." `compaction-naive` is a two-lock, budget-driven, otherwise-invisible foil; a human
+   attaching `handoff` has explicitly signed up for exactly this.
+3. **Different intent.** `compaction-naive` exists to demonstrate what happens when a conductor is
+   NOT careful about user words. `handoff` exists to demonstrate what deliberately, consensually
+   starting over looks like. Forcing user-block exclusion onto `handoff` would fold a "the user's own
+   words are removed from the wire" case back into the "fresh session, only a handoff doc survives"
+   design it was built to model in the first place.
+
+See `AgedSummaryConductor.includeInGroup`'s doc comment (`../agedSummaryConductor.ts`) for the
+mechanism both conductors share and where they diverge.
+
 ## Output-token reservation
 
 The handoff request reserves output room against the model's context window. The host clamp bounds
@@ -79,6 +112,16 @@ out of the data section and inject instructions that persist across the session 
 conductor neutralizes any such closing sentinel in interpolated content and the system prompt
 declares everything inside those tags to be untrusted data, not instructions.
 
+## Shared base (PR #82)
+
+`HandoffConductor` and `NaiveCompactionConductor` were ~90% duplicated: the same aged-region
+derivation, foreign-grouped-id exclusion, group-emission run-walk, completion launch/inflight/
+attempt-key/sticky-status lifecycle, and output-token reservation math. `../agedSummaryConductor.ts`'s
+`AgedSummaryConductor` now owns all of that; this file owns only what is genuinely different for a
+"fold the whole session, all-locks-consented" conductor (documented in its own top-of-file PORT
+FIDELITY notes) — mainly the prompt text, the `tail-size` lock, and (see above) NOT overriding
+`includeInGroup`.
+
 ## Group persistence (the one real port hazard)
 
 The old host reset this conductor's own prior folds/groups back to raw before recomputing the view
@@ -87,10 +130,10 @@ owns this." The new `Truth`/`ViewConductor` engine persists a `group` op across 
 naively porting the old `!b.grouped` checks made the handoff's own group look owned-by-someone-else
 on the very next pass and get diffed away (`ungroup`), destroying the fresh start immediately after
 creating it. The fix — `foreignGroupedIds()`, keyed on group provenance (`by !== "auto"`) rather
-than the blanket `grouped` flag — and the matching raw-baseline trigger-math adjustment are
-documented in full in `handoff.ts`'s PORT FIDELITY section (§3/§4). This is the same fix pattern
-the sibling `core/conductors/compaction-naive/compaction-naive.ts` port established first; both
-conductors solve it the same way on purpose.
+than the blanket `grouped` flag — and the matching raw-baseline trigger-math adjustment now live
+once in `AgedSummaryConductor` (`../agedSummaryConductor.ts`). This was the fix pattern this
+conductor's port established first; the sibling `compaction-naive` port followed it, and PR #82
+merged both onto the one shared implementation.
 
 ## Unavailable model link
 
