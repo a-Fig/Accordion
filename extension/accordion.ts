@@ -133,7 +133,8 @@ const DOOR_PROBE_MS = 750;
 type DoorProbe = "accordion" | "foreign" | "transient";
 // ── the controller lease (ADR 0024) ──────────────────────────────────────────
 // The lease-holder's extension refreshes controller.json's heartbeat this often while a matching
-// socket is connected; other extensions observe changes by polling the file's mtime this often.
+// socket is connected; other extensions observe changes by polling + content-comparing the file
+// this often (no mtime gating — see pollControllerFile).
 // Both are bare unref'd timers, best-effort, NEVER on the context hook.
 const CONTROLLER_HEARTBEAT_MS = 2_000;
 const CONTROLLER_POLL_MS = 1_000;
@@ -1620,7 +1621,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// spam) shouldn't amplify disk churn. A stale-but-ours or someone-else's lease still rewrites.
 		const { lease: current } = reloadControllerLease();
 		if (current && current.surfaceId === info.surfaceId && isFreshLease(current, now)) {
-			return; // already the fresh holder — nothing to write, no change to broadcast
+			// The reload above may have just adopted a holder change this extension had not yet
+			// broadcast (cache updated ⇒ later polls see no change), so emit before skipping —
+			// otherwise TAKE CONTROL is a silent no-op in the same-surfaceId dual-tab corner.
+			// Holder-dedupe in maybeBroadcastController keeps plain claim spam emitting nothing.
+			maybeBroadcastController();
+			return; // already the fresh holder — nothing to write
 		}
 		const prior = current && current.surfaceId === info.surfaceId ? current : null;
 		writeControllerLease({
