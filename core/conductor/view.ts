@@ -113,6 +113,12 @@ export abstract class ViewConductor implements Conductor {
 	 * `state-changed` while `busy` is true is safe: `applyDesired`'s reconciliation always runs
 	 * immediately after the (now-settled) propose call returns, at which point the tracked state is
 	 * already caught up — no rerun is lost, only deduplicated.
+	 *
+	 * Caveat: the "nothing else can run in the window" reasoning holds for IN-PROCESS hosts, whose
+	 * `propose` applies synchronously and resolves on a microtask. Over an out-of-process host the
+	 * awaited propose is a full wire round trip, and a genuinely external `state-changed` arriving
+	 * mid-flight would be skipped until the next host event. No shipped `ViewConductor` runs out of
+	 * process today (thermocline is a raw `Conductor`), so this stays a documented limitation.
 	 */
 	private busy = false;
 
