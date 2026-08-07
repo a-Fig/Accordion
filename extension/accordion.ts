@@ -2417,17 +2417,51 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		ingestMessages(event.messages as unknown as PiMessage[]);
 	});
 
-	// ── suppress pi's native compaction ONLY while the GUI is driving ───────────
+	// ── suppress pi's native compaction ONLY while folding is actually armed ────
+	// Owner-approved policy: suppression is gated on `foldingEnabled`, NOT on `attached()`. A
+	// connected client with folding OFF (a read-only mirror, or a preview with an attached conductor
+	// but folding disarmed) leaves pi's own overflow safety net fully intact — whoever is actually
+	// rewriting the wire owns overflow, not whoever merely has a socket open. While folding IS armed,
+	// suppression stays unconditional (no hard-overflow escape valve) — Accordion's own budget/fold
+	// state is the only thing standing between the session and overflow at that point, so pi's native
+	// compaction must not race it. When a native compaction DOES run because folding was off, the
+	// paired `session_compact` handler below notifies and the existing structural-divergence rebuild
+	// (`ingestMessages` → `rebuildTruth`, next `agent_end`/`message_end`/`context`) picks up the
+	// compacted history — including for an attached-but-collaborative conductor via `liveHost.dispatchResync()`.
 	pi.on("session_before_compact", (_event, ctx: ExtensionContext) => {
-		if (attached()) {
+		if (foldingEnabled) {
 			try {
-				ctx.ui.notify("Accordion attached — native compaction suppressed.", "info");
+				ctx.ui.notify("Accordion folding armed — native compaction suppressed.", "info");
 			} catch {
 				/* ignore */
 			}
 			return { cancel: true };
 		}
-		// detached → let pi protect itself
+		// folding off (whether or not a client is attached) → let pi protect itself natively
+	});
+
+	// ── native compaction ran while folding was off: quietly rebuild + notify ──
+	// Fires AFTER pi has actually saved a compaction (the one above did not cancel it, since folding
+	// was off). The Truth itself catches up via the normal structural-divergence path the next time
+	// `agent_end`/`message_end`/`context` reconciles pi's rewritten history (`ingestMessages` detects
+	// the mismatch and calls `rebuildTruth`, which forces every connected client to resnapshot and
+	// resyncs an attached conductor) — nothing to force here. This handler only surfaces the
+	// human-facing note when someone is actually watching; a `notify` is the lightest existing channel
+	// that reaches the human without inventing a new protocol message or interrupting anything (no
+	// modal, no lock, purely informational — same posture as the suppression notify above). There is
+	// currently no arbitrary-text GUI toast broadcast to piggyback on instead: `conductorStatus` is
+	// display-only for an attached conductor's OWN status line and is gated in the UI on
+	// `conductorState.active`, so repurposing it here would mis-render (or not render at all) when no
+	// conductor is attached — the common case for a plain read-only viewer. If a client is connected,
+	// the map itself already visibly changes shape on the forced resnapshot, which is the visual
+	// confirmation; this note is the accompanying explanation of why.
+	pi.on("session_compact", (_event, ctx: ExtensionContext) => {
+		if (!attached()) return;
+		try {
+			ctx.ui.notify("pi compacted the session natively — Accordion's map has been rebuilt to match.", "info");
+		} catch {
+			/* ignore */
+		}
 	});
 
 	pi.on("session_shutdown", () => {
