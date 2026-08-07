@@ -184,6 +184,7 @@ Colors are brand **Spectrum** identity colors — defined in [brand/accordion-br
 
 | kind | hex |
 |------|-----|
+| `system` | `#FFF6A4` |
 | `user` | `#044EFF` |
 | `text` | `#1AA6E8` |
 | `thinking` | `#B480DF` |
@@ -196,7 +197,7 @@ Colors are brand **Spectrum** identity colors — defined in [brand/accordion-br
 - Group tiles use the current chestnut group palette from `app/src/app.css`: `--group #7C5230 · --group-edge #0A0A0A · --group-accent #E8E8E8`. Summary/sliver tiles stay dark neutral via `--k-summary`.
 - Dark surfaces: `--bg #0A0A0A`, `--panel #1C1C1C` — no blue tint (blue is reserved for `user` blocks)
 - Fonts: **IBM Plex Sans** (`--sans`) / **IBM Plex Mono** (`--mono`) via `@fontsource` in `routes/+layout.svelte`
-- **Map grid:** every block is the same-size square in conversation order. Token weight = dice face 1–6. Thresholds in `ContextMap.svelte → faceFor()`: ≤100→1 · ≤500→2 · ≤1.5k→3 · ≤5k→4 · ≤15k→5 · >15k→6
+- **Map grid:** every block is the same-size square in conversation order. Token weight = dice face 1–6, including the bolted `system` block; that tile adds four inset Smoke-gray L corners as its immutable-context cue without replacing the dice face. Thresholds in `ContextMap.svelte → faceFor()`: ≤100→1 · ≤500→2 · ≤1.5k→3 · ≤5k→4 · ≤15k→5 · >15k→6
 - **Two-box layout:** grid splits at `store.protectedFromIndex` — foldable region above (thin border), protected tail below (thick accented border, `.box.prot`)
 
 ## Pi extension hooks
