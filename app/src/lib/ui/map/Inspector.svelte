@@ -104,18 +104,9 @@
 		if (pinned) stateBits.push("pinned");
 		if (bolted) stateBits.push("bolted");
 		const tok = store.calBlockTokens(b, folded ? store.effTokens(b) : b.tokens);
-		const header = [
-			`# ${KIND_LABEL[b.kind]} block`,
-			"",
-			`- kind: ${b.kind}`,
-			`- turn: ${bolted ? "preamble" : `turn ${b.turn}`}`,
-			`- tokens: ${fmt(tok)}`,
-			`- state: ${stateBits.join(", ")}`,
-			"",
-			"---",
-			"",
-		];
-		return header.join("\n") + (b.text ?? "");
+		const turnLabel = bolted ? "preamble" : `turn ${b.turn}`;
+		const header = `> ${KIND_LABEL[b.kind]} — ${turnLabel} · ${fmt(tok)} tok · ${stateBits.join(", ")}`;
+		return header + "\n\n" + (b.text ?? "");
 	}
 
 	async function openAsMd() {
