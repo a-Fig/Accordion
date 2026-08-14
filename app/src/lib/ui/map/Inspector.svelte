@@ -4,6 +4,7 @@
 	import type { AccordionStore } from "../../engine/store.svelte";
 	import type { Block, Group } from "../../engine/types";
 	import { isBolted } from "$core/digest";
+	import { isTauriEnv } from "$lib/session.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 
 	let {
@@ -91,6 +92,57 @@
 
 	// Block mode: is this block part of a group? Used to render the "part of group" link.
 	const inGroup = $derived(block ? store.groupOf(block) : null);
+
+	// "Open as .md" (issue #119) — view-only, so it's offered regardless of steerLocked or
+	// bolted (the RULE: observation is never gated, only mutating controls are).
+	let openBusy = $state(false);
+	let openError = $state("");
+
+	function markdownFor(b: Block): string {
+		const stateBits = [folded ? "folded" : "live"];
+		if (protect) stateBits.push("protected");
+		if (pinned) stateBits.push("pinned");
+		if (bolted) stateBits.push("bolted");
+		const tok = store.calBlockTokens(b, folded ? store.effTokens(b) : b.tokens);
+		const header = [
+			`# ${KIND_LABEL[b.kind]} block`,
+			"",
+			`- kind: ${b.kind}`,
+			`- turn: ${bolted ? "preamble" : `turn ${b.turn}`}`,
+			`- tokens: ${fmt(tok)}`,
+			`- state: ${stateBits.join(", ")}`,
+			"",
+			"---",
+			"",
+		];
+		return header.join("\n") + (b.text ?? "");
+	}
+
+	async function openAsMd() {
+		if (!block) return;
+		const md = markdownFor(block);
+		openBusy = true;
+		openError = "";
+		try {
+			if (isTauriEnv) {
+				const { invoke } = await import("@tauri-apps/api/core");
+				await invoke("open_text_as_md", { text: md });
+			} else {
+				// Browser-served: no filesystem/shell access from the tab, so fall back
+				// to a plain download the user opens themselves.
+				const url = URL.createObjectURL(new Blob([md], { type: "text/markdown" }));
+				const a = document.createElement("a");
+				a.href = url;
+				a.download = `accordion-${block.id.replace(/[^a-zA-Z0-9_-]/g, "_")}.md`;
+				a.click();
+				URL.revokeObjectURL(url);
+			}
+		} catch (e) {
+			openError = e instanceof Error ? e.message : String(e);
+		} finally {
+			openBusy = false;
+		}
+	}
 
 	// Group mode derived values. Token readouts calibrated (issue #11 stage 1) — display only.
 	const gMembers = $derived(group ? store.groupMembers(group) : []);
@@ -364,6 +416,24 @@
 				</button>
 			</div>
 			{/if}
+
+			<!-- Open as .md (issue #119) — view-only, so it's offered even when bolted or locked. -->
+			<div class="action-row">
+				<button
+					class="action-btn action-outline"
+					class:action-disabled={openBusy}
+					disabled={openBusy}
+					aria-disabled={openBusy}
+					onclick={openAsMd}
+					title={isTauriEnv
+						? "Write the full block to a temp .md file and open it in your default program"
+						: "Download the full block as a .md file"}
+				>
+					<Icon name="file-text" size={14} />
+					{isTauriEnv ? "Open as .md" : "Download as .md"}
+				</button>
+				{#if openError}<span class="open-md-error mono">{openError}</span>{/if}
+			</div>
 		</div>
 
 		<!-- ── Body ───────────────────────────────────────────────── -->
@@ -690,6 +760,11 @@
 		align-items: center;
 		gap: var(--sp-2);
 		flex-wrap: wrap;
+	}
+
+	.open-md-error {
+		font-size: var(--fs-xs);
+		color: var(--danger);
 	}
 
 	/* ── Button system (brand spec) ─────────────────────────── */
