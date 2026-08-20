@@ -3036,346 +3036,77 @@ Any facts, invariants, or constraints the assistant MUST remember: API keys patt
 
 Be terse everywhere EXCEPT the verbatim user messages, which must be complete. Omit pleasantries, meta-commentary, and filler. The output will be placed directly into the agent's context window.`;
 
-// conductors/in-process/doorman/classify.ts
-var READ_TOOLS = /* @__PURE__ */ new Set(["read", "view", "cat", "readfile", "read_file", "open"]);
-var SHELL_TOOLS = /* @__PURE__ */ new Set([
-  "bash",
-  "shell",
-  "sh",
-  "exec_command",
-  "run_command",
-  "execute",
-  "powershell",
-  "pwsh"
-]);
-var CODE_EXTS = /* @__PURE__ */ new Set([
-  "ts",
-  "tsx",
-  "mts",
-  "cts",
-  "js",
-  "jsx",
-  "mjs",
-  "cjs",
-  "svelte",
-  "vue",
-  "py",
-  "pyi",
-  "rs",
-  "go",
-  "java",
-  "kt",
-  "kts",
-  "c",
-  "h",
-  "cpp",
-  "cc",
-  "hpp",
-  "cxx",
-  "rb",
-  "php",
-  "swift",
-  "sql",
-  "css",
-  "scss",
-  "less",
-  "sh",
-  "bash"
-]);
-var PROSE_DATA_EXTS = /* @__PURE__ */ new Set([
-  "md",
-  "markdown",
-  "txt",
-  "rst",
-  "json",
-  "yaml",
-  "yml",
-  "toml",
-  "lock",
-  "csv",
-  "log",
-  "html",
-  "xml",
-  "svg",
-  "png",
-  "jpg",
-  "jpeg",
-  "gif",
-  "webp",
-  "pdf"
-]);
-var CSS_EXTS = /* @__PURE__ */ new Set(["css", "scss", "less"]);
-var CODE_KEYWORDS = [
-  "function ",
-  "class ",
-  "def ",
-  "import ",
-  "export ",
-  "const ",
-  "fn ",
-  "struct ",
-  "impl ",
-  "interface ",
-  "public ",
-  "async ",
-  "return ",
-  "package ",
-  "#include"
-];
-function classifyCodeRead(block, callById) {
-  if (block.kind !== "tool_result" || block.isError) return null;
-  const rawOutput = block.text;
-  if (typeof rawOutput !== "string" || rawOutput.length === 0) return null;
-  const call = block.callId ? callById.get(block.callId) : void 0;
-  const callText = call?.text;
-  const args = parseCallArgs(callText);
-  const effName = effectiveToolName(block.toolName, callText);
-  if (!effName) return null;
-  let path;
-  if (READ_TOOLS.has(effName)) {
-    path = asPath(args.file_path) ?? asPath(args.path);
-  } else if (SHELL_TOOLS.has(effName)) {
-    const command = asString(args.command);
-    if (command === void 0) return null;
-    path = singleFileCatTarget(command);
-    if (path === void 0) return null;
-  } else {
-    return null;
-  }
-  if (path !== void 0) {
-    const ext2 = extensionOf(path);
-    if (ext2 !== void 0) {
-      if (PROSE_DATA_EXTS.has(ext2)) return null;
-      if (!CODE_EXTS.has(ext2)) return null;
+// conductors/ws/triptych/content.ts
+var FENCE_RE = /```([^\r\n`]*)\r?\n([\s\S]*?)(\r?\n)```/g;
+function payloadStart(text) {
+  const marker = /\r?\nOutput:\r?\n/;
+  const found = marker.exec(text);
+  if (found === null) return 0;
+  const at = found.index;
+  const prefix = text.slice(0, at);
+  if (!/^Command:/m.test(prefix)) return 0;
+  if (!/^(?:Chunk ID|Wall time|Process exited|Original token count):/m.test(prefix)) return 0;
+  return at + found[0].length;
+}
+function countLines(text) {
+  if (text.length === 0) return 0;
+  let n = 1;
+  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) n++;
+  return n;
+}
+function languageLabel(language) {
+  if (language === "typescript") return "TypeScript";
+  if (language === "javascript") return "JavaScript";
+  return "Python";
+}
+function header(language, lines) {
+  return `[code skeleton \u2014 ${languageLabel(language)} signatures kept, bodies elided (${lines} source lines). Use recall with the fold code above for the full block.]`;
+}
+function skeletonizeBlockContent(text, engine) {
+  if (text.length === 0) return null;
+  const start = payloadStart(text);
+  const prefix = text.slice(0, start);
+  const payload = text.slice(start);
+  let cursor = 0;
+  let changed = false;
+  let spans = 0;
+  const languages = /* @__PURE__ */ new Set();
+  const parts = [];
+  FENCE_RE.lastIndex = 0;
+  for (let match = FENCE_RE.exec(payload); match !== null; match = FENCE_RE.exec(payload)) {
+    const whole = match[0];
+    const info = match[1].trim().split(/\s+/, 1)[0] || void 0;
+    const source = match[2];
+    const bodyAt = whole.indexOf(source);
+    const result2 = engine.skeletonize(source, info);
+    parts.push(payload.slice(cursor, match.index));
+    if (result2 !== null && result2.skeleton.length < source.length) {
+      parts.push(
+        whole.slice(0, bodyAt),
+        `${header(result2.language, countLines(source))}
+${result2.skeleton}`,
+        whole.slice(bodyAt + source.length)
+      );
+      changed = true;
+      spans++;
+      languages.add(result2.language);
     } else {
+      parts.push(whole);
     }
+    cursor = match.index + whole.length;
   }
-  const source = cleanSource(rawOutput);
-  if (source.length === 0) return null;
-  const ext = path !== void 0 ? extensionOf(path) : void 0;
-  const cssMode = ext !== void 0 && CSS_EXTS.has(ext);
-  const knownCodeExt = ext !== void 0 && CODE_EXTS.has(ext);
-  if (!looksLikeCode(source, cssMode)) return null;
-  if (!knownCodeExt && !cssMode) {
-    if (!hasCodeKeyword(source)) return null;
-    if (looksLikeJson(source)) return null;
+  if (cursor > 0) {
+    parts.push(payload.slice(cursor));
+    return changed ? { content: prefix + parts.join(""), spans, languages: [...languages] } : null;
   }
-  return { path, source };
-}
-function leadingToolName(callText) {
-  if (typeof callText !== "string") return void 0;
-  const trimmed = callText.trimStart();
-  if (trimmed.length === 0) return void 0;
-  const m = trimmed.match(/^([^\s{]+)/);
-  if (!m) return void 0;
-  return m[1].toLowerCase();
-}
-function effectiveToolName(toolName, callText) {
-  const own = typeof toolName === "string" ? toolName.trim().toLowerCase() : "";
-  if (own !== "" && own !== "tool") return own;
-  return leadingToolName(callText);
-}
-function parseCallArgs(callText) {
-  if (typeof callText !== "string") return {};
-  const start = callText.indexOf("{");
-  if (start < 0) return {};
-  const jsonPart = callText.slice(start);
-  try {
-    const parsed = JSON.parse(jsonPart);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed;
-    }
-  } catch {
-  }
-  return {};
-}
-function asString(v) {
-  return typeof v === "string" ? v : void 0;
-}
-function asPath(v) {
-  if (typeof v !== "string") return void 0;
-  const t = v.trim();
-  return t.length > 0 ? t : void 0;
-}
-function extensionOf(path) {
-  const cleaned = path.trim().replace(/^["']|["']$/g, "");
-  const base = cleaned.split(/[\\/]/).pop() ?? cleaned;
-  const dot = base.lastIndexOf(".");
-  if (dot <= 0 || dot === base.length - 1) return void 0;
-  return base.slice(dot + 1).toLowerCase();
-}
-function singleFileCatTarget(command) {
-  const cmd = command.trim();
-  if (cmd.length === 0) return void 0;
-  if (/[|]/.test(cmd)) return void 0;
-  if (/&&|\|\||;/.test(cmd)) return void 0;
-  if (/[<>]/.test(cmd)) return void 0;
-  if (/`|\$\(/.test(cmd)) return void 0;
-  if (/(^|\s)(-f|-F|--follow(=\S*)?|-Wait)(\s|$)/.test(cmd)) return void 0;
-  if (/\b(grep|rg|egrep|fgrep|ag|ack|find|fd|ls|dir|get-childitem|gci|tree)\b/i.test(cmd)) return void 0;
-  if (/\bgit\s+\w/i.test(cmd)) return void 0;
-  const tokens = tokenizeCommand(cmd);
-  if (tokens.length === 0) return void 0;
-  let i = 0;
-  const first = tokens[0].toLowerCase();
-  if ((first === "type" || first === "cat" || first === "bat") && tokens.length > 2) {
-    const second = tokens[1].toLowerCase();
-    if (DUMP_VERBS.has(second) || (second === "get-content" || second === "gc")) {
-      i = 1;
-    }
-  }
-  const verb = tokens[i].toLowerCase();
-  let rest = tokens.slice(i + 1);
-  if (verb === "sed") {
-    if (!rest.some((t) => t === "-n")) return void 0;
-    const fileCandidates = rest.filter((t) => !t.startsWith("-") && !isSedScript(t));
-    return soleFile(fileCandidates);
-  }
-  if (verb === "get-content" || verb === "gc") {
-    return soleFile(stripFlagsAndValues(rest));
-  }
-  if (DUMP_VERBS.has(verb)) {
-    return soleFile(stripFlagsAndValues(rest));
-  }
-  return void 0;
-}
-var DUMP_VERBS = /* @__PURE__ */ new Set(["cat", "head", "tail", "type"]);
-function isSedScript(t) {
-  const s = t.replace(/^["']|["']$/g, "");
-  return /^[$\d][\d,]*[a-z]?$/i.test(s) || /p$/.test(s);
-}
-function soleFile(candidates) {
-  const files = candidates.map((t) => t.replace(/^["']|["']$/g, "")).filter((t) => t.length > 0);
-  if (files.length !== 1) return void 0;
-  const file = files[0];
-  if (file.includes("*") || file.includes("?")) return void 0;
-  if (/[\\/]$/.test(file)) return void 0;
-  return file;
-}
-function stripFlagsAndValues(tokens) {
-  const out = [];
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
-    if (t.startsWith("-")) {
-      const next = tokens[i + 1];
-      if (next !== void 0 && /^\d+$/.test(next.replace(/^["']|["']$/g, ""))) i++;
-      continue;
-    }
-    out.push(t);
-  }
-  return out;
-}
-function tokenizeCommand(cmd) {
-  const tokens = [];
-  let cur = "";
-  let quote = null;
-  for (let i = 0; i < cmd.length; i++) {
-    const ch = cmd[i];
-    if (quote) {
-      cur += ch;
-      if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      cur += ch;
-      continue;
-    }
-    if (/\s/.test(ch)) {
-      if (cur.length > 0) {
-        tokens.push(cur);
-        cur = "";
-      }
-      continue;
-    }
-    cur += ch;
-  }
-  if (cur.length > 0) tokens.push(cur);
-  return tokens;
-}
-function cleanSource(raw) {
-  let text = stripExecHeader(raw);
-  text = stripLineNumberPrefixes(text);
-  text = stripTrailingTruncation(text);
-  return text;
-}
-function stripExecHeader(raw) {
-  const lines = raw.split("\n");
-  const limit = Math.min(lines.length, 12);
-  let outputIdx = -1;
-  for (let i = 0; i < limit; i++) {
-    if (lines[i].trim() === "Output:") {
-      outputIdx = i;
-      break;
-    }
-  }
-  if (outputIdx < 0) return raw;
-  const strongRe = /^(Wall time:|Chunk ID:|Original token count:|Process exited with code\b)/i;
-  let strong = 0;
-  for (let i = 0; i < outputIdx; i++) {
-    if (strongRe.test(lines[i].trim())) strong++;
-  }
-  if (strong === 0) return raw;
-  return lines.slice(outputIdx + 1).join("\n");
-}
-function stripLineNumberPrefixes(text) {
-  const lines = text.split("\n");
-  const prefixRe = /^\s*(\d+)\t/;
-  let nonEmpty = 0;
-  let matching = 0;
-  let prev = -Infinity;
-  let monotonic = true;
-  for (const line of lines) {
-    if (line.trim() === "") continue;
-    nonEmpty++;
-    const m = prefixRe.exec(line);
-    if (m) {
-      matching++;
-      const n = Number(m[1]);
-      if (n < prev) monotonic = false;
-      prev = n;
-    }
-  }
-  if (nonEmpty === 0) return text;
-  if (matching / nonEmpty <= 0.6) return text;
-  if (!monotonic) return text;
-  return lines.map((line) => prefixRe.test(line) ? line.replace(prefixRe, "") : line).join("\n");
-}
-function stripTrailingTruncation(text) {
-  return text.replace(/[\s.…]*[([]?\s*truncated\s*[)\]]?\s*$/i, "");
-}
-function looksLikeCode(source, cssMode) {
-  const head = source.slice(0, 4096);
-  if (cssMode) {
-    return head.includes("{") && head.includes("}");
-  }
-  let signals = 0;
-  if (hasCodeKeyword(head)) signals++;
-  const punct = (head.match(/[{}()\[\];:]/g) ?? []).length;
-  if (punct >= 6 && punct / head.length >= 0.012) signals++;
-  const lines = head.split("\n");
-  let indented = 0;
-  for (const line of lines) {
-    if (/^(\t| {2,})\S/.test(line)) indented++;
-  }
-  if (indented >= 2) signals++;
-  return signals >= 2;
-}
-function hasCodeKeyword(text) {
-  const head = text.slice(0, 4096);
-  return CODE_KEYWORDS.some((kw) => head.includes(kw));
-}
-function looksLikeJson(source) {
-  const trimmed = source.trim();
-  if (trimmed.length === 0) return false;
-  const first = trimmed[0];
-  if (first !== "{" && first !== "[") return false;
-  try {
-    const parsed = JSON.parse(trimmed);
-    return parsed !== null && typeof parsed === "object";
-  } catch {
-    return false;
-  }
+  const result = engine.skeletonize(payload);
+  if (result === null || result.skeleton.length >= payload.length) return null;
+  return {
+    content: `${prefix}${header(result.language, countLines(payload))}
+${result.skeleton}`,
+    spans: 1,
+    languages: [result.language]
+  };
 }
 
 // conductors/ws/triptych/triptych.ts
@@ -3388,7 +3119,7 @@ var TriptychConductor = class extends AgedSummaryConductor {
   }
   id = "triptych";
   label = "Triptych";
-  description = "Pressure-gated thirds: raw recent band, code-skeleton middle band, lossy compaction summary top band.";
+  description = "90%-gated thirds: raw recent band; content-detected TypeScript, JavaScript, and Python skeletons in assistant/thinking/tool results; lossy summary top band.";
   /**
    * Involvement locks (ADR 0011): fully exclusive, compaction-naive's posture (owner decision).
    * `human-steering` keeps the summarized region contiguous (a mid-region pin would split the
@@ -3430,8 +3161,13 @@ var TriptychConductor = class extends AgedSummaryConductor {
     }
     const summary = super.conduct(view);
     if (summary === null) return null;
-    if (!this.active) return summary;
-    return [...summary, ...this.skeletonCommands(view)];
+    if (!this.active) {
+      this.publishWaitingStatus();
+      return summary;
+    }
+    const skeletons = this.skeletonCommands(view);
+    this.publishDiscoveryStatus(skeletons.scanned, skeletons.folded, skeletons.declined);
+    return [...summary, ...skeletons.commands];
   }
   // ── band geometry ────────────────────────────────────────────────────────────
   /** The effective cap the bands are thirds of — same clamp the base trigger uses. */
@@ -3487,50 +3223,53 @@ var TriptychConductor = class extends AgedSummaryConductor {
   }
   // ── the middle band: skeleton folds ──────────────────────────────────────────
   /**
-   * One labeled `replace` (recoverable ⇒ `{#code FOLDED}`-tagged) per classified code read
+   * One labeled `replace` (recoverable ⇒ `{#code FOLDED}`-tagged) per content-detected code block
    * older than the bottom band that the summary group does not already cover. Blocks in the
    * not-yet-summarized part of the top band are included on purpose — they benefit from the
    * skeleton until a summary run sweeps them (at which point `ViewConductor`'s diffing clears
    * the replace as the block enters the group).
    */
   skeletonCommands(view) {
-    if (!this.skel.ready()) return [];
+    if (!this.skel.ready()) return { commands: [], scanned: 0, folded: 0, declined: 0 };
     const { bottomStart } = this.bands(view);
     const limit = Math.min(bottomStart, view.protectedFromIndex, view.blocks.length);
-    if (limit <= 0) return [];
-    let callById = null;
+    if (limit <= 0) return { commands: [], scanned: 0, folded: 0, declined: 0 };
     const out = [];
+    let scanned = 0;
     for (let i = 0; i < limit; i++) {
       const b = view.blocks[i];
-      if (b.kind !== "tool_result" || b.held || b.grouped) continue;
+      if (b.kind !== "text" && b.kind !== "thinking" && b.kind !== "tool_result") continue;
+      if (b.held || b.grouped) continue;
       if (b.tokens < MIN_SKELETON_TOKENS) continue;
       if (this.coveredIds.has(b.id) && this.includeInGroup(b)) continue;
+      scanned++;
       let content = this.skelCache.get(b.id);
       if (content === void 0) {
-        if (callById === null) {
-          callById = /* @__PURE__ */ new Map();
-          for (const c of view.blocks) if (c.kind === "tool_call" && c.callId) callById.set(c.callId, c);
-        }
-        content = this.evaluateSkeleton(b, callById);
+        content = this.evaluateSkeleton(b);
         this.skelCache.set(b.id, content);
       }
       if (content === null) continue;
       out.push({ kind: "replace", id: b.id, content, recoverable: true });
     }
-    return out;
+    return { commands: out, scanned, folded: out.length, declined: scanned - out.length };
   }
-  /** Classify → skeletonize → label → shrink-gate. Null = decline (cached, never re-parsed). */
-  evaluateSkeleton(b, callById) {
-    const info = classifyCodeRead(b, callById);
-    if (info === null) return null;
-    const skeleton = this.skel.skeletonize(info.path, info.source);
-    if (skeleton === null) return null;
-    const srcLines = countLines(info.source);
-    const content = `${skeletonHeader(info.path, srcLines)}
-${skeleton}`;
+  /** Discover → skeletonize → label → shrink-gate. Null = decline (cached, never re-parsed). */
+  evaluateSkeleton(b) {
+    const found = skeletonizeBlockContent(b.text ?? "", this.skel);
+    if (found === null) return null;
+    const content = found.content;
     const original = b.text ?? "";
     if (original.length === 0 || content.length > original.length * SHRINK_MAX) return null;
     return content;
+  }
+  publishDiscoveryStatus(scanned, folded, declined) {
+    if (this.failureStatus !== null) return;
+    const text = `Triptych: ${scanned} scanned \xB7 ${folded} folded \xB7 ${declined} declined`;
+    this.host.setStatus(text, { scanned, folded, declined });
+  }
+  publishWaitingStatus() {
+    if (this.failureStatus !== null) return;
+    this.host.setStatus("Triptych: waiting for 90% context pressure", { active: false });
   }
   // ── summary prompt + status strings (subclass-owned by the AgedSummaryConductor contract) ──
   /* The two instruction strings are compaction-naive's VERBATIM (the owner's spec is "the same
@@ -3561,16 +3300,6 @@ ${body}`;
     return "Triptych: summary unavailable \u2014 waiting for live model link";
   }
 };
-function skeletonHeader(path, srcLines) {
-  const what = path !== void 0 ? path : "a code file";
-  return `[code skeleton of ${what} \u2014 signatures kept, bodies elided (${srcLines} source lines). Use recall with the fold code above for the full file.]`;
-}
-function countLines(s) {
-  if (s.length === 0) return 0;
-  let n = 1;
-  for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
-  return n;
-}
 export {
   TriptychConductor,
   runRemoteConductor

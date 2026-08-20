@@ -6,13 +6,20 @@ each differently:
 | band | region | treatment |
 |---|---|---|
 | **bottom** | the most recent ~⅓ of the cap (raw tokens from the tip; never smaller than the protected tail) | untouched |
-| **middle** | older than the bottom band, not yet summarized | code-file `tool_result` reads → **tree-sitter L2 skeleton** (signatures kept, bodies elided) as a labeled, recoverable `replace` fold — `{#code FOLDED}`-tagged, so `recall` still reaches the full source. Everything else untouched (code-only v1) |
+| **middle** | older than the bottom band, not yet summarized | TypeScript, JavaScript, and Python discovered directly in assistant text, thinking, or tool-result content → **tree-sitter L2 skeleton** (signatures kept, bodies elided) as a labeled, recoverable `replace` fold — `{#code FOLDED}`-tagged, so `recall` still reaches the full source. Everything else remains untouched |
 | **top** | older than ~⅔ of the cap | swept into ONE lossy summary group using compaction-naive's `COMPACTION_SYSTEM` prompt **verbatim** — untagged, agent-unrecoverable, recursive |
 
 **Pressure-gated:** inert until the visible window first crosses the shared 90%
 high-water mark (`TRIGGER`). The first crossing arranges the context into thirds;
 activation is then sticky — skeletons keep applying as blocks age past the bottom
 boundary, summaries re-run at each subsequent 90% crossing.
+
+Discovery is content-only: Triptych does not consult tool names, tool arguments,
+file paths, or extensions. It examines raw supported-language source and explicit
+Markdown code fences, while preserving prose and command-output wrappers around a
+detected span. User, system, and tool-call blocks are never candidates. The
+existing conductor status reports whether Triptych is waiting for the 90% gate and,
+after activation, how many eligible blocks were scanned, folded, and declined.
 
 **Fully exclusive** (ADR 0011): locks `human-steering` + `agent-unfold`. `recall`
 is never lockable, so skeletons stay readable in full; the summary group is the
@@ -22,11 +29,12 @@ one one-way door (only a human detach — the freeze kill switch — recovers it
 
 | file | what |
 |---|---|
-| `triptych.ts` | the conductor — `AgedSummaryConductor` subclass: band geometry, sticky activation, skeleton `replace` folds with a decline-to-fold shrink gate, triptych-branded statuses. Engine-agnostic: the skeletonizer is injected (`Skeletonizer` interface) |
+| `triptych.ts` | the conductor — `AgedSummaryConductor` subclass: band geometry, sticky activation, content discovery, skeleton `replace` folds with a decline-to-fold shrink gate, triptych-branded statuses. Engine-agnostic: the skeletonizer is injected (`Skeletonizer` interface) |
+| `content.ts` | content-span discovery and reconstruction: raw source, fenced code, and command-output payload handling without tool/path provenance |
 | `skeleton.mjs` | the tree-sitter L2 engine, ported from the skeleton-lab research (branch `claude/code-skeleton-extraction-rv0ovo`, `research/skeleton-lab/`): web-tree-sitter + tree-sitter-wasms (ts/tsx/js/py), byte-range splice, ASCII parse-valid elision markers with line counts, error-tolerant. ~80–90% removal on typical files at full signature recall |
 | `runner.mjs` | the spawn entry point — imports the committed `triptych-sdk.mjs`, injects `./skeleton.mjs`, dials back as `?role=conductor&token=…` |
 | `triptych-sdk.mjs` | **committed generated artifact** (do not edit): the conductor + its `core/` graph, bundled by `extension/build-remote-sdk.mjs`. Regenerate after touching `triptych.ts`, its `conductors/in-process` imports, or `core/conductor/remote.ts` |
-| `skeleton.test.ts` / `triptych.test.ts` | engine regression suite (skips cleanly without node_modules) / conductor golden tests (fake engine, no deps) |
+| `skeleton.test.ts` / `content.test.ts` / `triptych.test.ts` | engine confidence and skeleton regressions / content reconstruction regressions / conductor golden tests |
 | `testdata/` | fixture corpus ported from the research lab (provenance in its README) |
 
 ## One-time setup (repo checkouts)

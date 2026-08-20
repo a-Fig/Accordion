@@ -19,13 +19,11 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
   // Loaded in beforeAll rather than at module scope so the dynamic import
   // itself never runs (and can never throw) when the suite is skipped.
   let engine: typeof import("./skeleton.mjs")["default"];
-  let langOf: typeof import("./skeleton.mjs")["langOf"];
   let fs: typeof import("node:fs");
 
   beforeAll(async () => {
     const mod = await import("./skeleton.mjs");
     engine = mod.default;
-    langOf = mod.langOf;
     fs = await import("node:fs");
     await engine.init();
   });
@@ -36,6 +34,10 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
 
   function removalPct(original: string, skeleton: string): number {
     return (1 - skeleton.length / original.length) * 100;
+  }
+
+  function skel(source: string, hint?: string): string | null {
+    return engine.skeletonize(source, hint)?.skeleton ?? null;
   }
 
   const ALL_FIXTURES = [
@@ -51,21 +53,37 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
     "lib.es2015.collection.d.ts",
   ];
 
-  describe("langOf", () => {
-    it("maps extensions to the expected grammar keys", () => {
-      expect(langOf("foo.ts")).toBe("ts");
-      expect(langOf("foo.mts")).toBe("ts");
-      expect(langOf("foo.cts")).toBe("ts");
-      expect(langOf("foo.tsx")).toBe("tsx");
-      expect(langOf("foo.jsx")).toBe("tsx");
-      expect(langOf("foo.js")).toBe("js");
-      expect(langOf("foo.mjs")).toBe("js");
-      expect(langOf("foo.cjs")).toBe("js");
-      expect(langOf("foo.py")).toBe("py");
-      expect(langOf("foo.pyi")).toBe("py");
-      expect(langOf("foo.rs")).toBeNull();
-      expect(langOf("no-extension")).toBeNull();
-      expect(langOf("lib.es2015.collection.d.ts")).toBe("ts");
+  describe("content language inference", () => {
+    it("detects the three supported language families without file names", () => {
+      expect(engine.skeletonize(read("agentView.ts"))?.language).toBe("typescript");
+      expect(engine.skeletonize(read("mock-server.min.js"))?.language).toBe("javascript");
+      expect(engine.skeletonize(read("reprlib.py"))?.language).toBe("python");
+    });
+
+    it("uses in-context fence hints and rejects unsupported ones", () => {
+      expect(engine.skeletonize(read("agentView.ts"), "ts")?.language).toBe("typescript");
+      expect(engine.skeletonize("fn main() {}", "rust")).toBeNull();
+    });
+
+    it("rejects prose, JSON, logs, and search listings", () => {
+      const prose =
+        "The deployment completed successfully. We reviewed the request and kept the existing " +
+        "behavior because it is clear, stable, and easy to explain. This paragraph is not source code.";
+      const json = JSON.stringify(
+        { status: "ok", items: Array.from({ length: 30 }, (_, i) => ({ id: i, active: i % 2 === 0 })) },
+        null,
+        2,
+      );
+      const logs = Array.from(
+        { length: 40 },
+        (_, i) => `2026-08-04T10:${String(i).padStart(2, "0")}:00Z INFO worker=${i % 4} completed request ${i}`,
+      ).join("\n");
+      const search = Array.from(
+        { length: 40 },
+        (_, i) => `src/module${i}.ts:${i + 1}: export function result${i}`,
+      ).join("\n");
+
+      for (const source of [prose, json, logs, search]) expect(engine.skeletonize(source)).toBeNull();
     });
   });
 
@@ -74,25 +92,21 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
       expect(engine.ready()).toBe(true);
     });
 
-    it("returns null for an unsupported extension", () => {
-      expect(engine.skeletonize("foo.rs", "fn main() {}")).toBeNull();
-    });
-
-    it("returns null for a missing/empty path", () => {
-      expect(engine.skeletonize("", "const x = 1;")).toBeNull();
+    it("returns null for missing/empty source", () => {
+      expect(engine.skeletonize("")).toBeNull();
       // @ts-expect-error deliberately exercising a bad-input guard
-      expect(engine.skeletonize(undefined, "const x = 1;")).toBeNull();
+      expect(engine.skeletonize(undefined)).toBeNull();
     });
 
-    it("never throws on any fixture, and returns a non-null string", () => {
+    it("never throws on any fixture, and returns a non-null match", () => {
       for (const name of ALL_FIXTURES) {
         const src = read(name);
-        let out: string | null = null;
+        let out: ReturnType<typeof engine.skeletonize> = null;
         expect(() => {
-          out = engine.skeletonize(name, src);
+          out = engine.skeletonize(src);
         }).not.toThrow();
         expect(out).not.toBeNull();
-        expect(typeof out).toBe("string");
+        expect(typeof out?.skeleton).toBe("string");
       }
     });
   });
@@ -104,10 +118,10 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
         // A structurally-independent (but content-identical) string object,
         // so the two calls can never accidentally share any cached identity.
         const src2 = (" " + src1).slice(1);
-        const out1 = engine.skeletonize(`${name}`, src1);
-        const out2 = engine.skeletonize(`${name.slice(0)}`, src2);
+        const out1 = engine.skeletonize(src1);
+        const out2 = engine.skeletonize(src2);
         expect(out1).not.toBeNull();
-        expect(out1).toBe(out2);
+        expect(out1).toEqual(out2);
       }
     });
   });
@@ -115,7 +129,7 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
   describe("no bare U+2026 ellipsis anywhere, and the marker shapes are present", () => {
     it("never emits a U+2026 character", () => {
       for (const name of ALL_FIXTURES) {
-        const out = engine.skeletonize(name, read(name))!;
+        const out = skel(read(name))!;
         expect(out.includes("…")).toBe(false);
       }
     });
@@ -123,14 +137,14 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
     it("brace-language outputs contain a `{ /* ... N lines` body marker", () => {
       // agentView.ts / wire.ts both have plenty of real function bodies.
       for (const name of ["agentView.ts", "wire.ts"]) {
-        const out = engine.skeletonize(name, read(name))!;
+        const out = skel(read(name))!;
         expect(out).toMatch(/\{ \/\* \.\.\. \d+ lines \*\/ \}/);
       }
     });
 
     it("python outputs contain a `...  # ...` body marker", () => {
       for (const name of ["reprlib.py", "textwrap.py", "decorator_maze.py"]) {
-        const out = engine.skeletonize(name, read(name))!;
+        const out = skel(read(name))!;
         expect(out).toMatch(/\.\.\.  # \.\.\. \d+ lines/);
       }
     });
@@ -139,7 +153,7 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
   describe("typical files: signature survival + substantial removal", () => {
     it("agentView.ts keeps resolveUnfold/resolveRecall signatures and removes >= 55%", () => {
       const src = read("agentView.ts");
-      const out = engine.skeletonize("agentView.ts", src)!;
+      const out = skel(src)!;
       expect(out).toContain("export function resolveUnfold(truth: Truth, codes: string[])");
       expect(out).toContain("export function resolveRecall(truth: Truth, codes: string[])");
       expect(removalPct(src, out)).toBeGreaterThanOrEqual(55);
@@ -147,7 +161,7 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
 
     it("wire.ts keeps linearize/applyPlan signatures and removes >= 55%", () => {
       const src = read("wire.ts");
-      const out = engine.skeletonize("wire.ts", src)!;
+      const out = skel(src)!;
       expect(out).toContain("export function linearize(messages: PiMessage[], orderStart = 0, turnStart = 0)");
       expect(out).toContain("export function applyPlan(messages: PiMessage[], ops: FoldOp[], groups: GroupOp[] = [])");
       expect(removalPct(src, out)).toBeGreaterThanOrEqual(55);
@@ -155,7 +169,7 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
 
     it("reprlib.py keeps `class Repr` / `def repr_str` and removes >= 55%", () => {
       const src = read("reprlib.py");
-      const out = engine.skeletonize("reprlib.py", src)!;
+      const out = skel(src)!;
       expect(out).toContain("class Repr:");
       expect(out).toContain("def repr_str(self, x, level):");
       expect(removalPct(src, out)).toBeGreaterThanOrEqual(55);
@@ -163,7 +177,7 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
 
     it("textwrap.py keeps `def wrap` / `class TextWrapper` and removes >= 55%", () => {
       const src = read("textwrap.py");
-      const out = engine.skeletonize("textwrap.py", src)!;
+      const out = skel(src)!;
       expect(out).toContain("class TextWrapper:");
       expect(out).toContain("def wrap(text, width=70, **kwargs):");
       expect(removalPct(src, out)).toBeGreaterThanOrEqual(55);
@@ -175,7 +189,7 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
       const src = read("ops_truncated.ts");
       let out: string | null = null;
       expect(() => {
-        out = engine.skeletonize("ops_truncated.ts", src);
+        out = skel(src);
       }).not.toThrow();
       expect(typeof out).toBe("string");
     });
@@ -184,7 +198,7 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
       const src = read("mock-server.min.js");
       let out: string | null = null;
       expect(() => {
-        out = engine.skeletonize("mock-server.min.js", src);
+        out = skel(src);
       }).not.toThrow();
       expect(typeof out).toBe("string");
     });
@@ -192,7 +206,7 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
     it("string-hell.ts (code-shaped string/template content) skeletonizes without throwing " +
       "and keeps its real exported signatures", () => {
       const src = read("string-hell.ts");
-      const out = engine.skeletonize("string-hell.ts", src)!;
+      const out = skel(src)!;
       expect(out).toContain("export function buildQuery(spec: QuerySpec): string");
       expect(out).toContain("export function renderBanner(name: string, level: number): string");
       expect(out).toContain("export class TemplateBook");
@@ -202,14 +216,14 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
       const src = read("mixed-eol-indent.ts");
       let out: string | null = null;
       expect(() => {
-        out = engine.skeletonize("mixed-eol-indent.ts", src);
+        out = skel(src);
       }).not.toThrow();
       expect(typeof out).toBe("string");
     });
 
     it("decorator_maze.py keeps decorated real def names but not the docstring-embedded fake ones", () => {
       const src = read("decorator_maze.py");
-      const out = engine.skeletonize("decorator_maze.py", src)!;
+      const out = skel(src)!;
 
       // Real, decorated definitions must survive as structure.
       expect(out).toContain("def compute(self, a: int, b: int) -> int:");
@@ -232,7 +246,7 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
   describe("lib.es2015.collection.d.ts: the all-contract decline case", () => {
     it("keeps every interface signature whole (nothing here is a body to elide)", () => {
       const src = read("lib.es2015.collection.d.ts");
-      const out = engine.skeletonize("lib.es2015.collection.d.ts", src)!;
+      const out = skel(src)!;
       expect(out).toContain("interface Map<K, V> {");
       expect(out).toContain("get(key: K): V | undefined;");
       expect(out).toContain("interface WeakMapConstructor {");
@@ -254,7 +268,7 @@ describe.skipIf(!nodeModulesPresent)("triptych/skeleton.mjs", () => {
     // original guess — see the task report for this deviation.
     it("removes markedly less than a typical body-heavy file (documented deviation: <30% -> <65%)", () => {
       const src = read("lib.es2015.collection.d.ts");
-      const out = engine.skeletonize("lib.es2015.collection.d.ts", src)!;
+      const out = skel(src)!;
       expect(removalPct(src, out)).toBeLessThan(65);
     });
   });
