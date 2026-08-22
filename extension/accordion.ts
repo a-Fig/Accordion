@@ -173,6 +173,19 @@ interface RuntimeDependencies {
 	 * here is swallowed, exactly like every other optional host API this file calls.
 	 */
 	onFoldingChanged?: (enabled: boolean) => void;
+	/**
+	 * Additive HOST seam (`extension/sidecar.ts`): labels this session's registry entry
+	 * (`SessionEntry.harness`/`title`, `app/src/lib/live/registry.ts`) as coming from a non-pi
+	 * harness, for the Sessions sidebar's `pi | vibe | Claude Code` source switcher. A pi host never
+	 * passes this, so `meta.harness`/`meta.title` default to the existing pi behavior byte-identical
+	 * (`"pi"` / `"pi session"`). `title` is a plain string, not a callback: `dependencies` is a single
+	 * object passed once at `accordionLive()` call time, but `meta` re-reads `dependencies.harness`
+	 * fresh on every rebuild (module load AND `session_start`) rather than caching it, so a caller MAY
+	 * mutate the SAME object's `title` field after the fact (see sidecar.ts's `hello` handler, which
+	 * fills it in once the harness's session cwd is known) and have it observed the next time `meta`
+	 * is rebuilt.
+	 */
+	harness?: { kind: "pi" | "vibe"; title?: string };
 }
 // Vite's fixed localhost:1420 Origin is browser-obtainable, unlike Tauri's production custom
 // origins. Trust it only for an explicit local development session; shipped installs stay closed.
@@ -419,7 +432,14 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// surfaceId/label decide who may steer (the READ-ONLY controller gate) and who claimed the lease.
 	const clients = new Map<WebSocket, { role: Role; surfaceId: string | null; label: string | null }>();
 	let sessionId = "";
-	let meta = { title: "pi session", cwd: "", model: "", contextWindow: null as number | null, format: "pi" as const };
+	let meta = {
+		title: dependencies.harness?.title ?? "pi session",
+		cwd: "",
+		model: "",
+		contextWindow: null as number | null,
+		format: "pi" as const,
+		harness: dependencies.harness?.kind ?? ("pi" as const),
+	};
 	let pendingSiblingOriginProbes = 0;
 	// Phase C: the socket of the currently-attached spawn conductor (null for none / in-process).
 	// `sendToConductor` routes to it; the connection handler sets it on accept, clears it on close.
@@ -764,6 +784,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			pid: process.pid,
 			cwd: meta.cwd,
 			title: meta.title,
+			harness: meta.harness,
 			model,
 			tokens,
 			contextWindow,
@@ -2417,7 +2438,14 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		sessionId = `s-${process.pid}-${Date.now()}`;
 		startedAt = Date.now();
 		try {
-			meta = { title: "pi session", cwd: process?.cwd?.() ?? "", model: "", contextWindow: null, format: "pi" };
+			meta = {
+				title: dependencies.harness?.title ?? "pi session",
+				cwd: process?.cwd?.() ?? "",
+				model: "",
+				contextWindow: null,
+				format: "pi",
+				harness: dependencies.harness?.kind ?? "pi",
+			};
 		} catch {
 			/* keep defaults */
 		}

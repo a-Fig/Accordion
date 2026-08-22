@@ -42,6 +42,7 @@ console.log = (...a: unknown[]) => console.error(...a);
 console.info = (...a: unknown[]) => console.error(...a);
 console.debug = (...a: unknown[]) => console.error(...a);
 
+import { basename } from "node:path";
 import { estTokens } from "../core/tokens";
 import { PROTOCOL_VERSION } from "../core/protocol";
 import type { PiMessage, PiPart } from "../core/wire";
@@ -139,6 +140,19 @@ let lastContextEst = 0;
 let foldingArm = false;
 let helloSeen = false;
 let shuttingDown = false;
+
+/**
+ * `RuntimeDependencies.harness` (accordion.ts) for this session — labels the registry entry
+ * `harness: "vibe"` and (once known) a real title, for the Sessions sidebar's `pi | vibe | Claude
+ * Code` source switcher (issue: sidecar sessions all showed up as the hardcoded pi title). Passed
+ * to `accordionLive()` at IMPORT TIME, before any message has been read off stdin — so `title`
+ * starts undefined and is filled in by the `hello` handler below, once the harness's session cwd is
+ * known (post-chdir). This is safe because `accordion.ts` re-reads `dependencies.harness` fresh on
+ * every `meta` rebuild (module load AND `session_start`) rather than caching it at call time, and
+ * `session_start` is always sent strictly after `hello`/`ready` — so by the time it fires, this
+ * mutation has already landed.
+ */
+const harnessDeps: { kind: "vibe"; title?: string } = { kind: "vibe" };
 
 // ── the `pi` shim ────────────────────────────────────────────────────────────
 type Handler = (event: any, ctx: any) => unknown;
@@ -662,6 +676,18 @@ async function handle(msg: any): Promise<void> {
 					console.error("[sidecar] could not chdir to the harness cwd:", err);
 				}
 			}
+			// Registry-entry title (harnessDeps, above): computed HERE — after the chdir just above —
+			// so it reflects the real session cwd. Only set once: a repeat `hello` (M8) must not
+			// overwrite an already-observed title with a possibly different cwd basis, since the
+			// session itself hasn't restarted.
+			if (!harnessDeps.title) {
+				try {
+					const base = basename(process.cwd());
+					harnessDeps.title = base ? `vibe · ${base}` : "vibe session";
+				} catch {
+					harnessDeps.title = "vibe session";
+				}
+			}
 			// IDEMPOTENT (M8): a repeat `hello` re-answers with the CURRENT surface and the CURRENT
 			// folding arm — it never resets session state, and never claims the arm is off when it is
 			// on. Everything above is itself idempotent (same model, same flags, same cwd).
@@ -921,6 +947,7 @@ accordionLive(pi as any, {
 		foldingArm = enabled; // mirrored so a repeat `hello` restates the CURRENT arm (M8)
 		send({ type: "folding", enabled });
 	},
+	harness: harnessDeps,
 });
 
 // Every `register*` call has now run, so `ready` (emitted by the `hello` handler) can describe the

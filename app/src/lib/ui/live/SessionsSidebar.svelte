@@ -23,8 +23,10 @@
 		onselectclaude = () => {},
 		browserServed = false,
 	}: {
-		source?: "pi" | "claude";
-		onsource?: (s: "pi" | "claude") => void;
+		source?: "pi" | "vibe" | "claude";
+		onsource?: (s: "pi" | "vibe" | "claude") => void;
+		// Every live session, of EITHER harness — filtered below by `SessionEntry.harness`, not by the
+		// caller (registry.ts: absent/`"pi"` ⇒ pi, `"vibe"` ⇒ the mistral-vibe sidecar bridge).
 		sessions: SessionEntry[];
 		selected: string | null;
 		connected: boolean;
@@ -36,9 +38,9 @@
 		onselectclaude?: (s: ClaudeCodeSession) => void;
 		// Browser-served mode: the extension's own HTTP server lists every live session
 		// (no Tauri fs access needed — see extension/accordion.ts /__accordion/sessions), so
-		// the rail renders the SAME multi-session list as desktop. The only thing it hides is
-		// the source switcher: browsing read-only Claude Code transcripts reads ~/.claude
-		// straight off disk, which still requires the Tauri Rust layer.
+		// the rail renders the SAME multi-session list as desktop, pi and vibe both. The only
+		// thing it hides is Claude Code: browsing read-only Claude Code transcripts reads
+		// ~/.claude straight off disk, which still requires the Tauri Rust layer.
 		browserServed?: boolean;
 	} = $props();
 
@@ -91,9 +93,35 @@
 		return baseName(s.cwd) || s.title || "session";
 	}
 
-	// browserServed forces the pi source (no CC transcript browsing without Tauri fs access).
-	const effectiveSource = $derived(browserServed ? "pi" : source);
-	const activeCount = $derived(effectiveSource === "pi" ? sessions.length : claudeSessions.length);
+	// browserServed hides Claude Code only (no CC transcript browsing without Tauri fs access) — pi
+	// and vibe both stay selectable, since browser-served discovery lists live sessions of either.
+	const effectiveSource = $derived(browserServed && source === "claude" ? "pi" : source);
+	// `SessionEntry.harness` is absent for every pre-existing/pi-written entry (registry.ts) —
+	// that absence reads as "pi", never as "unknown"/"other".
+	const piSessions = $derived(sessions.filter((s) => (s.harness ?? "pi") === "pi"));
+	const vibeSessions = $derived(sessions.filter((s) => s.harness === "vibe"));
+	const liveSessions = $derived(effectiveSource === "vibe" ? vibeSessions : piSessions);
+	const activeCount = $derived(effectiveSource === "claude" ? claudeSessions.length : liveSessions.length);
+	const sourceOptions: import("$lib/ui/SegControl.svelte").SegOption[] = $derived(
+		browserServed
+			? [
+					{ id: "pi", label: "pi", icon: "terminal" },
+					{ id: "vibe", label: "vibe", icon: "terminal" },
+				]
+			: [
+					{ id: "pi", label: "pi", icon: "terminal" },
+					{ id: "vibe", label: "vibe", icon: "terminal" },
+					{ id: "claude", label: "Claude Code", icon: "message-square" },
+				],
+	);
+	function nextSource(): "pi" | "vibe" | "claude" {
+		if (source === "pi") return "vibe";
+		if (source === "vibe") return browserServed ? "pi" : "claude";
+		return "pi";
+	}
+	function pillLabel(s: "pi" | "vibe" | "claude"): string {
+		return s === "pi" ? "pi" : s === "vibe" ? "vibe" : "CC";
+	}
 </script>
 
 <aside class="rail" class:collapsed>
@@ -108,21 +136,19 @@
 			<Logo size={20} />
 		</button>
 
-		{#if !browserServed}
 		<!-- Tiny source toggle pill -->
 		<button
 			class="src-pill"
-			title="Switch source (pi / Claude Code)"
+			title="Switch source (pi / vibe{browserServed ? '' : ' / Claude Code'})"
 			aria-label="Switch source"
-			onclick={() => onsource(source === "pi" ? "claude" : "pi")}
+			onclick={() => onsource(nextSource())}
 		>
-			{source === "pi" ? "pi" : "CC"}
+			{pillLabel(source)}
 		</button>
-		{/if}
 
-		{#if effectiveSource === "pi"}
+		{#if effectiveSource !== "claude"}
 			<div class="icon-list">
-				{#each sessions as s (s.sessionId)}
+				{#each liveSessions as s (s.sessionId)}
 					{@const isSel = s.sessionId === selected}
 					<button
 						class="rail-btn dot-btn"
@@ -202,42 +228,43 @@
 			</button>
 		</div>
 
-		{#if !browserServed}
 		<!-- Source eyebrow + switcher -->
 		<div class="source-section">
 			<span class="eyebrow">Source</span>
 			<div class="source-row">
 				<SegControl
-					options={[
-						{ id: "pi", label: "pi", icon: "terminal" },
-						{ id: "claude", label: "Claude Code", icon: "message-square" },
-					]}
+					options={sourceOptions}
 					value={source}
-					onchange={(v) => onsource(v as "pi" | "claude")}
+					onchange={(v) => onsource(v as "pi" | "vibe" | "claude")}
 					ariaLabel="Session source"
 					iconSize={11}
 				/>
 			</div>
 		</div>
-		{/if}
 
-		{#if effectiveSource === "pi"}
+		{#if effectiveSource !== "claude"}
 			<!-- Sessions eyebrow -->
 			<div class="list-header">
 				<span class="eyebrow">Sessions</span>
-				<span class="eyebrow-count mono">{sessions.length}</span>
+				<span class="eyebrow-count mono">{liveSessions.length}</span>
 			</div>
 
 			<div class="scroll">
-				{#if sessions.length === 0}
+				{#if liveSessions.length === 0}
 					<div class="empty">
 						<Icon name="terminal" size={20} class="empty-icon" />
-						<p class="empty-msg">No live pi sessions</p>
-						<p class="empty-hint">Start <code>pi</code> in a project — it shows up here on its own.</p>
+						<p class="empty-msg">No live {effectiveSource} sessions</p>
+						<p class="empty-hint">
+							{#if effectiveSource === "vibe"}
+								Start a <code>mistral-vibe</code> session with the Accordion sidecar attached — it shows up here on its own.
+							{:else}
+								Start <code>pi</code> in a project — it shows up here on its own.
+							{/if}
+						</p>
 					</div>
 				{:else}
 					<ul class="list">
-						{#each sessions as s (s.sessionId)}
+						{#each liveSessions as s (s.sessionId)}
 							{@const p = pct(s)}
 							{@const isSel = s.sessionId === selected}
 							<li>

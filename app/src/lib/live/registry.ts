@@ -98,6 +98,15 @@ export interface SessionEntry {
 	startedAt: number;
 	/** Epoch ms of the last heartbeat refresh — the staleness/liveness signal. */
 	heartbeatAt: number;
+	/**
+	 * Which harness advertised this session — `"pi"` (the extension's native host) or `"vibe"` (the
+	 * mistral-vibe fork, hosted through `extension/sidecar.ts`; see `docs/sidecar-protocol.md`).
+	 * OPTIONAL and ABSENT ⇒ `"pi"`: every entry written before this field existed, and every entry a
+	 * pi host writes today, carries no `harness` key at all, so a reader must treat a missing field
+	 * exactly like `"pi"` rather than as unknown/other. Powers the Sessions sidebar's `pi | vibe |
+	 * Claude Code` source switcher (`app/src/lib/ui/live/SessionsSidebar.svelte`).
+	 */
+	harness?: "pi" | "vibe";
 }
 
 /** A one-shot request from `/accordion` to foreground the app on a session. */

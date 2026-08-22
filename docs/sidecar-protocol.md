@@ -59,7 +59,7 @@ learns pi's types.
 
 | type | fields | notes |
 |---|---|---|
-| `hello` | `v:1, harness:"vibe", harnessVersion, sessionId, cwd, sessionFile?, model:{id, provider, contextWindow}, flags?:{[name]:value}` | First message. `sessionFile` = path of vibe's `messages.jsonl` if known (used for the registry entry only). `cwd` is best-effort `chdir`'d before `session_start`, since `accordion.ts` captures `process.cwd()` for its registry entry. `sessionId` is **informational**: the extension mints its own (`s-<pid>-<ms>`) and the registry entry's `title` is `accordion.ts`'s hardcoded `"pi session"` — `SessionEntry` (`app/src/lib/live/registry.ts`) has no harness/kind field to label, and adding one is an app change this bridge deliberately does not make. |
+| `hello` | `v:1, harness:"vibe", harnessVersion, sessionId, cwd, sessionFile?, model:{id, provider, contextWindow}, flags?:{[name]:value}` | First message. `sessionFile` = path of vibe's `messages.jsonl` if known (used for the registry entry only). `cwd` is best-effort `chdir`'d before `session_start`, since `accordion.ts` captures `process.cwd()` for its registry entry. `sessionId` is **informational**: the extension mints its own (`s-<pid>-<ms>`). The registry entry's `title` and `harness` fields ARE labeled: `SessionEntry.harness` (`app/src/lib/live/registry.ts`) is `"pi" | undefined` for a pi host and `"vibe"` for this bridge, and the title defaults to `` `vibe · <cwd basename>` `` — both sourced from `RuntimeDependencies.harness` (`accordion.ts`), which this file constructs from the `hello` message's (post-`chdir`) `process.cwd()`. Powers the Sessions sidebar's `pi \| vibe \| Claude Code` source switcher. |
 | `shutdown` | — | see Exit. |
 
 ### pi hooks (fire-and-forget unless `req` is present)
@@ -263,7 +263,12 @@ not a request for the sidecar to change.
   usages into the pairing window would poison the calibration anchor. The discriminator is object
   identity — `messages is self.messages` — which also gates the `context` hook itself.
 - `session_before_compact` is sent in the **notification** form (no `req`); the harness never
-  cancels its own compaction from the sidecar's answer.
+  cancels its own compaction from the sidecar's answer. The matching `session_compact` carries the
+  full POST-compaction `messages`.
+- A `context` whose message list would be **empty** is never sent: it is malformed on the wire and
+  would be answered `null` anyway, so the harness skips the round trip and passes through.
+- Outbound lines are refused above the sidecar's **64 MB** cap rather than written and silently
+  dropped; the affected `context` then times out into a normal passthrough.
 
 **Replies the harness reads**
 
@@ -273,8 +278,10 @@ not a request for the sidecar to change.
   `SkillManager` searches a directory for `<child>/SKILL.md`, so each returned path whose own
   `SKILL.md` exists is lifted to its parent before being added. `promptPaths` and `themePaths` are
   ignored: vibe has no equivalent runtime list to extend.
-- A `hook_result{messages}` that is not a list, or whose entries fail
-  `LLMMessage.model_validate`, is treated exactly like a timeout: passthrough plus a counter bump.
+- A `hook_result{messages}` that is not a list, that is **longer than the request** (Accordion may
+  collapse a group, so shorter is legal and longer is not a rewrite of what was sent), or whose
+  entries fail `LLMMessage.model_validate`, is treated exactly like a timeout: passthrough plus a
+  counter bump.
 
 **Not emitted by this harness**
 

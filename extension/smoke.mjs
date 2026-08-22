@@ -107,6 +107,7 @@ if (!(entry.port > 0)) fails.push(`registry port not assigned (got ${entry.port}
 if (entry.registryProtocol !== 1) fails.push(`registry protocol mismatch (${entry.registryProtocol})`);
 if (entry.model !== "test/model") fails.push(`model not captured (${entry.model})`);
 if (entry.protocolVersion !== PROTOCOL_VERSION) fails.push(`protocol version expected ${PROTOCOL_VERSION}, got ${entry.protocolVersion}`);
+if (entry.harness !== undefined && entry.harness !== "pi") fails.push(`a pi host's registry entry should have no/"pi" harness (got ${JSON.stringify(entry.harness)})`);
 const PORT = entry.port;
 
 // Durable-id messages (a:/u: prefixes) the whole protocol flow builds on.

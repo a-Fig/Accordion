@@ -219,6 +219,8 @@ if (entry) {
 	if (entry.contextWindow !== 128000) fails.push(`registry contextWindow not captured (got ${entry.contextWindow})`);
 	if (path.resolve(entry.cwd) !== path.resolve(S.cwd)) fails.push(`registry cwd expected ${S.cwd}, got ${entry.cwd}`);
 	if (typeof entry.title !== "string" || !entry.title) fails.push(`registry title missing (got ${JSON.stringify(entry.title)})`);
+	if (entry.harness !== "vibe") fails.push(`registry harness expected "vibe" (got ${JSON.stringify(entry.harness)})`);
+	if (entry.title !== `vibe · ${path.basename(S.cwd)}`) fails.push(`registry title expected "vibe · <cwd basename>" (got ${JSON.stringify(entry.title)})`);
 }
 const PORT = entry?.port;
 

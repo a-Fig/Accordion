@@ -29,11 +29,15 @@
 	let manualPort = $state(DEFAULT_PORT);
 	let browserServed = $state(false);
 
-	// Which session source the sidebar lists: live pi vs read-only Claude Code.
+	// Which session source the sidebar lists: live pi, live vibe (the mistral-vibe sidecar bridge),
+	// or read-only Claude Code.
 	const SRC_KEY = "accordion.sidebar.source";
-	let source = $state<"pi" | "claude">(
-		typeof localStorage !== "undefined" && localStorage.getItem(SRC_KEY) === "claude" ? "claude" : "pi",
-	);
+	function loadSource(): "pi" | "vibe" | "claude" {
+		if (typeof localStorage === "undefined") return "pi";
+		const v = localStorage.getItem(SRC_KEY);
+		return v === "claude" || v === "vibe" ? v : "pi";
+	}
+	let source = $state<"pi" | "vibe" | "claude">(loadSource());
 	$effect(() => {
 		if (typeof localStorage !== "undefined") localStorage.setItem(SRC_KEY, source);
 	});
