@@ -119,6 +119,45 @@ export function foldTag(id: string): string {
 }
 
 /**
+ * A leading `{#code FOLDED}` tag (plus any surrounding whitespace). ONE definition, shared by
+ * `Truth` (which strips it so the engine stays the sole author of the tag) and `agentView`
+ * (which reads its PRESENCE as the agent's permission to reach the block).
+ */
+export const LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
+
+/**
+ * Does this wire text carry a fold tag — i.e. did the ENGINE author it?
+ *
+ * The tag is the agent's handle: it is the only way a code ever reaches the model, so text without
+ * one is text the agent was never given a way to ask about. Two substitutions are deliberately
+ * untagged, and this predicate is what makes that absence mean something:
+ *   • a HUMAN-authored digest (`opFold` with `op.digest`) — the human's own words replace the
+ *     block, and an `unfold` handle would let the agent undo exactly the curation they just did;
+ *   • a conductor's non-recoverable `replace` (`recoverable: false`), which is verbatim by contract.
+ * `resolveUnfold`/`resolveRecall` consult this so a `foldCode` HASH COLLISION with some other
+ * block's visible tag can never restore one of them by accident.
+ */
+export function hasFoldTag(text: string): boolean {
+	return LEADING_FOLD_TAG.test(text);
+}
+
+/**
+ * What a human-emptied block collapses to on the wire.
+ *
+ * A user who clears the digest editor is saying "the agent should not see this block". Per-block
+ * folding cannot honour that literally: it is content SUBSTITUTION, and `applyPlan` refuses any
+ * fold op with an empty `digestText` (`core/wire.ts`) — which would ship the block WHOLE, the exact
+ * UI lie this repo forbids. Removing a block outright is only legal where the wire's message count
+ * may change, i.e. a GROUP drop (`Group.digest === null`), which carries the tool-pair fixpoint and
+ * the role-validity floor to keep the result provider-valid. So the block-level answer is the
+ * smallest honest placeholder: three tokens that say plainly that something was here and is gone.
+ *
+ * Untagged by construction — it is a human-authored digest, so `hasFoldTag` is false for it and the
+ * agent gets no handle to unfold or recall what was removed.
+ */
+export const EMPTY_DIGEST = "{empty}";
+
+/**
  * Per-block memo of the (immutable) digest string and its token cost. `digest(b)` reads
  * only fields fixed at parse time — kind, text, id, toolName, isError, tokens — and folding
  * never touches any of them (it flips override/autoFolded/by/subst). So the result is

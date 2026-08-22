@@ -19,6 +19,7 @@ import type { Op } from "$core/ops";
 import type { TruthEvent } from "$core/events";
 import { applyWireEvent } from "$core/replica";
 import { resolveUnfold as coreResolveUnfold, resolveRecall as coreResolveRecall } from "$core/agentView";
+import { EMPTY_DIGEST } from "$core/digest";
 import type { WireEvent, WireCommand, FoldOp, GroupOp } from "$core/protocol";
 
 function cloneBlock(b: Block): Block {
@@ -403,8 +404,31 @@ export class AccordionStore {
 	}
 
 	// ── manual actions (route to the wire in live mode, else the single write path) ──
-	fold(id: string, by: Actor = "you"): void {
-		this.applyOps([{ kind: "fold", ids: [id] }], by);
+	fold(id: string, by: Actor = "you", digest?: string): void {
+		this.applyOps([{ kind: "fold", ids: [id], ...(digest ? { digest } : {}) }], by);
+	}
+
+	/**
+	 * Human-authored digest for a folded block — the text the agent receives in its place.
+	 *
+	 * `text` is trimmed. An EMPTY result becomes the literal `EMPTY_DIGEST` sentinel rather than
+	 * nothing at all: per-block folding is content SUBSTITUTION, and `applyPlan` drops any fold op
+	 * whose `digestText` is empty, which would ship the block WHOLE — the exact UI lie this repo
+	 * forbids. `{empty}` is the smallest honest thing that still rides the wire. (True removal
+	 * exists only at GROUP granularity, where the message count may legally change — see
+	 * `setGroupSummary`.)
+	 *
+	 * Passing `null` restores the ENGINE digest (the "put the auto-generated message back" path),
+	 * which also re-tags the block as agent-reachable. Folds the block first if it is still live,
+	 * so a single call is enough from an editor that opened on an unfolded block.
+	 */
+	setBlockDigest(id: string, text: string | null): void {
+		if (text === null) {
+			this.fold(id, "you");
+			return;
+		}
+		const t = text.trim();
+		this.fold(id, "you", t.length ? t : EMPTY_DIGEST);
 	}
 	unfold(id: string, by: Actor = "you"): void {
 		this.applyOps([{ kind: "unfold", ids: [id] }], by);
@@ -485,6 +509,37 @@ export class AccordionStore {
 		if (!res || !res.applied || !res.detail) return null;
 		return this.groupById(res.detail) ?? null;
 	}
+	/**
+	 * Rewrite a group's summary — the text the agent receives in place of the whole range.
+	 *
+	 * `text` is trimmed. `null` restores the engine's default recap. An EMPTY result is a true
+	 * DROP (`Group.digest === null`): unlike a per-block digest, a group legally changes the wire's
+	 * message count, so `applyPlan` really can remove the range — subject to the tool-pair fixpoint
+	 * and the role-validity floor, which degrade an illegal drop to a tagged stub rather than
+	 * producing an invalid wire. That asymmetry with `setBlockDigest` is deliberate: at group
+	 * granularity "empty" can mean gone, at block granularity it cannot.
+	 *
+	 * There is no `setGroupSummary` OP — the frozen vocabulary has no summary mutator. Instead this
+	 * ungroups and regroups in ONE transaction (one `apply`, one rev bump, one event). The group id
+	 * is derived from its first member (`g:${memberIds[0]}`), so it survives the round trip
+	 * unchanged — and with it `foldCode(g.id)`, the handle an agent may already be holding.
+	 */
+	setGroupSummary(groupId: string, text: string | null, by: Actor = "you"): void {
+		const g = this.groupById(groupId);
+		if (!g || !g.memberIds.length) return;
+		const first = g.memberIds[0];
+		const last = g.memberIds[g.memberIds.length - 1];
+		const t = text === null ? undefined : text.trim();
+		const summary: string | null | undefined = t === undefined ? undefined : t.length ? t : null;
+		this.applyOps(
+			[
+				{ kind: "ungroup", groupId },
+				{ kind: "group", ids: [first, last], summary },
+			],
+			by,
+		);
+	}
+
 	deleteGroup(id: string, by: Actor = "you"): void {
 		this.applyOps([{ kind: "ungroup", groupId: id }], by);
 	}
