@@ -9,6 +9,7 @@
 import { describe, it, expect } from "vitest";
 import { Truth } from "./truth";
 import { EMPTY_DIGEST, foldCode, foldTag, hasFoldTag } from "./digest";
+import { BLOCK_OVERHEAD, estTokens } from "./tokens";
 import { resolveUnfold, resolveRecall } from "./agentView";
 import type { Block, ParsedSession } from "./types";
 
@@ -143,6 +144,28 @@ describe("the seeded-digest trap (review finding: the editor pre-fills WITH the 
 		expect(t.get(TEXT_ID)!.subst).toBeUndefined();
 	});
 
+	// `applyPlan`'s fold-op filter guards only on `digestText` being TRUTHY, while its sibling group
+	// filter two lines below explicitly rejects a whitespace-only summary as "a provider-invalid text
+	// part". Without a trim in `opFold`, blank-but-not-empty text is truthy AND has length, so the
+	// block path shipped exactly what the group path refuses. Unreachable through the editor (which
+	// trims first) — this pins the raw-wire-command path.
+	it("a WHITESPACE-only digest falls back too, and never rides the wire as blank text", () => {
+		const t = makeTruth();
+		t.apply([{ kind: "fold", ids: [TEXT_ID], digest: "  \t \n " }], "you");
+		expect(t.get(TEXT_ID)!.subst).toBeUndefined();
+
+		const op = t.computeFoldOps().find((o) => o.id === TEXT_ID)!;
+		expect(op.digestText.trim()).not.toBe("");
+		// Fell all the way back to the engine digest, so the handle comes back with it.
+		expect(hasFoldTag(op.digestText)).toBe(true);
+	});
+
+	it("whitespace AROUND a tag is not a substitution either", () => {
+		const t = makeTruth();
+		t.apply([{ kind: "fold", ids: [TEXT_ID], digest: `\t ${foldTag(TEXT_ID)} \n` }], "you");
+		expect(t.get(TEXT_ID)!.subst).toBeUndefined();
+	});
+
 	it("a FOREIGN tag does not make a block reachable by its own code", () => {
 		// `hasFoldTag` would pass this (there IS a tag); only an OWN-tag check refuses it. A pasted or
 		// fabricated tag must not re-open the accidental-restore path.
@@ -220,6 +243,9 @@ describe("EMPTY_DIGEST — the emptied block", () => {
 		t.apply([{ kind: "fold", ids: ["r:c1"], digest: EMPTY_DIGEST }], "you");
 		expect(t.effTokens(b)).toBeLessThan(15);
 		expect(t.effTokens(b)).toBeGreaterThan(0);
+		// Exactly `estTokens("{empty}")` + BLOCK_OVERHEAD. Pinned because `core/digest.ts`'s comment
+		// states the number, and it was wrong (said three) until this was asserted.
+		expect(t.effTokens(b)).toBe(estTokens(EMPTY_DIGEST) + BLOCK_OVERHEAD);
 	});
 });
 
