@@ -17,7 +17,7 @@ import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
 import { SYSTEM_BLOCK_ID, SYSTEM_BLOCK_ORDER } from "./types";
 import type { LockName } from "./locks";
 import { hasLock } from "./locks";
-import { digest, digestTokens, substTokens, groupDigest, groupDigestTokens, wireFoldable, isBolted, foldTag } from "./digest";
+import { digest, digestTokens, substTokens, groupDigest, groupDigestTokens, wireFoldable, isBolted, foldTag, LEADING_FOLD_TAG } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { isDurableId, applyPlan, computeDegradedDropRuns, roleFloorRecap, type PiMessage, type WireMsgShape } from "./wire";
 import { collapsibleMessageKeys, messageKey } from "./groupShape";
@@ -79,10 +79,6 @@ export interface TruthStats {
 
 /** Whole-block slack allowed above `protectTokens` before the next older block is left foldable. */
 const PROTECT_OVERFLOW_CAP = 1.25;
-
-/** A leading `{#code FOLDED}` tag (with surrounding whitespace) a strategy may have baked into a
- *  recoverable `replace` body. Stripped so the engine stays the SOLE author of the tag. */
-const LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
 
 /** Re-exported from its new home in `core/groupShape.ts` (which owns the per-MESSAGE collapse
  *  fixpoint keyed on it), so every existing `import { messageKey } from ".../core/truth"` is
@@ -1407,7 +1403,13 @@ export class Truth {
 				if (this.isProtected(b)) return "protected";
 				b.override = "folded";
 				b.by = "you";
-				b.subst = undefined;
+				// A human may author the digest verbatim (issue: editable folded digest). Stored EXACTLY
+				// as given — no `{#code FOLDED}` tag is prepended, unlike `opReplace`'s recoverable path.
+				// That absence IS the contract: a tag means machine-authored and agent-reachable, so a
+				// human's own words are invisible to `unfold`/`recall` (see `agentView.ts`, which skips
+				// every untagged digest). Omitting `digest` restores the engine digest — the "put the
+				// auto-generated message back" path — and re-tags the block as agent-reachable again.
+				b.subst = op.digest && op.digest.length ? op.digest : undefined;
 				this.birthFolded.delete(id);
 				return null;
 			}
