@@ -154,6 +154,43 @@ describe("the seeded-digest trap (review finding: the editor pre-fills WITH the 
 		expect(t.isFolded(t.get(TEXT_ID)!)).toBe(true);
 	});
 
+	it("strips at GROUP granularity too, in Truth and not just in the widget", () => {
+		// The group editor seeds its box with the current summary, and the default recap is tagged —
+		// the identical trap one layer down. The strip has to live HERE, because `sanitizeOps` passes
+		// a raw `group` command's `summary` through untouched.
+		const t = makeTruth();
+		const r0 = t.apply([{ kind: "group", ids: ["a:r1:p0", "r:c1"] }], "you");
+		const gid = r0.results[0].detail!;
+		expect(hasFoldTag(t.groupSummary(t.groupById(gid)!))).toBe(true); // default recap: tagged
+
+		// Regroup the way an edited-around-the-tag save would.
+		const t2 = makeTruth();
+		const edited = `${foldTag("g:a:r1:p0")} I summarized this myself`;
+		const r = t2.apply([{ kind: "group", ids: ["a:r1:p0", "r:c1"], summary: edited }], "you");
+		const gid2 = r.results[0].detail!;
+		expect(gid2).toBe("g:a:r1:p0");
+		expect(t2.groupSummary(t2.groupById(gid2)!)).toBe("I summarized this myself");
+		expect(resolveUnfold(t2, [foldCode(gid2)]).missing).toEqual([foldCode(gid2)]);
+		expect(t2.groupById(gid2)!.folded).toBe(true); // the agent could not undo it
+	});
+
+	it("a STRATEGY group summary keeps its tag — thermocline's strata stay recall-able", () => {
+		const t = makeTruth();
+		const tagged = `${foldTag("g:a:r1:p0")} stratum`;
+		const r = t.apply([{ kind: "group", ids: ["a:r1:p0", "r:c1"], summary: tagged }], "auto");
+		const gid = r.results[0].detail!;
+		expect(t.groupSummary(t.groupById(gid)!)).toBe(tagged); // NOT stripped
+		expect(resolveUnfold(t, [foldCode(gid)]).missing).toEqual([]);
+	});
+
+	it("strips to a FIXED POINT, so a doubled tag leaves no residual handle", () => {
+		const t = makeTruth();
+		const doubled = `${foldTag(TEXT_ID)} ${foldTag(TEXT_ID)} words`;
+		t.apply([{ kind: "fold", ids: [TEXT_ID], digest: doubled }], "you");
+		expect(t.digestOf(t.get(TEXT_ID)!)).toBe("words");
+		expect(resolveUnfold(t, [foldCode(TEXT_ID)]).missing).toEqual([foldCode(TEXT_ID)]);
+	});
+
 	it("a STRATEGY fold-with-digest keeps its tag — ViewConductor authors its own handle", () => {
 		const t = makeTruth();
 		const tagged = `${foldTag(TEXT_ID)} conductor's own handle`;

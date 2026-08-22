@@ -37,7 +37,12 @@ describe("computeGroupOps", () => {
 
 	it("preserves conductor custom group summaries with recovery tags", () => {
 		const s = makeStore();
-		const g = s.createGroup("a:r1:p0", "r:c1", "you", `{#${foldCode("g:a:r1:p0")} FOLDED} conductor group summary`)!;
+		// `by: "auto"` — this test is about a CONDUCTOR's summary, and the actor is now what decides
+		// whether the baked tag survives: `opGroup` strips leading tags on the HUMAN path (a human's
+		// own words must not hand the agent a handle back to what they replaced), and leaves a
+		// strategy's verbatim, so thermocline's strata stay recall-able. It previously passed "you"
+		// as a convenience, which no longer matches what it is checking.
+		const g = s.createGroup("a:r1:p0", "r:c1", "auto", `{#${foldCode("g:a:r1:p0")} FOLDED} conductor group summary`)!;
 		const ops = s.computeGroupOps();
 		expect(ops.length).toBe(1);
 		expect(ops[0].summaryText).toBe(`{#${foldCode(g.id)} FOLDED} conductor group summary`);

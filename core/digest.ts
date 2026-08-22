@@ -157,6 +157,27 @@ export function hasOwnFoldTag(text: string, id: string): boolean {
 }
 
 /**
+ * Strip EVERY leading `{#code FOLDED}` tag from human-authored text, so the engine stays the sole
+ * author of the tag (`Truth.opFold` / `opGroup` human branches, and `DigestEditor` so its optimistic
+ * value predicts the same result).
+ *
+ * A LOOP, not a single replace: the editor seeds its box with the current digest, so text that
+ * already carries a tag is the norm here, and a doubled tag (`{#x FOLDED} {#x FOLDED} words` —
+ * pasted, or produced by one layer stripping before another) would otherwise leave a residual OWN
+ * tag behind and hand the agent back the handle this strip exists to remove. Stripping to a fixed
+ * point makes the result independent of how many layers ran, which is also what keeps the UI's
+ * predicted commit byte-equal to the engine's.
+ */
+export function stripFoldTags(text: string): string {
+	let out = text;
+	for (let prev = ""; prev !== out; ) {
+		prev = out;
+		out = out.replace(LEADING_FOLD_TAG, "");
+	}
+	return out;
+}
+
+/**
  * What a human-emptied block collapses to on the wire.
  *
  * A user who clears the digest editor is saying "the agent should not see this block". Per-block

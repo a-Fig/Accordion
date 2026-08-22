@@ -53,6 +53,14 @@ function foldTag(id) {
   return `{#${foldCode(id)} FOLDED}`;
 }
 var LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
+function stripFoldTags(text) {
+  let out = text;
+  for (let prev = ""; prev !== out; ) {
+    prev = out;
+    out = out.replace(LEADING_FOLD_TAG, "");
+  }
+  return out;
+}
 var digestCache = /* @__PURE__ */ new WeakMap();
 var digestTokenCache = /* @__PURE__ */ new WeakMap();
 function digest(b) {
@@ -1573,7 +1581,7 @@ var Truth = class _Truth {
         if (this.isProtected(b)) return "protected";
         b.override = "folded";
         b.by = "you";
-        const authored = op.digest ? op.digest.replace(LEADING_FOLD_TAG, "") : "";
+        const authored = op.digest ? stripFoldTags(op.digest) : "";
         b.subst = authored.length ? authored : void 0;
         this.birthFolded.delete(id);
         return null;
@@ -1721,7 +1729,8 @@ var Truth = class _Truth {
     if ((this.index.get(memberIds[memberIds.length - 1]) ?? Infinity) >= this.protectedFromIndex()) return this.clamp(op, "protected");
     for (const id of memberIds) if (this.groupOf(this.get(id))) return this.clamp(op, "invalid-group", "overlaps an existing group");
     if (by !== "you" && memberIds.some((id) => this.get(id).override !== null)) return this.clamp(op, "human-override");
-    const g = { id: `g:${memberIds[0]}`, memberIds, folded: true, by, digest: op.summary };
+    const summary = by === "you" && typeof op.summary === "string" ? stripFoldTags(op.summary) : op.summary;
+    const g = { id: `g:${memberIds[0]}`, memberIds, folded: true, by, digest: summary };
     if (this.classifyGroup(g).carrier === null) return this.clamp(op, "invalid-group", "nothing collapses (all stragglers)");
     this.groupList = [...this.groupList, g];
     for (const id of memberIds) touched.add(id);

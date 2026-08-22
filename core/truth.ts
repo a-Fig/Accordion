@@ -17,7 +17,7 @@ import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
 import { SYSTEM_BLOCK_ID, SYSTEM_BLOCK_ORDER } from "./types";
 import type { LockName } from "./locks";
 import { hasLock } from "./locks";
-import { digest, digestTokens, substTokens, groupDigest, groupDigestTokens, wireFoldable, isBolted, foldTag, LEADING_FOLD_TAG } from "./digest";
+import { digest, digestTokens, substTokens, groupDigest, groupDigestTokens, wireFoldable, isBolted, foldTag, LEADING_FOLD_TAG, stripFoldTags } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { isDurableId, applyPlan, computeDegradedDropRuns, roleFloorRecap, type PiMessage, type WireMsgShape } from "./wire";
 import { collapsibleMessageKeys, messageKey } from "./groupShape";
@@ -1420,7 +1420,7 @@ export class Truth {
 				//
 				// Omitting `digest` (or leaving only a tag) restores the engine digest — the "put the
 				// auto-generated message back" path — which re-tags the block as agent-reachable again.
-				const authored = op.digest ? op.digest.replace(LEADING_FOLD_TAG, "") : "";
+				const authored = op.digest ? stripFoldTags(op.digest) : "";
 				b.subst = authored.length ? authored : undefined;
 				this.birthFolded.delete(id);
 				return null;
@@ -1616,7 +1616,18 @@ export class Truth {
 		for (const id of memberIds) if (this.groupOf(this.get(id)!)) return this.clamp(op, "invalid-group", "overlaps an existing group");
 		// A strategy group must never sweep a human-held block into the collapse.
 		if (by !== "you" && memberIds.some((id) => this.get(id)!.override !== null)) return this.clamp(op, "human-override");
-		const g: Group = { id: `g:${memberIds[0]}`, memberIds, folded: true, by, digest: op.summary };
+		// A HUMAN-authored verbatim summary is stripped of any leading tag, the exact mirror of
+		// `opFold`'s human branch — and for the same reason, because the group editor seeds its box
+		// with the CURRENT summary and the default recap is tagged. Enforcing it HERE rather than in
+		// the editor is the point: the invariant belongs to Truth, not to a Svelte component, or a raw
+		// `group` command over the wire (`sanitizeOps` passes `summary` through untouched) would
+		// silently hand the agent back a handle to content the human replaced with their own words.
+		// A summary that was ONLY a tag strips to "" and therefore means DROP — which is exactly what
+		// an emptied box means at group granularity, so the two paths agree. Strategy summaries are
+		// left verbatim: thermocline bakes `foldTag(g.id)` into its strata on purpose so they stay
+		// recall-able (see `conductors/ws/thermocline/policy.ts`).
+		const summary = by === "you" && typeof op.summary === "string" ? stripFoldTags(op.summary) : op.summary;
+		const g: Group = { id: `g:${memberIds[0]}`, memberIds, folded: true, by, digest: summary };
 		if (this.classifyGroup(g).carrier === null) return this.clamp(op, "invalid-group", "nothing collapses (all stragglers)");
 		this.groupList = [...this.groupList, g];
 		for (const id of memberIds) touched.add(id);

@@ -27,7 +27,7 @@
 	 * steering, not to be more restrictive than it.
 	 */
 	import Icon from "$lib/ui/Icon.svelte";
-	import { EMPTY_DIGEST, LEADING_FOLD_TAG } from "$core/digest";
+	import { EMPTY_DIGEST, stripFoldTags } from "$core/digest";
 	import { estTokens, BLOCK_OVERHEAD } from "$core/tokens";
 	import { getDraft, setDraft, clearDraft } from "./digestDrafts";
 
@@ -135,12 +135,12 @@
 
 	function save() {
 		if (!dirty) return;
-		// Mirror `Truth.opFold`'s human branch, which strips a leading `{#code FOLDED}` tag so the
-		// engine stays the sole author of it. Doing it HERE too is not belt-and-braces: the box is
+		// Mirror `Truth.opFold`/`opGroup`'s human branches, which strip leading `{#code FOLDED}` tags
+		// so the engine stays the sole author of them — same helper, so the two agree byte-for-byte. Doing it HERE too is not belt-and-braces: the box is
 		// seeded with the current digest, so an edited engine digest still starts with the tag, and
 		// if we sent it unstripped `typed` would predict a committed value the engine will never
 		// produce — leaving Save dirty forever. Predict what actually lands.
-		const t = draft.replace(LEADING_FOLD_TAG, "").trim();
+		const t = stripFoldTags(draft).trim();
 		// NOTE: the draft is deliberately NOT cleared here. A save can be refused outright — a
 		// protected block, a block inside a folded group, a lost controller lease — and in demo/CC
 		// mode the TxnResult is discarded, so a refusal is silent. Clearing now would leave the
