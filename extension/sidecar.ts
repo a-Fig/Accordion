@@ -5,8 +5,8 @@
  * spawns `node <ACCORDION_HOME>/extension/sidecar.mjs` with cwd = the session cwd and speaks
  * JSON-lines over stdin/stdout. This file:
  *
- *   1. redirects console.log/info/debug to STDERR before any extension code runs (stdout is the
- *      protocol channel and NOTHING else may ever be written to it),
+ *   1. redirects `process.stdout.write` itself to STDERR before any extension code runs (stdout is
+ *      the protocol channel and NOTHING else may ever be written to it),
  *   2. shims the exact `pi` + `ctx` surface `accordion.ts` consumes (the same shape
  *      `extension/smoke.mjs` fakes),
  *   3. converts vibe-native `LLMMessage` JSON to pi's `PiMessage` shape on the way IN and back to
@@ -30,6 +30,14 @@
 // that this runs before any of its module-level code — a single stray `console.log` from an
 // extension would corrupt the protocol stream and desync the harness's line reader.
 const realStdoutWrite = process.stdout.write.bind(process.stdout);
+// Capture the real writer, then REDIRECT THE STREAM ITSELF. Overriding only console.log/info/debug
+// leaves a whole class of leaks open — console.dir/table/group/count, `util.debuglog`, a dependency
+// writing to the stream directly — and any one of them would inject a non-JSON line into the
+// protocol channel and desync the harness's reader. After this, everything except `send()` (which
+// holds `realStdoutWrite`) lands on stderr. The console overrides below are then redundant but kept
+// as defence in depth, and because they keep the intent legible.
+(process.stdout as { write: (...a: any[]) => boolean }).write = (...args: any[]) =>
+	(process.stderr.write as (...a: any[]) => boolean).apply(process.stderr, args);
 console.log = (...a: unknown[]) => console.error(...a);
 console.info = (...a: unknown[]) => console.error(...a);
 console.debug = (...a: unknown[]) => console.error(...a);
@@ -96,16 +104,40 @@ let usage: { promptTokens?: number; completionTokens?: number; contextWindow?: n
  * message finalized after it and before the next model call — see the report / the doc's `usage` row.
  */
 let pendingUsage: { input: number; output: number } | null = null;
-/** The current system prompt text (from the vibe `system` message), fed to `ctx.getSystemPrompt()`. */
+/**
+ * The current system prompt text, fed to `ctx.getSystemPrompt()`.
+ *
+ * `""` (not null) once we have seen a conversion with NO leading system message: `accordion.ts`'s
+ * `refreshFromCtx` only assigns when `getSystemPrompt()` returns a STRING, so returning `undefined`
+ * would leave a previously-captured prompt standing as a stale bolted block whose tokens keep
+ * counting (M6). `Truth.setSystemPrompt("", 0)` rewrites that block to empty/zero-token instead.
+ * Known residual: `Truth` has no "remove the block" path, so a cleared prompt leaves an EMPTY bolted
+ * block rather than no block at all — see docs/sidecar-protocol.md.
+ */
 let systemPromptText: string | null = null;
-/** The ORIGINAL system LLMMessage, re-inserted at index 0 of every replacement wire, unchanged. */
+/** The ORIGINAL system LLMMessage (source index 0 only), re-inserted at index 0, unchanged. */
 let systemSource: LLMMessage | null = null;
-/** The source array + converted PiMessages of the most recent conversion (back-conversion basis). */
+/** The source array of the most recent tagged conversion (the back-conversion basis). */
 let lastSource: LLMMessage[] = [];
+/**
+ * What each source index of `lastSource` became, so `fromPi` can rebuild the wire without ever
+ * DELETING a message (H1/H3/H4/M5):
+ *   • "prompt"      — the leading system message; it is the bolted prompt, re-emitted at index 0.
+ *   • "converted"   — it produced a PiMessage the extension can see, fold and group.
+ *   • "passthrough" — the converter could not represent it (empty assistant turn, payload-only
+ *                     reasoning, an id-less tool call, a duplicate tool_call_id, a LATER system
+ *                     message). It never enters the pi array, so Accordion can neither fold nor drop
+ *                     it — and `fromPi` re-interleaves the ORIGINAL at its source position.
+ */
+type SlotKind = "prompt" | "converted" | "passthrough";
+let lastSlots: SlotKind[] = [];
 /** What `ctx.sessionManager.buildSessionContext()` reports — the extension's view of history. */
 let sessionMessages: PiMessage[] = [];
 /** Cheap estimate of the last converted context, the `getContextUsage` fallback when no `usage` seen. */
 let lastContextEst = 0;
+/** The CURRENT folding arm, mirrored off the `onFoldingChanged` seam so `ready` can restate it. */
+let foldingArm = false;
+let helloSeen = false;
 let shuttingDown = false;
 
 // ── the `pi` shim ────────────────────────────────────────────────────────────
@@ -162,6 +194,9 @@ const ctx = {
 		return { tokens: lastContextEst, contextWindow: model.contextWindow };
 	},
 	getSystemPrompt() {
+		// `null` = we have never converted anything, so we genuinely do not know — return undefined
+		// and let the extension keep whatever it has. `""` = we HAVE converted and there was no
+		// system message: that is a positive "cleared" signal and must reach `Truth` (M6).
 		return systemPromptText ?? undefined;
 	},
 	sessionManager: {
@@ -240,19 +275,57 @@ function parseToolArgs(raw: unknown): Record<string, unknown> {
 	return {};
 }
 
+/** Per-conversion anchor bookkeeping — see `toPiOne`'s duplicate-id handling (M5). */
+interface AnchorScope {
+	seenMessageIds: Set<string>;
+	seenToolCallIds: Set<string>;
+}
+function newScope(): AnchorScope {
+	return { seenMessageIds: new Set(), seenToolCallIds: new Set() };
+}
+
 /**
- * Convert ONE vibe message. Returns null for a `system` message (it is the bolted system PROMPT,
- * not a PiMessage — `ctx.getSystemPrompt()` carries it) and for anything that yields no wire
- * content at all.
+ * Convert ONE vibe message, or return `null` meaning UNREPRESENTABLE — the message carries no wire
+ * content Accordion can model as blocks.
+ *
+ * `null` is never "delete it": every caller keeps the original and re-emits it verbatim (the
+ * `"passthrough"` slot). Because such a message contributes no blocks, Accordion can neither fold
+ * nor group-drop it, so passing it straight through is exactly right. The cases:
+ *
+ *   • a `system` message (the leading one is the bolted PROMPT; any later one is a passthrough — a
+ *     `Truth` has exactly ONE system block, so hoisting or overwriting with a later one would
+ *     delete or relocate real content: H3);
+ *   • an assistant turn with nothing representable — empty content, payload-bearing reasoning only,
+ *     an aborted empty turn, non-text-only content chunks (H1);
+ *   • an assistant turn carrying a tool call with NO `id` (H4). `core/wire.ts messageInfo` records a
+ *     call only when the toolCall part has a non-empty id, so an id-less call is invisible to the
+ *     tool-pair fixpoint that keeps a group drop from orphaning its `tool` result. Making the whole
+ *     message a passthrough keeps it — and therefore its pairing — off the removable set entirely;
+ *   • a `tool` message repeating an ALREADY-SEEN `tool_call_id` (M5). `blockId` maps both to
+ *     `r:<id>`, so `Truth.append` would drop the second while `applyPlan` folded BOTH — silent
+ *     content loss. Suppressing the id instead is not an option here: `messageInfo` needs it for
+ *     pair balance, so the duplicate becomes a passthrough.
+ *
+ * A duplicate `message_id` on a user/assistant/other message is handled differently: the id is
+ * SUPPRESSED (no `messageId`, no `responseId`) so `blockId` falls back to its positional
+ * `m<i>:…` form, which `isDurableId` rejects and `canFold` therefore refuses to fold. The message
+ * stays fully visible in the map — just unfoldable — rather than mis-foldable (M5).
  *
  * `srcIndex >= 0` stamps the back-conversion tag; pass -1 for a conversion whose output never
- * returns to the harness (`message_end` / `agent_end` / `turn_end` ingest paths).
+ * returns to the harness (`message_end` / `agent_end` ingest paths).
  */
-function toPiOne(m: LLMMessage, srcIndex: number): PiMessage | null {
+function toPiOne(m: LLMMessage, srcIndex: number, scope: AnchorScope): PiMessage | null {
 	if (!m || typeof m !== "object") return null;
 	const role = typeof m.role === "string" ? m.role : "user";
-	const messageId = typeof m.message_id === "string" ? m.message_id : undefined;
 	const tag = srcIndex >= 0 ? { [SRC]: srcIndex } : {};
+
+	// Duplicate message_id ⇒ suppress the anchor (positional, non-durable, unfoldable).
+	const rawId = typeof m.message_id === "string" && m.message_id ? m.message_id : undefined;
+	let messageId: string | undefined = rawId;
+	if (rawId !== undefined) {
+		if (scope.seenMessageIds.has(rawId)) messageId = undefined;
+		else scope.seenMessageIds.add(rawId);
+	}
 
 	if (role === "system") return null;
 
@@ -268,9 +341,12 @@ function toPiOne(m: LLMMessage, srcIndex: number): PiMessage | null {
 		if (text.length > 0) parts.push({ type: "text", text });
 		for (const tc of m.tool_calls ?? []) {
 			if (!tc) continue;
+			// H4: no usable id ⇒ the whole message is unrepresentable. Emitting `id:""` (or skipping
+			// just this part) would leave a tool_call the pair fixpoint cannot see.
+			if (typeof tc.id !== "string" || !tc.id) return null;
 			parts.push({
 				type: "toolCall",
-				id: typeof tc.id === "string" ? tc.id : "",
+				id: tc.id,
 				name: typeof tc.function?.name === "string" ? tc.function.name : "",
 				arguments: parseToolArgs(tc.function?.arguments),
 			});
@@ -282,7 +358,11 @@ function toPiOne(m: LLMMessage, srcIndex: number): PiMessage | null {
 	}
 
 	if (role === "tool") {
-		const callId = typeof m.tool_call_id === "string" ? m.tool_call_id : undefined;
+		const callId = typeof m.tool_call_id === "string" && m.tool_call_id ? m.tool_call_id : undefined;
+		if (callId !== undefined) {
+			if (scope.seenToolCallIds.has(callId)) return null; // M5 — duplicate `r:<id>`
+			scope.seenToolCallIds.add(callId);
+		}
 		const isError = m.is_error === true || m.isError === true;
 		return {
 			role: "toolResult",
@@ -301,37 +381,58 @@ function toPiOne(m: LLMMessage, srcIndex: number): PiMessage | null {
 }
 
 /**
- * Convert a whole vibe array. Captures the system prompt + its original message as a side effect
- * (both are needed to answer a `context` request) and records a cheap token estimate for the
- * `getContextUsage` fallback.
+ * Convert a whole vibe array for INGEST (`agent_end`) — untagged, no state captured, unrepresentable
+ * messages simply contribute nothing (there is no wire to rebuild on this path).
  */
-function toPi(messages: unknown, tagged: boolean): PiMessage[] {
+function toPiIngest(messages: unknown): PiMessage[] {
 	const src = Array.isArray(messages) ? (messages as LLMMessage[]) : [];
+	const scope = newScope();
 	const out: PiMessage[] = [];
+	src.forEach((m) => {
+		const pm = toPiOne(m, -1, scope);
+		if (pm) out.push(pm);
+	});
+	return out;
+}
+
+/**
+ * Convert a whole vibe array and RECORD the back-conversion basis: `lastSource`, the per-index
+ * `lastSlots` map, the system prompt + its original message, and a cheap token estimate for the
+ * `getContextUsage` fallback. Every source index lands in exactly one slot, so `fromPi` can rebuild
+ * the wire without ever losing a message.
+ */
+function toPiTagged(messages: LLMMessage[]): PiMessage[] {
+	const scope = newScope();
+	const out: PiMessage[] = [];
+	const slots: SlotKind[] = new Array(messages.length).fill("passthrough");
 	let sysText: string | null = null;
 	let sysMsg: LLMMessage | null = null;
 	let est = 0;
-	src.forEach((m, i) => {
-		if (m && m.role === "system") {
+	messages.forEach((m, i) => {
+		// H3: ONLY a system message at index 0 is the bolted prompt. `Truth` holds exactly one system
+		// block; a later system message is content, and content is never hoisted or overwritten.
+		if (i === 0 && m && m.role === "system") {
 			sysText = vibeText(m.content);
 			sysMsg = m;
+			slots[i] = "prompt";
 			est += estTokens(sysText);
 			return;
 		}
-		const pm = toPiOne(m, tagged ? i : -1);
+		const pm = toPiOne(m, i, scope);
 		if (pm) {
+			slots[i] = "converted";
 			out.push(pm);
 			est += estTokens(piText(pm)) + estTokens(piThinking(pm) ?? "");
 		}
+		// else: stays "passthrough" — re-emitted verbatim by `fromPi`.
 	});
-	if (tagged) {
-		lastSource = src;
-		lastContextEst = est;
-		// A harness that stops sending a system message clears the prompt: `Truth.setSystemPrompt`
-		// is the only writer of the bolted block, and a stale prompt would keep counting tokens.
-		systemPromptText = sysText;
-		systemSource = sysMsg;
-	}
+	lastSource = messages;
+	lastSlots = slots;
+	lastContextEst = est;
+	// `""` (not null) when there is no leading system message: a positive "cleared" signal that
+	// reaches `Truth.setSystemPrompt` — see `systemPromptText`'s declaration (M6).
+	systemPromptText = sysText ?? "";
+	systemSource = sysMsg;
 	return out;
 }
 
@@ -345,12 +446,31 @@ function toPi(messages: unknown, tagged: boolean): PiMessage[] {
  * UNTAGGED message is a recap/summary the wire INSERTED (a group collapse, or the role-validity
  * floor's stub) and becomes a minimal LLMMessage.
  *
- * The system message is re-inserted at index 0 byte-identical, because `toPi` removed it (it is the
- * bolted system PROMPT, never a PiMessage — `Truth` folds nothing there by definition).
+ * The leading system message is re-inserted at index 0 byte-identical, because `toPiTagged` removed
+ * it (it is the bolted system PROMPT, never a PiMessage — `Truth` folds nothing there by definition).
+ *
+ * PASSTHROUGH RE-INTERLEAVING (H1/H3/H4/M5). A source message the converter could not represent
+ * produced no PiMessage and therefore no block, so it can appear in NEITHER the tagged output nor a
+ * fold/group op — but it is still real wire content and MUST survive. `lastSlots` records where
+ * those messages were; as we walk the output we flush every not-yet-emitted `"passthrough"` source
+ * that sits before the message we are about to emit, then a final flush drains the tail. Converted
+ * sources the wire deliberately DROPPED (a group collapse) are skipped by the same walk, because
+ * only `"passthrough"` slots are ever re-emitted.
  */
 function fromPi(out: PiMessage[]): LLMMessage[] {
 	const result: LLMMessage[] = [];
-	if (systemSource) result.push(systemSource);
+	let nextSrc = 0;
+	/** Emit every passthrough source in `[nextSrc, limit)` and advance the cursor past them. */
+	const flushUpTo = (limit: number) => {
+		while (nextSrc < limit) {
+			if (lastSlots[nextSrc] === "passthrough") result.push(lastSource[nextSrc]);
+			nextSrc++;
+		}
+	};
+	if (systemSource) {
+		result.push(systemSource);
+		nextSrc = 1; // slot 0 is the prompt and has just been emitted
+	}
 	for (const m of out) {
 		const idx = (m as any)[SRC];
 		const orig = typeof idx === "number" ? lastSource[idx] : undefined;
@@ -359,17 +479,23 @@ function fromPi(out: PiMessage[]): LLMMessage[] {
 			// its own role mapped to assistant/user. `applyPlan` picks that role deliberately to
 			// keep the surviving wire role-valid (no leading non-user, no same-role adjacency);
 			// forcing every insert to "user" would re-introduce the exact adjacency its
-			// role-validity floor exists to prevent. See the report.
+			// role-validity floor exists to prevent. See the doc.
 			result.push({ role: m.role === "assistant" ? "assistant" : "user", content: piText(m) });
 			continue;
 		}
+		flushUpTo(idx);
 		const next: LLMMessage = { ...orig };
 		const newText = piText(m);
 		if (newText !== vibeText(orig.content)) next.content = newText;
 		const newThinking = piThinking(m);
 		if (newThinking !== null && newThinking !== orig.reasoning_content) next.reasoning_content = newThinking;
 		result.push(next);
+		// `Math.max`, not a bare assignment: the walk assumes non-decreasing source indices (nothing
+		// in `applyPlan` reorders), and this keeps a future op that DID reorder from rewinding the
+		// cursor and re-emitting an already-flushed passthrough twice.
+		nextSrc = Math.max(nextSrc, idx + 1);
 	}
+	flushUpTo(lastSource.length);
 	return result;
 }
 
@@ -406,12 +532,22 @@ async function callSafe(name: string, event: unknown): Promise<unknown> {
  */
 async function handleContext(msg: any): Promise<void> {
 	const req = msg.req;
+	// H2: a malformed or EMPTY `messages` is not a context to fold — it is a request we cannot
+	// answer. Reply passthrough BEFORE touching any state: converting it would coerce to `[]`, wipe
+	// `lastSource`/`systemSource`/`sessionMessages`, and hand the extension an empty history that
+	// `ingestMessages` reads as structural divergence — rebuilding the Truth down to nothing and
+	// destroying every fold, group and dial in it.
+	if (!Array.isArray(msg.messages) || msg.messages.length === 0) {
+		console.error("[sidecar] context request carried no messages array; replying passthrough");
+		if (req !== undefined) send({ type: "hook_result", req, messages: null });
+		return;
+	}
 	let reply: LLMMessage[] | null = null;
 	try {
 		applyModelFrom(msg.model);
 		// Convert BEFORE dispatch: the handler reads the system prompt off `ctx.getSystemPrompt()`
 		// (via `refreshFromCtx`) during the very call we are about to make.
-		const converted = toPi(msg.messages, true);
+		const converted = toPiTagged(msg.messages as LLMMessage[]);
 		sessionMessages = converted;
 		pendingUsage = null; // a new model call opens a fresh calibration window
 		const ret = (await call("context", { messages: converted })) as { messages?: PiMessage[] } | undefined;
@@ -483,19 +619,30 @@ function sendReady(): void {
 			default: def?.default ?? null,
 		})),
 	});
-	// The arm is OFF at birth and `setFolding` only fires the seam on a real CHANGE, so state the
-	// initial value explicitly — the harness must know from message one whether to run its own
-	// compaction middleware.
-	send({ type: "folding", enabled: false });
+	// `setFolding` fires the seam only on a real CHANGE, so state the arm explicitly — the harness
+	// must know from message one whether to run its own compaction middleware. `foldingArm`, not a
+	// hardcoded `false`: a REPEAT `hello` (a harness that re-handshakes) must be told the CURRENT
+	// arm, or it would switch its compaction middleware back on underneath a folding session (M8).
+	send({ type: "folding", enabled: foldingArm });
 }
 
 async function shutdown(): Promise<void> {
 	if (shuttingDown) return;
 	shuttingDown = true;
 	await callSafe("session_shutdown", {});
-	// Give stdout a beat to flush (a Windows pipe write is asynchronous) and let the extension's
-	// servers close, then leave — an extension timer must never keep the sidecar alive.
-	setTimeout(() => process.exit(0), 200);
+	// Prefer a NATURAL exit: on Windows a pipe write is asynchronous, so a hard `process.exit` can
+	// truncate an in-flight stdout write (L14). Stop reading, set the code, and let the loop drain
+	// once the extension's servers and timers are gone. The backstop timer is `unref`'d, so it never
+	// keeps the process alive on its own — it only fires if something DID linger, which it then
+	// kills rather than hanging the harness's `proc.wait()`.
+	process.exitCode = 0;
+	try {
+		process.stdin.destroy();
+	} catch {
+		/* already gone */
+	}
+	const backstop = setTimeout(() => process.exit(0), 2000);
+	(backstop as { unref?: () => void }).unref?.();
 }
 
 async function handle(msg: any): Promise<void> {
@@ -515,6 +662,11 @@ async function handle(msg: any): Promise<void> {
 					console.error("[sidecar] could not chdir to the harness cwd:", err);
 				}
 			}
+			// IDEMPOTENT (M8): a repeat `hello` re-answers with the CURRENT surface and the CURRENT
+			// folding arm — it never resets session state, and never claims the arm is off when it is
+			// on. Everything above is itself idempotent (same model, same flags, same cwd).
+			if (helloSeen) console.error("[sidecar] repeat hello — re-answering ready with the current state");
+			helloSeen = true;
 			sendReady();
 			return;
 		}
@@ -525,8 +677,9 @@ async function handle(msg: any): Promise<void> {
 		// ── pi hooks ───────────────────────────────────────────────────────────
 		case "session_start": {
 			// Seed the extension's view BEFORE the hook: `session_start` builds the Truth from
-			// `ctx.sessionManager.buildSessionContext()`.
-			sessionMessages = toPi(msg.messages, true);
+			// `ctx.sessionManager.buildSessionContext()`. An EMPTY array is legitimate here (a fresh
+			// session), unlike `context` — so no H2-style guard.
+			sessionMessages = toPiTagged(Array.isArray(msg.messages) ? (msg.messages as LLMMessage[]) : []);
 			await callSafe("session_start", { reason: msg.reason ?? "start" });
 			return;
 		}
@@ -538,9 +691,22 @@ async function handle(msg: any): Promise<void> {
 			if (msg.req !== undefined) send({ type: "hook_result", req: msg.req, cancel: ret?.cancel === true });
 			return;
 		}
-		case "session_compact":
+		case "session_compact": {
+			// L9: `accordion.ts`'s handler reconciles the Truth against
+			// `ctx.sessionManager.buildSessionContext()` and then TELLS THE USER it rebuilt the map to
+			// match. Left alone, that would read our STALE pre-compaction `sessionMessages` — a claimed
+			// rebuild that silently reproduces exactly the history compaction just removed. So the
+			// harness SHOULD send the post-compaction `messages`; when it does, refresh first. When it
+			// does not, hand over `[]`, which the handler's own `if (msgs.length > 0)` guard skips —
+			// it then only notifies, and the next `context` reconciles for real.
+			if (Array.isArray(msg.messages) && msg.messages.length > 0) {
+				sessionMessages = toPiTagged(msg.messages as LLMMessage[]);
+			} else {
+				sessionMessages = [];
+			}
 			await callSafe("session_compact", { summary: msg.summary });
 			return;
+		}
 		case "before_agent_start": {
 			const ret = (await callSafe("before_agent_start", { prompt: msg.prompt })) as { systemPrompt?: string } | undefined;
 			if (msg.req !== undefined) {
@@ -552,14 +718,10 @@ async function handle(msg: any): Promise<void> {
 		case "agent_start":
 			await callSafe("agent_start", {});
 			return;
-		case "agent_end": {
-			// Run-local messages, never returned to the harness → untagged conversion.
-			const msgs = (Array.isArray(msg.messages) ? msg.messages : [])
-				.map((m: LLMMessage) => toPiOne(m, -1))
-				.filter((m: PiMessage | null): m is PiMessage => m !== null);
-			await callSafe("agent_end", { messages: msgs });
+		case "agent_end":
+			// Run-local messages, never returned to the harness → untagged INGEST conversion.
+			await callSafe("agent_end", { messages: toPiIngest(msg.messages) });
 			return;
-		}
 		case "turn_start":
 			await callSafe("turn_start", { turnIndex: msg.turnIndex });
 			return;
@@ -575,8 +737,10 @@ async function handle(msg: any): Promise<void> {
 			await callSafe("message_update", { assistantMessageEvent: msg.assistantMessageEvent });
 			return;
 		case "message_end": {
-			const pm = toPiOne(msg.message ?? {}, -1);
-			if (!pm) return;
+			// A fresh scope per message: duplicate-anchor suppression is a WITHIN-ARRAY concern, and a
+			// single message can never collide with itself.
+			const pm = toPiOne(msg.message ?? {}, -1, newScope());
+			if (!pm) return; // unrepresentable ⇒ no blocks to append; the wire keeps it via `fromPi`
 			// Calibration pairing (opt-in, ADR 0025): attach the provider's real usage for the model
 			// call this message came out of. `pendingUsage` is set by a `usage` message and cleared by
 			// the next `context` request, so it can only ever describe THIS call.
@@ -662,6 +826,21 @@ function enqueue(msg: any): void {
 
 let buffer = "";
 /**
+ * Hard cap on ONE unterminated line (L12). A harness bug or a corrupt pipe could otherwise stream
+ * newline-free bytes forever and grow this string until the process dies of memory pressure —
+ * taking the whole map with it. 64 MB is far above any plausible `context` payload.
+ */
+const MAX_LINE_BYTES = (() => {
+	// Test seam, mirroring `ACCORDION_DOOR_PORT`/`ACCORDION_HOME`: the smoke suite trips the cap with
+	// a small value instead of streaming 64 MB. Production never sets it.
+	const raw = Number(process.env.ACCORDION_SIDECAR_MAX_LINE);
+	return Number.isSafeInteger(raw) && raw > 0 ? raw : 64 * 1024 * 1024;
+})();
+/** True while we are throwing bytes away up to the next newline, after tripping the cap. */
+let discardingLine = false;
+let discardWarned = false;
+
+/**
  * Attached only AFTER the extension has registered everything (see the bottom of this file): stdin
  * stays paused until a `data` listener exists, so nothing the harness wrote is lost, and no `hello`
  * can be dispatched against a half-registered `pi` shim.
@@ -674,6 +853,11 @@ function startReadLoop(): void {
 		while ((nl = buffer.indexOf("\n")) >= 0) {
 			const raw = buffer.slice(0, nl).replace(/\r$/, "");
 			buffer = buffer.slice(nl + 1);
+			// Resync: the tail of an over-long line is garbage, never a message.
+			if (discardingLine) {
+				discardingLine = false;
+				continue;
+			}
 			if (!raw.trim()) continue;
 			let msg: any;
 			try {
@@ -687,6 +871,16 @@ function startReadLoop(): void {
 				continue;
 			}
 			enqueue(msg);
+		}
+		// No newline in sight and the buffer is over the cap ⇒ drop what we hold and skip to the next
+		// newline. Warned ONCE: a runaway producer would otherwise spam stderr as hard as it spams us.
+		if (buffer.length > MAX_LINE_BYTES) {
+			if (!discardWarned) {
+				discardWarned = true;
+				console.error(`[sidecar] a single stdin line exceeded ${MAX_LINE_BYTES} bytes — dropping it and resyncing at the next newline`);
+			}
+			buffer = "";
+			discardingLine = true;
 		}
 	});
 	process.stdin.on("end", () => {
@@ -703,6 +897,19 @@ function startReadLoop(): void {
 process.on("uncaughtException", (err) => console.error("[sidecar] uncaught exception:", err));
 process.on("unhandledRejection", (err) => console.error("[sidecar] unhandled rejection:", err));
 
+// M7: a harness that reaches for `proc.terminate()` / Ctrl-C (or a closing terminal) must still get
+// the full teardown — without this, the default disposition kills us outright and LEAKS the registry
+// entry (`~/.accordion/sessions/<id>.json`), so the app lists a dead session until its heartbeat goes
+// stale, and the bound loopback server dies without closing. `shutdown` is idempotent, so overlapping
+// signals are harmless.
+for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+	try {
+		process.on(sig, () => void shutdown());
+	} catch {
+		// SIGHUP is not raisable on every platform; never let registration failure abort startup.
+	}
+}
+
 // ── load the extension ───────────────────────────────────────────────────────
 // DYNAMIC, so the console redirection at the top of this file is already in effect. The lazy
 // `@earendil-works/pi-ai` import inside `accordion.ts` is only reached by the (unwired) completion
@@ -710,7 +917,10 @@ process.on("unhandledRejection", (err) => console.error("[sidecar] unhandled rej
 // from `extension/node_modules` can never crash the sidecar.
 const { default: accordionLive } = await import("./accordion");
 accordionLive(pi as any, {
-	onFoldingChanged: (enabled: boolean) => send({ type: "folding", enabled }),
+	onFoldingChanged: (enabled: boolean) => {
+		foldingArm = enabled; // mirrored so a repeat `hello` restates the CURRENT arm (M8)
+		send({ type: "folding", enabled });
+	},
 });
 
 // Every `register*` call has now run, so `ready` (emitted by the `hello` handler) can describe the
