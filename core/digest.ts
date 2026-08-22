@@ -142,6 +142,21 @@ export function hasFoldTag(text: string): boolean {
 }
 
 /**
+ * Does this wire text carry the fold tag for THIS SPECIFIC id — the only tag that would actually
+ * resolve back to it?
+ *
+ * `hasFoldTag` asks the weaker question ("is there a tag at all"), and the difference is a real
+ * hole: a digest whose text begins with some OTHER block's tag — pasted by a human, or baked in by
+ * a conductor that hand-authored one — would pass the weak check and become reachable by its own
+ * code, which is exactly the accidental-restore path the tag rule exists to close. Reachability
+ * must be decided by the handle the model was ACTUALLY given, so `agentView` asks this one.
+ */
+export function hasOwnFoldTag(text: string, id: string): boolean {
+	const m = text.match(LEADING_FOLD_TAG);
+	return m ? m[0].includes(`{#${foldCode(id)} `) : false;
+}
+
+/**
  * What a human-emptied block collapses to on the wire.
  *
  * A user who clears the digest editor is saying "the agent should not see this block". Per-block

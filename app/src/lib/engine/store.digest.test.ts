@@ -61,6 +61,18 @@ describe("setBlockDigest", () => {
 		expect(s.isFolded(blk)).toBe(true); // still folded — only the TEXT went back to auto
 	});
 
+	it("strips a tag the user edited around, so the agent cannot undo the edit", () => {
+		const s = makeStore();
+		s.fold("r:c1"); // engine digest — arrives in the editor already tagged
+		const seeded = s.digestOf(s.get("r:c1")!);
+		expect(hasFoldTag(seeded)).toBe(true);
+
+		// The editor strips before sending AND `opFold` strips again; either alone is enough, but the
+		// UI needs its copy so `typed` predicts the committed value and Save clears itself.
+		s.setBlockDigest("r:c1", seeded.replace(/^\S+ /, "kept the tag by accident: "));
+		expect(hasFoldTag(s.digestOf(s.get("r:c1")!))).toBe(false);
+	});
+
 	it("takes the block over from a conductor that folded it", () => {
 		const s = makeStore();
 		s.fold("r:c1", "auto", "conductor's summary");
@@ -124,6 +136,19 @@ describe("setGroupSummary", () => {
 		const after = s.groupById(g.id)!;
 		expect(s.isDropGroup(after)).toBe(false);
 		expect(s.groupSummary(after)).toBe("actually, keep a note of this");
+	});
+
+	it("does NOT resurrect a fold state the user did not ask for — open groups stay open", () => {
+		// `opGroup` hardcodes `folded: true`, so a summary edit on an OPEN group would silently
+		// collapse live wire content. The Inspector only offers the editor on a FOLDED group; this
+		// pins the engine behaviour that makes that gate necessary, so the gate is never "cleaned up".
+		const s = makeStore();
+		const g = s.createGroup("a:r1:p0", "r:c1")!;
+		s.unfoldGroup(g.id);
+		expect(s.groupById(g.id)!.folded).toBe(false);
+
+		s.setGroupSummary(g.id, "text edit on an open group");
+		expect(s.groupById(g.id)!.folded).toBe(true); // ← why the UI must not offer this
 	});
 
 	it("is a no-op on an unknown group id", () => {

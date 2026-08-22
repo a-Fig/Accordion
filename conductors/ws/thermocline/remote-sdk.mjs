@@ -51,6 +51,7 @@ function foldCode(id) {
 function foldTag(id) {
   return `{#${foldCode(id)} FOLDED}`;
 }
+var LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
 var digestCache = /* @__PURE__ */ new WeakMap();
 var digestTokenCache = /* @__PURE__ */ new WeakMap();
 function digest(b) {
@@ -438,7 +439,6 @@ function collapsibleMessageKeys(members, requireDurable) {
 
 // core/truth.ts
 var PROTECT_OVERFLOW_CAP = 1.25;
-var LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
 function wireRoleOfId(id) {
   if (id.startsWith("sys:")) return "system";
   if (id.startsWith("u:") || /^m\d+:u$/.test(id)) return "user";
@@ -1572,7 +1572,8 @@ var Truth = class _Truth {
         if (this.isProtected(b)) return "protected";
         b.override = "folded";
         b.by = "you";
-        b.subst = void 0;
+        const authored = op.digest ? op.digest.replace(LEADING_FOLD_TAG, "") : "";
+        b.subst = authored.length ? authored : void 0;
         this.birthFolded.delete(id);
         return null;
       }
