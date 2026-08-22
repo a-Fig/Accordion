@@ -2,7 +2,7 @@
  * sidecar.ts — host the UNCHANGED pi extension (`accordion.ts`) for a harness that is NOT pi.
  *
  * The contract is `docs/sidecar-protocol.md` (v1). A host harness — today the mistral-vibe fork —
- * spawns `node <ACCORDION_HOME>/extension/sidecar.mjs` with cwd = the session cwd and speaks
+ * spawns `node <ACCORDION_REPO>/extension/sidecar.mjs` with cwd = the session cwd and speaks
  * JSON-lines over stdin/stdout. This file:
  *
  *   1. redirects `process.stdout.write` itself to STDERR before any extension code runs (stdout is

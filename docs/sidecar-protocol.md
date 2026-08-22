@@ -22,7 +22,10 @@ learns pi's types.
 
 ## Transport
 
-- Spawn: `node <ACCORDION_HOME>/extension/sidecar.mjs` (cwd = the harness session cwd).
+- Spawn: `node <ACCORDION_REPO>/extension/sidecar.mjs` (cwd = the harness session cwd). `ACCORDION_REPO` is the
+  harness-side name for the Accordion checkout; it is deliberately NOT `ACCORDION_HOME`, which the extension
+  itself already honors as an override for where `~/.accordion/` lives (`accordion.ts`) — the harness must not
+  set or forward `ACCORDION_HOME` to the sidecar.
   - The bundle is a **generated, gitignored, repo-checkout-only** artifact (like
     `conductors/ws/*/…-sdk.mjs`, and deliberately NOT in the npm tarball). Build it once with
     `npm --prefix extension run build:sidecar`; `npm --prefix extension run build` also emits it.
@@ -181,7 +184,7 @@ Block ids: `core/wire.ts blockId()` prefers `messageId` over `timestamp`
 
 ## Failure semantics (the harness side MUST honor)
 
-- No `ACCORDION_HOME` (and no `[accordion] home` in config) ⇒ the bridge is inert; upstream behavior.
+- No `ACCORDION_REPO` (and no `[accordion] repo` in config) ⇒ the bridge is inert; upstream behavior.
 - Sidecar spawn failure / no `ready` / crash / `context` timeout ⇒ passthrough + a one-time status
   note; never an exception on the model-call path.
 - `context` is the only hook that blocks the harness; everything else is fire-and-forget writes.
@@ -231,7 +234,7 @@ not a request for the sidecar to change.
 
 **Spawn / handshake**
 
-- Command is `node <ACCORDION_HOME>/extension/sidecar.mjs`, with `<home>/extension/dist/sidecar.mjs`
+- Command is `node <ACCORDION_REPO>/extension/sidecar.mjs`, with `<repo>/extension/dist/sidecar.mjs`
   accepted as a fallback so a local build that still emits into `dist/` keeps working.
 - `hello.model` is always sent. vibe has **no declared provider context window**, so
   `contextWindow` is the active model's `auto_compact_threshold` — the number every other vibe
