@@ -152,17 +152,21 @@ function groupDigestTokens(group, members) {
 // core/wire.ts
 function blockId(m, i, partIndex) {
   switch (m.role) {
-    case "user":
-      return m.timestamp != null ? `u:${m.timestamp}` : `m${i}:u`;
+    case "user": {
+      const anchor = m.messageId ?? m.timestamp;
+      return anchor != null ? `u:${anchor}` : `m${i}:u`;
+    }
     case "assistant": {
       if (partIndex == null) return `m${i}:p?`;
-      const anchor = m.responseId != null ? m.responseId : m.timestamp != null ? `t${m.timestamp}` : null;
+      const anchor = m.responseId ?? m.messageId ?? (m.timestamp != null ? `t${m.timestamp}` : null);
       return anchor != null ? `a:${anchor}:p${partIndex}` : `m${i}:p${partIndex}`;
     }
     case "toolResult":
       return m.toolCallId != null ? `r:${m.toolCallId}` : `m${i}:r`;
-    default:
-      return m.timestamp != null ? `s:${m.timestamp}` : `m${i}:s`;
+    default: {
+      const anchor = m.messageId ?? m.timestamp;
+      return anchor != null ? `s:${anchor}` : `m${i}:s`;
+    }
   }
 }
 function isDurableId(id) {
