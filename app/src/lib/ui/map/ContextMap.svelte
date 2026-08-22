@@ -9,6 +9,8 @@
 	import { settings } from "$lib/settings.svelte";
 	import { anotherSurfaceControls } from "$lib/live/liveClient.svelte";
 	import { attemptSteer, readOnlyTip } from "$lib/live/controllerUi.svelte";
+	import DigestEditor from "./DigestEditor.svelte";
+	import { clearAllDrafts } from "./digestDrafts";
 	import Icon from "$lib/ui/Icon.svelte";
 	import SegControl from "$lib/ui/SegControl.svelte";
 	import TileCanvas from "./TileCanvas.svelte";
@@ -493,6 +495,7 @@
 		untrack(() => {
 			clearRange();
 			clearPendingClick(); // drop any deferred inspect bound to the old session
+			clearAllDrafts(); // unsaved digest text is id-keyed; another session may reuse an id
 			peeked = new Set();
 		});
 	});
@@ -866,6 +869,11 @@
 	function onKey(e: KeyboardEvent) {
 		const key = e.key;
 		if (key !== "ArrowLeft" && key !== "ArrowRight" && key !== "ArrowUp" && key !== "ArrowDown") return;
+		// A caret inside the digest editor owns the arrow keys. Without this the stage would
+		// preventDefault them and jump the selection to another block mid-sentence. `DigestEditor`
+		// also stops the event at its own edge; this is the backstop for any future field in here.
+		const t = e.target as HTMLElement | null;
+		if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT" || t.isContentEditable)) return;
 		e.preventDefault();
 		if (key === "ArrowUp" || key === "ArrowDown") {
 			const r = tryVerticalNav(key === "ArrowDown");
@@ -1254,7 +1262,21 @@
 								</button>
 							{/if}
 						</header>
-						<div class="tr-text" class:digest={folded}>{folded ? store.digestOf(b) : b.text}</div>
+						{#if folded}
+							<div class="tr-text digest">
+								<DigestEditor
+									id={b.id}
+									text={store.digestOf(b)}
+									editable={!steerLocked && !notController && store.canFold(b)}
+									isCustom={b.override === "folded" && b.subst !== undefined}
+									fullTokens={b.tokens}
+									disabledTitle={steerLocked ? lockTip : readOnlyTip("edit the digest")}
+									onsave={(next) => store.setBlockDigest(b.id, next)}
+								/>
+							</div>
+						{:else}
+							<div class="tr-text">{b.text}</div>
+						{/if}
 					</article>
 				{/each}
 			</div>

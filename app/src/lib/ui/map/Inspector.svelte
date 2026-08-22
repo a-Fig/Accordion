@@ -6,6 +6,9 @@
 	import { isBolted } from "$core/digest";
 	import { isTauriEnv } from "$lib/session.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
+	import DigestEditor from "./DigestEditor.svelte";
+	import { readOnlyTip } from "$lib/live/controllerUi.svelte";
+	import { anotherSurfaceControls } from "$lib/live/liveClient.svelte";
 
 	let {
 		store,
@@ -50,6 +53,15 @@
 	const lockTip = $derived(
 		`Locked by ${store.lockHolder ?? "the active strategy"} — release the lock to take back control`,
 	);
+
+	// Digest editing is a MUTATION, so unlike the observation panels it is gated on both fronts:
+	// the conductor's `human-steering` lock and (ADR 0024) whether this surface holds the controller
+	// lease. Mirrors `ContextMap`'s `notController` exactly. The gate matters more here than on a
+	// button — letting someone type a paragraph and only then have the wire refuse it as
+	// `read-only` is a far worse trade than showing plain text they cannot click into.
+	const notController = $derived(store.wireControlled && anotherSurfaceControls());
+	const canEditDigest = $derived(!steerLocked && !notController);
+	const editDisabledTitle = $derived(steerLocked ? lockTip : readOnlyTip("edit the digest"));
 
 	// the call/result partner — they're separate blocks sharing a callId
 	const partner = $derived.by<Block | null>(() => {
@@ -268,23 +280,44 @@
 		</div>
 
 		<!-- ── Body: group digest ─────────────────────────────────── -->
+		<!-- An OPEN group has no digest on the wire at all — its members ride whole — so it gets
+		     neither the drop label nor an editor: `setGroupSummary` regroups, and `opGroup` hardcodes
+		     `folded: true`, so editing the text of an open group would collapse live wire content as
+		     a side effect nobody asked for. It still shows what the summary WOULD be, read-only. -->
 		<div class="body-wrap">
 			<span class="eyebrow section-eyebrow">
-				{gIsDropGroup ? "Drop group" : "Digest — shown to agent"}
+				{!group.folded ? "Summary — when collapsed" : gIsDropGroup ? "Drop group" : "Digest — shown to agent"}
 			</span>
-			{#if gIsDropGroup}
-				<div class="digest-callout digest-callout-drop">
-					<div class="digest-label digest-label-drop">
-						<Icon name="chevrons-down-up" size={12} stroke={2} />
-						Removed from wire
-					</div>
-					<p class="drop-note">The agent does not see this block</p>
-				</div>
-			{:else}
-				<div class="digest-callout">
-					<pre class="digest-text mono">{gDigest}</pre>
-				</div>
-			{/if}
+			<div class="digest-callout" class:digest-callout-drop={group.folded && gIsDropGroup}>
+				{#if !group.folded}
+					<pre class="digest-text mono">{gIsDropGroup ? "(removes these messages from the wire)" : gDigest}</pre>
+				{:else}
+					{#if gIsDropGroup}
+						<div class="digest-label digest-label-drop">
+							<Icon name="chevrons-down-up" size={12} stroke={2} />
+							Removed from wire
+						</div>
+						<p class="drop-note">The agent does not see this block</p>
+					{/if}
+					<!-- Editable in both the drop and non-drop states: a drop group's summary is "" —
+					     typing text un-drops it (the range comes back as one verbatim message); clearing
+					     it back to empty drops it again. Unlike a per-block digest, empty here really
+					     does remove the messages, subject to the tool-pair fixpoint and role floor. -->
+					{#key group.id}
+						<DigestEditor
+							id={group.id}
+							text={gDigest}
+							editable={canEditDigest}
+							isCustom={group.by === "you" && typeof group.digest === "string" && group.digest.length > 0}
+							fullTokens={store.groupFullTokens(group)}
+							emptyMeans="drop"
+							savingsExact={false}
+							disabledTitle={editDisabledTitle}
+							onsave={(next) => store.setGroupSummary(group.id, next)}
+						/>
+					{/key}
+				{/if}
+			</div>
 		</div>
 	</aside>
 {:else if block}
@@ -432,7 +465,17 @@
 			{#if folded}
 				<span class="eyebrow section-eyebrow">Digest — shown to agent</span>
 				<div class="digest-callout">
-					<pre class="digest-text mono">{store.digestOf(block)}</pre>
+					{#key block.id}
+						<DigestEditor
+							id={block.id}
+							text={store.digestOf(block)}
+							editable={canEditDigest && !isBolted(block) && canFoldBlock}
+							isCustom={block.override === "folded" && block.subst !== undefined}
+							fullTokens={block.tokens}
+							disabledTitle={editDisabledTitle}
+							onsave={(next) => store.setBlockDigest(block.id, next)}
+						/>
+					{/key}
 				</div>
 				<div class="body-divider">
 					<span class="body-divider-label eyebrow">Full content</span>

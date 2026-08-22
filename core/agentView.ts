@@ -11,9 +11,9 @@
  *            touches fold state. The safe-by-construction read that keeps a locked unfold from
  *            blinding the agent.
  */
-import type { Block } from "./types";
+import type { Block, Group } from "./types";
 import type { Truth } from "./truth";
-import { foldCode, wireFoldable } from "./digest";
+import { foldCode, wireFoldable, hasOwnFoldTag } from "./digest";
 import { isDurableId } from "./wire";
 
 /** One block/group restored by `resolveUnfold`. */
@@ -41,6 +41,41 @@ export function blockLabel(b: Block): string {
 }
 
 /**
+ * Is this folded BLOCK reachable by an agent handle at all?
+ *
+ * The wire text the model receives is the only place a `{#code FOLDED}` tag ever appears, so a
+ * digest not carrying THIS BLOCK'S OWN tag is one the agent was never handed a working code for — a human-authored digest, or a
+ * conductor's non-recoverable `replace`. Without this guard a `foldCode` hash collision with some
+ * OTHER block's visible tag would restore (or read out) content the human deliberately replaced
+ * with their own words. `foldCode` is a 6-char base36 hash, so collisions are rare but real, and
+ * `resolveUnfold` restores EVERY match for a code by design — exactly the path a collision rides.
+ *
+ * Mirrors the rest of the match set (`isFolded` / `wireFoldable` / `isDurableId`) so unfold, recall,
+ * and the wire serialization all agree on which blocks carry a handle.
+ */
+function agentReachable(truth: Truth, b: Block): boolean {
+	return hasOwnFoldTag(truth.digestOf(b), b.id);
+}
+
+/**
+ * Is this folded GROUP reachable by an agent handle?
+ *
+ * The same tag-presence rule as `agentReachable`, over the summary the group actually emits — a
+ * VERBATIM summary is reachable exactly when whoever wrote it included a tag. A conductor
+ * routinely does (see `plan.groups` — a custom summary carrying `{#code FOLDED}` is a supported,
+ * tested shape); a human typing into the digest editor does not, which is what makes their words
+ * invisible to `unfold`/`recall`.
+ *
+ * The one carve-out is a DROP group, whose `groupSummary` is `""` — it emits no message at all,
+ * yet it MUST stay reachable: the role-validity floor can degrade it to a `roleFloorRecap` stub
+ * that deliberately carries `foldTag(g.id)` precisely so an agent `unfold` of that stub resolves
+ * back to this group.
+ */
+function groupAgentReachable(truth: Truth, g: Group): boolean {
+	return truth.isDropGroup(g) || hasOwnFoldTag(truth.groupSummary(g), g.id);
+}
+
+/**
  * Resolve an agent `unfold` request against the Truth. For each code (read from a `{#<code> FOLDED}`
  * tag) restore EVERY folded block/group carrying it, and record it; a code matching nothing folded
  * is reported in `missing`. A group is unfolded whole (its members reflow next context). Every
@@ -55,7 +90,7 @@ export function resolveUnfold(truth: Truth, codes: string[]): { restored: Unfold
 		// A GROUP code restores the WHOLE range. Checked first; a code can in principle match both a
 		// group and a block (rare collision) → restore both.
 		for (const g of truth.groups) {
-			if (g.folded && foldCode(g.id) === code) {
+			if (g.folded && groupAgentReachable(truth, g) && foldCode(g.id) === code) {
 				truth.apply([{ kind: "unfoldGroup", groupId: g.id }], "agent");
 				if (!truth.groupById(g.id)?.folded) {
 					restored.push({ code, kind: "text", label: `group · ${g.memberIds.length} blocks`, ids: g.memberIds.slice() });
@@ -64,7 +99,9 @@ export function resolveUnfold(truth: Truth, codes: string[]): { restored: Unfold
 			}
 		}
 		// Mirror EXACTLY the set the wire serialization folds: folded, a foldable kind, a durable id.
-		const matches = truth.blocks.filter((b) => truth.isFolded(b) && wireFoldable(b) && isDurableId(b.id) && foldCode(b.id) === code);
+		const matches = truth.blocks.filter(
+			(b) => truth.isFolded(b) && wireFoldable(b) && isDurableId(b.id) && agentReachable(truth, b) && foldCode(b.id) === code,
+		);
 		for (const b of matches) {
 			const grp = truth.groupOf(b);
 			const grpFolded = grp?.folded ?? false;
@@ -91,7 +128,7 @@ export function resolveRecall(truth: Truth, codes: string[]): { restored: Recall
 	for (const code of codes) {
 		let hit = false;
 		for (const g of truth.groups) {
-			if (g.folded && foldCode(g.id) === code) {
+			if (g.folded && groupAgentReachable(truth, g) && foldCode(g.id) === code) {
 				const text = g.memberIds
 					.map((id) => truth.get(id)?.text ?? "")
 					.filter((t) => t.length > 0)
@@ -100,7 +137,9 @@ export function resolveRecall(truth: Truth, codes: string[]): { restored: Recall
 				hit = true;
 			}
 		}
-		const matches = truth.blocks.filter((b) => truth.isFolded(b) && wireFoldable(b) && isDurableId(b.id) && foldCode(b.id) === code);
+		const matches = truth.blocks.filter(
+			(b) => truth.isFolded(b) && wireFoldable(b) && isDurableId(b.id) && agentReachable(truth, b) && foldCode(b.id) === code,
+		);
 		for (const b of matches) {
 			if (truth.groupOf(b)?.folded) continue; // the group branch already returns the whole range
 			restored.push({ code, label: blockLabel(b), text: truth.get(b.id)?.text ?? b.text, ids: [b.id] });

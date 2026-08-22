@@ -119,6 +119,85 @@ export function foldTag(id: string): string {
 }
 
 /**
+ * A leading `{#code FOLDED}` tag (plus any surrounding whitespace). ONE definition, shared by
+ * `Truth` (which strips it so the engine stays the sole author of the tag) and `agentView`
+ * (which reads its PRESENCE as the agent's permission to reach the block).
+ */
+export const LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
+
+/**
+ * Does this wire text carry a fold tag — i.e. did the ENGINE author it?
+ *
+ * The tag is the agent's handle: it is the only way a code ever reaches the model, so text without
+ * one is text the agent was never given a way to ask about. Two substitutions are deliberately
+ * untagged, and this predicate is what makes that absence mean something:
+ *   • a HUMAN-authored digest (`opFold` with `op.digest`) — the human's own words replace the
+ *     block, and an `unfold` handle would let the agent undo exactly the curation they just did;
+ *   • a conductor's non-recoverable `replace` (`recoverable: false`), which is verbatim by contract.
+ *
+ * NOT the reachability predicate. `resolveUnfold`/`resolveRecall` ask the STRICTER `hasOwnFoldTag`,
+ * because a `foldCode` HASH COLLISION with some other block's visible tag would otherwise restore
+ * one of these by accident. This weaker any-tag question has no production caller left; it is kept
+ * as the direct expression of "is there a tag at all", which the tag-contract tests assert on.
+ */
+export function hasFoldTag(text: string): boolean {
+	return LEADING_FOLD_TAG.test(text);
+}
+
+/**
+ * Does this wire text carry the fold tag for THIS SPECIFIC id — the only tag that would actually
+ * resolve back to it?
+ *
+ * `hasFoldTag` asks the weaker question ("is there a tag at all"), and the difference is a real
+ * hole: a digest whose text begins with some OTHER block's tag — pasted by a human, or baked in by
+ * a conductor that hand-authored one — would pass the weak check and become reachable by its own
+ * code, which is exactly the accidental-restore path the tag rule exists to close. Reachability
+ * must be decided by the handle the model was ACTUALLY given, so `agentView` asks this one.
+ */
+export function hasOwnFoldTag(text: string, id: string): boolean {
+	const m = text.match(LEADING_FOLD_TAG);
+	return m ? m[0].includes(`{#${foldCode(id)} `) : false;
+}
+
+/**
+ * Strip EVERY leading `{#code FOLDED}` tag from human-authored text, so the engine stays the sole
+ * author of the tag (`Truth.opFold` / `opGroup` human branches, and `DigestEditor` so its optimistic
+ * value predicts the same result).
+ *
+ * A LOOP, not a single replace: the editor seeds its box with the current digest, so text that
+ * already carries a tag is the norm here, and a doubled tag (`{#x FOLDED} {#x FOLDED} words` —
+ * pasted, or produced by one layer stripping before another) would otherwise leave a residual OWN
+ * tag behind and hand the agent back the handle this strip exists to remove. Stripping to a fixed
+ * point makes the result independent of how many layers ran, which is also what keeps the UI's
+ * predicted commit byte-equal to the engine's.
+ */
+export function stripFoldTags(text: string): string {
+	let out = text;
+	for (let prev = ""; prev !== out; ) {
+		prev = out;
+		out = out.replace(LEADING_FOLD_TAG, "");
+	}
+	return out;
+}
+
+/**
+ * What a human-emptied block collapses to on the wire.
+ *
+ * A user who clears the digest editor is saying "the agent should not see this block". Per-block
+ * folding cannot honour that literally: it is content SUBSTITUTION, and `applyPlan` refuses any
+ * fold op with an empty `digestText` (`core/wire.ts`) — which would ship the block WHOLE, the exact
+ * UI lie this repo forbids. Removing a block outright is only legal where the wire's message count
+ * may change, i.e. a GROUP drop (`Group.digest === null`), which carries the tool-pair fixpoint and
+ * the role-validity floor to keep the result provider-valid. So the block-level answer is the
+ * smallest honest placeholder: six tokens (`estTokens` 2 + `BLOCK_OVERHEAD` 4) that say plainly
+ * that something was here and is gone.
+ *
+ * Untagged by construction — it is a human-authored digest, so `hasOwnFoldTag` is false for it and
+ * the agent gets no handle to unfold or recall what was removed.
+ */
+export const EMPTY_DIGEST = "{empty}";
+
+/**
  * Per-block memo of the (immutable) digest string and its token cost. `digest(b)` reads
  * only fields fixed at parse time — kind, text, id, toolName, isError, tokens — and folding
  * never touches any of them (it flips override/autoFolded/by/subst). So the result is
