@@ -33,7 +33,7 @@ with a TUI widget (perpetual rebase against high-churn `app.py` — rejected).
 
 ## Decision
 
-1. **A generic sidecar host** (`extension/sidecar.ts` → `extension/dist/sidecar.mjs`): a Node
+1. **A generic sidecar host** (`extension/sidecar.ts` → `extension/sidecar.mjs`, beside `accordion.js`): a Node
    process that presents the shim `pi`/`ctx` surface to an unchanged `accordionLive()` and is
    driven over stdin/stdout JSON-lines by the host harness. The harness is vibe-native on the wire;
    the sidecar converts `LLMMessage` ⇄ `PiMessage` (system message → bolted system prompt; assistant
@@ -51,7 +51,7 @@ with a TUI widget (perpetual rebase against high-churn `app.py` — rejected).
    sidecar `context` call, 250 ms timeout → passthrough), `_setup_middleware` (drop
    `AutoCompactMiddleware` while Accordion folding is on), event forwarding, `unfold`/`recall` as
    native `BaseTool`s, sidecar process management. Activated only by `ACCORDION_REPO` / `[accordion]
-   home`; otherwise upstream behavior.
+   repo`; otherwise upstream behavior.
 4. **Project layout (owner's machine):** one folder `…/vibe-accordion/` holding `accordion/` (this
    repo, worktree on branch `vibe`) and `mistral-vibe/` (the fork). Dependency points fork →
    Accordion only; the stdio protocol is the sole contract.
