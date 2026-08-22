@@ -134,8 +134,11 @@ export const LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
  *   • a HUMAN-authored digest (`opFold` with `op.digest`) — the human's own words replace the
  *     block, and an `unfold` handle would let the agent undo exactly the curation they just did;
  *   • a conductor's non-recoverable `replace` (`recoverable: false`), which is verbatim by contract.
- * `resolveUnfold`/`resolveRecall` consult this so a `foldCode` HASH COLLISION with some other
- * block's visible tag can never restore one of them by accident.
+ *
+ * NOT the reachability predicate. `resolveUnfold`/`resolveRecall` ask the STRICTER `hasOwnFoldTag`,
+ * because a `foldCode` HASH COLLISION with some other block's visible tag would otherwise restore
+ * one of these by accident. This weaker any-tag question has no production caller left; it is kept
+ * as the direct expression of "is there a tag at all", which the tag-contract tests assert on.
  */
 export function hasFoldTag(text: string): boolean {
 	return LEADING_FOLD_TAG.test(text);
@@ -186,10 +189,11 @@ export function stripFoldTags(text: string): string {
  * UI lie this repo forbids. Removing a block outright is only legal where the wire's message count
  * may change, i.e. a GROUP drop (`Group.digest === null`), which carries the tool-pair fixpoint and
  * the role-validity floor to keep the result provider-valid. So the block-level answer is the
- * smallest honest placeholder: three tokens that say plainly that something was here and is gone.
+ * smallest honest placeholder: six tokens (`estTokens` 2 + `BLOCK_OVERHEAD` 4) that say plainly
+ * that something was here and is gone.
  *
- * Untagged by construction — it is a human-authored digest, so `hasFoldTag` is false for it and the
- * agent gets no handle to unfold or recall what was removed.
+ * Untagged by construction — it is a human-authored digest, so `hasOwnFoldTag` is false for it and
+ * the agent gets no handle to unfold or recall what was removed.
  */
 export const EMPTY_DIGEST = "{empty}";
 

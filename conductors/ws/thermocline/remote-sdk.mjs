@@ -1584,7 +1584,7 @@ var Truth = class _Truth {
         if (this.isProtected(b)) return "protected";
         b.override = "folded";
         b.by = "you";
-        const authored = op.digest ? stripFoldTags(op.digest) : "";
+        const authored = op.digest ? stripFoldTags(op.digest).trim() : "";
         b.subst = authored.length ? authored : void 0;
         this.birthFolded.delete(id);
         return null;

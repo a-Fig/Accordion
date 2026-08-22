@@ -308,7 +308,7 @@
 							id={group.id}
 							text={gDigest}
 							editable={canEditDigest}
-							isCustom={typeof group.digest === "string" && group.digest.length > 0}
+							isCustom={group.by === "you" && typeof group.digest === "string" && group.digest.length > 0}
 							fullTokens={store.groupFullTokens(group)}
 							emptyMeans="drop"
 							savingsExact={false}

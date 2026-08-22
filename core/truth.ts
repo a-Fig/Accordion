@@ -1420,7 +1420,17 @@ export class Truth {
 				//
 				// Omitting `digest` (or leaving only a tag) restores the engine digest — the "put the
 				// auto-generated message back" path — which re-tags the block as agent-reachable again.
-				const authored = op.digest ? stripFoldTags(op.digest) : "";
+				//
+				// TRIMMED for the same reason `applyPlan` trims a group summary (`core/wire.ts`: "a
+				// whitespace-only string would emit a provider-invalid text part"). Without it a blank-but-
+				// not-empty digest is truthy AND has length, so it rides the wire as whitespace: the fold-op
+				// filter there guards only on `digestText` being TRUTHY, so the block path would ship what
+				// the sibling group path rejects two lines below. Whitespace therefore behaves like a
+				// tag-only digest and restores the engine's, rather than substituting the sentinel:
+				// `{empty}` is what the STORE commits for a deliberately cleared editor, and stealing it
+				// here would break the tag-only restore path above. Unreachable from the UI (the editor
+				// trims first); this closes the raw-wire-command path.
+				const authored = op.digest ? stripFoldTags(op.digest).trim() : "";
 				b.subst = authored.length ? authored : undefined;
 				this.birthFolded.delete(id);
 				return null;
