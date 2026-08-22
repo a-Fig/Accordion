@@ -40,6 +40,84 @@ describe("core/wire — durable ids", () => {
 	});
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// `messageId` — the sidecar (docs/sidecar-protocol.md) bridges a non-pi harness
+// (mistral-vibe) that hands over per-message uuids but no `timestamp`. `blockId`
+// must prefer `messageId` over `timestamp` so those sessions still get durable
+// (foldable) ids instead of falling through to a positional one. Pi never sets
+// `messageId`, so every pre-existing id (asserted above and in mapping.test.ts)
+// must stay byte-identical — this block only covers the NEW anchor.
+// ─────────────────────────────────────────────────────────────────────────────
+describe("core/wire — messageId anchor (sidecar/vibe harness)", () => {
+	it("user: messageId is preferred over timestamp when both are present", () => {
+		const m: PiMessage = { role: "user", content: "hi", timestamp: 1, messageId: "msg-u1" };
+		expect(blockId(m, 0)).toBe("u:msg-u1");
+	});
+	it("user: messageId alone (no timestamp) still yields a durable id", () => {
+		const m: PiMessage = { role: "user", content: "hi", messageId: "msg-u2" };
+		expect(blockId(m, 0)).toBe("u:msg-u2");
+		expect(isDurableId(blockId(m, 0))).toBe(true);
+	});
+	it("assistant: responseId still wins over messageId when both are present", () => {
+		const m: PiMessage = {
+			role: "assistant",
+			responseId: "r1",
+			messageId: "msg-a1",
+			timestamp: 2,
+			content: [{ type: "text", text: "hi" }] as any,
+		};
+		expect(blockId(m, 0, 0)).toBe("a:r1:p0");
+	});
+	it("assistant: messageId is preferred over timestamp when there is no responseId", () => {
+		const m: PiMessage = { role: "assistant", messageId: "msg-a2", timestamp: 2, content: [{ type: "text", text: "hi" }] as any };
+		expect(blockId(m, 0, 0)).toBe("a:msg-a2:p0");
+	});
+	it("assistant: messageId alone (no responseId, no timestamp) still yields a durable id", () => {
+		const m: PiMessage = { role: "assistant", messageId: "msg-a3", content: [{ type: "text", text: "hi" }] as any };
+		expect(blockId(m, 0, 0)).toBe("a:msg-a3:p0");
+		expect(isDurableId(blockId(m, 0, 0))).toBe(true);
+	});
+	it("default (summary/other role): messageId is preferred over timestamp", () => {
+		const m: PiMessage = { role: "custom", summary: "note", timestamp: 5, messageId: "msg-s1" };
+		expect(blockId(m, 0)).toBe("s:msg-s1");
+	});
+	it("toolResult is unaffected by messageId (still keyed on toolCallId only)", () => {
+		const m: PiMessage = { role: "toolResult", toolCallId: "c1", toolName: "read", content: "x", messageId: "msg-should-be-ignored" };
+		expect(blockId(m, 0)).toBe("r:c1");
+	});
+	it("messages without messageId are byte-identical to the pre-existing (pi) behavior", () => {
+		const ms = session(); // no message in session() sets messageId
+		expect(blockId(ms[0], 0)).toBe("u:1");
+		expect(blockId(ms[1], 1, 1)).toBe("a:r1:p1");
+		expect(blockId(ms[2], 2)).toBe("r:c1");
+	});
+
+	it("linearize + applyPlan round-trip a fold for a message with messageId but no timestamp", () => {
+		// Without the messageId anchor these would fall through to a POSITIONAL id
+		// (isDurableId → false), and applyPlan would silently refuse the fold op —
+		// the exact gap this change closes for a vibe-sourced session.
+		const ms: PiMessage[] = [
+			{ role: "user", content: "read the file", messageId: "msg-1" },
+			{
+				role: "assistant",
+				messageId: "msg-2",
+				content: [{ type: "text", text: "here is a long-winded reply that we will fold away" }] as any,
+			},
+		];
+		const blocks = linearize(ms);
+		const textBlock = blocks.find((b) => b.kind === "text")!;
+		expect(textBlock.id).toBe("a:msg-2:p0");
+		expect(isDurableId(textBlock.id)).toBe(true);
+
+		const out = applyPlan(ms, [{ id: textBlock.id, digestText: "{#abc123 FOLDED} 1 line" }]);
+		expect(out).not.toBe(ms); // the fold actually applied (not silently refused)
+		expect(((out[1].content as any[])[0] as any).text).toBe("{#abc123 FOLDED} 1 line");
+		// Re-linearizing the folded messages resolves to the SAME durable id — the whole
+		// point of a content-anchored id: it survives the substitution.
+		expect(linearize(out).find((b) => b.kind === "text")!.id).toBe("a:msg-2:p0");
+	});
+});
+
 describe("core/wire — linearize", () => {
 	it("explodes messages into typed blocks in conversation order", () => {
 		const blocks = linearize(session());

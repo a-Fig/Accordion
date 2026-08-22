@@ -165,11 +165,13 @@ export const DEFAULT_PORT = DOOR_PORT;
  * A serialisable block — the wire form of engine `Block`, minus the reactive overlay (which
  * travels separately in a snapshot's `overlay`, and is reconstructed by replaying events). `id`
  * is durable, content-anchored identity (see core/wire.ts → blockId):
- *   • `u:<timestamp>`                      — a user message
- *   • `a:<responseId|"t"+timestamp>:p<j>`  — part j of an assistant message (thinking|text|tool_call)
- *   • `r:<toolCallId>`                     — a tool_result message
- *   • `s:<timestamp>`                      — a summary/other message
- * Fallback (anchor absent): positional `m<i>:u|p<j>|r|s`.
+ *   • `u:<messageId|timestamp>`                     — a user message
+ *   • `a:<responseId|messageId|"t"+timestamp>:p<j>` — part j of an assistant message (thinking|text|tool_call)
+ *   • `r:<toolCallId>`                              — a tool_result message
+ *   • `s:<messageId|timestamp>`                     — a summary/other message
+ * Fallback (anchor absent): positional `m<i>:u|p<j>|r|s`. (`messageId` is set only by a non-pi
+ * harness bridged through the sidecar — see `docs/sidecar-protocol.md`; pi messages never carry
+ * it, so this is purely an additional preferred anchor, not a behavior change for pi sessions.)
  *
  * The one exception is the `system` block (v22): its id is the constant `SYSTEM_BLOCK_ID`
  * (`"sys:0"`, `core/types.ts`) and its `order` is -1, because the agent's system prompt is not a

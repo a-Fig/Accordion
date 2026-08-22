@@ -9,12 +9,21 @@
  *
  * Block ids are durable and content-anchored — identical whether derived now or
  * after the message array shifts position:
- *   • user          → `u:<timestamp>`
- *   • assistant part j (thinking/text/tool_call) → `a:<responseId ?? "t"+timestamp>:p<j>`
+ *   • user          → `u:<messageId ?? timestamp>`
+ *   • assistant part j (thinking/text/tool_call) → `a:<responseId ?? messageId ?? "t"+timestamp>:p<j>`
  *   • tool_result   → `r:<toolCallId>`
- *   • summary/other → `s:<timestamp>`
+ *   • summary/other → `s:<messageId ?? timestamp>`
  * Fallback (missing anchor): `m<i>:u`, `m<i>:p<j>`, `m<i>:r`, `m<i>:s` (position-based,
  * same as the old scheme) — so nothing crashes on malformed messages.
+ *
+ * `messageId` exists because pi is not the only harness on the other end of this bridge: the
+ * mistral-vibe sidecar (`docs/sidecar-protocol.md`) hands over per-message uuids but no
+ * `timestamp` field at all, so without a messageId-aware anchor those messages would fall all
+ * the way through to a POSITIONAL id — which `isDurableId` refuses to fold (see its doc comment).
+ * `messageId` is preferred over `timestamp` (closer to the harness's own stable identity) but
+ * always loses to `responseId` on assistant messages, since a single provider response can
+ * legitimately carry multiple parts under one response id. Pi messages never set `messageId`, so
+ * every id this module already produces for a pi session is byte-identical to before.
  *
  * NOTE ON THE PROTOCOL IMPORT: `WireBlock`/`FoldOp`/`GroupOp` are wire-message shapes that now
  * live in `core/protocol.ts` (relocated in Phase B; `app/src/lib/live/protocol.ts` is a re-export
@@ -55,6 +64,13 @@ export interface PiMessage {
 	timestamp?: number;
 	/** Provider-assigned response id; preferred anchor for assistant-message part ids. */
 	responseId?: string;
+	/**
+	 * Harness-assigned per-message uuid. Pi never sets this. A non-pi harness (the mistral-vibe
+	 * sidecar, `docs/sidecar-protocol.md`) has stable message ids but no `timestamp`, so `blockId`
+	 * prefers `messageId` over `timestamp` wherever both could apply — see `blockId`'s doc comment
+	 * for the exact per-role anchor order.
+	 */
+	messageId?: string;
 }
 
 /**
@@ -62,23 +78,38 @@ export interface PiMessage {
  * where the message sits in the array. Both `linearize` and `applyPlan` must call
  * this — never inline the formula — so the two can never drift.
  *
+ * Per-role anchor preference (first present wins; falls through to the positional
+ * `m<i>:…` id only when NONE of a role's anchors are set):
+ *   • user          → `messageId` → `timestamp`
+ *   • assistant     → `responseId` → `messageId` → `t<timestamp>` (id shape `a:<anchor>:p<j>`
+ *     unchanged — `responseId` stays first because one provider response can carry multiple
+ *     parts that must all anchor to the SAME id)
+ *   • toolResult    → `toolCallId` only (unaffected by `messageId`)
+ *   • default (system/summary/etc.) → `messageId` → `timestamp`
+ * Pi never sets `messageId` (see its doc comment on `PiMessage`), so this preference order is
+ * purely additive for pi sessions — every id already produced here is byte-identical.
+ *
  * @param m         the pi message
  * @param i         the message's current array index (used ONLY as a fallback)
  * @param partIndex for assistant messages, the content-part index; omit for others
  */
 export function blockId(m: PiMessage, i: number, partIndex?: number): string {
 	switch (m.role) {
-		case "user":
-			return m.timestamp != null ? `u:${m.timestamp}` : `m${i}:u`;
+		case "user": {
+			const anchor = m.messageId ?? m.timestamp;
+			return anchor != null ? `u:${anchor}` : `m${i}:u`;
+		}
 		case "assistant": {
 			if (partIndex == null) return `m${i}:p?`; // shouldn't happen; defensive only
-			const anchor = m.responseId != null ? m.responseId : m.timestamp != null ? `t${m.timestamp}` : null;
+			const anchor = m.responseId ?? m.messageId ?? (m.timestamp != null ? `t${m.timestamp}` : null);
 			return anchor != null ? `a:${anchor}:p${partIndex}` : `m${i}:p${partIndex}`;
 		}
 		case "toolResult":
 			return m.toolCallId != null ? `r:${m.toolCallId}` : `m${i}:r`;
-		default:
-			return m.timestamp != null ? `s:${m.timestamp}` : `m${i}:s`;
+		default: {
+			const anchor = m.messageId ?? m.timestamp;
+			return anchor != null ? `s:${anchor}` : `m${i}:s`;
+		}
 	}
 }
 
