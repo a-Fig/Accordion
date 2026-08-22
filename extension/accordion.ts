@@ -163,6 +163,16 @@ type CompletionFunction = (
 ) => Promise<any>;
 interface RuntimeDependencies {
 	complete?: CompletionFunction;
+	/**
+	 * Additive HOST seam (`extension/sidecar.ts`, `docs/sidecar-protocol.md`): notified whenever the
+	 * folding arm actually CHANGES. A pi host never passes this; the sidecar does, because the vibe
+	 * harness must swap its own compaction middleware off exactly while Accordion is folding, and it
+	 * is NOT a WebSocket client, so the existing `folding` broadcast never reaches it. Purely
+	 * observational — it can neither set nor veto the arm, so `setFolding`'s semantics are unchanged
+	 * (still fires only on a real transition, and only after the broadcast). Best-effort: a throw
+	 * here is swallowed, exactly like every other optional host API this file calls.
+	 */
+	onFoldingChanged?: (enabled: boolean) => void;
 }
 // Vite's fixed localhost:1420 Origin is browser-obtainable, unlike Tauri's production custom
 // origins. Trust it only for an explicit local development session; shipped installs stay closed.
@@ -2081,6 +2091,12 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (foldingEnabled === on) return;
 		foldingEnabled = on;
 		broadcast({ type: "folding", enabled: foldingEnabled });
+		// Non-WebSocket hosts (the sidecar) learn about the arm here — see RuntimeDependencies.
+		try {
+			dependencies.onFoldingChanged?.(foldingEnabled);
+		} catch {
+			/* host seam is best-effort — never let it break a toggle */
+		}
 	}
 
 	/**

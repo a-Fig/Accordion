@@ -1,38 +1,44 @@
 {
-  "name": "@a-fig/accordion",
-  "version": "0.1.2",
-  "type": "module",
-  "description": "Accordion live link — a pi extension that hosts the session's context Truth and serves a replica + remote-control protocol to the Accordion GUI.",
-  "keywords": ["pi-package"],
-  "scripts": {
-    "build:app": "npm --prefix ../app run build",
-    "build:extension": "node ./build-extension.mjs",
-    "build:client": "node ./build-client.mjs",
-    "build:remote-sdk": "node ./build-remote-sdk.mjs",
-    "build": "npm run build:app && npm run build:client && npm run build:extension && npm run build:remote-sdk",
-    "prepack": "npm run build && npm run smoke",
-    "smoke": "node smoke.mjs && node smoke-conductor.mjs"
-  },
-  "pi": {
-    "extensions": ["./accordion.js"]
-  },
-  "files": [
-    "accordion.js",
-    "dist",
-    "skills",
-    "README.md"
-  ],
-  "dependencies": {
-    "ws": "^8.18.0"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
-    "typebox": "*"
-  },
-  "devDependencies": {
-    "esbuild": "^0.25.0",
-    "jiti": "^2.7.0"
-  }
+	"name": "@a-fig/accordion",
+	"version": "0.1.2",
+	"type": "module",
+	"description": "Accordion live link \u2014 a pi extension that hosts the session's context Truth and serves a replica + remote-control protocol to the Accordion GUI.",
+	"keywords": [
+		"pi-package"
+	],
+	"scripts": {
+		"build:app": "npm --prefix ../app run build",
+		"build:extension": "node ./build-extension.mjs",
+		"build:client": "node ./build-client.mjs",
+		"build:remote-sdk": "node ./build-remote-sdk.mjs",
+		"build:sidecar": "node ./build-sidecar.mjs",
+		"build": "npm run build:app && npm run build:client && npm run build:extension && npm run build:remote-sdk && npm run build:sidecar",
+		"prepack": "npm run build && npm run smoke",
+		"smoke": "node smoke.mjs && node smoke-conductor.mjs && npm run smoke:sidecar",
+		"smoke:sidecar": "node ./build-sidecar.mjs && node smoke-sidecar.mjs"
+	},
+	"pi": {
+		"extensions": [
+			"./accordion.js"
+		]
+	},
+	"files": [
+		"accordion.js",
+		"dist",
+		"skills",
+		"README.md"
+	],
+	"dependencies": {
+		"ws": "^8.18.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"esbuild": "^0.25.0",
+		"jiti": "^2.7.0"
+	}
 }
