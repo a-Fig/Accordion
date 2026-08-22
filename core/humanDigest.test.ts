@@ -8,7 +8,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { Truth } from "./truth";
-import { EMPTY_DIGEST, foldCode, hasFoldTag } from "./digest";
+import { EMPTY_DIGEST, foldCode, foldTag, hasFoldTag } from "./digest";
 import { resolveUnfold, resolveRecall } from "./agentView";
 import type { Block, ParsedSession } from "./types";
 
@@ -112,6 +112,54 @@ describe("human-authored digest", () => {
 		const r = t.apply([{ kind: "fold", ids: [TEXT_ID], digest: "mine" }], "you");
 		expect(r.results[0].applied).toBe(false);
 		expect(r.results[0].clamped).toBe("locked");
+	});
+});
+
+describe("the seeded-digest trap (review finding: the editor pre-fills WITH the tag)", () => {
+	// The editor seeds its box with the CURRENT digest, so an engine digest arrives already carrying
+	// `{#code FOLDED}`. A user who edits that text rather than replacing it wholesale would commit a
+	// still-tagged "human" digest — leaving the block agent-reachable and the whole contract false in
+	// the single most common flow. `opFold` strips the leading tag on the human path so it cannot.
+	it("strips a leading tag the human edited around, keeping the block unreachable", () => {
+		const t = makeTruth();
+		t.apply([{ kind: "fold", ids: [TEXT_ID] }], "you"); // plain fold → engine digest, tagged
+		const seeded = t.digestOf(t.get(TEXT_ID)!);
+		expect(hasFoldTag(seeded)).toBe(true);
+
+		// Exactly what the editor sends back when the user edits the body and leaves the tag alone.
+		const edited = `${foldTag(TEXT_ID)} I rewrote this`;
+		t.apply([{ kind: "fold", ids: [TEXT_ID], digest: edited }], "you");
+
+		const after = t.digestOf(t.get(TEXT_ID)!);
+		expect(after).toBe("I rewrote this");
+		expect(hasFoldTag(after)).toBe(false);
+		expect(resolveUnfold(t, [foldCode(TEXT_ID)]).missing).toEqual([foldCode(TEXT_ID)]);
+		expect(t.isFolded(t.get(TEXT_ID)!)).toBe(true); // the agent could not undo it
+	});
+
+	it("a digest that is ONLY a tag falls back to the engine digest", () => {
+		const t = makeTruth();
+		t.apply([{ kind: "fold", ids: [TEXT_ID], digest: foldTag(TEXT_ID) }], "you");
+		expect(t.get(TEXT_ID)!.subst).toBeUndefined();
+	});
+
+	it("a FOREIGN tag does not make a block reachable by its own code", () => {
+		// `hasFoldTag` would pass this (there IS a tag); only an OWN-tag check refuses it. A pasted or
+		// fabricated tag must not re-open the accidental-restore path.
+		const t = makeTruth();
+		t.apply([{ kind: "replace", id: TEXT_ID, content: `${foldTag("r:c1")} not my tag`, recoverable: false }], "auto");
+		const wire = t.digestOf(t.get(TEXT_ID)!);
+		expect(hasFoldTag(wire)).toBe(true); // the weak check is fooled
+		expect(resolveUnfold(t, [foldCode(TEXT_ID)]).missing).toEqual([foldCode(TEXT_ID)]);
+		expect(t.isFolded(t.get(TEXT_ID)!)).toBe(true);
+	});
+
+	it("a STRATEGY fold-with-digest keeps its tag — ViewConductor authors its own handle", () => {
+		const t = makeTruth();
+		const tagged = `${foldTag(TEXT_ID)} conductor's own handle`;
+		t.apply([{ kind: "fold", ids: [TEXT_ID], digest: tagged }], "auto");
+		expect(t.digestOf(t.get(TEXT_ID)!)).toBe(tagged); // NOT stripped
+		expect(resolveUnfold(t, [foldCode(TEXT_ID)]).missing).toEqual([]);
 	});
 });
 

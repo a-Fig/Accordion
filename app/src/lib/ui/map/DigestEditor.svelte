@@ -16,13 +16,18 @@
 	 * permanently-live field with the row's gestures stopped at its edge sidesteps that entirely;
 	 * unfolding stays on the row's own Fold/Unfold button, which already exists.
 	 *
-	 * READ-ONLY (a `human-steering` lock, a non-controller surface, a Claude Code transcript)
-	 * degrades to a plain `<pre>` — same type, same colour, no caret, nothing to discover and then
-	 * be refused. The RULE in CLAUDE.md cuts the other way too: a read-only surface must never
-	 * render an affordance the steering path could not produce.
+	 * `editable` false degrades to a plain `<pre>` — same type, same colour, no caret, nothing to
+	 * discover and then be refused. Callers must pass false for every state where a save would be
+	 * REFUSED, not just where it is forbidden: a `human-steering` lock, a non-controller surface,
+	 * and — easy to miss — anything `Truth.canFold(b, "you")` rejects, which includes the protected
+	 * working tail (a lock-free conductor's birth-fold puts a FOLDED block in there, and the human
+	 * branch has no birth-fold exemption) and a block inside a folded group. A read-only Claude Code
+	 * transcript is NOT one of those states: it has a local Truth and no wire, so editing is a
+	 * legitimate preview — the RULE in CLAUDE.md requires preview to obey the same rules as
+	 * steering, not to be more restrictive than it.
 	 */
 	import Icon from "$lib/ui/Icon.svelte";
-	import { EMPTY_DIGEST } from "$core/digest";
+	import { EMPTY_DIGEST, LEADING_FOLD_TAG } from "$core/digest";
 	import { estTokens, BLOCK_OVERHEAD } from "$core/tokens";
 	import { getDraft, setDraft, clearDraft } from "./digestDrafts";
 
@@ -130,15 +135,28 @@
 
 	function save() {
 		if (!dirty) return;
-		const t = draft.trim();
-		clearDraft(id);
-		// Hold `typed` at exactly what we asked for, rather than dropping back to the OLD committed
-		// text for the frame before the echoed event lands. `dirty` goes false on its own the moment
-		// `text` catches up, so the Save button still disappears when the write sticks — and stays
-		// put if it never does (a clamp, a refusal), which is the honest signal.
+		// Mirror `Truth.opFold`'s human branch, which strips a leading `{#code FOLDED}` tag so the
+		// engine stays the sole author of it. Doing it HERE too is not belt-and-braces: the box is
+		// seeded with the current digest, so an edited engine digest still starts with the tag, and
+		// if we sent it unstripped `typed` would predict a committed value the engine will never
+		// produce — leaving Save dirty forever. Predict what actually lands.
+		const t = draft.replace(LEADING_FOLD_TAG, "").trim();
+		// NOTE: the draft is deliberately NOT cleared here. A save can be refused outright — a
+		// protected block, a block inside a folded group, a lost controller lease — and in demo/CC
+		// mode the TxnResult is discarded, so a refusal is silent. Clearing now would leave the
+		// user's only copy in `typed`, which the `{#key}` remount discards on the next block click:
+		// the paragraph they just wrote would vanish with no message. The draft is cleared when the
+		// commit is OBSERVED (the effect below), so a refusal simply leaves the text in the box.
 		typed = t.length ? t : emptyCommitsTo;
 		onsave(t);
 	}
+
+	// Commit observation: the moment `text` catches up with what we asked for, the write really
+	// landed and the draft has served its purpose. Until then it stays, so a refused save keeps the
+	// user's words recoverable.
+	$effect(() => {
+		if (typed !== null && typed === text) clearDraft(id);
+	});
 
 	function restoreAuto() {
 		clearDraft(id);

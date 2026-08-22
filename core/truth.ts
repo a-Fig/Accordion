@@ -1403,13 +1403,25 @@ export class Truth {
 				if (this.isProtected(b)) return "protected";
 				b.override = "folded";
 				b.by = "you";
-				// A human may author the digest verbatim (issue: editable folded digest). Stored EXACTLY
-				// as given — no `{#code FOLDED}` tag is prepended, unlike `opReplace`'s recoverable path.
-				// That absence IS the contract: a tag means machine-authored and agent-reachable, so a
-				// human's own words are invisible to `unfold`/`recall` (see `agentView.ts`, which skips
-				// every untagged digest). Omitting `digest` restores the engine digest — the "put the
-				// auto-generated message back" path — and re-tags the block as agent-reachable again.
-				b.subst = op.digest && op.digest.length ? op.digest : undefined;
+				// A human may author the digest (issue: editable folded digest). A leading `{#code FOLDED}`
+				// tag is STRIPPED, exactly as `opReplace` strips it below and for the same reason: the
+				// engine is the sole author of that tag. Here it is load-bearing rather than tidy — the
+				// tag is the only handle the model ever receives, so an untagged digest is unreachable
+				// by `unfold`/`recall` (`agentView.ts`), and that is what keeps a human's own words from
+				// being undone by the agent.
+				//
+				// Stripping is NOT cosmetic defensive coding: the editor seeds its box with the CURRENT
+				// digest, which for an engine digest or a default recap already begins with the tag. A
+				// user who edits that text rather than replacing it wholesale would otherwise commit a
+				// still-tagged "human" digest and silently keep the block agent-reachable — the contract
+				// broken in the single most common flow. The strategy branch below deliberately does NOT
+				// strip: `ViewConductor` emits fold-with-digest (`core/conductor/view.ts`) and a
+				// conductor authoring its own recall handle is a supported shape.
+				//
+				// Omitting `digest` (or leaving only a tag) restores the engine digest — the "put the
+				// auto-generated message back" path — which re-tags the block as agent-reachable again.
+				const authored = op.digest ? op.digest.replace(LEADING_FOLD_TAG, "") : "";
+				b.subst = authored.length ? authored : undefined;
 				this.birthFolded.delete(id);
 				return null;
 			}

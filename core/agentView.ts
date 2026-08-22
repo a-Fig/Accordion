@@ -13,7 +13,7 @@
  */
 import type { Block, Group } from "./types";
 import type { Truth } from "./truth";
-import { foldCode, wireFoldable, hasFoldTag } from "./digest";
+import { foldCode, wireFoldable, hasOwnFoldTag } from "./digest";
 import { isDurableId } from "./wire";
 
 /** One block/group restored by `resolveUnfold`. */
@@ -43,8 +43,8 @@ export function blockLabel(b: Block): string {
 /**
  * Is this folded BLOCK reachable by an agent handle at all?
  *
- * The wire text the model receives is the only place a `{#code FOLDED}` tag ever appears, so an
- * UNTAGGED digest is one the agent was never handed a code for — a human-authored digest, or a
+ * The wire text the model receives is the only place a `{#code FOLDED}` tag ever appears, so a
+ * digest not carrying THIS BLOCK'S OWN tag is one the agent was never handed a working code for — a human-authored digest, or a
  * conductor's non-recoverable `replace`. Without this guard a `foldCode` hash collision with some
  * OTHER block's visible tag would restore (or read out) content the human deliberately replaced
  * with their own words. `foldCode` is a 6-char base36 hash, so collisions are rare but real, and
@@ -54,7 +54,7 @@ export function blockLabel(b: Block): string {
  * and the wire serialization all agree on which blocks carry a handle.
  */
 function agentReachable(truth: Truth, b: Block): boolean {
-	return hasFoldTag(truth.digestOf(b));
+	return hasOwnFoldTag(truth.digestOf(b), b.id);
 }
 
 /**
@@ -72,7 +72,7 @@ function agentReachable(truth: Truth, b: Block): boolean {
  * back to this group.
  */
 function groupAgentReachable(truth: Truth, g: Group): boolean {
-	return truth.isDropGroup(g) || hasFoldTag(truth.groupSummary(g));
+	return truth.isDropGroup(g) || hasOwnFoldTag(truth.groupSummary(g), g.id);
 }
 
 /**

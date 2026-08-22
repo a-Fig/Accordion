@@ -1267,8 +1267,8 @@
 								<DigestEditor
 									id={b.id}
 									text={store.digestOf(b)}
-									editable={!steerLocked && !notController}
-									isCustom={b.subst !== undefined}
+									editable={!steerLocked && !notController && store.canFold(b)}
+									isCustom={b.override === "folded" && b.subst !== undefined}
 									fullTokens={b.tokens}
 									disabledTitle={steerLocked ? lockTip : readOnlyTip("edit the digest")}
 									onsave={(next) => store.setBlockDigest(b.id, next)}
