@@ -29,6 +29,18 @@ alone — no Rust, no desktop app required.
 pi install npm:@a-fig/accordion
 ```
 
+The package also provides an `accordion-mcp` stdio server for Claude Code and
+Codex. Its `open_accordion` tool opens or focuses the native desktop GUI:
+
+```bash
+claude mcp add --scope user accordion -- accordion-mcp
+codex mcp add accordion -- accordion-mcp
+```
+
+Set `ACCORDION_APP_PATH` in the MCP server environment when the desktop app is
+not installed in a standard location. Claude Code transcript browsing is
+read-only, and live context folding remains pi-only.
+
 That adds the package to `~/.pi/agent/settings.json`. Restart pi, then in any project:
 
 ```bash

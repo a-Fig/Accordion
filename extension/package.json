@@ -9,15 +9,20 @@
     "build:extension": "node ./build-extension.mjs",
     "build:client": "node ./build-client.mjs",
     "build:remote-sdk": "node ./build-remote-sdk.mjs",
-    "build": "npm run build:app && npm run build:client && npm run build:extension && npm run build:remote-sdk",
+    "build:mcp": "node ./build-mcp.mjs",
+    "build": "npm run build:app && npm run build:client && npm run build:extension && npm run build:remote-sdk && npm run build:mcp",
     "prepack": "npm run build && npm run smoke",
-    "smoke": "node smoke.mjs && node smoke-conductor.mjs"
+    "smoke": "node smoke.mjs && node smoke-conductor.mjs && node smoke-mcp.mjs"
   },
   "pi": {
     "extensions": ["./accordion.js"]
   },
+  "bin": {
+    "accordion-mcp": "./accordion-mcp.js"
+  },
   "files": [
     "accordion.js",
+    "accordion-mcp.js",
     "dist",
     "skills",
     "README.md"
