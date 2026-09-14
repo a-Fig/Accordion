@@ -7,6 +7,7 @@
 	import { isTauriEnv } from "$lib/session.svelte";
 	import Icon from "$lib/ui/Icon.svelte";
 	import DigestEditor from "./DigestEditor.svelte";
+	import { clearDraft } from "./digestDrafts";
 	import { readOnlyTip } from "$lib/live/controllerUi.svelte";
 	import { anotherSurfaceControls } from "$lib/live/liveClient.svelte";
 
@@ -36,6 +37,22 @@
 	const HEAD_CAP = 3000;
 	const TAIL_CAP = 3000;
 	const fmt = (n: number) => n.toLocaleString();
+
+	/**
+	 * Delete the current group. Group ids are `g:${memberIds[0]}` (see `store.svelte.ts`'s
+	 * `setGroupSummary` doc comment) and get REUSED whenever a new group later starts at the same
+	 * leading block — `deleteGroup` on its own only ungroups the Truth-side overlay, so a stale
+	 * unsaved draft left in `digestDrafts.ts`'s client-local Map would silently resurrect onto that
+	 * unrelated later group. Clearing the draft here, at the one call site that actually destroys a
+	 * group, keeps that Map from outliving the group it was typed against — same reasoning as
+	 * `DigestEditor`'s own commit-observation effect clearing a draft once it lands.
+	 */
+	function deleteGroup() {
+		const id = group!.id;
+		clearDraft(id);
+		store.deleteGroup(id);
+		onclose();
+	}
 
 	const folded = $derived(block ? store.isFolded(block) : false);
 	const pinned = $derived(block?.override === "pinned");
@@ -246,7 +263,7 @@
 						class:action-disabled={steerLocked}
 						disabled={steerLocked}
 						aria-disabled={steerLocked}
-						onclick={() => { store.deleteGroup(group!.id); onclose(); }}
+						onclick={deleteGroup}
 						title={steerLocked ? lockTip : "Delete group"}
 					>
 						<Icon name="trash-2" size={14} />
@@ -269,7 +286,7 @@
 						class:action-disabled={steerLocked}
 						disabled={steerLocked}
 						aria-disabled={steerLocked}
-						onclick={() => { store.deleteGroup(group!.id); onclose(); }}
+						onclick={deleteGroup}
 						title={steerLocked ? lockTip : "Delete group"}
 					>
 						<Icon name="trash-2" size={14} />
