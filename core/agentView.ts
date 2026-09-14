@@ -66,13 +66,20 @@ function agentReachable(truth: Truth, b: Block): boolean {
  * tested shape); a human typing into the digest editor does not, which is what makes their words
  * invisible to `unfold`/`recall`.
  *
- * The one carve-out is a DROP group, whose `groupSummary` is `""` — it emits no message at all,
- * yet it MUST stay reachable: the role-validity floor can degrade it to a `roleFloorRecap` stub
- * that deliberately carries `foldTag(g.id)` precisely so an agent `unfold` of that stub resolves
- * back to this group.
+ * The one carve-out is a DROP group whose collapse is RIGHT NOW manifesting as a role-floor-forced
+ * `roleFloorRecap` stub on the wire (`Truth.isDegradedDropGroup`) — the role-validity floor can
+ * degrade a drop run to a stub that deliberately carries `foldTag(g.id)`, precisely so an agent
+ * `unfold`/`recall` of that stub resolves back to this group. A drop group is NOT unconditionally
+ * reachable just because it IS a drop: `groupSummary` is `""` for every drop, degraded or not, so
+ * without checking the degrade condition a plain human drop — which puts nothing at all on the
+ * wire — would be just as reachable as a genuine role-floor stub, handing the agent a working
+ * `recall`/`unfold` handle to content the human deliberately removed. That would make the
+ * strongest human curation action (drop) MORE reachable than a weaker one (a custom summary,
+ * which correctly stays unreachable via `hasOwnFoldTag`) — the exact inversion this predicate
+ * exists to prevent.
  */
 function groupAgentReachable(truth: Truth, g: Group): boolean {
-	return truth.isDropGroup(g) || hasOwnFoldTag(truth.groupSummary(g), g.id);
+	return truth.isDegradedDropGroup(g) || hasOwnFoldTag(truth.groupSummary(g), g.id);
 }
 
 /**

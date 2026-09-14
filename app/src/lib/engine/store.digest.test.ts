@@ -214,3 +214,69 @@ describe("setGroupSummary", () => {
 		expect(s.groupSummary(after!)).toBe(s.groupSummary(beforeEdit));
 	});
 });
+
+describe("Finding A — clearing a tagged group's digest to a drop must revoke the agent's handle", () => {
+	// Reviewer's confirmed repro: human groups blocks the agent already has a working tag for → the
+	// wire carries `{#code FOLDED} group · N blocks · ...` (the agent now knows this code) → human
+	// clears the group's digest box in the Inspector (`setGroupSummary(id, "")`, a REAL drop at group
+	// granularity) → `Group.digest === null`, nothing on the wire → the agent tries `recall`/`unfold`
+	// with the SAME code it already knew. Pre-fix, `groupAgentReachable` treated EVERY drop group as
+	// reachable, so the agent could still pull back the full original content the human just told the
+	// engine to drop — the strongest human curation action (drop) was MORE reachable than a weaker one
+	// (a custom summary). Post-fix, a drop that truly vanishes must be unreachable.
+	//
+	// The layout deliberately puts a LIVE assistant turn ("a:r2:p0") between the group and the next
+	// user turn — NOT another user turn immediately after — so dropping the group does not trip the
+	// role-validity floor's same-role-adjacency guard. That guard is a SEPARATE, legitimate carve-out
+	// (see the "a drop group stays reachable" test in core/humanDigest.test.ts): this test is deliberately
+	// shaped to avoid it, so it exercises the genuine-silent-drop case Finding A is actually about.
+	function makeReachabilityStore(): AccordionStore {
+		const blocks: Block[] = [
+			b("u:1", "user", 1, 0, 20),
+			b("a:r1:p0", "thinking", 1, 1, 200),
+			b("a:r1:p1", "text", 1, 2, 200),
+			b("a:r1:p2", "tool_call", 1, 3, 10, "c1"),
+			b("r:c1", "tool_result", 1, 4, 3000, "c1"),
+			b("a:r2:p0", "text", 2, 5, 50), // live assistant turn AFTER the group — keeps the drop role-valid
+			b("u:2", "user", 3, 6, 20),
+		];
+		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks, lineCount: 0, skipped: 0 };
+		const s = new AccordionStore(parsed);
+		s.setBudget(1_000_000);
+		s.setProtect(0);
+		return s;
+	}
+
+	it("recall/unfold on the known code no longer succeed once the group is dropped", () => {
+		const s = makeReachabilityStore();
+		const g = s.createGroup("a:r1:p0", "r:c1")!;
+		expect(g).not.toBeNull();
+
+		// The agent has already been shown this on the wire: the default recap is tagged, and (via
+		// the read-only `recall`, which never mutates) it can pull the full original content right now.
+		const summary = s.groupSummary(s.groupById(g.id)!);
+		expect(hasFoldTag(summary)).toBe(true);
+		const code = foldCode(g.id);
+		const preDrop = s.resolveRecall([code]);
+		expect(preDrop.missing).toEqual([]);
+		expect(preDrop.restored[0]?.text.length).toBeGreaterThan(0);
+
+		// The human clears the box — a REAL drop at group granularity (unlike a per-block digest,
+		// which becomes `{empty}` instead).
+		s.setGroupSummary(g.id, "");
+		const dropped = s.groupById(g.id)!;
+		expect(s.isDropGroup(dropped)).toBe(true);
+		expect(s.groupSummary(dropped)).toBe(""); // nothing on the wire at all
+
+		// The agent tries the SAME code it already knew. Pre-fix this succeeded (recall handed back
+		// the full original text; unfold restored the whole range). Post-fix, both must fail.
+		const recall = s.resolveRecall([code]);
+		expect(recall.missing).toEqual([code]);
+		expect(recall.restored).toEqual([]);
+
+		const unfold = s.resolveUnfold([code]);
+		expect(unfold.missing).toEqual([code]);
+		expect(unfold.restored).toEqual([]);
+		expect(s.groupById(g.id)!.folded).toBe(true); // still folded — unfold did NOT succeed
+	});
+});

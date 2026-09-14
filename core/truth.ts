@@ -770,6 +770,30 @@ export class Truth {
 		const c = this.classifyGroup(g);
 		return groupDigest(g, c.collapsedMembers.length ? c.collapsedMembers : c.members);
 	}
+	/**
+	 * Is this DROP group's collapse manifesting, RIGHT NOW, as a role-floor-forced `roleFloorRecap`
+	 * stub actually sitting on the wire — as opposed to a drop that truly vanishes, pushing nothing
+	 * at all? This is the ONLY legitimate carve-out `agentView.ts`'s `groupAgentReachable` may treat
+	 * as reachable for a drop group: the role-validity floor (`computeDegradedDropRuns`, `wire.ts`)
+	 * synthesizes that stub carrying `foldTag(g.id)` ON PURPOSE, precisely so an agent `unfold`/
+	 * `recall` of it resolves back to the group it degraded FROM.
+	 *
+	 * `isDropGroup` alone is NOT enough: it is true for a genuine human drop too (cleared the
+	 * digest box to nothing), which puts literally nothing on the wire and must stay unreachable —
+	 * treating every drop as reachable would make the strongest human curation action (drop) MORE
+	 * reachable than a weaker one (a custom summary, kept unreachable by `hasOwnFoldTag`), letting
+	 * `recall`/`unfold` hand back content the human just chose to remove.
+	 *
+	 * Reuses `degradedRunKeys()` — the SAME verdict `applyPlan` reaches for the real wire, never a
+	 * re-derived approximation — so this can never drift from what the agent actually receives.
+	 */
+	isDegradedDropGroup(g: Group): boolean {
+		if (!g.folded || !this.isDropGroup(g)) return false;
+		const c = this.classifyGroup(g);
+		if (!c.collapsedRuns.length) return false;
+		const keys = this.degradedRunKeys();
+		return c.collapsedRuns.some((run) => keys.has(messageKey(run[0].id)));
+	}
 	groupFullTokens(g: Group): number {
 		let n = 0;
 		for (const b of this.groupMembers(g)) n += b.tokens;
