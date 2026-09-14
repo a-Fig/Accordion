@@ -157,4 +157,60 @@ describe("setGroupSummary", () => {
 		s.setGroupSummary("g:nope", "hello");
 		expect(s.groups.length).toBe(before);
 	});
+
+	// Review finding: `setGroupSummary` sends `[{ungroup}, {group}]` as one batch so an agent handle
+	// survives a summary edit. `Truth.apply` is NOT atomic — if the `ungroup` half commits and the
+	// paired `group` half is then clamped, the group used to vanish silently with no error surfaced.
+	//
+	// The reported repro (`setProtect` alone, after group creation) turns out to be blocked earlier:
+	// `pruneProtectedGroups` runs on every housekeeping pass and already destroys a group whose members
+	// fall in the protected tail, well before `setGroupSummary` is ever called — so that path was never
+	// actually reachable through `setGroupSummary`. The REAL path is `opGroup`'s own `snappedRange`
+	// widening the edit's effective range at rewrite time: a group created over an INCOMPLETE multi-part
+	// assistant message survives later `append()`s of sibling parts (`pruneProtectedGroups` only checks
+	// the group's own already-narrow stored `memberIds`, never re-derives a wider range) and survives a
+	// `setProtect` move that doesn't reach past that narrow stored range — but `setGroupSummary`'s
+	// internal regroup re-snaps to the FULL message (pulling in the now-appended sibling part), and if
+	// that wider range now reaches into the protected tail, `opGroup` clamps it as `"protected"` — after
+	// the `ungroup` half already committed.
+	it("a mid-edit widen into the protected tail must not destroy the group (Truth.apply is not atomic)", () => {
+		// Group created over only the first TWO parts of a three-part assistant message.
+		const early: Block[] = [b("u:1", "user", 1, 0, 100), b("a:r1:p0", "thinking", 1, 1, 800), b("a:r1:p1", "text", 1, 2, 600)];
+		const parsed: ParsedSession = { meta: { format: "pi", title: "t", cwd: "", model: "" }, blocks: early, lineCount: 0, skipped: 0 };
+		const s = new AccordionStore(parsed);
+		s.setBudget(1_000_000);
+		s.setProtect(0);
+
+		const g = s.createGroup("a:r1:p0", "a:r1:p1")!;
+		expect(g).not.toBeNull();
+		expect(s.groups.length).toBe(1);
+
+		// The rest of the assistant turn streams in later: the message's own third part (same
+		// `messageKey`, so `snappedRange` will later pull it into a regroup) plus its tool result and
+		// the next user turn.
+		s.appendBlocks([b("a:r1:p2", "tool_call", 1, 3, 100, "c1"), b("r:c1", "tool_result", 1, 4, 3000, "c1"), b("u:2", "user", 2, 5, 100)]);
+		expect(s.groups.length).toBe(1); // pruneProtectedGroups: group's own narrow range is still safe
+
+		// The human drags the protect dial. It lands past the newly-arrived sibling part but not past
+		// the group's own (still narrow) stored range — so the group survives this move too.
+		s.setProtect(3150);
+		expect(s.groups.length).toBe(1);
+		const beforeEdit = s.groupById(g.id)!;
+		expect(beforeEdit.memberIds).toEqual(["a:r1:p0", "a:r1:p1"]);
+
+		// Now the edit: setGroupSummary's internal regroup re-snaps via snappedRange, widening to
+		// include "a:r1:p2" (same messageKey) — which sits at/past the now-moved protected boundary.
+		// Pre-fix, this silently destroyed the group. Post-fix, the whole rewrite is refused atomically
+		// and the original group survives untouched.
+		s.setGroupSummary(g.id, "my own words");
+
+		const after = s.groupById(g.id);
+		expect(after).toBeDefined(); // not destroyed
+		expect(s.groups.length).toBe(1);
+		expect(after!.memberIds).toEqual(["a:r1:p0", "a:r1:p1"]); // unchanged, not silently widened either
+		expect(after!.folded).toBe(true);
+		// The edit itself was refused (protected range can't be rewritten right now) — so the summary
+		// must be exactly what it was before the attempted edit, not the human's new text.
+		expect(s.groupSummary(after!)).toBe(s.groupSummary(beforeEdit));
+	});
 });

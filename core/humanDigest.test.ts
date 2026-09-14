@@ -316,4 +316,33 @@ describe("group summaries", () => {
 		expect(hasFoldTag(t.groupSummary(t.groupById(gid)!))).toBe(true);
 		expect(resolveUnfold(t, [foldCode(gid)]).missing).toEqual([]);
 	});
+
+	// `opFold`'s human branch does `stripFoldTags(op.digest).trim()` (asserted above, "a WHITESPACE-only
+	// digest falls back too"); `opGroup`'s sibling line was missing the `.trim()`. A whitespace-only
+	// `summary` then survived as `g.digest === "   "` — non-null, non-empty, so `isDropGroup` (which
+	// only checks `digest === null || digest === ""`) read it as a real summary, not a drop. But
+	// `computeGroupOps` separately guards `summaryText !== null && !summaryText.trim()` and SKIPS the
+	// group entirely on a match (core/truth.ts, mirroring the `applyPlan` `safeGroups` filter in
+	// core/wire.ts that rejects a whitespace-only `summaryText` as "a provider-invalid text part") — so
+	// the group op never reaches `applyPlan` at all. Net effect: `g.folded` stays `true` (the UI still
+	// shows it collapsed) while the wire ships every member block WHOLE, since nothing ever told
+	// `applyPlan` to remove them. Bypasses the store (`setGroupSummary` normalizes an all-whitespace box
+	// to `null` before this ever runs) to pin the raw-wire-command path, same as its `opFold` sibling.
+	it("a WHITESPACE-only summary is a real drop, not a silent ship-whole", () => {
+		const t = makeTruth();
+		const r = t.apply([{ kind: "group", ids: ["a:r1:p0", "r:c1"], summary: "  \t \n " }], "you");
+		expect(r.results[0].applied).toBe(true);
+		const gid = r.results[0].detail!;
+		const g = t.groupById(gid)!;
+
+		expect(g.folded).toBe(true); // still reads as folded in the UI
+		expect(t.isDropGroup(g)).toBe(true); // ...but a REAL drop underneath, not a live 3-space summary
+		expect(t.groupSummary(g)).toBe("");
+
+		// The load-bearing assertion: the group must actually reach `applyPlan` as a drop, not vanish
+		// from `computeGroupOps` and let the members ship whole while `folded` still reads true.
+		const op = t.computeGroupOps().find((o) => o.id === gid);
+		expect(op).toBeDefined();
+		expect(op!.summaryText).toBeNull();
+	});
 });
