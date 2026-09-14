@@ -80,10 +80,11 @@ reasons over at full fidelity.
 
 **Conductors are opt-in, same as folding itself** — pick one from the header's Conductor
 menu, or leave it on "None" for fully manual steering. `compaction-naive`, `handoff`, and
-`doorman` run right inside this extension, no extra setup. The fourth, `thermocline`
-(attention-gated compression under a hard budget invariant), runs as its own out-of-process
-Node program; its runner ships with the full [GitHub repo](https://github.com/a-Fig/Accordion),
-not with this npm package, so it only shows up in the picker when Accordion is running from a
+`doorman` run right inside this extension, no extra setup. Two more, `thermocline`
+(attention-gated compression under a hard budget invariant) and `triptych` (pressure-gated
+thirds with tree-sitter code skeletons), each run as their own out-of-process Node program.
+Their runners ship with the full [GitHub repo](https://github.com/a-Fig/Accordion) and not
+with this npm package, so they only show up in the picker when Accordion is running from a
 repo checkout (e.g. the desktop app build) rather than a bare `pi install`. Picking a
 conductor that takes over any steering control shows you a consent screen first — cancel or
 detach anytime and your own edits are preserved.
