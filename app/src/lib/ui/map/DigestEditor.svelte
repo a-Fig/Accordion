@@ -27,9 +27,10 @@
 	 * steering, not to be more restrictive than it.
 	 */
 	import Icon from "$lib/ui/Icon.svelte";
-	import { EMPTY_DIGEST, stripFoldTags } from "$core/digest";
+	import { EMPTY_DIGEST } from "$core/digest";
 	import { estTokens, BLOCK_OVERHEAD } from "$core/tokens";
 	import { getDraft, setDraft, clearDraft } from "./digestDrafts";
+	import { committedFromDraft, isEmptied } from "./digestEditorLogic";
 
 	let {
 		id,
@@ -96,12 +97,28 @@
 	// carrying one block's half-written text onto another.
 	let typed = $state<string | null>(null);
 	let el = $state<HTMLTextAreaElement | null>(null);
+	// Bumped by `revert()` so `draft` below re-reads `getDraft(id)` even in the one case a plain
+	// `typed = null` reassignment doesn't invalidate it: `typed` was ALREADY `null` on entry (e.g.
+	// this instance just remounted onto an existing stored draft — see the `typed` doc comment
+	// above). Reassigning a `$state` to the SAME value is not observed as a change, and
+	// `digestDrafts.ts`'s Map is deliberately non-reactive (so one block's draft never re-renders
+	// every other open editor), so without this `draft` would keep showing the text `revert()` just
+	// deleted from the Map, with Save/Cancel stuck open — and a subsequent Save would silently
+	// re-commit the very text the user just tried to discard. Mirrors the `void this.version`
+	// version-counter idiom already used throughout `store.svelte.ts`.
+	let draftEpoch = $state(0);
 
-	const draft = $derived(typed ?? getDraft(id) ?? text);
+	const draft = $derived.by(() => (void draftEpoch, typed ?? getDraft(id) ?? text));
 	const dirty = $derived(draft !== text);
+	// What `save()` below will actually commit — see `digestEditorLogic.ts`. `emptied` and the cost
+	// readout are computed from THIS, not the raw `draft`: an engine-authored digest is seeded into
+	// the box WITH its `{#code FOLDED}` tag, so deleting everything but that tag leaves `draft`
+	// falsy-non-empty even though save() (via the same `committedFromDraft`) commits an actual
+	// drop/`{empty}`.
+	const committed = $derived(committedFromDraft(draft));
 	// `{empty}` is a saved state, not an empty field: the block is standing in for itself with three
 	// tokens. Clearing the box entirely is how you ASK for that, so both read as "emptied".
-	const emptied = $derived(draft.trim().length === 0 || (emptyMeans === "sentinel" && draft.trim() === EMPTY_DIGEST));
+	const emptied = $derived(isEmptied(committed, emptyMeans));
 	/** What the committed `text` becomes once an emptied save lands. */
 	const emptyCommitsTo = $derived(emptyMeans === "drop" ? "" : EMPTY_DIGEST);
 
@@ -112,7 +129,7 @@
 	// negative saving reads as a warning and explains itself.
 	// A dropped group costs nothing at all; an emptied block still pays for its sentinel.
 	const draftTokens = $derived(
-		emptied && emptyMeans === "drop" ? 0 : estTokens(emptied ? EMPTY_DIGEST : draft.trim()) + BLOCK_OVERHEAD,
+		emptied && emptyMeans === "drop" ? 0 : estTokens(emptied ? EMPTY_DIGEST : committed) + BLOCK_OVERHEAD,
 	);
 	const saved = $derived(savingsExact && fullTokens > 0 ? fullTokens - draftTokens : 0);
 	/** Only a delta we can stand behind counts as "over budget"; otherwise it is just a cost. */
@@ -139,8 +156,9 @@
 		// so the engine stays the sole author of them — same helper, so the two agree byte-for-byte. Doing it HERE too is not belt-and-braces: the box is
 		// seeded with the current digest, so an edited engine digest still starts with the tag, and
 		// if we sent it unstripped `typed` would predict a committed value the engine will never
-		// produce — leaving Save dirty forever. Predict what actually lands.
-		const t = stripFoldTags(draft).trim();
+		// produce — leaving Save dirty forever. Predict what actually lands (`committed`, already
+		// computed above from this same helper).
+		const t = committed;
 		// NOTE: the draft is deliberately NOT cleared here. A save can be refused outright — a
 		// protected block, a block inside a folded group, a lost controller lease — and in demo/CC
 		// mode the TxnResult is discarded, so a refusal is silent. Clearing now would leave the
@@ -167,6 +185,8 @@
 	function revert() {
 		clearDraft(id);
 		typed = null;
+		draftEpoch++; // see the doc comment on `draftEpoch` above — forces `draft` to re-read
+		// `getDraft(id)` even when `typed` was already `null` on entry.
 		el?.blur();
 	}
 
