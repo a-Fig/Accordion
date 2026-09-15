@@ -17,7 +17,7 @@ import type { Block, Actor, SessionMeta, ParsedSession, Group } from "./types";
 import { SYSTEM_BLOCK_ID, SYSTEM_BLOCK_ORDER } from "./types";
 import type { LockName } from "./locks";
 import { hasLock } from "./locks";
-import { digest, digestTokens, substTokens, groupDigest, groupDigestTokens, wireFoldable, isBolted, foldTag } from "./digest";
+import { digest, digestTokens, substTokens, groupDigest, groupDigestTokens, wireFoldable, isBolted, foldTag, LEADING_FOLD_TAG, stripFoldTags } from "./digest";
 import { estTokens, BLOCK_OVERHEAD } from "./tokens";
 import { isDurableId, applyPlan, computeDegradedDropRuns, roleFloorRecap, type PiMessage, type WireMsgShape } from "./wire";
 import { collapsibleMessageKeys, messageKey } from "./groupShape";
@@ -79,10 +79,6 @@ export interface TruthStats {
 
 /** Whole-block slack allowed above `protectTokens` before the next older block is left foldable. */
 const PROTECT_OVERFLOW_CAP = 1.25;
-
-/** A leading `{#code FOLDED}` tag (with surrounding whitespace) a strategy may have baked into a
- *  recoverable `replace` body. Stripped so the engine stays the SOLE author of the tag. */
-const LEADING_FOLD_TAG = /^\s*\{#[0-9a-z]{6} FOLDED\}\s*/;
 
 /** Re-exported from its new home in `core/groupShape.ts` (which owns the per-MESSAGE collapse
  *  fixpoint keyed on it), so every existing `import { messageKey } from ".../core/truth"` is
@@ -774,6 +770,30 @@ export class Truth {
 		const c = this.classifyGroup(g);
 		return groupDigest(g, c.collapsedMembers.length ? c.collapsedMembers : c.members);
 	}
+	/**
+	 * Is this DROP group's collapse manifesting, RIGHT NOW, as a role-floor-forced `roleFloorRecap`
+	 * stub actually sitting on the wire — as opposed to a drop that truly vanishes, pushing nothing
+	 * at all? This is the ONLY legitimate carve-out `agentView.ts`'s `groupAgentReachable` may treat
+	 * as reachable for a drop group: the role-validity floor (`computeDegradedDropRuns`, `wire.ts`)
+	 * synthesizes that stub carrying `foldTag(g.id)` ON PURPOSE, precisely so an agent `unfold`/
+	 * `recall` of it resolves back to the group it degraded FROM.
+	 *
+	 * `isDropGroup` alone is NOT enough: it is true for a genuine human drop too (cleared the
+	 * digest box to nothing), which puts literally nothing on the wire and must stay unreachable —
+	 * treating every drop as reachable would make the strongest human curation action (drop) MORE
+	 * reachable than a weaker one (a custom summary, kept unreachable by `hasOwnFoldTag`), letting
+	 * `recall`/`unfold` hand back content the human just chose to remove.
+	 *
+	 * Reuses `degradedRunKeys()` — the SAME verdict `applyPlan` reaches for the real wire, never a
+	 * re-derived approximation — so this can never drift from what the agent actually receives.
+	 */
+	isDegradedDropGroup(g: Group): boolean {
+		if (!g.folded || !this.isDropGroup(g)) return false;
+		const c = this.classifyGroup(g);
+		if (!c.collapsedRuns.length) return false;
+		const keys = this.degradedRunKeys();
+		return c.collapsedRuns.some((run) => keys.has(messageKey(run[0].id)));
+	}
 	groupFullTokens(g: Group): number {
 		let n = 0;
 		for (const b of this.groupMembers(g)) n += b.tokens;
@@ -1295,12 +1315,63 @@ export class Truth {
 	}
 
 	// ── the single write path ─────────────────────────────────────────────────
+	/**
+	 * `apply` is NOT atomic across a multi-op batch — each op is applied independently via
+	 * `applyOne`, with no rollback if a later op fails. That is fine for the common case (a batch of
+	 * independent proposals, some of which no-op) but it is UNSAFE for the "rewrite" pattern
+	 * `setGroupSummary` uses: `[{ungroup, groupId}, {group, ids:[first,last], summary}]`, sent as one
+	 * batch so an agent handle survives a summary edit. If the `ungroup` commits and the paired
+	 * `group` is then clamped (e.g. the protected tail moved between the group's creation and the
+	 * edit, or `opGroup`'s `snappedRange` widens the requested range — a later-arriving sibling
+	 * message part, say — into now-protected territory) the group would otherwise vanish with no
+	 * signal: `groupById` returns undefined, `groups.length` drops, and nothing surfaces the loss.
+	 *
+	 * Since `opGroup` always derives a group's id as `g:${memberIds[0]}`, a regroup targeting the
+	 * exact same first member recreates the exact same id — so a same-batch `group` op that fails
+	 * where an `ungroup` on that derived id just succeeded is unambiguously "the other half of a
+	 * rewrite that didn't complete," not an unrelated failed create. We restore the pre-batch group
+	 * AND retroactively flip that `ungroup`'s own `OpResult.applied` to `false` (rather than only
+	 * patching local state), so the whole doomed pair reads as "nothing applied": a live host must
+	 * not forward the `ungroup` half alone, since `wireEventFromTruthEvent`/`appliedOpForWire`
+	 * (core/replica.ts) mirror the wire ONLY what `applied`, and a replica replaying just the
+	 * `ungroup` (with no paired `group` op to trigger the same revival) would drop the group for
+	 * real — a silent, undetected host/replica divergence (`rev` still bumps by one on both sides)
+	 * worse than the original bug. Flipping `applied` makes the rewrite atomic in its observable
+	 * effect without making EVERY multi-op batch atomic — unrelated ops in the same batch still
+	 * apply/replicate independently. (A plain `resetAll` in the same batch takes precedence —
+	 * nothing survives a full reset.)
+	 */
 	apply(ops: Op[], by: Actor, baseRev?: number): TxnResult {
 		const results: OpResult[] = [];
 		const touched = new Set<string>();
 		let didReset = false;
+		// derived group id -> {pre-batch group, the ungroup OpResult that removed it}
+		const revivable = new Map<string, { group: Group; ungroupResult: OpResult }>();
 		for (const op of ops) {
+			if (op.kind === "ungroup") {
+				const g = this.groupById(op.groupId);
+				const r = this.applyOne(op, by, baseRev, touched);
+				if (g && r.applied) revivable.set(op.groupId, { group: g, ungroupResult: r });
+				results.push(r);
+				continue;
+			}
 			const r = this.applyOne(op, by, baseRev, touched);
+			if (op.kind === "resetAll" && r.applied) revivable.clear();
+			if (op.kind === "group") {
+				const revivedId = `g:${op.ids[0]}`;
+				if (r.applied) {
+					revivable.delete(revivedId);
+				} else {
+					const prior = revivable.get(revivedId);
+					if (prior && !this.groupById(revivedId)) {
+						this.groupList = [...this.groupList, prior.group];
+						prior.ungroupResult.applied = false;
+						prior.ungroupResult.detail = "regroup refused; ungroup reverted to avoid silent data loss";
+						r.detail = r.detail ? `${r.detail} — original group restored` : "original group restored";
+						revivable.delete(revivedId);
+					}
+				}
+			}
 			results.push(r);
 			if (r.applied && op.kind === "resetAll") didReset = true;
 		}
@@ -1407,7 +1478,35 @@ export class Truth {
 				if (this.isProtected(b)) return "protected";
 				b.override = "folded";
 				b.by = "you";
-				b.subst = undefined;
+				// A human may author the digest (issue: editable folded digest). A leading `{#code FOLDED}`
+				// tag is STRIPPED, exactly as `opReplace` strips it below and for the same reason: the
+				// engine is the sole author of that tag. Here it is load-bearing rather than tidy — the
+				// tag is the only handle the model ever receives, so an untagged digest is unreachable
+				// by `unfold`/`recall` (`agentView.ts`), and that is what keeps a human's own words from
+				// being undone by the agent.
+				//
+				// Stripping is NOT cosmetic defensive coding: the editor seeds its box with the CURRENT
+				// digest, which for an engine digest or a default recap already begins with the tag. A
+				// user who edits that text rather than replacing it wholesale would otherwise commit a
+				// still-tagged "human" digest and silently keep the block agent-reachable — the contract
+				// broken in the single most common flow. The strategy branch below deliberately does NOT
+				// strip: `ViewConductor` emits fold-with-digest (`core/conductor/view.ts`) and a
+				// conductor authoring its own recall handle is a supported shape.
+				//
+				// Omitting `digest` (or leaving only a tag) restores the engine digest — the "put the
+				// auto-generated message back" path — which re-tags the block as agent-reachable again.
+				//
+				// TRIMMED for the same reason `applyPlan` trims a group summary (`core/wire.ts`: "a
+				// whitespace-only string would emit a provider-invalid text part"). Without it a blank-but-
+				// not-empty digest is truthy AND has length, so it rides the wire as whitespace: the fold-op
+				// filter there guards only on `digestText` being TRUTHY, so the block path would ship what
+				// the sibling group path rejects two lines below. Whitespace therefore behaves like a
+				// tag-only digest and restores the engine's, rather than substituting the sentinel:
+				// `{empty}` is what the STORE commits for a deliberately cleared editor, and stealing it
+				// here would break the tag-only restore path above. Unreachable from the UI (the editor
+				// trims first); this closes the raw-wire-command path.
+				const authored = op.digest ? stripFoldTags(op.digest).trim() : "";
+				b.subst = authored.length ? authored : undefined;
 				this.birthFolded.delete(id);
 				return null;
 			}
@@ -1602,7 +1701,27 @@ export class Truth {
 		for (const id of memberIds) if (this.groupOf(this.get(id)!)) return this.clamp(op, "invalid-group", "overlaps an existing group");
 		// A strategy group must never sweep a human-held block into the collapse.
 		if (by !== "you" && memberIds.some((id) => this.get(id)!.override !== null)) return this.clamp(op, "human-override");
-		const g: Group = { id: `g:${memberIds[0]}`, memberIds, folded: true, by, digest: op.summary };
+		// A HUMAN-authored verbatim summary is stripped of any leading tag, the exact mirror of
+		// `opFold`'s human branch — and for the same reason, because the group editor seeds its box
+		// with the CURRENT summary and the default recap is tagged. Enforcing it HERE rather than in
+		// the editor is the point: the invariant belongs to Truth, not to a Svelte component, or a raw
+		// `group` command over the wire (`sanitizeOps` passes `summary` through untouched) would
+		// silently hand the agent back a handle to content the human replaced with their own words.
+		// A summary that was ONLY a tag strips to "" and therefore means DROP — which is exactly what
+		// an emptied box means at group granularity, so the two paths agree. Strategy summaries are
+		// left verbatim: thermocline bakes `foldTag(g.id)` into its strata on purpose so they stay
+		// recall-able (see `conductors/ws/thermocline/policy.ts`).
+		// `.trim()` mirrors `opFold`'s human branch (line ~1484): without it, a whitespace-only
+		// summary survives as a non-empty, non-null string, so `isDropGroup` (`digest === null ||
+		// digest === ""`) reads it as a real summary rather than a drop — but `computeGroupOps`
+		// (below, this file) skips any non-null `summaryText` that trims to empty, and `applyPlan`'s
+		// own `safeGroups` filter (core/wire.ts) rejects one the same way as a second line of
+		// defense — either way the group op never reaches the wire. Net effect: the group still
+		// *reads* as folded (`g.folded` stays true) while its members ship WHOLE, because nothing
+		// ever told `applyPlan` to remove them. Unreachable from the UI (`setGroupSummary` normalizes
+		// an all-whitespace box to `null` before this ever runs); this closes the raw-wire-command path.
+		const summary = by === "you" && typeof op.summary === "string" ? stripFoldTags(op.summary).trim() : op.summary;
+		const g: Group = { id: `g:${memberIds[0]}`, memberIds, folded: true, by, digest: summary };
 		if (this.classifyGroup(g).carrier === null) return this.clamp(op, "invalid-group", "nothing collapses (all stragglers)");
 		this.groupList = [...this.groupList, g];
 		for (const id of memberIds) touched.add(id);

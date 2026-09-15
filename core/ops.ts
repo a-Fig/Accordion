@@ -17,7 +17,14 @@ import type { Actor } from "./types";
 export type Op =
 	/** Collapse blocks to a digest. `digest` (a verbatim string) overrides the engine's
 	 *  per-kind digest; omit it to use the engine digest. A human fold sets `override:"folded"`;
-	 *  a strategy fold (by:"auto") sets `autoFolded` and leaves `override` null. */
+	 *  a strategy fold (by:"auto") sets `autoFolded` and leaves `override` null.
+	 *
+	 *  BOTH actors may author `digest`, and it is stored EXACTLY as given — no `{#code FOLDED}`
+	 *  tag is prepended (unlike `replace`'s recoverable path). That absence is load-bearing: the
+	 *  tag is the only handle the agent ever receives, so an untagged digest is unreachable by
+	 *  `unfold`/`recall` (`agentView.ts`'s `agentReachable`). Re-issuing `fold` on an already-folded
+	 *  block with a different `digest` REWRITES it; re-issuing with `digest` omitted restores the
+	 *  engine digest — that is the "put the auto-generated message back" path. */
 	| { kind: "fold"; ids: string[]; digest?: string }
 	/** Return blocks to live/open. Human ("you"): a sticky `unfolded` override. Agent ("agent"):
 	 *  unfold a folded block, staying sticky (cannot downgrade a human pin; ADR 0005). Strategy
