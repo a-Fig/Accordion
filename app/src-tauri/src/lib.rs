@@ -15,6 +15,7 @@ use std::time::UNIX_EPOCH;
 
 use serde_json::Value;
 use tauri::Manager;
+use tauri_plugin_opener::OpenerExt;
 
 // Per-process cache for head-reads: path → (mtime_ms, title, cwd).
 // Avoids re-reading unchanged files on every 3-second poll.
@@ -540,6 +541,25 @@ fn read_claude_session(path: String) -> Result<String, String> {
     fs::read_to_string(&target).map_err(|e| format!("read failed: {e}"))
 }
 
+/// Write text to a temp `.md` file and open it with the OS's default handler for the
+/// extension (issue #119) — whatever the user already has associated with .md (VS Code,
+/// Notes, etc.), so a block's full content can be read outside the Inspector's clipped
+/// preview. Written into the OS temp dir and never explicitly deleted: the external
+/// program needs the file to persist while it's open, and OS temp dirs are periodically
+/// cleared on their own — the same "don't take up permanent storage" tradeoff the issue asked for.
+#[tauri::command]
+fn open_text_as_md(app: tauri::AppHandle, text: String) -> Result<(), String> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("accordion-block-{millis}.md"));
+    fs::write(&path, text).map_err(|e| format!("could not write temp file: {e}"))?;
+    app.opener()
+        .open_path(path.to_string_lossy().to_string(), None::<String>)
+        .map_err(|e| format!("could not open file: {e}"))
+}
+
 fn focus_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -572,7 +592,8 @@ pub fn run() {
             read_claude_session,
             launch_mock_session,
             stop_mock_session,
-            mock_session_running
+            mock_session_running,
+            open_text_as_md
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
