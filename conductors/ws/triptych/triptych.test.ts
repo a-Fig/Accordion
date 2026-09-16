@@ -40,8 +40,8 @@ function mkBlock(id: string, order: number, kind: BlockKind, tokens: number, tex
 
 const idOf = (idx: number): string => `a:b${idx}:p0`;
 
-/** Real-shaped TS so doorman's classifyCodeRead accepts it (keyword + punctuation + indent) —
- *  and BIG: the conductor's shrink gate compares the labeled skeleton against the block's actual
+/** Real-shaped TS for content discovery, and BIG: the conductor's shrink gate compares the
+ *  labeled skeleton against the block's actual
  *  text, so the fixture needs a genuinely large body for a fold to be worth it. */
 const BIG_SOURCE = [
 	"import { helper } from './helper';",
@@ -71,16 +71,17 @@ function buildBlocks(): Block[] {
 	const blocks: Block[] = [];
 	for (let i = 0; i <= 9; i++) blocks.push(mkBlock(idOf(i), i, "text", 200, `OLD-${i}`));
 	blocks.push(mkBlock(idOf(10), 10, "tool_call", 50, 'read {"file_path":"/proj/src/big.ts"}', { toolName: "read", callId: "c1" }));
-	blocks.push(mkBlock(idOf(11), 11, "tool_result", 800, BIG_SOURCE, { toolName: "read", callId: "c1" }));
+	// Deliberately no toolName/callId on the result: Triptych must find code from block content.
+	blocks.push(mkBlock(idOf(11), 11, "tool_result", 800, BIG_SOURCE));
 	blocks.push(mkBlock(idOf(12), 12, "tool_call", 50, 'read {"file_path":"/proj/src/small.ts"}', { toolName: "read", callId: "c2" }));
-	blocks.push(mkBlock(idOf(13), 13, "tool_result", 300, SMALL_SOURCE, { toolName: "read", callId: "c2" }));
+	blocks.push(mkBlock(idOf(13), 13, "tool_result", 300, SMALL_SOURCE));
 	for (let i = 14; i <= 17; i++) blocks.push(mkBlock(idOf(i), i, "text", 200, `MID-${i}`));
 	for (let i = 18; i <= 27; i++) blocks.push(mkBlock(idOf(i), i, "text", 200, `NEW-${i}`));
 	return blocks;
 }
 
 /** A deterministic fake engine. `holdInit` keeps `ready()` false until `releaseInit()`. */
-function fakeSkeletonizer(opts: { holdInit?: boolean; skeletonOf?: (path: string | undefined, source: string) => string | null } = {}): {
+function fakeSkeletonizer(opts: { holdInit?: boolean; skeletonOf?: (source: string, hint?: string) => string | null } = {}): {
 	skel: Skeletonizer;
 	releaseInit: () => void;
 } {
@@ -93,8 +94,12 @@ function fakeSkeletonizer(opts: { holdInit?: boolean; skeletonOf?: (path: string
 			ready = true;
 		},
 		ready: () => ready,
-		skeletonize: (path, source) =>
-			opts.skeletonOf ? opts.skeletonOf(path, source) : `// SKEL of ${path}\nexport function alpha(a: number, b: number): number { /* ... 3 lines */ }`,
+		skeletonize: (source, hint) => {
+			const skeleton = opts.skeletonOf
+				? opts.skeletonOf(source, hint)
+				: "// CONTENT-DETECTED SKEL\nexport function alpha(a: number, b: number): number { /* ... 3 lines */ }";
+			return skeleton === null ? null : { language: "typescript", skeleton };
+		},
 	};
 	return { skel, releaseInit: release };
 }
@@ -131,6 +136,9 @@ describe("TriptychConductor", () => {
 		expect(host.completeLog).toHaveLength(0);
 		expect(host.truth.groups).toHaveLength(0);
 		for (const b of host.blocks()) expect(b.folded).toBe(false);
+		const last = host.statusLog[host.statusLog.length - 1];
+		expect(last.text).toBe("Triptych: waiting for 90% context pressure");
+		expect(last.metrics).toMatchObject({ active: false });
 	});
 
 	it("first crossing arranges the thirds: lossy top group, labeled skeleton folds in the middle, raw bottom", async () => {
@@ -162,8 +170,8 @@ describe("TriptychConductor", () => {
 		expect(host.get(idOf(11))!.folded).toBe(true);
 		expect(big.subst).toBeDefined();
 		expect(big.subst!).toMatch(new RegExp(`^${FOLD_TAG_RE.source}`));
-		expect(big.subst!).toContain("[code skeleton of /proj/src/big.ts");
-		expect(big.subst!).toContain("SKEL of /proj/src/big.ts");
+		expect(big.subst!).toContain("[code skeleton — TypeScript");
+		expect(big.subst!).toContain("CONTENT-DETECTED SKEL");
 		expect(big.subst!).not.toContain("BODY_SENTINEL_A");
 
 		// Everything else rides untouched: the small code read (below the size floor), the
@@ -173,7 +181,7 @@ describe("TriptychConductor", () => {
 	});
 
 	it("decline-to-fold: a skeleton that doesn't shrink the block leaves it live", async () => {
-		const { host } = setup({ skeletonOf: (_path, source) => source }); // "skeleton" = full source
+		const { host } = setup({ skeletonOf: (source) => source }); // "skeleton" = full source
 		host.queueCompletion({ text: SUMMARY_A });
 		await flush();
 		await host.commitTurn();
@@ -181,6 +189,43 @@ describe("TriptychConductor", () => {
 		expect(host.truth.groups).toHaveLength(1); // the summary still runs
 		expect(host.get(idOf(11))!.folded).toBe(false); // but the code read was declined
 		expect(host.truth.get(idOf(11))!.subst).toBeUndefined();
+	});
+
+	it("discovers code by content in assistant text, thinking, and tool results without provenance", async () => {
+		for (const kind of ["text", "thinking", "tool_result"] as const) {
+			const blocks = buildBlocks();
+			blocks[11] = mkBlock(idOf(11), 11, kind, 800, BIG_SOURCE);
+			const { host } = setup({ blocks });
+			host.queueCompletion({ text: SUMMARY_A });
+			await flush();
+			await host.commitTurn();
+			await flush();
+			expect(host.get(idOf(11))!.folded, `${kind} should be content-detected`).toBe(true);
+		}
+	});
+
+	it("never scans user or tool-call blocks even when they contain supported code", async () => {
+		for (const kind of ["user", "tool_call"] as const) {
+			const blocks = buildBlocks();
+			blocks[11] = mkBlock(idOf(11), 11, kind, 800, BIG_SOURCE);
+			const { host } = setup({ blocks });
+			host.queueCompletion({ text: SUMMARY_A });
+			await flush();
+			await host.commitTurn();
+			await flush();
+			expect(host.get(idOf(11))!.folded, `${kind} must stay live`).toBe(false);
+		}
+	});
+
+	it("publishes content-discovery counts in the existing conductor status surface", async () => {
+		const { host } = setup();
+		host.queueCompletion({ text: SUMMARY_A });
+		await flush();
+		await host.commitTurn();
+		await flush();
+		const last = host.statusLog[host.statusLog.length - 1];
+		expect(last.text).toBe("Triptych: 1 scanned · 1 folded · 0 declined");
+		expect(last.metrics).toMatchObject({ scanned: 1, folded: 1, declined: 0 });
 	});
 
 	it("engine not ready: summaries-only, then skeletons land when init resolves", async () => {
@@ -195,7 +240,7 @@ describe("TriptychConductor", () => {
 		releaseInit();
 		await flush(10); // init resolve → conductor rerun → propose
 		expect(host.get(idOf(11))!.folded).toBe(true);
-		expect(host.truth.get(idOf(11))!.subst!).toContain("[code skeleton of /proj/src/big.ts");
+		expect(host.truth.get(idOf(11))!.subst!).toContain("[code skeleton — TypeScript");
 	});
 
 	it("recursive pass feeds the summarizer the SKELETON of aged code, never the body", async () => {
@@ -220,7 +265,7 @@ describe("TriptychConductor", () => {
 		expect(prompt).toContain(SUMMARY_A);
 		// The skeletonized read contributes its skeleton; the never-skeletonized small read
 		// contributes its full body — proving promptTextOf swaps exactly the folded ones.
-		expect(prompt).toContain("[code skeleton of /proj/src/big.ts");
+		expect(prompt).toContain("[code skeleton — TypeScript");
 		expect(prompt).not.toContain("BODY_SENTINEL_A");
 		expect(prompt).toContain("BODY_SENTINEL_B");
 

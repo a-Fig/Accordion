@@ -8,7 +8,7 @@
  * docstrings are dropped, and any literal (object/array/dict/list/set/tuple,
  * or a large embedded string) spanning more than 6 source lines is elided.
  *
- * Strategy (unchanged from the lab candidate): parse the file with
+ * Strategy (unchanged from the lab candidate): parse a candidate source span with
  * web-tree-sitter, walk the tree once, and SPLICE the original source — copy
  * kept byte ranges verbatim, replace elided ranges with a short marker. Same
  * input -> same edit list -> byte-identical output; untouched code keeps its
@@ -39,7 +39,7 @@
  * tree-sitter ERROR node itself is NOT treated as a hard failure: it is
  * recursed into (if it recovered named children) or given a head/tail
  * excerpt (if it didn't), exactly like the lab candidate, so a truncated or
- * malformed-but-mostly-valid file still produces a real skeleton instead of
+ * malformed-but-mostly-valid source span still produces a real skeleton instead of
  * null.
  */
 
@@ -104,22 +104,40 @@ function ready() {
 }
 
 // ---------------------------------------------------------------------------
-// Path -> language
+// In-context language hints
 // ---------------------------------------------------------------------------
 
-/** Map a file path to a grammar key, or null if out of scope.
- * ts/mts/cts -> "ts" grammar. tsx/jsx -> "tsx" grammar (jsx deliberately
- * loads the TSX grammar, a JSX-aware superset, not the plain JS one).
- * js/mjs/cjs -> "js" (javascript) grammar. py/pyi -> "py" (python) grammar. */
-export function langOf(p) {
-  const m = /\.([a-zA-Z]+)$/.exec(String(p ?? ""));
-  if (!m) return null;
-  const ext = m[1].toLowerCase();
-  if (ext === "ts" || ext === "mts" || ext === "cts") return "ts";
-  if (ext === "tsx" || ext === "jsx") return "tsx";
-  if (ext === "js" || ext === "mjs" || ext === "cjs") return "js";
-  if (ext === "py" || ext === "pyi") return "py";
-  return null;
+const HINTS = new Map([
+  ["ts", "typescript"], ["typescript", "typescript"], ["tsx", "typescript"],
+  ["js", "javascript"], ["javascript", "javascript"], ["jsx", "javascript"],
+  ["py", "python"], ["python", "python"],
+]);
+
+function normalizedHint(hint) {
+  if (hint === undefined || hint === null || String(hint).trim() === "") return null;
+  return HINTS.get(String(hint).trim().toLowerCase()) ?? "unsupported";
+}
+
+function candidateSpecs(source, hint) {
+  const h = normalizedHint(hint);
+  if (h === "unsupported") return [];
+  if (h === "python") return [{ parser: "py", language: "python" }];
+  if (h === "typescript") return [
+    { parser: "ts", language: "typescript" },
+    { parser: "tsx", language: "typescript" },
+  ];
+  if (h === "javascript") return [
+    { parser: "js", language: "javascript" },
+    { parser: "tsx", language: "javascript" },
+  ];
+
+  // With no in-context hint, try all three supported languages. Ordering only breaks exact
+  // score ties: TypeScript-specific syntax prefers TS; ordinary brace code prefers JavaScript.
+  const typeScriptShaped = /\b(?:interface|namespace|enum|implements|abstract|declare)\b|\btype\s+[A-Za-z_$][\w$]*\s*=|\bas\s+const\b/.test(source);
+  const brace = typeScriptShaped
+    ? [{ parser: "ts", language: "typescript" }, { parser: "tsx", language: "typescript" }, { parser: "js", language: "javascript" }]
+    : [{ parser: "js", language: "javascript" }, { parser: "ts", language: "typescript" }, { parser: "tsx", language: "javascript" }];
+  return [{ parser: "py", language: "python" }, ...brace];
 }
 
 // Ts/tsx/js all share the same node-type vocabulary; python is its own.
@@ -370,43 +388,109 @@ function collapseBlankLines(text) {
 }
 
 // ---------------------------------------------------------------------------
+// Content confidence
+// ---------------------------------------------------------------------------
+
+const TS_STRONG = new Set([
+  "import_statement", "export_statement", "function_declaration", "generator_function_declaration",
+  "class_declaration", "interface_declaration", "type_alias_declaration", "enum_declaration",
+  "namespace_declaration", "ambient_declaration",
+]);
+const TS_WEAK = new Set([
+  "lexical_declaration", "variable_declaration", "method_definition", "arrow_function",
+  "for_statement", "for_in_statement", "while_statement", "if_statement", "switch_statement",
+]);
+const PY_STRONG = new Set([
+  "import_statement", "import_from_statement", "future_import_statement", "function_definition",
+  "class_definition", "decorated_definition",
+]);
+const PY_WEAK = new Set([
+  "assignment", "typed_parameter", "for_statement", "while_statement", "if_statement",
+  "with_statement", "try_statement", "match_statement",
+]);
+
+function isMissing(node) {
+  return typeof node.isMissing === "function" ? node.isMissing() : node.isMissing === true;
+}
+
+/** Reject prose/data that a permissive grammar can technically recover into a tree. */
+function confidenceOf(root, lang, source, hinted) {
+  const strongTypes = defsKey(lang) === "py" ? PY_STRONG : TS_STRONG;
+  const weakTypes = defsKey(lang) === "py" ? PY_WEAK : TS_WEAK;
+  let strong = 0;
+  let weak = 0;
+  let missing = 0;
+  let errorBytes = 0;
+  const visit = (node) => {
+    if (node.type === "ERROR") {
+      const recovered = node.namedChildren.filter(Boolean);
+      if (recovered.length > 0) {
+        // A truncated file can surface a root ERROR while retaining a rich, trustworthy subtree.
+        // Judge that recovered structure instead of charging the whole source as invalid.
+        for (const child of recovered) visit(child);
+      } else {
+        errorBytes += Math.max(1, node.endIndex - node.startIndex);
+      }
+      return;
+    }
+    if (isMissing(node)) missing++;
+    if (strongTypes.has(node.type)) strong++;
+    else if (weakTypes.has(node.type)) weak++;
+    for (const child of node.namedChildren) if (child) visit(child);
+  };
+  visit(root);
+  const errorRatio = errorBytes / Math.max(1, source.length);
+  const anchorCount = strong + weak;
+  const maxErrorRatio = hinted ? 0.4 : 0.2;
+  if (anchorCount === 0 || strong === 0 && weak < 2 || errorRatio > maxErrorRatio) return null;
+  return strong * 100 + weak * 12 - errorRatio * 1000 - missing * 25;
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/** L2 skeleton of `source` at `path`, or null when: the engine isn't ready,
- * `path` is missing/undetectable, the extension isn't one of
- * ts/tsx/mts/cts/jsx/js/mjs/cjs/py/pyi, or an internal error occurred.
- * NEVER throws. Byte-deterministic for identical (path, source) inputs. */
-function skeletonize(p, source) {
-  let tree = null;
+/** Content-only L2 skeletonization for TypeScript/JavaScript/Python. NEVER throws. */
+function skeletonize(source, hint) {
   try {
     if (!readyFlag) return null;
-    if (typeof p !== "string" || p.length === 0) return null;
-    const lang = langOf(p);
-    if (!lang) return null;
-    const parser = parsers.get(lang);
-    if (!parser) return null;
     const src = typeof source === "string" ? source : String(source ?? "");
-
-    tree = parser.parse(src);
-    if (!tree) return null;
-    const root = tree.rootNode;
-    const defs = defsFor(lang);
-    const edits = [];
-    visitL2(root, { lang, defs, source: src, edits });
-    const spliced = applyEdits(src, edits);
-    return collapseBlankLines(spliced);
+    if (src.trim().length === 0) return null;
+    const hinted = normalizedHint(hint) !== null;
+    let best = null;
+    for (const spec of candidateSpecs(src, hint)) {
+      const parser = parsers.get(spec.parser);
+      if (!parser) continue;
+      let tree = null;
+      try {
+        tree = parser.parse(src);
+        if (!tree) continue;
+        const score = confidenceOf(tree.rootNode, spec.parser, src, hinted);
+        if (score === null) continue;
+        const edits = [];
+        visitL2(tree.rootNode, { lang: spec.parser, defs: defsFor(spec.parser), source: src, edits });
+        const skeleton = collapseBlankLines(applyEdits(src, edits));
+        // A permissive grammar can recover structure from logs or data. If L2 cannot make the
+        // candidate smaller, it is not code Triptych can usefully skeletonize.
+        if (edits.length === 0 || skeleton.length >= src.length) continue;
+        const result = {
+          language: spec.language,
+          skeleton,
+          score,
+        };
+        if (best === null || result.score > best.score) best = result;
+      } finally {
+        // Tree-sitter trees live in wasm memory the JS GC never sees.
+        try {
+          tree?.delete();
+        } catch {
+          /* a tree that failed mid-parse may already be freed */
+        }
+      }
+    }
+    return best === null ? null : { language: best.language, skeleton: best.skeleton };
   } catch {
     return null;
-  } finally {
-    // Tree-sitter trees live in wasm memory the JS GC never sees — without an explicit
-    // delete() every call leaks its whole parse tree (~0.5MB/call measured; an adversarial
-    // review probe grew the runner ~1.1GB over 2000 calls, flat with delete()).
-    try {
-      tree?.delete();
-    } catch {
-      /* a tree that failed mid-parse may already be freed */
-    }
   }
 }
 

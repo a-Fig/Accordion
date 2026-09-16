@@ -7,8 +7,8 @@
  *
  *   bottom  — the most recent ~⅓ of the cap (raw tokens, measured from the tip; never smaller
  *             than the host's protected tail). Untouched.
- *   middle  — older than the bottom band, not yet summarized. Code-file `tool_result` reads
- *             (doorman's reject-biased `classifyCodeRead`) are replaced with a tree-sitter L2
+ *   middle  — older than the bottom band, not yet summarized. Code discovered directly inside
+ *             assistant text/thinking/tool-result content is replaced with a tree-sitter L2
  *             SKELETON — signatures kept, bodies elided — as a labeled, RECOVERABLE `replace`
  *             fold (`recoverable: true` ⇒ the `{#code FOLDED}` tag, so `recall` still reaches
  *             the full source). Everything else rides untouched (code-only v1).
@@ -47,17 +47,17 @@
  */
 import { AgedSummaryConductor, TRIGGER, sumTokens, truncateForStatus } from "../../in-process/agedSummaryConductor";
 import { COMPACTION_SYSTEM } from "../../in-process/compaction-naive/compaction-naive";
-import { classifyCodeRead } from "../../in-process/doorman/classify";
 import { messageKey } from "../../../core/truth";
 import type { Command, ConductorView } from "../../../core/conductor/view";
 import type { ConductorHost, LockName, ViewBlock } from "../../../core/conductor/contract";
+import { skeletonizeBlockContent, type ContentSkeletonizer, type SkeletonMatch } from "./content";
 
 /**
  * The injected skeleton engine. `runner.mjs` supplies the real tree-sitter implementation
  * (`./skeleton.mjs`); tests supply a fake. Kept minimal on purpose — the conductor needs
  * exactly three capabilities and no more.
  */
-export interface Skeletonizer {
+export interface Skeletonizer extends ContentSkeletonizer {
 	/** Async engine init (wasm load, disk I/O — runner process only). Idempotent. */
 	init(): Promise<void>;
 	/** True once `init()` has resolved. */
@@ -66,7 +66,7 @@ export interface Skeletonizer {
 	 * The L2 skeleton of `source`, or null when the language is unsupported/undetectable or the
 	 * engine is not ready. MUST be deterministic and MUST NOT throw.
 	 */
-	skeletonize(path: string | undefined, source: string): string | null;
+	skeletonize(source: string, hint?: string): SkeletonMatch | null;
 }
 
 /**
@@ -84,7 +84,8 @@ const MIN_SKELETON_TOKENS = 700;
 export class TriptychConductor extends AgedSummaryConductor {
 	readonly id = "triptych";
 	readonly label = "Triptych";
-	readonly description = "Pressure-gated thirds: raw recent band, code-skeleton middle band, lossy compaction summary top band.";
+	readonly description =
+		"90%-gated thirds: raw recent band; content-detected TypeScript, JavaScript, and Python skeletons in assistant/thinking/tool results; lossy summary top band.";
 
 	/**
 	 * Involvement locks (ADR 0011): fully exclusive, compaction-naive's posture (owner decision).
@@ -148,9 +149,14 @@ export class TriptychConductor extends AgedSummaryConductor {
 		// resolve handler's rerun a moment later).
 		const summary = super.conduct(view);
 		if (summary === null) return null;
-		if (!this.active) return summary; // pre-activation: nothing else to say
+		if (!this.active) {
+			this.publishWaitingStatus();
+			return summary;
+		}
 
-		return [...summary, ...this.skeletonCommands(view)];
+		const skeletons = this.skeletonCommands(view);
+		this.publishDiscoveryStatus(skeletons.scanned, skeletons.folded, skeletons.declined);
+		return [...summary, ...skeletons.commands];
 	}
 
 	// ── band geometry ────────────────────────────────────────────────────────────
@@ -220,52 +226,59 @@ export class TriptychConductor extends AgedSummaryConductor {
 	// ── the middle band: skeleton folds ──────────────────────────────────────────
 
 	/**
-	 * One labeled `replace` (recoverable ⇒ `{#code FOLDED}`-tagged) per classified code read
+	 * One labeled `replace` (recoverable ⇒ `{#code FOLDED}`-tagged) per content-detected code block
 	 * older than the bottom band that the summary group does not already cover. Blocks in the
 	 * not-yet-summarized part of the top band are included on purpose — they benefit from the
 	 * skeleton until a summary run sweeps them (at which point `ViewConductor`'s diffing clears
 	 * the replace as the block enters the group).
 	 */
-	private skeletonCommands(view: ConductorView): Command[] {
-		if (!this.skel.ready()) return [];
+	private skeletonCommands(view: ConductorView): { commands: Command[]; scanned: number; folded: number; declined: number } {
+		if (!this.skel.ready()) return { commands: [], scanned: 0, folded: 0, declined: 0 };
 		const { bottomStart } = this.bands(view);
 		const limit = Math.min(bottomStart, view.protectedFromIndex, view.blocks.length);
-		if (limit <= 0) return [];
+		if (limit <= 0) return { commands: [], scanned: 0, folded: 0, declined: 0 };
 
-		let callById: Map<string, ViewBlock> | null = null; // built lazily — most passes see no new candidates
 		const out: Command[] = [];
+		let scanned = 0;
 		for (let i = 0; i < limit; i++) {
 			const b = view.blocks[i];
-			if (b.kind !== "tool_result" || b.held || b.grouped) continue;
+			// Content-only discovery (#114). User/system/tool-call blocks are intentionally ignored.
+			if (b.kind !== "text" && b.kind !== "thinking" && b.kind !== "tool_result") continue;
+			if (b.held || b.grouped) continue;
 			if (b.tokens < MIN_SKELETON_TOKENS) continue;
 			if (this.coveredIds.has(b.id) && this.includeInGroup(b)) continue; // the summary group's, not ours
+			scanned++;
 			let content = this.skelCache.get(b.id);
 			if (content === undefined) {
-				if (callById === null) {
-					callById = new Map();
-					for (const c of view.blocks) if (c.kind === "tool_call" && c.callId) callById.set(c.callId, c);
-				}
-				content = this.evaluateSkeleton(b, callById);
+				content = this.evaluateSkeleton(b);
 				this.skelCache.set(b.id, content);
 			}
 			if (content === null) continue; // evaluated and declined
 			out.push({ kind: "replace", id: b.id, content, recoverable: true });
 		}
-		return out;
+		return { commands: out, scanned, folded: out.length, declined: scanned - out.length };
 	}
 
-	/** Classify → skeletonize → label → shrink-gate. Null = decline (cached, never re-parsed). */
-	private evaluateSkeleton(b: ViewBlock, callById: Map<string, ViewBlock>): string | null {
-		const info = classifyCodeRead(b, callById);
-		if (info === null) return null;
-		const skeleton = this.skel.skeletonize(info.path, info.source);
-		if (skeleton === null) return null;
-		const srcLines = countLines(info.source);
-		const content = `${skeletonHeader(info.path, srcLines)}\n${skeleton}`;
+	/** Discover → skeletonize → label → shrink-gate. Null = decline (cached, never re-parsed). */
+	private evaluateSkeleton(b: ViewBlock): string | null {
+		const found = skeletonizeBlockContent(b.text ?? "", this.skel);
+		if (found === null) return null;
+		const content = found.content;
 		// Decline gate vs the block's ORIGINAL text (wrappers included — that is what the wire pays).
 		const original = b.text ?? "";
 		if (original.length === 0 || content.length > original.length * SHRINK_MAX) return null;
 		return content;
+	}
+
+	private publishDiscoveryStatus(scanned: number, folded: number, declined: number): void {
+		if (this.failureStatus !== null) return;
+		const text = `Triptych: ${scanned} scanned · ${folded} folded · ${declined} declined`;
+		this.host.setStatus(text, { scanned, folded, declined });
+	}
+
+	private publishWaitingStatus(): void {
+		if (this.failureStatus !== null) return;
+		this.host.setStatus("Triptych: waiting for 90% context pressure", { active: false });
 	}
 
 	// ── summary prompt + status strings (subclass-owned by the AgedSummaryConductor contract) ──
@@ -309,23 +322,6 @@ export class TriptychConductor extends AgedSummaryConductor {
 	protected unavailableMessage(): string {
 		return "Triptych: summary unavailable — waiting for live model link";
 	}
-}
-
-/**
- * The one-line label riding above every skeleton so the agent knows what it is looking at (owner
- * requirement: "it should be labeled as such so the agent knows"). The `{#code FOLDED}` tag the
- * host prepends is the recovery pointer; this line says what the compressed form IS.
- */
-export function skeletonHeader(path: string | undefined, srcLines: number): string {
-	const what = path !== undefined ? path : "a code file";
-	return `[code skeleton of ${what} — signatures kept, bodies elided (${srcLines} source lines). Use recall with the fold code above for the full file.]`;
-}
-
-function countLines(s: string): number {
-	if (s.length === 0) return 0;
-	let n = 1;
-	for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) === 10) n++;
-	return n;
 }
 
 export { COMPACTION_SYSTEM };
