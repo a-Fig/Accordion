@@ -18,7 +18,7 @@ import type { ConductorHost } from "../../../core/conductor/contract";
 import type { Block } from "../../../core/types";
 import type { Op, TxnResult } from "../../../core/ops";
 import { foldTag } from "../../../core/digest";
-import { ThermoclineConductor, reconcilePlan, planWithRealStratumTokens, dropOwnStrataOldestFirst } from "./thermocline";
+import { ThermoclineConductor, reconcilePlan, planWithRealStratumTokens, dropOwnStrataOldestFirst, overflowStatusText } from "./thermocline";
 import { planEpoch, emitOps, DEFAULT_CFG } from "./policy";
 import type { Plan, ConductorView, ViewBlock } from "./policy";
 
@@ -442,6 +442,102 @@ test("probe-absent fallback: a rejecting scorer still compresses (age-based stra
 	expect(host.completeLog.length).toBe(0); // deterministic emergency — no model calls
 	expect(host.truth.groups.length).toBeGreaterThanOrEqual(1); // age-based strata carried the strategy
 	expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(30_000);
+});
+
+// ── BUDGET FLOOR (probe absent) — the overnight log_query failure shape ─────────────────────────
+//
+// Live run (pi + deepseek, no attention probe, budget 40k / protect 8k): compliant for ~540s, then
+// every wire went over cap (peak 148k) while the status insisted "protected tail ≈ 8k > cap 40k".
+// Two compounding bugs, each pinned by one test below:
+//   (A) our OWN applied strata came back `grouped:true` in the next epoch's view, so every mover
+//       skipped them as buoys; against the fullTokens baseline the plan counted them at FULL cost,
+//       reported irreducible, and applyDesired UNGROUPED them all — flip-flopping every epoch.
+//   (B) folding a message's thinking part stranded its tool_call+result pair (see policy.test.ts
+//       "message-atom bridge"), so big write calls piled up outside the tail, ungroupable.
+describe("BUDGET FLOOR (probe absent)", () => {
+	function lastMetrics(host: TestHost) {
+		return [...host.statusLog].reverse().find((s) => s.metrics)?.metrics;
+	}
+	function pairsFrom(start: number, n: number): Block[] {
+		const out: Block[] = [];
+		for (let i = start; i < start + n; i++) {
+			out.push(block({ id: `call${i}`, kind: "tool_call", callId: `c${i}`, tokens: 500, order: i * 2, toolName: "read_file" }));
+			out.push(block({ id: `res${i}`, kind: "tool_result", callId: `c${i}`, tokens: 9_500, order: i * 2 + 1, text: `result body ${i}` }));
+		}
+		return out;
+	}
+
+	test("(A) a second over-budget batch re-plans OUR strata instead of ungrouping them: live ≤ cap at the wire", async () => {
+		const host = new TestHost();
+		const cond = new ThermoclineConductor({ scorer: rejectScorer, sessionKey: null });
+		cond.attach(host);
+		host.setBudget(30_000);
+		host.setProtect(300);
+		host.appendBlocks(pairsFrom(0, 8)); // 80k of NON-foldable pairs → only age-based strata compress
+		await flush();
+		expect(host.truth.groups.length).toBeGreaterThanOrEqual(1);
+		expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(30_000);
+
+		host.appendBlocks(pairsFrom(8, 4)); // +40k — the next epoch must plan AROUND/THROUGH epoch 1's strata
+		await flush();
+		await host.departWire();
+
+		expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(30_000);
+		expect(host.truth.groups.length).toBeGreaterThanOrEqual(1);
+		expect(lastMetrics(host)?.irreducibleOverflow).toBe(false);
+	});
+
+	test("(A+B) message-shaped turns (thinking + whole-file write call): every wire ≤ cap, no false irreducible", async () => {
+		const host = new TestHost();
+		host.setWireAttached(true); // as on every live pi session
+		host.truth.setSystemPrompt("S".repeat(8_000), 2_000);
+		const cond = new ThermoclineConductor({ scorer: rejectScorer, sessionKey: null });
+		cond.attach(host);
+		host.setBudget(40_000);
+		host.setProtect(8_000);
+
+		const CAP = 40_000;
+		let order = 0;
+		const wires: number[] = [];
+		for (let i = 0; i < 16; i++) {
+			await host.departWire();
+			wires.push(host.truth.stats().liveTokens);
+			const turn = i + 1;
+			host.appendBlocks([
+				block({ id: `a:m${i}:p0`, kind: "thinking", tokens: 6_000, order: order++, turn }),
+				block({ id: `a:m${i}:p1`, kind: "tool_call", callId: `w${i}`, toolName: "write", tokens: 4_000, order: order++, turn }),
+				block({ id: `r:w${i}`, kind: "tool_result", callId: `w${i}`, tokens: 150, order: order++, turn }),
+			]);
+			await host.commitTurn(turn);
+			await flush();
+		}
+		await host.departWire();
+		wires.push(host.truth.stats().liveTokens);
+
+		// ~164k of history went through a 40k cap: the invariant held on EVERY departing wire.
+		expect(Math.max(...wires)).toBeLessThanOrEqual(CAP);
+		expect(host.truth.stats().fullTokens).toBeGreaterThan(4 * CAP);
+		// The tail (~8k) + system prompt (2k) always fit — "irreducible" would be a lie here.
+		for (const s of host.statusLog) expect(s.text).not.toMatch(/irreducible/i);
+		expect(lastMetrics(host)?.irreducibleOverflow).toBe(false);
+	});
+
+	test("overflow status names the REAL blocker: the floor only when it exceeds cap, else un-absorbed history", () => {
+		// The live run's numbers: ~42k projected, 40k cap, ~9k tail, 2.6k system prompt. The floor fits.
+		const live = overflowStatusText({ projected: 41_961, cap: 40_000, tail: 8_509, held: 0, fixed: 2_600 });
+		expect(live).not.toMatch(/irreducible/i);
+		expect(live).not.toMatch(/tail ≈ \d+k > cap/); // the old, self-contradictory "tail ≈ 8k > cap 40k"
+		expect(live).toMatch(/≈ 31k of older content could not be folded or grouped/);
+		expect(live).toMatch(/protected tail ≈ 9k \+ system prompt ≈ 3k fit under cap/);
+
+		// A genuinely un-winnable configuration keeps the original wording + knobs.
+		const config = overflowStatusText({ projected: 30_000, cap: 12_000, tail: 21_000, held: 0, fixed: 0 });
+		expect(config).toBe("over budget and irreducible: protected tail ≈ 21k > cap 12k — raise the budget or shrink the protected tail");
+		const pinned = overflowStatusText({ projected: 30_000, cap: 12_000, tail: 6_000, held: 9_000, fixed: 0 });
+		expect(pinned).toBe(
+			"over budget and irreducible: protected tail ≈ 6k + held content ≈ 9k > cap 12k — raise the budget, shrink the protected tail, or unpin held content",
+		);
+	});
 });
 
 // ── persistence round-trip — write after commit, restore + validate against live ids ─────────
