@@ -33,10 +33,74 @@ import { isBolted } from "../../core/digest";
 import { roleFloorRecap } from "../../core/wire";
 import { estTokens, BLOCK_OVERHEAD } from "../../core/tokens";
 
+/** Default high-water mark (fraction of the effective cap). See `TRIGGER`. */
+export const DEFAULT_TRIGGER = 0.9;
+
+/** Default overshoot mark (multiple of the effective cap). See `OVERSHOOT`. */
+export const DEFAULT_OVERSHOOT = 1.15;
+
+/** The two benchmark-sweep dials `summaryTuningFromEnv` resolves. */
+export interface SummaryTuning {
+	trigger: number;
+	overshoot: number;
+}
+
+/**
+ * Resolve the trigger/overshoot marks, honoring two OPTIONAL environment overrides meant for
+ * benchmark sweeps (production never sets them, so the defaults below are the shipped behavior):
+ *   - `ACCORDION_SUMMARY_TRIGGER`   — a float strictly inside (0, 1); anything else → 0.9.
+ *   - `ACCORDION_SUMMARY_OVERSHOOT` — a finite float strictly > 1; anything else → 1.15.
+ *
+ * This is the ONLY place this module touches the environment, and it guards `process` itself: the
+ * module graph is also bundled for non-Node consumers, where `process` does not exist and the
+ * defaults simply apply. `env` is a parameter so tests can pass a literal instead of mutating the
+ * real environment. Read once, at module load — the out-of-process runner inherits the extension's
+ * environment at spawn, so one setting reaches every conductor in the session.
+ */
+export function summaryTuningFromEnv(
+	env: Readonly<Record<string, string | undefined>> | undefined = typeof process !== "undefined" ? process.env : undefined,
+): SummaryTuning {
+	const num = (raw: string | undefined): number => (raw === undefined || raw.trim() === "" ? NaN : Number(raw));
+	const trigger = num(env?.ACCORDION_SUMMARY_TRIGGER);
+	const overshoot = num(env?.ACCORDION_SUMMARY_OVERSHOOT);
+	return {
+		trigger: trigger > 0 && trigger < 1 ? trigger : DEFAULT_TRIGGER,
+		overshoot: Number.isFinite(overshoot) && overshoot > 1 ? overshoot : DEFAULT_OVERSHOOT,
+	};
+}
+
+const TUNING = summaryTuningFromEnv();
+
 /** Fraction of budget at which a run triggers (high-water mark). Shared by every subclass;
  *  exported so a subclass with its own activation logic (triptych's sticky pressure gate) keys off
- *  the same mark rather than growing a second constant to drift. */
-export const TRIGGER = 0.9;
+ *  the same mark rather than growing a second constant to drift. 0.9 unless overridden by
+ *  `ACCORDION_SUMMARY_TRIGGER` (see `summaryTuningFromEnv`). */
+export const TRIGGER = TUNING.trigger;
+
+/**
+ * Visible-window multiple of the effective cap at which the conductor is OVERSHOOTING — past the
+ * budget itself, not merely near it. At or above this mark the paid-retry back-off and the
+ * attempt-key dedupe in `conduct()` stop being allowed to hold the conductor dark (rate-limited by
+ * `OVERSHOOT_COOLDOWN_MS`), and triptych widens its summarizable band (see `triptych.ts`). 1.15
+ * unless overridden by `ACCORDION_SUMMARY_OVERSHOOT`.
+ */
+export const OVERSHOOT = TUNING.overshoot;
+
+/**
+ * Minimum wall-clock gap between the previous attempt (the later of its launch START and its
+ * settle) and an overshoot un-latch relaunch (see `conduct()`). Summaries are async and a single
+ * agent step can add ~15k tokens while one is in flight, so the visible window can sit over
+ * `OVERSHOOT` for many consecutive ticks; without a cooldown, a region that genuinely will not
+ * collapse would re-bill a model call on every one of them. Applies ONLY to the un-latch path — a
+ * normal (productive, new-key) launch is not throttled, exactly as before.
+ */
+export const OVERSHOOT_COOLDOWN_MS = 45_000;
+
+/** Construction options shared by every `AgedSummaryConductor` subclass. */
+export interface AgedSummaryOptions {
+	/** Wall-clock source for the overshoot cooldown (ms). Defaults to `Date.now`; tests pin it. */
+	now?: () => number;
+}
 
 /**
  * Soft cap on completion output tokens. Sized for the job: both conductors summarize/hand off
@@ -309,6 +373,21 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	 *  refill has to clear before an unproductive conductor spends another model call. */
 	private lastPassAgedTokens = 0;
 
+	/** `now()` at the most recent attempt START (`launchCompletion`, a window-too-tight decline
+	 *  included) or SETTLE (resolve/reject), whichever came later; null before the first attempt.
+	 *  Read only by the overshoot cooldown in `conduct()`. Refreshed at settle too because the pass
+	 *  that commits a result is evaluated against the PRE-commit wire and the PREVIOUS pass's
+	 *  saving — an un-latch judged there would re-bill off a stale reading. */
+	private lastAttemptAt: number | null = null;
+
+	/** Wall-clock source (ms) for the overshoot cooldown — injectable via `AgedSummaryOptions`. */
+	private readonly now: () => number;
+
+	constructor(opts: AgedSummaryOptions = {}) {
+		super();
+		this.now = opts.now ?? (() => Date.now());
+	}
+
 	// ── lifecycle ────────────────────────────────────────────────────────────────
 
 	/** A conductor lifetime starts fresh on attach — don't let state from a prior session leak into
@@ -324,6 +403,7 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		this.failureStatus = null;
 		this.lastPassSaving = null;
 		this.lastPassAgedTokens = 0;
+		this.lastAttemptAt = null;
 		super.attach(host);
 	}
 
@@ -372,6 +452,9 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// happening first). Never widens the cap — a known, smaller window only ever tightens it.
 		const cap = view.contextWindow != null ? Math.min(view.budget, view.contextWindow) : view.budget;
 		const overThreshold = visible >= cap * TRIGGER;
+		// OVERSHOOT: past the budget itself, not merely near it (see `OVERSHOOT`). Only ever used to
+		// lift the two suppressions below, never to launch anything the normal path would not.
+		const overshoot = cap > 0 && visible >= cap * OVERSHOOT;
 
 		// What is genuinely new since the last successful completion.
 		const newlyAged = aged.filter((b) => !this.coveredIds.has(b.id));
@@ -394,14 +477,15 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// the healthy path is unchanged. The gate is deliberately blind to content FREED without
 		// refill (e.g. a pin lifted mid-latch): it stays shut until new tokens age in, trading a
 		// missed compaction opportunity for never re-billing on a region that already failed once.
+		// One exception: past `OVERSHOOT` the latch lifts on a cooldown (OVERSHOOT UN-LATCH, below).
 		const productive = this.lastPassSaving === null || this.lastPassSaving > MIN_PASS_SAVING;
-		const refilled = sumTokens(newlyAged) > this.lastPassAgedTokens;
+		const newlyAgedTokens = sumTokens(newlyAged);
+		const refilled = newlyAgedTokens > this.lastPassAgedTokens;
 
 		// Trigger only when the VISIBLE window is at/over the high-water mark AND there are
 		// newly-aged blocks to fold in. Below the mark, or with nothing new, HOLD: re-emit the
 		// existing group (or clear to raw if no result yet).
-		const needsRun = overThreshold && newlyAged.length > 0 && (productive || refilled);
-		if (!needsRun) {
+		if (!overThreshold || newlyAged.length === 0) {
 			this.surfaceIdleStatus();
 			return this.text !== null ? this.emitCoverageGroup(view) : [];
 		}
@@ -414,9 +498,43 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 			.map((b) => b.id)
 			.sort()
 			.join("\0");
-		if (attemptKey === this.lastAttemptKey) {
-			this.surfaceIdleStatus();
-			return this.text !== null ? this.emitCoverageGroup(view) : [];
+
+		// The two SUPPRESSIONS — the back-off latch (not productive, not refilled) and the attempt-key
+		// dedupe — are unchanged below `OVERSHOOT`: they hold, exactly as before, now with a status
+		// line saying so (a latched conductor used to go dark with no trace at all).
+		//
+		// OVERSHOOT UN-LATCH. Both suppressions were built to stop a conductor sitting just over the
+		// mark from re-billing for nothing, and both can hold far too long once the wire runs PAST the
+		// budget: the refill bar is the WHOLE aged region the unproductive pass was handed (on a
+		// recursive pass that is effectively the entire session history, so it may never be cleared),
+		// and a timeout/provider error leaves the key set until a DIFFERENT newly-aged set appears.
+		// Observed: a latched triptych let the provider-bound context climb to 2x budget for 10+
+		// minutes with no further pass. So at/over `OVERSHOOT` either suppression may be bypassed —
+		// but only once `OVERSHOOT_COOLDOWN_MS` has passed since the last attempt started or settled
+		// (`lastAttemptAt`), so a region that genuinely will not collapse costs one call per cooldown
+		// rather than one per tick. The in-flight hold above still applies: this never launches a
+		// second concurrent completion.
+		const backedOff = !(productive || refilled);
+		const deduped = attemptKey === this.lastAttemptKey;
+		let launchNote: string | null = null;
+		if (backedOff || deduped) {
+			const saving = Math.round(this.lastPassSaving ?? 0);
+			const why = backedOff
+				? `back-off: last pass ${saving >= 0 ? `saved ${saving}` : `grew the wire ${-saving}`} tok; waiting for refill (${Math.round(newlyAgedTokens)}/${Math.round(this.lastPassAgedTokens)} tok newly aged)`
+				: `holding: this newly-aged set (${newlyAged.length} block${newlyAged.length === 1 ? "" : "s"}) was already attempted; waiting for new context`;
+			if (!overshoot) {
+				this.surfaceIdleStatus(`${this.label} ${why}`);
+				return this.text !== null ? this.emitCoverageGroup(view) : [];
+			}
+			const sinceAttempt = this.lastAttemptAt === null ? Infinity : this.now() - this.lastAttemptAt;
+			if (sinceAttempt < OVERSHOOT_COOLDOWN_MS) {
+				// Still holding, but say when the un-latch will fire. Appended to a sticky failure
+				// rather than replacing it, so a failure is still never erased before it is seen.
+				const waitS = Math.ceil((OVERSHOOT_COOLDOWN_MS - sinceAttempt) / 1000);
+				this.host.setStatus(`${this.failureStatus ?? `${this.label} ${why}`} — over ${OVERSHOOT}x cap, overshoot retry in ${waitS}s`);
+				return this.text !== null ? this.emitCoverageGroup(view) : [];
+			}
+			launchNote = `${this.label} overshoot un-latch: visible ${Math.round(visible)} tok ≥ ${OVERSHOOT}x cap ${Math.round(cap)}; re-summarizing despite ${backedOff ? "back-off" : "attempt dedupe"}`;
 		}
 
 		// LAUNCH a background completion (which may DECLINE if the window is too tight — see
@@ -424,7 +542,7 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		// result against exactly the blocks it summarized, regardless of what the view looks like
 		// when it resolves. `view.contextWindow` is threaded in so the request reserves output room
 		// against the real window.
-		this.launchCompletion(aged, newlyAged, attemptKey, view.contextWindow);
+		this.launchCompletion(aged, newlyAged, attemptKey, view.contextWindow, launchNote);
 
 		// Hold while the completion is in-flight: re-emit the existing group if one is already
 		// applied, or null on the very first trip (no prior result yet — the ONE correct use of
@@ -660,9 +778,14 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	/** Surface the sticky failure status (or clear the bar when there is none). Used in every
 	 *  `conduct()` path that would otherwise bare-`setStatus(null)`, so a completion failure set out
 	 *  of band in the async handlers is not erased before the human sees it. Cleared exactly when a
-	 *  genuine retry launches (see `launchCompletion`) or a result commits. */
-	private surfaceIdleStatus(): void {
-		this.host.setStatus(this.failureStatus);
+	 *  genuine retry launches (see `launchCompletion`) or a result commits.
+	 *
+	 *  `note` is a NON-sticky explanation of why this pass held while over the trigger (the back-off
+	 *  latch or the attempt-key dedupe). It is shown only when there is no sticky failure — a
+	 *  failure is the more important thing to show, and after a rejection it is already the reason
+	 *  the dedupe is holding — and it is recomputed (or dropped) every pass. */
+	private surfaceIdleStatus(note: string | null = null): void {
+		this.host.setStatus(this.failureStatus ?? note);
 	}
 
 	/** Neutralize a sentinel-breakout attempt against BOTH tags this conductor's prompt ever wraps
@@ -683,8 +806,10 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 	 *                        prevent relaunching the same newly-aged set after a rejection.
 	 * @param contextWindow - the model's total context window (or null if unknown), used to reserve
 	 *                        output room so `input + output` cannot overflow the window.
+	 * @param launchNote    - status shown while this attempt is in flight (the overshoot un-latch
+	 *                        says so); null clears the bar, as every launch did before.
 	 */
-	private launchCompletion(agedBlocks: ViewBlock[], newlyAged: ViewBlock[], attemptKey: string, contextWindow: number | null): void {
+	private launchCompletion(agedBlocks: ViewBlock[], newlyAged: ViewBlock[], attemptKey: string, contextWindow: number | null, launchNote: string | null = null): void {
 		if (this.inflight !== null) return; // defensive: should never reach here while inflight
 
 		// Snapshot the ids and count at LAUNCH TIME. The resolve handler closes over these so it
@@ -700,8 +825,11 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 		const prompt = this.buildPrompt(newlyAged);
 
 		// Record the attempt key (keyed on newlyAged ids) so a rejected OR declined completion does
-		// NOT immediately relaunch for the same newly-aged set on the next conduct() tick.
+		// NOT immediately relaunch for the same newly-aged set on the next conduct() tick. The launch
+		// time starts the overshoot cooldown — a decline included, so an un-latch that keeps
+		// declining does not recompute (and re-post) the same decline on every tick either.
 		this.lastAttemptKey = attemptKey;
+		this.lastAttemptAt = this.now();
 
 		// RESERVE output room against the context window. The host clamp bounds max-OUTPUT only, not
 		// `input + output`, so a blind MAX_OUTPUT_TOKENS request overflows the window when the input
@@ -716,7 +844,8 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 				// The aged-region input alone nearly fills the window — there is no room to write
 				// anything useful. Decline deliberately with a visible, sticky status instead of
 				// sending a request the provider will reject. The attempt key is already recorded
-				// above, so we do not re-attempt until genuinely new content ages in.
+				// above, so we do not re-attempt until genuinely new content ages in (or, past
+				// OVERSHOOT, until the un-latch cooldown lapses).
 				this.failureStatus = this.windowTooTightMessage(inputTokens, contextWindow);
 				this.host.setStatus(this.failureStatus, { input: inputTokens, window: contextWindow });
 				return;
@@ -724,9 +853,10 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 			maxOutputTokens = Math.min(MAX_OUTPUT_TOKENS, reserve);
 		}
 
-		// A genuine attempt is underway: clear any prior failure and the status bar.
+		// A genuine attempt is underway: clear any prior failure and the status bar (or show the
+		// launch note — only the overshoot un-latch passes one).
 		this.failureStatus = null;
-		this.host.setStatus(null);
+		this.host.setStatus(launchNote);
 
 		const controller = new AbortController();
 		this.inflight = controller;
@@ -746,6 +876,7 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 					// result must never overwrite a new session's state, and clearing `inflight` here
 					// would clobber a fresh in-flight completion.
 					if (this.inflight !== controller) return;
+					this.lastAttemptAt = this.now(); // settle restarts the overshoot cooldown (see the field)
 					const text = result.text.trim();
 					if (!text) {
 						// Empty output would collapse the aged context behind a header-only result.
@@ -783,6 +914,7 @@ export abstract class AgedSummaryConductor extends ViewConductor {
 					// failure status (the human chose to stop it).
 					if (this.inflight !== controller) return;
 					this.inflight = null;
+					this.lastAttemptAt = this.now(); // settle restarts the overshoot cooldown (see the field)
 					if (isUnavailableError(err)) {
 						// No live model link — the v2-contract analog of main's `host.can("complete")`
 						// pre-check reporting unavailability BEFORE ever launching. Mirror its semantics

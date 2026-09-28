@@ -22,6 +22,11 @@
  * bottom boundary, while summaries (an LLM call each) re-run only at each subsequent 90%
  * crossing, recursively, exactly like compaction-naive.
  *
+ * SUSTAINED OVERSHOOT: while the visible window sits at/over `OVERSHOOT` (1.15x the cap by
+ * default), the summarizable region widens from the top band to top + middle (see
+ * `agedBoundaryIndex`) — only the raw bottom band is kept — so growth the thirds would otherwise
+ * leave live (non-code output the skeletons never touch) becomes summarizable.
+ *
  * FULLY EXCLUSIVE (owner decision): locks `human-steering` + `agent-unfold`, compaction-naive's
  * posture. `recall` is never lockable (sacred tier), so the tagged skeletons still give the
  * agent read-access to elided bodies; the summary group is the one one-way door.
@@ -45,7 +50,7 @@
  * is inherited from `AgedSummaryConductor`; this file owns only the banding, the skeleton
  * folds, and the triptych-branded status strings.
  */
-import { AgedSummaryConductor, TRIGGER, sumTokens, truncateForStatus } from "../../in-process/agedSummaryConductor";
+import { AgedSummaryConductor, OVERSHOOT, TRIGGER, sumTokens, truncateForStatus, type AgedSummaryOptions } from "../../in-process/agedSummaryConductor";
 import { COMPACTION_SYSTEM } from "../../in-process/compaction-naive/compaction-naive";
 import { classifyCodeRead } from "../../in-process/doorman/classify";
 import { messageKey } from "../../../core/truth";
@@ -102,6 +107,11 @@ export class TriptychConductor extends AgedSummaryConductor {
 	 *  until detach/re-attach. */
 	private active = false;
 
+	/** True once the overshoot fallback in `agedBoundaryIndex` has widened the summarizable region
+	 *  this attachment; from then on the top band never retreats behind blocks a summary already
+	 *  covers. Never unset until detach/re-attach. */
+	private widened = false;
+
 	/**
 	 * Per-block skeleton cache: block id → the full labeled replacement content, or null for
 	 * "evaluated and declined" (not code / unsupported language / didn't shrink) so a declined
@@ -110,12 +120,16 @@ export class TriptychConductor extends AgedSummaryConductor {
 	 */
 	private skelCache = new Map<string, string | null>();
 
-	constructor(private readonly skel: Skeletonizer) {
-		super();
+	constructor(
+		private readonly skel: Skeletonizer,
+		opts?: AgedSummaryOptions,
+	) {
+		super(opts);
 	}
 
 	attach(host: ConductorHost): void {
 		this.active = false;
+		this.widened = false;
 		this.skelCache = new Map();
 		super.attach(host);
 		// Kick the (idempotent) engine init off-path; when it resolves, re-run so the middle band
@@ -197,18 +211,43 @@ export class TriptychConductor extends AgedSummaryConductor {
 		// summarizer never saw (adversarial-review finding: un-summarized content vanishing into
 		// the lossy group). Shrinking the top band is the conservative direction: the bisected
 		// message stays whole in the middle band until ALL its parts age past the boundary.
-		while (topEnd > 0 && topEnd < view.blocks.length && messageKey(view.blocks[topEnd].id) === messageKey(view.blocks[topEnd - 1].id)) {
-			topEnd--;
-		}
+		topEnd = snapDownToMessageEdge(view, topEnd);
 		return { bottomStart, topEnd };
 	}
 
 	// ── AgedSummaryConductor hooks ───────────────────────────────────────────────
 
-	/** The summary machinery may sweep ONLY the top band — and nothing at all pre-activation. */
+	/**
+	 * The summary machinery may sweep ONLY the top band — and nothing at all pre-activation —
+	 * with ONE exception, sustained overshoot:
+	 *
+	 *   - At/over `OVERSHOOT` (visible >= 1.15x the cap by default) the boundary falls back to the
+	 *     MIDDLE band's end: top + middle are summarizable, only the raw bottom band is kept. The
+	 *     thirds are measured in raw tokens from the tip, so when the growth is output the middle
+	 *     band's skeletons do not touch (logs, grep, test runs), the top band alone can stay far too
+	 *     small to bring the wire back under budget. Snapped down to a message edge for the same
+	 *     reason `topEnd` is (see `bands`).
+	 *   - Once that fallback has been used, the boundary never retreats behind the covered frontier
+	 *     (one past the newest block the current summary covers, capped at the bottom band). Without
+	 *     this the pass right after a widened summary commits — back under the mark — would shrink
+	 *     the group to the top band again, putting the middle band straight back on the wire and
+	 *     potentially flapping wide/narrow every turn. Normal thirds behavior resumes by itself once
+	 *     `topEnd` moves past that frontier.
+	 *
+	 * Below the overshoot mark in a session that never reached it, this is exactly `topEnd`.
+	 */
 	protected agedBoundaryIndex(view: ConductorView): number {
 		if (!this.active) return 0;
-		return this.bands(view).topEnd;
+		const { bottomStart, topEnd } = this.bands(view);
+		const cap = this.effectiveCap(view);
+		if (cap > 0 && view.liveTokens >= cap * OVERSHOOT) {
+			this.widened = true;
+			return snapDownToMessageEdge(view, bottomStart);
+		}
+		if (!this.widened) return topEnd;
+		let frontier = 0;
+		for (let i = 0; i < bottomStart && i < view.blocks.length; i++) if (this.coveredIds.has(view.blocks[i].id)) frontier = i + 1;
+		return Math.max(topEnd, snapDownToMessageEdge(view, frontier));
 	}
 
 	/** Feed the summarizer the skeleton for skeletonized blocks (implementer decision #1). */
@@ -319,6 +358,13 @@ export class TriptychConductor extends AgedSummaryConductor {
 export function skeletonHeader(path: string | undefined, srcLines: number): string {
 	const what = path !== undefined ? path : "a code file";
 	return `[code skeleton of ${what} — signatures kept, bodies elided (${srcLines} source lines). Use recall with the fold code above for the full file.]`;
+}
+
+/** Move `idx` down until it no longer bisects a multi-part message (blocks `idx - 1` and `idx`
+ *  sharing a `messageKey`), so a region `[0, idx)` never holds only part of a message. */
+function snapDownToMessageEdge(view: ConductorView, idx: number): number {
+	while (idx > 0 && idx < view.blocks.length && messageKey(view.blocks[idx].id) === messageKey(view.blocks[idx - 1].id)) idx--;
+	return idx;
 }
 
 function countLines(s: string): number {

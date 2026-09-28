@@ -14,6 +14,13 @@ high-water mark (`TRIGGER`). The first crossing arranges the context into thirds
 activation is then sticky — skeletons keep applying as blocks age past the bottom
 boundary, summaries re-run at each subsequent 90% crossing.
 
+**Sustained overshoot:** while the visible window is at or over `OVERSHOOT` (1.15× the
+cap by default), the summarizable region widens from the top band to top + middle;
+only the raw bottom band is kept. Once widened, the summary group never shrinks back
+behind what it already covers. The shared overshoot un-latch and the
+`ACCORDION_SUMMARY_TRIGGER` / `ACCORDION_SUMMARY_OVERSHOOT` overrides apply here as
+well — see `conductors/in-process/compaction-naive/README.md`.
+
 **Fully exclusive** (ADR 0011): locks `human-steering` + `agent-unfold`. `recall`
 is never lockable, so skeletons stay readable in full; the summary group is the
 one one-way door (only a human detach — the freeze kill switch — recovers it).

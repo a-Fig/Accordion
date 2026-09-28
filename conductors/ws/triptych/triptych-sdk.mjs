@@ -987,6 +987,30 @@ var Truth = class _Truth {
     const c = this.classifyGroup(g);
     return groupDigest(g, c.collapsedMembers.length ? c.collapsedMembers : c.members);
   }
+  /**
+   * Is this DROP group's collapse manifesting, RIGHT NOW, as a role-floor-forced `roleFloorRecap`
+   * stub actually sitting on the wire — as opposed to a drop that truly vanishes, pushing nothing
+   * at all? This is the ONLY legitimate carve-out `agentView.ts`'s `groupAgentReachable` may treat
+   * as reachable for a drop group: the role-validity floor (`computeDegradedDropRuns`, `wire.ts`)
+   * synthesizes that stub carrying `foldTag(g.id)` ON PURPOSE, precisely so an agent `unfold`/
+   * `recall` of it resolves back to the group it degraded FROM.
+   *
+   * `isDropGroup` alone is NOT enough: it is true for a genuine human drop too (cleared the
+   * digest box to nothing), which puts literally nothing on the wire and must stay unreachable —
+   * treating every drop as reachable would make the strongest human curation action (drop) MORE
+   * reachable than a weaker one (a custom summary, kept unreachable by `hasOwnFoldTag`), letting
+   * `recall`/`unfold` hand back content the human just chose to remove.
+   *
+   * Reuses `degradedRunKeys()` — the SAME verdict `applyPlan` reaches for the real wire, never a
+   * re-derived approximation — so this can never drift from what the agent actually receives.
+   */
+  isDegradedDropGroup(g) {
+    if (!g.folded || !this.isDropGroup(g)) return false;
+    const c = this.classifyGroup(g);
+    if (!c.collapsedRuns.length) return false;
+    const keys = this.degradedRunKeys();
+    return c.collapsedRuns.some((run) => keys.has(messageKey(run[0].id)));
+  }
   groupFullTokens(g) {
     let n = 0;
     for (const b of this.groupMembers(g)) n += b.tokens;
@@ -1480,12 +1504,62 @@ var Truth = class _Truth {
     return this.computeProtectedFromIndex();
   }
   // ── the single write path ─────────────────────────────────────────────────
+  /**
+   * `apply` is NOT atomic across a multi-op batch — each op is applied independently via
+   * `applyOne`, with no rollback if a later op fails. That is fine for the common case (a batch of
+   * independent proposals, some of which no-op) but it is UNSAFE for the "rewrite" pattern
+   * `setGroupSummary` uses: `[{ungroup, groupId}, {group, ids:[first,last], summary}]`, sent as one
+   * batch so an agent handle survives a summary edit. If the `ungroup` commits and the paired
+   * `group` is then clamped (e.g. the protected tail moved between the group's creation and the
+   * edit, or `opGroup`'s `snappedRange` widens the requested range — a later-arriving sibling
+   * message part, say — into now-protected territory) the group would otherwise vanish with no
+   * signal: `groupById` returns undefined, `groups.length` drops, and nothing surfaces the loss.
+   *
+   * Since `opGroup` always derives a group's id as `g:${memberIds[0]}`, a regroup targeting the
+   * exact same first member recreates the exact same id — so a same-batch `group` op that fails
+   * where an `ungroup` on that derived id just succeeded is unambiguously "the other half of a
+   * rewrite that didn't complete," not an unrelated failed create. We restore the pre-batch group
+   * AND retroactively flip that `ungroup`'s own `OpResult.applied` to `false` (rather than only
+   * patching local state), so the whole doomed pair reads as "nothing applied": a live host must
+   * not forward the `ungroup` half alone, since `wireEventFromTruthEvent`/`appliedOpForWire`
+   * (core/replica.ts) mirror the wire ONLY what `applied`, and a replica replaying just the
+   * `ungroup` (with no paired `group` op to trigger the same revival) would drop the group for
+   * real — a silent, undetected host/replica divergence (`rev` still bumps by one on both sides)
+   * worse than the original bug. Flipping `applied` makes the rewrite atomic in its observable
+   * effect without making EVERY multi-op batch atomic — unrelated ops in the same batch still
+   * apply/replicate independently. (A plain `resetAll` in the same batch takes precedence —
+   * nothing survives a full reset.)
+   */
   apply(ops, by, baseRev) {
     const results = [];
     const touched = /* @__PURE__ */ new Set();
     let didReset = false;
+    const revivable = /* @__PURE__ */ new Map();
     for (const op of ops) {
+      if (op.kind === "ungroup") {
+        const g = this.groupById(op.groupId);
+        const r2 = this.applyOne(op, by, baseRev, touched);
+        if (g && r2.applied) revivable.set(op.groupId, { group: g, ungroupResult: r2 });
+        results.push(r2);
+        continue;
+      }
       const r = this.applyOne(op, by, baseRev, touched);
+      if (op.kind === "resetAll" && r.applied) revivable.clear();
+      if (op.kind === "group") {
+        const revivedId = `g:${op.ids[0]}`;
+        if (r.applied) {
+          revivable.delete(revivedId);
+        } else {
+          const prior = revivable.get(revivedId);
+          if (prior && !this.groupById(revivedId)) {
+            this.groupList = [...this.groupList, prior.group];
+            prior.ungroupResult.applied = false;
+            prior.ungroupResult.detail = "regroup refused; ungroup reverted to avoid silent data loss";
+            r.detail = r.detail ? `${r.detail} \u2014 original group restored` : "original group restored";
+            revivable.delete(revivedId);
+          }
+        }
+      }
       results.push(r);
       if (r.applied && op.kind === "resetAll") didReset = true;
     }
@@ -1729,7 +1803,7 @@ var Truth = class _Truth {
     if ((this.index.get(memberIds[memberIds.length - 1]) ?? Infinity) >= this.protectedFromIndex()) return this.clamp(op, "protected");
     for (const id of memberIds) if (this.groupOf(this.get(id))) return this.clamp(op, "invalid-group", "overlaps an existing group");
     if (by !== "you" && memberIds.some((id) => this.get(id).override !== null)) return this.clamp(op, "human-override");
-    const summary = by === "you" && typeof op.summary === "string" ? stripFoldTags(op.summary) : op.summary;
+    const summary = by === "you" && typeof op.summary === "string" ? stripFoldTags(op.summary).trim() : op.summary;
     const g = { id: `g:${memberIds[0]}`, memberIds, folded: true, by, digest: summary };
     if (this.classifyGroup(g).carrier === null) return this.clamp(op, "invalid-group", "nothing collapses (all stragglers)");
     this.groupList = [...this.groupList, g];
@@ -2502,7 +2576,21 @@ var ViewConductor = class {
 };
 
 // conductors/in-process/agedSummaryConductor.ts
-var TRIGGER = 0.9;
+var DEFAULT_TRIGGER = 0.9;
+var DEFAULT_OVERSHOOT = 1.15;
+function summaryTuningFromEnv(env = typeof process !== "undefined" ? process.env : void 0) {
+  const num = (raw) => raw === void 0 || raw.trim() === "" ? NaN : Number(raw);
+  const trigger = num(env?.ACCORDION_SUMMARY_TRIGGER);
+  const overshoot = num(env?.ACCORDION_SUMMARY_OVERSHOOT);
+  return {
+    trigger: trigger > 0 && trigger < 1 ? trigger : DEFAULT_TRIGGER,
+    overshoot: Number.isFinite(overshoot) && overshoot > 1 ? overshoot : DEFAULT_OVERSHOOT
+  };
+}
+var TUNING = summaryTuningFromEnv();
+var TRIGGER = TUNING.trigger;
+var OVERSHOOT = TUNING.overshoot;
+var OVERSHOOT_COOLDOWN_MS = 45e3;
 var MAX_OUTPUT_TOKENS = 8e3;
 var MIN_OUTPUT_TOKENS = 1e3;
 var OUTPUT_SAFETY_MARGIN = 512;
@@ -2618,6 +2706,18 @@ var AgedSummaryConductor = class extends ViewConductor {
   /** Σ full tokens of the aged region the most recently COMMITTED pass was handed — the bar a
    *  refill has to clear before an unproductive conductor spends another model call. */
   lastPassAgedTokens = 0;
+  /** `now()` at the most recent attempt START (`launchCompletion`, a window-too-tight decline
+   *  included) or SETTLE (resolve/reject), whichever came later; null before the first attempt.
+   *  Read only by the overshoot cooldown in `conduct()`. Refreshed at settle too because the pass
+   *  that commits a result is evaluated against the PRE-commit wire and the PREVIOUS pass's
+   *  saving — an un-latch judged there would re-bill off a stale reading. */
+  lastAttemptAt = null;
+  /** Wall-clock source (ms) for the overshoot cooldown — injectable via `AgedSummaryOptions`. */
+  now;
+  constructor(opts = {}) {
+    super();
+    this.now = opts.now ?? (() => Date.now());
+  }
   // ── lifecycle ────────────────────────────────────────────────────────────────
   /** A conductor lifetime starts fresh on attach — don't let state from a prior session leak into
    *  the next one, even if the same instance is re-attached. */
@@ -2632,6 +2732,7 @@ var AgedSummaryConductor = class extends ViewConductor {
     this.failureStatus = null;
     this.lastPassSaving = null;
     this.lastPassAgedTokens = 0;
+    this.lastAttemptAt = null;
     super.attach(host);
   }
   /** Cancel any in-flight completion so a stale result cannot mutate state after detach. */
@@ -2653,24 +2754,39 @@ var AgedSummaryConductor = class extends ViewConductor {
     const visible = view.liveTokens;
     const cap = view.contextWindow != null ? Math.min(view.budget, view.contextWindow) : view.budget;
     const overThreshold = visible >= cap * TRIGGER;
+    const overshoot = cap > 0 && visible >= cap * OVERSHOOT;
     const newlyAged = aged.filter((b) => !this.coveredIds.has(b.id));
     if (aged.length === 0 && this.text === null) {
       this.surfaceIdleStatus();
       return [];
     }
     const productive = this.lastPassSaving === null || this.lastPassSaving > MIN_PASS_SAVING;
-    const refilled = sumTokens(newlyAged) > this.lastPassAgedTokens;
-    const needsRun = overThreshold && newlyAged.length > 0 && (productive || refilled);
-    if (!needsRun) {
+    const newlyAgedTokens = sumTokens(newlyAged);
+    const refilled = newlyAgedTokens > this.lastPassAgedTokens;
+    if (!overThreshold || newlyAged.length === 0) {
       this.surfaceIdleStatus();
       return this.text !== null ? this.emitCoverageGroup(view) : [];
     }
     const attemptKey = newlyAged.map((b) => b.id).sort().join("\0");
-    if (attemptKey === this.lastAttemptKey) {
-      this.surfaceIdleStatus();
-      return this.text !== null ? this.emitCoverageGroup(view) : [];
+    const backedOff = !(productive || refilled);
+    const deduped = attemptKey === this.lastAttemptKey;
+    let launchNote = null;
+    if (backedOff || deduped) {
+      const saving = Math.round(this.lastPassSaving ?? 0);
+      const why = backedOff ? `back-off: last pass ${saving >= 0 ? `saved ${saving}` : `grew the wire ${-saving}`} tok; waiting for refill (${Math.round(newlyAgedTokens)}/${Math.round(this.lastPassAgedTokens)} tok newly aged)` : `holding: this newly-aged set (${newlyAged.length} block${newlyAged.length === 1 ? "" : "s"}) was already attempted; waiting for new context`;
+      if (!overshoot) {
+        this.surfaceIdleStatus(`${this.label} ${why}`);
+        return this.text !== null ? this.emitCoverageGroup(view) : [];
+      }
+      const sinceAttempt = this.lastAttemptAt === null ? Infinity : this.now() - this.lastAttemptAt;
+      if (sinceAttempt < OVERSHOOT_COOLDOWN_MS) {
+        const waitS = Math.ceil((OVERSHOOT_COOLDOWN_MS - sinceAttempt) / 1e3);
+        this.host.setStatus(`${this.failureStatus ?? `${this.label} ${why}`} \u2014 over ${OVERSHOOT}x cap, overshoot retry in ${waitS}s`);
+        return this.text !== null ? this.emitCoverageGroup(view) : [];
+      }
+      launchNote = `${this.label} overshoot un-latch: visible ${Math.round(visible)} tok \u2265 ${OVERSHOOT}x cap ${Math.round(cap)}; re-summarizing despite ${backedOff ? "back-off" : "attempt dedupe"}`;
     }
-    this.launchCompletion(aged, newlyAged, attemptKey, view.contextWindow);
+    this.launchCompletion(aged, newlyAged, attemptKey, view.contextWindow, launchNote);
     return this.emitCoverageGroup(view);
   }
   // ── helpers ───────────────────────────────────────────────────────────────────
@@ -2885,9 +3001,14 @@ var AgedSummaryConductor = class extends ViewConductor {
   /** Surface the sticky failure status (or clear the bar when there is none). Used in every
    *  `conduct()` path that would otherwise bare-`setStatus(null)`, so a completion failure set out
    *  of band in the async handlers is not erased before the human sees it. Cleared exactly when a
-   *  genuine retry launches (see `launchCompletion`) or a result commits. */
-  surfaceIdleStatus() {
-    this.host.setStatus(this.failureStatus);
+   *  genuine retry launches (see `launchCompletion`) or a result commits.
+   *
+   *  `note` is a NON-sticky explanation of why this pass held while over the trigger (the back-off
+   *  latch or the attempt-key dedupe). It is shown only when there is no sticky failure — a
+   *  failure is the more important thing to show, and after a rejection it is already the reason
+   *  the dedupe is holding — and it is recomputed (or dropped) every pass. */
+  surfaceIdleStatus(note = null) {
+    this.host.setStatus(this.failureStatus ?? note);
   }
   /** Neutralize a sentinel-breakout attempt against BOTH tags this conductor's prompt ever wraps
    *  content in: the always-present `"conversation"` wrapper and the subclass's `priorTag`. */
@@ -2906,14 +3027,17 @@ var AgedSummaryConductor = class extends ViewConductor {
    *                        prevent relaunching the same newly-aged set after a rejection.
    * @param contextWindow - the model's total context window (or null if unknown), used to reserve
    *                        output room so `input + output` cannot overflow the window.
+   * @param launchNote    - status shown while this attempt is in flight (the overshoot un-latch
+   *                        says so); null clears the bar, as every launch did before.
    */
-  launchCompletion(agedBlocks, newlyAged, attemptKey, contextWindow) {
+  launchCompletion(agedBlocks, newlyAged, attemptKey, contextWindow, launchNote = null) {
     if (this.inflight !== null) return;
     const launchedAgedIds = new Set(agedBlocks.map((b) => b.id));
     const launchedAgedTokens = sumTokens(agedBlocks);
     const count = agedBlocks.filter((b) => this.includeInGroup(b)).length;
     const prompt = this.buildPrompt(newlyAged);
     this.lastAttemptKey = attemptKey;
+    this.lastAttemptAt = this.now();
     let maxOutputTokens = MAX_OUTPUT_TOKENS;
     if (contextWindow != null && contextWindow > 0) {
       const inputTokens = this.host.countTokens(this.systemPrompt) + this.host.countTokens(prompt);
@@ -2926,7 +3050,7 @@ var AgedSummaryConductor = class extends ViewConductor {
       maxOutputTokens = Math.min(MAX_OUTPUT_TOKENS, reserve);
     }
     this.failureStatus = null;
-    this.host.setStatus(null);
+    this.host.setStatus(launchNote);
     const controller = new AbortController();
     this.inflight = controller;
     this.host.complete({
@@ -2937,6 +3061,7 @@ var AgedSummaryConductor = class extends ViewConductor {
     }).then(
       (result) => {
         if (this.inflight !== controller) return;
+        this.lastAttemptAt = this.now();
         const text = result.text.trim();
         if (!text) {
           this.inflight = null;
@@ -2957,6 +3082,7 @@ var AgedSummaryConductor = class extends ViewConductor {
       (err) => {
         if (this.inflight !== controller) return;
         this.inflight = null;
+        this.lastAttemptAt = this.now();
         if (isUnavailableError(err)) {
           this.failureStatus = this.unavailableMessage();
           this.host.setStatus(this.failureStatus, { aged: count });
@@ -3392,8 +3518,8 @@ function looksLikeJson(source) {
 var SHRINK_MAX = 0.7;
 var MIN_SKELETON_TOKENS = 700;
 var TriptychConductor = class extends AgedSummaryConductor {
-  constructor(skel) {
-    super();
+  constructor(skel, opts) {
+    super(opts);
     this.skel = skel;
   }
   id = "triptych";
@@ -3412,6 +3538,10 @@ var TriptychConductor = class extends AgedSummaryConductor {
   /** Sticky pressure gate: false until the visible window first crosses `TRIGGER`; never unset
    *  until detach/re-attach. */
   active = false;
+  /** True once the overshoot fallback in `agedBoundaryIndex` has widened the summarizable region
+   *  this attachment; from then on the top band never retreats behind blocks a summary already
+   *  covers. Never unset until detach/re-attach. */
+  widened = false;
   /**
    * Per-block skeleton cache: block id → the full labeled replacement content, or null for
    * "evaluated and declined" (not code / unsupported language / didn't shrink) so a declined
@@ -3421,6 +3551,7 @@ var TriptychConductor = class extends AgedSummaryConductor {
   skelCache = /* @__PURE__ */ new Map();
   attach(host) {
     this.active = false;
+    this.widened = false;
     this.skelCache = /* @__PURE__ */ new Map();
     super.attach(host);
     void this.skel.init().then(
@@ -3479,16 +3610,41 @@ var TriptychConductor = class extends AgedSummaryConductor {
     }
     bottomStart = Math.min(bottomStart, view.protectedFromIndex);
     topEnd = Math.min(topEnd, bottomStart);
-    while (topEnd > 0 && topEnd < view.blocks.length && messageKey(view.blocks[topEnd].id) === messageKey(view.blocks[topEnd - 1].id)) {
-      topEnd--;
-    }
+    topEnd = snapDownToMessageEdge(view, topEnd);
     return { bottomStart, topEnd };
   }
   // ── AgedSummaryConductor hooks ───────────────────────────────────────────────
-  /** The summary machinery may sweep ONLY the top band — and nothing at all pre-activation. */
+  /**
+   * The summary machinery may sweep ONLY the top band — and nothing at all pre-activation —
+   * with ONE exception, sustained overshoot:
+   *
+   *   - At/over `OVERSHOOT` (visible >= 1.15x the cap by default) the boundary falls back to the
+   *     MIDDLE band's end: top + middle are summarizable, only the raw bottom band is kept. The
+   *     thirds are measured in raw tokens from the tip, so when the growth is output the middle
+   *     band's skeletons do not touch (logs, grep, test runs), the top band alone can stay far too
+   *     small to bring the wire back under budget. Snapped down to a message edge for the same
+   *     reason `topEnd` is (see `bands`).
+   *   - Once that fallback has been used, the boundary never retreats behind the covered frontier
+   *     (one past the newest block the current summary covers, capped at the bottom band). Without
+   *     this the pass right after a widened summary commits — back under the mark — would shrink
+   *     the group to the top band again, putting the middle band straight back on the wire and
+   *     potentially flapping wide/narrow every turn. Normal thirds behavior resumes by itself once
+   *     `topEnd` moves past that frontier.
+   *
+   * Below the overshoot mark in a session that never reached it, this is exactly `topEnd`.
+   */
   agedBoundaryIndex(view) {
     if (!this.active) return 0;
-    return this.bands(view).topEnd;
+    const { bottomStart, topEnd } = this.bands(view);
+    const cap = this.effectiveCap(view);
+    if (cap > 0 && view.liveTokens >= cap * OVERSHOOT) {
+      this.widened = true;
+      return snapDownToMessageEdge(view, bottomStart);
+    }
+    if (!this.widened) return topEnd;
+    let frontier = 0;
+    for (let i = 0; i < bottomStart && i < view.blocks.length; i++) if (this.coveredIds.has(view.blocks[i].id)) frontier = i + 1;
+    return Math.max(topEnd, snapDownToMessageEdge(view, frontier));
   }
   /** Feed the summarizer the skeleton for skeletonized blocks (implementer decision #1). */
   promptTextOf(b) {
@@ -3574,6 +3730,10 @@ ${body}`;
 function skeletonHeader(path, srcLines) {
   const what = path !== void 0 ? path : "a code file";
   return `[code skeleton of ${what} \u2014 signatures kept, bodies elided (${srcLines} source lines). Use recall with the fold code above for the full file.]`;
+}
+function snapDownToMessageEdge(view, idx) {
+  while (idx > 0 && idx < view.blocks.length && messageKey(view.blocks[idx].id) === messageKey(view.blocks[idx - 1].id)) idx--;
+  return idx;
 }
 function countLines(s) {
   if (s.length === 0) return 0;
