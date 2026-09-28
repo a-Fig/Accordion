@@ -986,6 +986,30 @@ var Truth = class _Truth {
     const c = this.classifyGroup(g);
     return groupDigest(g, c.collapsedMembers.length ? c.collapsedMembers : c.members);
   }
+  /**
+   * Is this DROP group's collapse manifesting, RIGHT NOW, as a role-floor-forced `roleFloorRecap`
+   * stub actually sitting on the wire — as opposed to a drop that truly vanishes, pushing nothing
+   * at all? This is the ONLY legitimate carve-out `agentView.ts`'s `groupAgentReachable` may treat
+   * as reachable for a drop group: the role-validity floor (`computeDegradedDropRuns`, `wire.ts`)
+   * synthesizes that stub carrying `foldTag(g.id)` ON PURPOSE, precisely so an agent `unfold`/
+   * `recall` of it resolves back to the group it degraded FROM.
+   *
+   * `isDropGroup` alone is NOT enough: it is true for a genuine human drop too (cleared the
+   * digest box to nothing), which puts literally nothing on the wire and must stay unreachable —
+   * treating every drop as reachable would make the strongest human curation action (drop) MORE
+   * reachable than a weaker one (a custom summary, kept unreachable by `hasOwnFoldTag`), letting
+   * `recall`/`unfold` hand back content the human just chose to remove.
+   *
+   * Reuses `degradedRunKeys()` — the SAME verdict `applyPlan` reaches for the real wire, never a
+   * re-derived approximation — so this can never drift from what the agent actually receives.
+   */
+  isDegradedDropGroup(g) {
+    if (!g.folded || !this.isDropGroup(g)) return false;
+    const c = this.classifyGroup(g);
+    if (!c.collapsedRuns.length) return false;
+    const keys = this.degradedRunKeys();
+    return c.collapsedRuns.some((run) => keys.has(messageKey(run[0].id)));
+  }
   groupFullTokens(g) {
     let n = 0;
     for (const b of this.groupMembers(g)) n += b.tokens;
@@ -1479,12 +1503,62 @@ var Truth = class _Truth {
     return this.computeProtectedFromIndex();
   }
   // ── the single write path ─────────────────────────────────────────────────
+  /**
+   * `apply` is NOT atomic across a multi-op batch — each op is applied independently via
+   * `applyOne`, with no rollback if a later op fails. That is fine for the common case (a batch of
+   * independent proposals, some of which no-op) but it is UNSAFE for the "rewrite" pattern
+   * `setGroupSummary` uses: `[{ungroup, groupId}, {group, ids:[first,last], summary}]`, sent as one
+   * batch so an agent handle survives a summary edit. If the `ungroup` commits and the paired
+   * `group` is then clamped (e.g. the protected tail moved between the group's creation and the
+   * edit, or `opGroup`'s `snappedRange` widens the requested range — a later-arriving sibling
+   * message part, say — into now-protected territory) the group would otherwise vanish with no
+   * signal: `groupById` returns undefined, `groups.length` drops, and nothing surfaces the loss.
+   *
+   * Since `opGroup` always derives a group's id as `g:${memberIds[0]}`, a regroup targeting the
+   * exact same first member recreates the exact same id — so a same-batch `group` op that fails
+   * where an `ungroup` on that derived id just succeeded is unambiguously "the other half of a
+   * rewrite that didn't complete," not an unrelated failed create. We restore the pre-batch group
+   * AND retroactively flip that `ungroup`'s own `OpResult.applied` to `false` (rather than only
+   * patching local state), so the whole doomed pair reads as "nothing applied": a live host must
+   * not forward the `ungroup` half alone, since `wireEventFromTruthEvent`/`appliedOpForWire`
+   * (core/replica.ts) mirror the wire ONLY what `applied`, and a replica replaying just the
+   * `ungroup` (with no paired `group` op to trigger the same revival) would drop the group for
+   * real — a silent, undetected host/replica divergence (`rev` still bumps by one on both sides)
+   * worse than the original bug. Flipping `applied` makes the rewrite atomic in its observable
+   * effect without making EVERY multi-op batch atomic — unrelated ops in the same batch still
+   * apply/replicate independently. (A plain `resetAll` in the same batch takes precedence —
+   * nothing survives a full reset.)
+   */
   apply(ops, by, baseRev) {
     const results = [];
     const touched = /* @__PURE__ */ new Set();
     let didReset = false;
+    const revivable = /* @__PURE__ */ new Map();
     for (const op of ops) {
+      if (op.kind === "ungroup") {
+        const g = this.groupById(op.groupId);
+        const r2 = this.applyOne(op, by, baseRev, touched);
+        if (g && r2.applied) revivable.set(op.groupId, { group: g, ungroupResult: r2 });
+        results.push(r2);
+        continue;
+      }
       const r = this.applyOne(op, by, baseRev, touched);
+      if (op.kind === "resetAll" && r.applied) revivable.clear();
+      if (op.kind === "group") {
+        const revivedId = `g:${op.ids[0]}`;
+        if (r.applied) {
+          revivable.delete(revivedId);
+        } else {
+          const prior = revivable.get(revivedId);
+          if (prior && !this.groupById(revivedId)) {
+            this.groupList = [...this.groupList, prior.group];
+            prior.ungroupResult.applied = false;
+            prior.ungroupResult.detail = "regroup refused; ungroup reverted to avoid silent data loss";
+            r.detail = r.detail ? `${r.detail} \u2014 original group restored` : "original group restored";
+            revivable.delete(revivedId);
+          }
+        }
+      }
       results.push(r);
       if (r.applied && op.kind === "resetAll") didReset = true;
     }
@@ -1728,7 +1802,7 @@ var Truth = class _Truth {
     if ((this.index.get(memberIds[memberIds.length - 1]) ?? Infinity) >= this.protectedFromIndex()) return this.clamp(op, "protected");
     for (const id of memberIds) if (this.groupOf(this.get(id))) return this.clamp(op, "invalid-group", "overlaps an existing group");
     if (by !== "you" && memberIds.some((id) => this.get(id).override !== null)) return this.clamp(op, "human-override");
-    const summary = by === "you" && typeof op.summary === "string" ? stripFoldTags(op.summary) : op.summary;
+    const summary = by === "you" && typeof op.summary === "string" ? stripFoldTags(op.summary).trim() : op.summary;
     const g = { id: `g:${memberIds[0]}`, memberIds, folded: true, by, digest: summary };
     if (this.classifyGroup(g).carrier === null) return this.clamp(op, "invalid-group", "nothing collapses (all stragglers)");
     this.groupList = [...this.groupList, g];
