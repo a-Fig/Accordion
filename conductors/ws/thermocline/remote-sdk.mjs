@@ -986,6 +986,30 @@ var Truth = class _Truth {
     const c = this.classifyGroup(g);
     return groupDigest(g, c.collapsedMembers.length ? c.collapsedMembers : c.members);
   }
+  /**
+   * Is this DROP group's collapse manifesting, RIGHT NOW, as a role-floor-forced `roleFloorRecap`
+   * stub actually sitting on the wire — as opposed to a drop that truly vanishes, pushing nothing
+   * at all? This is the ONLY legitimate carve-out `agentView.ts`'s `groupAgentReachable` may treat
+   * as reachable for a drop group: the role-validity floor (`computeDegradedDropRuns`, `wire.ts`)
+   * synthesizes that stub carrying `foldTag(g.id)` ON PURPOSE, precisely so an agent `unfold`/
+   * `recall` of it resolves back to the group it degraded FROM.
+   *
+   * `isDropGroup` alone is NOT enough: it is true for a genuine human drop too (cleared the
+   * digest box to nothing), which puts literally nothing on the wire and must stay unreachable —
+   * treating every drop as reachable would make the strongest human curation action (drop) MORE
+   * reachable than a weaker one (a custom summary, kept unreachable by `hasOwnFoldTag`), letting
+   * `recall`/`unfold` hand back content the human just chose to remove.
+   *
+   * Reuses `degradedRunKeys()` — the SAME verdict `applyPlan` reaches for the real wire, never a
+   * re-derived approximation — so this can never drift from what the agent actually receives.
+   */
+  isDegradedDropGroup(g) {
+    if (!g.folded || !this.isDropGroup(g)) return false;
+    const c = this.classifyGroup(g);
+    if (!c.collapsedRuns.length) return false;
+    const keys = this.degradedRunKeys();
+    return c.collapsedRuns.some((run) => keys.has(messageKey(run[0].id)));
+  }
   groupFullTokens(g) {
     let n = 0;
     for (const b of this.groupMembers(g)) n += b.tokens;
@@ -1479,12 +1503,62 @@ var Truth = class _Truth {
     return this.computeProtectedFromIndex();
   }
   // ── the single write path ─────────────────────────────────────────────────
+  /**
+   * `apply` is NOT atomic across a multi-op batch — each op is applied independently via
+   * `applyOne`, with no rollback if a later op fails. That is fine for the common case (a batch of
+   * independent proposals, some of which no-op) but it is UNSAFE for the "rewrite" pattern
+   * `setGroupSummary` uses: `[{ungroup, groupId}, {group, ids:[first,last], summary}]`, sent as one
+   * batch so an agent handle survives a summary edit. If the `ungroup` commits and the paired
+   * `group` is then clamped (e.g. the protected tail moved between the group's creation and the
+   * edit, or `opGroup`'s `snappedRange` widens the requested range — a later-arriving sibling
+   * message part, say — into now-protected territory) the group would otherwise vanish with no
+   * signal: `groupById` returns undefined, `groups.length` drops, and nothing surfaces the loss.
+   *
+   * Since `opGroup` always derives a group's id as `g:${memberIds[0]}`, a regroup targeting the
+   * exact same first member recreates the exact same id — so a same-batch `group` op that fails
+   * where an `ungroup` on that derived id just succeeded is unambiguously "the other half of a
+   * rewrite that didn't complete," not an unrelated failed create. We restore the pre-batch group
+   * AND retroactively flip that `ungroup`'s own `OpResult.applied` to `false` (rather than only
+   * patching local state), so the whole doomed pair reads as "nothing applied": a live host must
+   * not forward the `ungroup` half alone, since `wireEventFromTruthEvent`/`appliedOpForWire`
+   * (core/replica.ts) mirror the wire ONLY what `applied`, and a replica replaying just the
+   * `ungroup` (with no paired `group` op to trigger the same revival) would drop the group for
+   * real — a silent, undetected host/replica divergence (`rev` still bumps by one on both sides)
+   * worse than the original bug. Flipping `applied` makes the rewrite atomic in its observable
+   * effect without making EVERY multi-op batch atomic — unrelated ops in the same batch still
+   * apply/replicate independently. (A plain `resetAll` in the same batch takes precedence —
+   * nothing survives a full reset.)
+   */
   apply(ops, by, baseRev) {
     const results = [];
     const touched = /* @__PURE__ */ new Set();
     let didReset = false;
+    const revivable = /* @__PURE__ */ new Map();
     for (const op of ops) {
+      if (op.kind === "ungroup") {
+        const g = this.groupById(op.groupId);
+        const r2 = this.applyOne(op, by, baseRev, touched);
+        if (g && r2.applied) revivable.set(op.groupId, { group: g, ungroupResult: r2 });
+        results.push(r2);
+        continue;
+      }
       const r = this.applyOne(op, by, baseRev, touched);
+      if (op.kind === "resetAll" && r.applied) revivable.clear();
+      if (op.kind === "group") {
+        const revivedId = `g:${op.ids[0]}`;
+        if (r.applied) {
+          revivable.delete(revivedId);
+        } else {
+          const prior = revivable.get(revivedId);
+          if (prior && !this.groupById(revivedId)) {
+            this.groupList = [...this.groupList, prior.group];
+            prior.ungroupResult.applied = false;
+            prior.ungroupResult.detail = "regroup refused; ungroup reverted to avoid silent data loss";
+            r.detail = r.detail ? `${r.detail} \u2014 original group restored` : "original group restored";
+            revivable.delete(revivedId);
+          }
+        }
+      }
       results.push(r);
       if (r.applied && op.kind === "resetAll") didReset = true;
     }
@@ -1728,7 +1802,7 @@ var Truth = class _Truth {
     if ((this.index.get(memberIds[memberIds.length - 1]) ?? Infinity) >= this.protectedFromIndex()) return this.clamp(op, "protected");
     for (const id of memberIds) if (this.groupOf(this.get(id))) return this.clamp(op, "invalid-group", "overlaps an existing group");
     if (by !== "you" && memberIds.some((id) => this.get(id).override !== null)) return this.clamp(op, "human-override");
-    const summary = by === "you" && typeof op.summary === "string" ? stripFoldTags(op.summary) : op.summary;
+    const summary = by === "you" && typeof op.summary === "string" ? stripFoldTags(op.summary).trim() : op.summary;
     const g = { id: `g:${memberIds[0]}`, memberIds, folded: true, by, digest: summary };
     if (this.classifyGroup(g).carrier === null) return this.clamp(op, "invalid-group", "nothing collapses (all stragglers)");
     this.groupList = [...this.groupList, g];
@@ -2531,23 +2605,25 @@ function sedimentRuns(view, scores, graduated, cfg = DEFAULT_CFG, units = null) 
   flush();
   return runs;
 }
-function ageBasedRuns(units, view, claimed, cfg, minUnits = cfg.minRunUnits) {
+function ageBasedRuns(units, view, claimed, cfg, minUnits = cfg.minRunUnits, foldOnly = /* @__PURE__ */ new Set()) {
   const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
   const protectedFrom = view.blocks[pfi]?.order ?? Infinity;
   const ctx = runCtx(view);
+  const movable = (u) => u.order < protectedFrom && !u.held && !u.protected && !u.grouped;
+  const freeKeys = /* @__PURE__ */ new Set();
+  for (const u of units) if (movable(u) && !claimed.has(u.id)) for (const id of u.ids) freeKeys.add(messageKey(id));
+  const bridges = (u) => foldOnly.has(u.id) && movable(u) && u.ids.some((id) => freeKeys.has(messageKey(id)));
   const runs = [];
   let cur = [];
   const flush = () => {
     if (cur.length >= minUnits) {
       const safe = safeRunFromUnits(cur, ctx);
-      if (safe && safe.unitIds.length >= minUnits) runs.push(safe);
+      if (safe && safe.unitIds.length >= minUnits && safe.unitIds.some((id) => !claimed.has(id))) runs.push(safe);
     }
     cur = [];
   };
   for (const u of units) {
-    const olderThanTail = u.order < protectedFrom;
-    const notClaimed = !claimed.has(u.id);
-    const eligible = olderThanTail && notClaimed && !u.held && !u.protected && !u.grouped;
+    const eligible = movable(u) && (!claimed.has(u.id) || bridges(u));
     if (eligible) cur.push(u);
     else flush();
   }
@@ -2583,6 +2659,15 @@ function planEpoch(view, scores, _state, cfg = DEFAULT_CFG, opts = {}) {
     foldedIds,
     strata: strata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens }))
   });
+  const foldOnlyUnits = () => new Set(folds.map((f) => f.unitId));
+  const supersedeFolds = (unitIds) => {
+    const absorbed = new Set(unitIds);
+    for (let i = folds.length - 1; i >= 0; i--) {
+      if (!absorbed.has(folds[i].unitId)) continue;
+      for (const id of folds[i].ids) foldedIds.delete(id);
+      folds.splice(i, 1);
+    }
+  };
   let ci = 0;
   while (project(view, applied()) > targetTokens && ci < cands.length) {
     const u = cands[ci++];
@@ -2598,11 +2683,13 @@ function planEpoch(view, scores, _state, cfg = DEFAULT_CFG, opts = {}) {
       ...claimedByStratum,
       ...folds.flatMap((f) => byUnit.get(f.unitId)?.ids ?? [])
     ]);
-    const ageRuns = ageBasedRuns(units, view, claimedBeforeLastResort, cfg);
+    const foldOnly = foldOnlyUnits();
+    const ageRuns = ageBasedRuns(units, view, claimedBeforeLastResort, cfg, cfg.minRunUnits, foldOnly);
     for (const r of ageRuns) {
       if (project(view, applied()) <= targetTokens) break;
-      const alreadyClaimed = r.unitIds.some((id) => claimedBeforeLastResort.has(id));
+      const alreadyClaimed = r.unitIds.some((id) => claimedBeforeLastResort.has(id) && !foldOnly.has(id));
       if (alreadyClaimed) continue;
+      supersedeFolds(r.unitIds);
       const stratumEntry = {
         ids: [r.firstId, r.lastId],
         unitIds: r.unitIds,
@@ -2638,9 +2725,10 @@ function planEpoch(view, scores, _state, cfg = DEFAULT_CFG, opts = {}) {
         claimed.add(foldU.id);
         continue;
       }
-      const forceRuns = ageBasedRuns(units, view, claimed, cfg, 1);
+      const forceRuns = ageBasedRuns(units, view, claimed, cfg, 1, foldOnlyUnits());
       if (forceRuns.length) {
         const best = forceRuns[0];
+        supersedeFolds(best.unitIds);
         const bestTok = runMemberTokens(best, byUnit);
         const summaryTokens = estimateStratumTokens(best, byUnit);
         const reduces = bestTok > summaryTokens;
@@ -3108,6 +3196,10 @@ var ThermoclineConductor = class {
   overflowCapTokens = 0;
   overflowProtectedTokens = 0;
   overflowHeldTokens = 0;
+  /** The bolted (system prompt) floor outside the tail — nothing can fold it either. */
+  overflowFixedTokens = 0;
+  /** The post-plan projection that still exceeded cap. */
+  overflowProjectedTokens = 0;
   constructor(opts = {}) {
     this.cfg = { ...DEFAULT_CFG, ...opts.cfg ?? {} };
     this.scorer = opts.scorer ?? scoreCandidates;
@@ -3218,8 +3310,15 @@ var ThermoclineConductor = class {
   // ── view + state adapters ─────────────────────────────────────────────────────
   materialize() {
     const stats = this.host.stats();
+    const ownGroupIds = /* @__PURE__ */ new Set();
+    for (const s of this.appliedStrata) if (s.groupId) ownGroupIds.add(s.groupId);
+    const ownMembers = /* @__PURE__ */ new Set();
+    if (ownGroupIds.size) {
+      for (const g of this.host.groups()) if (ownGroupIds.has(g.id)) for (const id of g.memberIds) ownMembers.add(id);
+    }
+    const blocks = this.host.blocks().map((b) => b.grouped && ownMembers.has(b.id) ? { ...b, grouped: false } : b);
     return {
-      blocks: this.host.blocks().slice(),
+      blocks,
       budget: stats.budget,
       contextWindow: stats.contextWindow,
       // RAW baseline, NOT stats.liveTokens. The policy's `project()` re-derives OUR savings from a
@@ -3468,6 +3567,8 @@ var ThermoclineConductor = class {
     if (irreducible) {
       this.overflowProtectedTokens = protectedTailTokens(view);
       this.overflowHeldTokens = heldOutsideTailTokens(view);
+      this.overflowFixedTokens = boltedOutsideTailTokens(view);
+      this.overflowProjectedTokens = projected;
     }
   }
   /**
@@ -3762,7 +3863,15 @@ var ThermoclineConductor = class {
     const strata = this.appliedStrata.length;
     const scoring = this.scoringInFlight ? " \xB7 scoring\u2026" : "";
     const action = this.irreducibleOverflow ? "OVERFLOW" : this.preparing ? "PREPARE" : this.lastAction === "emergency" ? "EMERGENCY" : "HOLD";
-    const text = this.irreducibleOverflow ? this.overflowHeldTokens > 0 ? `over budget and irreducible: protected tail \u2248 ${fmtK(this.overflowProtectedTokens)}k + held content \u2248 ${fmtK(this.overflowHeldTokens)}k > cap ${fmtK(this.overflowCapTokens)}k \u2014 raise the budget, shrink the protected tail, or unpin held content` : `over budget and irreducible: protected tail \u2248 ${fmtK(this.overflowProtectedTokens)}k > cap ${fmtK(this.overflowCapTokens)}k \u2014 raise the budget or shrink the protected tail` : `${action} ${pct}% \xB7 ${folded} folded \xB7 ${strata} strata${scoring}`;
+    const overflow = {
+      projected: this.overflowProjectedTokens,
+      cap: this.overflowCapTokens,
+      tail: this.overflowProtectedTokens,
+      held: this.overflowHeldTokens,
+      fixed: this.overflowFixedTokens
+    };
+    const unabsorbed = this.irreducibleOverflow ? unabsorbedTokens(overflow) : 0;
+    const text = this.irreducibleOverflow ? overflowStatusText(overflow) : `${action} ${pct}% \xB7 ${folded} folded \xB7 ${strata} strata${scoring}`;
     if (text === this.lastStatusText) return;
     this.lastStatusText = text;
     this.host.setStatus(text, {
@@ -3775,7 +3884,8 @@ var ThermoclineConductor = class {
       highWater: Math.round(this.cfg.highWater * 100),
       irreducibleOverflow: this.irreducibleOverflow,
       overflowTokens: this.overflowTokens,
-      overflowHeldTokens: this.overflowHeldTokens
+      overflowHeldTokens: this.overflowHeldTokens,
+      overflowUnabsorbedTokens: unabsorbed
     });
   }
 };
@@ -3789,6 +3899,27 @@ function heldOutsideTailTokens(view) {
   const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
   let t = 0;
   for (let i = 0; i < pfi; i++) if (view.blocks[i].held) t += view.blocks[i].tokens;
+  return t;
+}
+function unabsorbedTokens(o) {
+  const floor = o.tail + o.held + o.fixed;
+  return floor > o.cap ? 0 : Math.max(0, o.projected - floor);
+}
+function overflowStatusText(o) {
+  const parts = [`protected tail \u2248 ${fmtK(o.tail)}k`];
+  if (o.held > 0) parts.push(`held content \u2248 ${fmtK(o.held)}k`);
+  if (o.fixed > 0) parts.push(`system prompt \u2248 ${fmtK(o.fixed)}k`);
+  const unabsorbed = unabsorbedTokens(o);
+  if (unabsorbed > 0) {
+    return `over budget: \u2248 ${fmtK(o.projected)}k after compaction > cap ${fmtK(o.cap)}k \u2014 \u2248 ${fmtK(unabsorbed)}k of older content could not be folded or grouped (${parts.join(" + ")} fit under cap)`;
+  }
+  const knobs = o.held > 0 ? "raise the budget, shrink the protected tail, or unpin held content" : "raise the budget or shrink the protected tail";
+  return `over budget and irreducible: ${parts.join(" + ")} > cap ${fmtK(o.cap)}k \u2014 ${knobs}`;
+}
+function boltedOutsideTailTokens(view) {
+  const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
+  let t = 0;
+  for (let i = 0; i < pfi; i++) if (isBolted(view.blocks[i])) t += view.blocks[i].tokens;
   return t;
 }
 function fmtK(tokens) {
