@@ -475,6 +475,62 @@ describe("IRREDUCIBLE OVERFLOW (P1-4)", () => {
 	});
 });
 
+// ── BUDGET FLOOR: a folded sibling must not strand its message's tool pair ─────────────────────
+//
+// The overnight log_query run (pi, no attention probe, budget 40k / protect 8k) shape: every
+// assistant message is `a:<m>:p0` thinking (big, foldable) + `a:<m>:p1` tool_call (a whole-file
+// write — big, NOT foldable) whose `r:<call>` result follows. Rung 1 / Rung 5a fold every thinking
+// part biggest-first, which CLAIMS it; the remaining call+result pair then straddles its message
+// (`a:<m>`) and `safeRunFromUnits` snaps every run holding it to nothing — so no rung could ever
+// group it, the pairs piled up outside the tail at full cost, and planEpoch reported a false
+// `irreducible` with a ~9k tail under a 40k cap. The fix lets a fold-only unit BRIDGE into a run
+// that needs it to complete a message, superseding its fold.
+describe("BUDGET FLOOR: message-atom bridge over a folded sibling", () => {
+	/** n messages; the LAST one is the protected tail (flag + protectedFromIndex agree, as on a host). */
+	function messageTurns(n: number): ConductorView {
+		const out: ViewBlock[] = [];
+		let order = 0;
+		for (let i = 0; i < n; i++) {
+			const t = { turn: i + 1, protected: i === n - 1 };
+			out.push(blk({ id: `a:m${i}:p0`, kind: "thinking", tokens: 6_000, foldedTokens: 150, order: order++, ...t }));
+			out.push(blk({ id: `a:m${i}:p1`, kind: "tool_call", callId: `c${i}`, toolName: "write", tokens: 4_000, foldedTokens: 50, order: order++, ...t }));
+			out.push(blk({ id: `r:c${i}`, kind: "tool_result", callId: `c${i}`, tokens: 150, foldedTokens: 40, order: order++, ...t }));
+		}
+		// The tail (~10k) fits comfortably under the 40k cap — the floor is NOT the blocker.
+		return view(out, { budget: 40_000, contextWindow: 40_000, protectedFromIndex: (n - 1) * 3 });
+	}
+
+	test("planEpoch reaches cap by grouping whole messages (pair + its folded thinking), no false irreducible", () => {
+		const N = 12; // ~122k baseline; folding every thinking part still leaves ~57k — over the HARD cap
+		const v = messageTurns(N);
+		const plan = planEpoch(v, new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+
+		expect(plan.irreducible).toBe(false);
+		expect(plan.projected).toBeLessThanOrEqual(plan.cap);
+		expect(project(v, appliedOf(plan))).toBe(plan.projected);
+
+		// Every non-foldable write pair outside the tail left the wire inside a stratum.
+		const inStratum = new Set(plan.strata.flatMap((s) => s.memberIds));
+		for (let i = 0; i < N - 1; i++) expect(inStratum.has(`a:m${i}:p1`)).toBe(true);
+
+		// A stratum SUPERSEDES the fold of a unit it absorbs — no member is credited twice.
+		const foldedIds = plan.folds.flatMap((f) => f.ids);
+		expect(foldedIds.filter((id) => inStratum.has(id))).toEqual([]);
+
+		// And each stratum is a message-atom fixed point: it never starts on a `:p1` (mid-message).
+		for (const s of plan.strata) expect(s.ids[0].endsWith(":p1")).toBe(false);
+	});
+
+	test("the same shape under the soft target (Rung 3.5) also groups the stranded pairs", () => {
+		const N = 7; // ~71k baseline; Rung 1 folds reach ~36k — under cap, over the 28k lowWater target
+		const v = messageTurns(N);
+		const plan = planEpoch(v, new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(plan.irreducible).toBe(false);
+		expect(plan.projected).toBeLessThanOrEqual(DEFAULT_CFG.lowWater * plan.cap);
+		expect(plan.strata.length).toBeGreaterThan(0);
+	});
+});
+
 // ── emitOps — engine op shapes + recoverability ──────────────────────────────────────────────
 describe("emitOps", () => {
 	test("a fold emits a recoverable `replace` op with the BARE body (engine adds the tag)", () => {

@@ -499,26 +499,46 @@ export function sedimentRuns(
  * compaction was insufficient. Runs are snapped INWARD to message atoms (`safeRunFromUnits`), the
  * SAME fixed-point guarantee as sedimentRuns — the emergency / hard-cap force-group path must not
  * absorb an ineligible sibling either. Returns runs in conversation order (oldest first).
+ *
+ * `foldOnly` — units THIS plan merely per-block-folded (claimed, but by a fold, never a stratum).
+ * Such a unit may BRIDGE into a run when it shares a message with an unclaimed unit: a message's
+ * NON-foldable parts (its tool_call, a user block) can only leave the wire inside a group, and the
+ * snap above refuses a group over part of a message. Without the bridge, folding a message's
+ * thinking part (Rung 1 / Rung 5a, biggest-first) strands its tool_call+result pair forever — the
+ * run holding the pair straddles the folded sibling and snaps to nothing, so a 10k whole-file-write
+ * call stays on the wire at full cost and the hard-cap floor reports a false `irreducible`. The
+ * caller must SUPERSEDE (drop) the fold of every bridged unit it groups — see `supersedeFolds`.
  */
-function ageBasedRuns(units: Unit[], view: ConductorView, claimed: Set<string>, cfg: Config, minUnits: number = cfg.minRunUnits): Run[] {
+function ageBasedRuns(
+	units: Unit[],
+	view: ConductorView,
+	claimed: Set<string>,
+	cfg: Config,
+	minUnits: number = cfg.minRunUnits,
+	foldOnly: ReadonlySet<string> = new Set(),
+): Run[] {
 	const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
 	const protectedFrom = view.blocks[pfi]?.order ?? Infinity;
 	const ctx = runCtx(view);
+	const movable = (u: Unit) => u.order < protectedFrom && !u.held && !u.protected && !u.grouped;
+	// Message keys that still have an unclaimed movable part — the only messages a bridge completes.
+	const freeKeys = new Set<string>();
+	for (const u of units) if (movable(u) && !claimed.has(u.id)) for (const id of u.ids) freeKeys.add(messageKey(id));
+	const bridges = (u: Unit) => foldOnly.has(u.id) && movable(u) && u.ids.some((id) => freeKeys.has(messageKey(id)));
 
 	const runs: Run[] = [];
 	let cur: Unit[] = [];
 	const flush = () => {
 		if (cur.length >= minUnits) {
 			const safe = safeRunFromUnits(cur, ctx);
-			if (safe && safe.unitIds.length >= minUnits) runs.push(safe);
+			// A run of ONLY bridges would just trade folds for a group — it frees nothing new.
+			if (safe && safe.unitIds.length >= minUnits && safe.unitIds.some((id) => !claimed.has(id))) runs.push(safe);
 		}
 		cur = [];
 	};
 
 	for (const u of units) {
-		const olderThanTail = u.order < protectedFrom;
-		const notClaimed = !claimed.has(u.id);
-		const eligible = olderThanTail && notClaimed && !u.held && !u.protected && !u.grouped;
+		const eligible = movable(u) && (!claimed.has(u.id) || bridges(u));
 		if (eligible) cur.push(u);
 		else flush();
 	}
@@ -592,6 +612,18 @@ export function planEpoch(
 		foldedIds,
 		strata: strata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens })),
 	});
+	// Units claimed ONLY by a per-block fold (the bridge candidates `ageBasedRuns` may absorb).
+	const foldOnlyUnits = (): Set<string> => new Set(folds.map((f) => f.unitId));
+	// A stratum SUPERSEDES any per-block fold on its units (the group renders one summary for all of
+	// them), so a bridged unit's fold leaves the plan — otherwise `project()` would credit both.
+	const supersedeFolds = (unitIds: readonly string[]): void => {
+		const absorbed = new Set(unitIds);
+		for (let i = folds.length - 1; i >= 0; i--) {
+			if (!absorbed.has(folds[i].unitId)) continue;
+			for (const id of folds[i].ids) foldedIds.delete(id);
+			folds.splice(i, 1);
+		}
+	};
 
 	// 3. Compose moves until the projection fits, or we run out of moves.
 	let ci = 0;
@@ -616,11 +648,13 @@ export function planEpoch(
 			...claimedByStratum,
 			...folds.flatMap((f) => byUnit.get(f.unitId)?.ids ?? []),
 		]);
-		const ageRuns = ageBasedRuns(units, view, claimedBeforeLastResort, cfg);
+		const foldOnly = foldOnlyUnits();
+		const ageRuns = ageBasedRuns(units, view, claimedBeforeLastResort, cfg, cfg.minRunUnits, foldOnly);
 		for (const r of ageRuns) {
 			if (project(view, applied()) <= targetTokens) break;
-			const alreadyClaimed = r.unitIds.some((id) => claimedBeforeLastResort.has(id));
+			const alreadyClaimed = r.unitIds.some((id) => claimedBeforeLastResort.has(id) && !foldOnly.has(id));
 			if (alreadyClaimed) continue;
+			supersedeFolds(r.unitIds);
 			const stratumEntry: PlanStratum = {
 				ids: [r.firstId, r.lastId],
 				unitIds: r.unitIds,
@@ -671,10 +705,12 @@ export function planEpoch(
 
 			// (b) No per-block fold left — force-GROUP the biggest contiguous run of NOT-yet-claimed
 			//     units (≥1 unit, ungraduated OK). ageBasedRuns(minUnits=1) surfaces the non-foldable
-			//     tool-pairs / lone user|tool_call that only a group command can absorb.
-			const forceRuns = ageBasedRuns(units, view, claimed, cfg, 1);
+			//     tool-pairs / lone user|tool_call that only a group command can absorb — bridging over
+			//     a folded sibling of the same message so the pair isn't snapped away (see ageBasedRuns).
+			const forceRuns = ageBasedRuns(units, view, claimed, cfg, 1, foldOnlyUnits());
 			if (forceRuns.length) {
 				const best = forceRuns[0]; // oldest eligible run → strata stay ordered & disjoint
+				supersedeFolds(best.unitIds);
 				const bestTok = runMemberTokens(best, byUnit);
 				const summaryTokens = estimateStratumTokens(best, byUnit);
 				// Recoverable summary preferred; but if a degenerate run's members are ≤ the summary

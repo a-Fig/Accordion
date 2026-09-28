@@ -43,6 +43,7 @@ import type {
 	Op,
 } from "../../../core/conductor/contract";
 import type { ConductorView } from "../../../core/conductor/view";
+import { isBolted } from "../../../core/digest";
 import type { Config, Plan, ThermoState, Applied, Unit } from "./policy";
 import {
 	DEFAULT_CFG,
@@ -195,6 +196,10 @@ export class ThermoclineConductor implements Conductor {
 	private overflowCapTokens = 0;
 	private overflowProtectedTokens = 0;
 	private overflowHeldTokens = 0;
+	/** The bolted (system prompt) floor outside the tail — nothing can fold it either. */
+	private overflowFixedTokens = 0;
+	/** The post-plan projection that still exceeded cap. */
+	private overflowProjectedTokens = 0;
 
 	constructor(opts: ThermoclineOptions = {}) {
 		this.cfg = { ...DEFAULT_CFG, ...(opts.cfg ?? {}) };
@@ -330,8 +335,26 @@ export class ThermoclineConductor implements Conductor {
 	// ── view + state adapters ─────────────────────────────────────────────────────
 	private materialize(): ConductorView {
 		const stats = this.host.stats();
+		// OUR OWN strata are re-plannable content, NOT buoys. The host reports `grouped: true` for a
+		// member of ANY folded group — including the strata WE committed last epoch — and every
+		// policy mover (Rung-1 deepen, Rung-3.5 ageBasedRuns, the Rung-5 force-fold/force-group floor)
+		// skips `grouped` units, reading them as someone else's content. But the baseline below is
+		// `fullTokens` (none of our work applied), so a plan that can't re-include our strata counts
+		// their members at FULL cost, can't reach cap, reports a false `irreducible`, and
+		// `applyDesired` then UNGROUPS every stratum it didn't re-derive — live jumps back over cap
+		// until the next epoch regroups them (the probe-absent flip-flop: each epoch ungroups all N
+		// strata and regroups a different set). The probe path only escaped this because
+		// `sedimentRuns` never checked `grouped`. A group we did NOT commit (human/pre-attach) stays a
+		// buoy. `folded` is left as-is (a collapsed-group member still renders folded).
+		const ownGroupIds = new Set<string>();
+		for (const s of this.appliedStrata) if (s.groupId) ownGroupIds.add(s.groupId);
+		const ownMembers = new Set<string>();
+		if (ownGroupIds.size) {
+			for (const g of this.host.groups()) if (ownGroupIds.has(g.id)) for (const id of g.memberIds) ownMembers.add(id);
+		}
+		const blocks = this.host.blocks().map((b) => (b.grouped && ownMembers.has(b.id) ? { ...b, grouped: false } : b));
 		return {
-			blocks: this.host.blocks().slice() as ViewBlock[],
+			blocks: blocks as ViewBlock[],
 			budget: stats.budget,
 			contextWindow: stats.contextWindow,
 			// RAW baseline, NOT stats.liveTokens. The policy's `project()` re-derives OUR savings from a
@@ -661,6 +684,8 @@ export class ThermoclineConductor implements Conductor {
 			// contributor to the irreducible floor — a conductor may never override a pin either. See
 			// `heldOutsideTailTokens` / the status text in `sendStatus`.
 			this.overflowHeldTokens = heldOutsideTailTokens(view);
+			this.overflowFixedTokens = boltedOutsideTailTokens(view);
+			this.overflowProjectedTokens = projected;
 		}
 	}
 
@@ -1053,14 +1078,16 @@ export class ThermoclineConductor implements Conductor {
 				: this.lastAction === "emergency"
 					? "EMERGENCY"
 					: "HOLD";
-		// Name the ACTUAL composition of the irreducible floor — not just the protected tail. A
-		// conductor may never override a human pin either, so held content sitting OUTSIDE the tail
-		// is an equally genuine contributor to an un-winnable configuration; blaming only the tail
-		// would mislead whoever reads the status when a large pin is the real culprit.
+		const overflow: OverflowBreakdown = {
+			projected: this.overflowProjectedTokens,
+			cap: this.overflowCapTokens,
+			tail: this.overflowProtectedTokens,
+			held: this.overflowHeldTokens,
+			fixed: this.overflowFixedTokens,
+		};
+		const unabsorbed = this.irreducibleOverflow ? unabsorbedTokens(overflow) : 0;
 		const text = this.irreducibleOverflow
-			? this.overflowHeldTokens > 0
-				? `over budget and irreducible: protected tail ≈ ${fmtK(this.overflowProtectedTokens)}k + held content ≈ ${fmtK(this.overflowHeldTokens)}k > cap ${fmtK(this.overflowCapTokens)}k — raise the budget, shrink the protected tail, or unpin held content`
-				: `over budget and irreducible: protected tail ≈ ${fmtK(this.overflowProtectedTokens)}k > cap ${fmtK(this.overflowCapTokens)}k — raise the budget or shrink the protected tail`
+			? overflowStatusText(overflow)
 			: `${action} ${pct}% · ${folded} folded · ${strata} strata${scoring}`;
 
 		if (text === this.lastStatusText) return;
@@ -1076,6 +1103,7 @@ export class ThermoclineConductor implements Conductor {
 			irreducibleOverflow: this.irreducibleOverflow,
 			overflowTokens: this.overflowTokens,
 			overflowHeldTokens: this.overflowHeldTokens,
+			overflowUnabsorbedTokens: unabsorbed,
 		});
 	}
 }
@@ -1099,6 +1127,54 @@ function heldOutsideTailTokens(view: ConductorView): number {
 	const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
 	let t = 0;
 	for (let i = 0; i < pfi; i++) if (view.blocks[i].held) t += view.blocks[i].tokens;
+	return t;
+}
+
+/** The numbers behind an over-cap plan: what it projects, the cap, and the immovable floor's parts. */
+export interface OverflowBreakdown {
+	projected: number;
+	cap: number;
+	/** Raw tokens from the protected tail boundary to the end. */
+	tail: number;
+	/** Held (pinned) content outside the tail. */
+	held: number;
+	/** Bolted content (the system prompt) outside the tail. */
+	fixed: number;
+}
+
+/** The part of an over-cap projection that is NOT the immovable floor (tail + held + bolted) — older
+ *  content the plan left on the wire. Zero when the floor ALONE exceeds cap (a configuration issue). */
+export function unabsorbedTokens(o: OverflowBreakdown): number {
+	const floor = o.tail + o.held + o.fixed;
+	return floor > o.cap ? 0 : Math.max(0, o.projected - floor);
+}
+
+/**
+ * The OVERFLOW status line. Names the ACTUAL blocker:
+ *   • floor (tail + held + system prompt) > cap → a configuration the ladder can never win; name
+ *     each part (a pin outside the tail is as immovable as the tail) and the knobs that fix it.
+ *   • floor ≤ cap → the ladder left older content it could not fold or group. Saying "protected
+ *     tail ≈ 8k > cap 40k" there (what this used to print) is self-contradictory and sends the
+ *     reader to the wrong knob; say how much un-absorbed content is over and that the floor fits.
+ */
+export function overflowStatusText(o: OverflowBreakdown): string {
+	const parts = [`protected tail ≈ ${fmtK(o.tail)}k`];
+	if (o.held > 0) parts.push(`held content ≈ ${fmtK(o.held)}k`);
+	if (o.fixed > 0) parts.push(`system prompt ≈ ${fmtK(o.fixed)}k`);
+	const unabsorbed = unabsorbedTokens(o);
+	if (unabsorbed > 0) {
+		return `over budget: ≈ ${fmtK(o.projected)}k after compaction > cap ${fmtK(o.cap)}k — ≈ ${fmtK(unabsorbed)}k of older content could not be folded or grouped (${parts.join(" + ")} fit under cap)`;
+	}
+	const knobs = o.held > 0 ? "raise the budget, shrink the protected tail, or unpin held content" : "raise the budget or shrink the protected tail";
+	return `over budget and irreducible: ${parts.join(" + ")} > cap ${fmtK(o.cap)}k — ${knobs}`;
+}
+
+/** Σ tokens of BOLTED blocks (the system prompt) strictly before the protected tail — a fixed floor
+ *  nothing can fold, so it belongs in the irreducible-overflow arithmetic next to the tail and pins. */
+function boltedOutsideTailTokens(view: ConductorView): number {
+	const pfi = Math.min(view.protectedFromIndex, view.blocks.length);
+	let t = 0;
+	for (let i = 0; i < pfi; i++) if (isBolted(view.blocks[i])) t += view.blocks[i].tokens;
 	return t;
 }
 
