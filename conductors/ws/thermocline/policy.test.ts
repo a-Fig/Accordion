@@ -19,6 +19,7 @@ import {
 	sedimentRuns,
 	emitOps,
 	FOLDABLE_KINDS,
+	stratumDigestKey,
 	type ConductorView,
 	type ViewBlock,
 } from "./policy";
@@ -573,7 +574,9 @@ describe("emitOps", () => {
 
 		const roomy = view(blocks, { budget: 100_000, contextWindow: 100_000, protectedFromIndex: N });
 		const gradRoomy = updateGraduation(st, roomy, scores, DEFAULT_CFG).graduated;
-		const keepOps = emitOps(planEpoch(roomy, scores, st, DEFAULT_CFG, { graduated: gradRoomy }), new Map([["stratum:g0", "holistic run summary"]]), roomy);
+		const keepPlan = planEpoch(roomy, scores, st, DEFAULT_CFG, { graduated: gradRoomy });
+		const keepRange = keepPlan.strata[0].ids;
+		const keepOps = emitOps(keepPlan, new Map([[stratumDigestKey(keepRange[0], keepRange[1]), "holistic run summary"]]), roomy);
 		const keepGroup = keepOps.find((o) => o.kind === "group");
 		expect(keepGroup?.kind === "group" && keepGroup.summary).toBe(`${foldTag("g:g0")} holistic run summary`);
 		// The tag encodes the GROUP id, NOT the bare first-member id.
@@ -592,5 +595,127 @@ describe("emitOps", () => {
 		for (const o of emitOps(plan, new Map(), v)) {
 			if (o.kind === "replace") expect(FOLDABLE_KINDS.has(byId.get(o.id)!.kind)).toBe(true);
 		}
+	});
+});
+
+// ── PREFIX STABILITY + BURST (live A/B of PR #148: circuit_eval, DeepSeek flash, 40k/8k) ─────────
+//
+// Two failures from the live run, both invisible to the budget invariant: (1) the cached prefix was
+// rewritten every turn — cacheRead fell to the bare system prompt on 20 of the last 22 turns — and
+// (2) a 61k tool result rode three wires over the hard cap. These pin the policy side of the fix.
+describe("PREFIX STABILITY: append-only epochs (PlanOpts.keep)", () => {
+	/** `n` one-call assistant messages (call + 7.5k result — a pair, so only a stratum can take it);
+	 *  the last `tail` messages are the protected tail. Members of an applied stratum are NOT marked
+	 *  `grouped` — the conductor's `materialize` reports its own strata as plannable content, so
+	 *  `keep` is the only thing holding them in place. */
+	function history(n: number, tail: number): ConductorView {
+		const blocks: ViewBlock[] = [];
+		for (let i = 0; i < n; i++) {
+			const t = { turn: i + 1, protected: i >= n - tail };
+			blocks.push(blk({ id: `a:m${i}:p0`, kind: "tool_call", callId: `c${i}`, toolName: "read", tokens: 500, foldedTokens: 500, order: 2 * i, ...t }));
+			blocks.push(blk({ id: `r:c${i}`, kind: "tool_result", callId: `c${i}`, tokens: 7_500, foldedTokens: 60, order: 2 * i + 1, ...t }));
+		}
+		return view(blocks, { budget: 40_000, contextWindow: 40_000, protectedFromIndex: 2 * (n - tail) });
+	}
+
+	test("a kept stratum survives the next epoch byte-for-byte; the new run is APPENDED after it (Rung 3 spares it)", () => {
+		const v1 = history(8, 1);
+		const p1 = planEpoch(v1, new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		const s1 = p1.strata.find((s) => s.digestKind === "summary")!;
+		expect(s1).toBeTruthy();
+
+		// The session grows past highWater. The first stratum is on the wire and its real deterministic
+		// recap is tiny — but the fresh run is big enough that its ESTIMATE alone sits at the 8k Rung-3
+		// ceiling, which used to fuse the kept stratum into it every epoch.
+		const v2 = history(30, 1);
+		const keep = { folds: [], strata: [{ ...s1, summaryTokens: 60 }] };
+		const p2 = planEpoch(v2, new Map(), stateOf(), DEFAULT_CFG, { deterministic: true, keep });
+		expect(p2.strata[0].ids).toEqual(s1.ids);
+		expect(p2.strata[0].memberIds).toEqual(s1.memberIds);
+		expect(p2.strata.length).toBeGreaterThan(1); // the new content went into a NEW stratum after it
+		expect(p2.projected).toBeLessThanOrEqual(p2.cap);
+
+		// Contrast: from scratch (no keep) the same view re-plans the bottom of the deep zone.
+		const scratch = planEpoch(v2, new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(scratch.strata[0].ids).not.toEqual(s1.ids);
+	});
+
+	test("a stratum's LLM summary is looked up by its full RANGE, never reused for a longer stratum", () => {
+		_order = 0;
+		const blocks = Array.from({ length: 6 }, (_, i) => blk({ id: `g${i}`, kind: "text", tokens: 8_000, foldedTokens: 50, order: i, text: `body ${i}` }));
+		const v = view(blocks, { budget: 100_000, contextWindow: 100_000, protectedFromIndex: 6 });
+		const plan = { folds: [], strata: [{ ids: ["g0", "g5"] as [string, string], unitIds: blocks.map((b) => b.id), memberIds: blocks.map((b) => b.id), digestKind: "summary" as const, summaryTokens: 100 }], targetTokens: 0, cap: 100_000, projected: 0 };
+		const stale = new Map([[stratumDigestKey("g0", "g3"), "summary of g0..g3 only"]]);
+		const g = emitOps(plan, stale, v).find((o) => o.kind === "group");
+		expect(g?.kind === "group" && g.summary).not.toContain("g0..g3 only");
+		const exact = new Map([[stratumDigestKey("g0", "g5"), "summary of g0..g5"]]);
+		const g2 = emitOps(plan, exact, v).find((o) => o.kind === "group");
+		expect(g2?.kind === "group" && g2.summary).toBe(`${foldTag("g:g0")} summary of g0..g5`);
+	});
+});
+
+describe("BURST: a big tool result never rides the wire over cap", () => {
+	// One assistant message, two calls: c1's big result just outside the tail, c2's small result
+	// inside it. The c1 pair is not `foldable` (its call can't fold) and can't be grouped without its
+	// whole message atom, which straddles the tail — so no rung used to touch it.
+	function straddle(resultTokens: number): ConductorView {
+		const blocks = [
+			blk({ id: "u0", kind: "user", tokens: 200, order: 0 }),
+			blk({ id: "a:m1:p0", kind: "tool_call", callId: "c1", toolName: "read", tokens: 100, foldedTokens: 100, order: 1 }),
+			blk({ id: "a:m1:p1", kind: "tool_call", callId: "c2", toolName: "read", tokens: 100, foldedTokens: 100, order: 2, protected: true }),
+			blk({ id: "r:c1", kind: "tool_result", callId: "c1", tokens: resultTokens, foldedTokens: 80, order: 3 }),
+			blk({ id: "r:c2", kind: "tool_result", callId: "c2", tokens: 500, foldedTokens: 40, order: 4, protected: true }),
+		];
+		return view(blocks, { budget: 40_000, contextWindow: 40_000, protectedFromIndex: 4 });
+	}
+
+	test("Rung 3.75: a straddling pair over the SOFT target gets its RESULT folded (never the call)", () => {
+		const plan = planEpoch(straddle(30_000), new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(plan.folds.flatMap((f) => f.ids)).toEqual(["r:c1"]);
+		expect(plan.projected).toBeLessThanOrEqual(DEFAULT_CFG.lowWater * plan.cap);
+	});
+
+	test("Rung 3.75 / 5a: the same pair over the HARD cap is folded, not reported irreducible", () => {
+		const plan = planEpoch(straddle(60_000), new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(plan.folds.flatMap((f) => f.ids)).toEqual(["r:c1"]);
+		expect(plan.irreducible).toBe(false);
+		expect(plan.projected).toBeLessThanOrEqual(plan.cap);
+	});
+
+	/** Older sent history + a strata-bearing prefix, then a fresh tool result as the newest block. */
+	function burst(o: { resultTokens: number; resultSent: boolean; sentTailTokens?: number }): ConductorView {
+		const blocks: ViewBlock[] = [
+			blk({ id: "h0", kind: "text", tokens: 5_000, foldedTokens: 60, order: 0 }),
+			blk({ id: "h1", kind: "text", tokens: 5_000, foldedTokens: 60, order: 1 }),
+			blk({ id: "h2", kind: "text", tokens: 5_000, foldedTokens: 60, order: 2 }),
+		];
+		if (o.sentTailTokens) blocks.push(blk({ id: "t0", kind: "text", tokens: o.sentTailTokens, foldedTokens: 60, order: 3, protected: true }));
+		blocks.push(blk({ id: "a:m9:p0", kind: "tool_call", callId: "c9", toolName: "run", tokens: 100, foldedTokens: 100, order: 4, protected: true, sent: false }));
+		blocks.push(blk({ id: "r:c9", kind: "tool_result", callId: "c9", tokens: o.resultTokens, foldedTokens: 80, order: 5, protected: true, sent: o.resultSent }));
+		const pfi = blocks.findIndex((b) => b.protected);
+		return view(blocks, { budget: 40_000, contextWindow: 40_000, protectedFromIndex: pfi });
+	}
+
+	test("Rung 0: an UNSENT fresh result that alone overflows the cap is birth-folded — nothing else is touched", () => {
+		const plan = planEpoch(burst({ resultTokens: 61_000, resultSent: false }), new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(plan.folds.flatMap((f) => f.ids)).toEqual(["r:c9"]);
+		expect(plan.strata).toEqual([]); // the older history (and any strata on it) is left alone
+		expect(plan.irreducible).toBe(false);
+	});
+
+	test("Rung 0 stays out: a fresh result that FITS reaches the model whole", () => {
+		const plan = planEpoch(burst({ resultTokens: 20_000, resultSent: false }), new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(plan.folds.flatMap((f) => f.ids)).not.toContain("r:c9");
+	});
+
+	test("Rung 0 stays out: a SENT result has no birth-fold exemption (the engine would clamp it)", () => {
+		const plan = planEpoch(burst({ resultTokens: 61_000, resultSent: true }), new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(plan.folds.flatMap((f) => f.ids)).not.toContain("r:c9");
+		expect(plan.irreducible).toBe(true);
+	});
+
+	test("Rung 0 stays out when the SENT tail alone is over cap (budget < protect) — folding fresh results can't fit it", () => {
+		const plan = planEpoch(burst({ resultTokens: 3_000, resultSent: false, sentTailTokens: 45_000 }), new Map(), stateOf(), DEFAULT_CFG, { deterministic: true });
+		expect(plan.folds.flatMap((f) => f.ids)).not.toContain("r:c9");
 	});
 });

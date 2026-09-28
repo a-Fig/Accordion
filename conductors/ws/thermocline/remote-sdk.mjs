@@ -2636,25 +2636,36 @@ function planEpoch(view, scores, _state, cfg = DEFAULT_CFG, opts = {}) {
   const targetTokens = cfg.lowWater * cap;
   const units = buildUnits(view.blocks);
   const byUnit = new Map(units.map((u) => [u.id, u]));
-  const graduated = opts.graduated ?? /* @__PURE__ */ new Set();
+  const orderOf = new Map(view.blocks.map((b) => [b.id, b.order]));
+  const keptStrata = (opts.keep?.strata ?? []).filter((s) => s.unitIds.length > 0 && s.unitIds.every((id) => byUnit.has(id)));
+  const keptStrataUnits = new Set(keptStrata.flatMap((s) => s.unitIds));
+  const keptKeys = new Set(keptStrata.map((s) => stratumDigestKey(s.ids[0], s.ids[1])));
+  const graduatedIn = opts.graduated ?? /* @__PURE__ */ new Set();
+  const graduated = keptStrataUnits.size ? new Set([...graduatedIn].filter((id) => !keptStrataUnits.has(id))) : graduatedIn;
   const runs = sedimentRuns(view, scores, graduated, cfg, units);
-  const strata = runs.map((r) => ({
-    ids: [r.firstId, r.lastId],
-    unitIds: r.unitIds,
-    memberIds: r.memberIds,
-    digestKind: "summary",
-    // an LLM (or deterministic recap) summary; never DROP at birth
-    summaryTokens: estimateStratumTokens(r, byUnit)
-  }));
+  const strata = [
+    ...keptStrata.map((s) => ({ ...s, ids: [s.ids[0], s.ids[1]], unitIds: s.unitIds.slice(), memberIds: s.memberIds.slice() })),
+    ...runs.map((r) => ({
+      ids: [r.firstId, r.lastId],
+      unitIds: r.unitIds,
+      memberIds: r.memberIds,
+      digestKind: "summary",
+      // an LLM (or deterministic recap) summary; never DROP at birth
+      summaryTokens: estimateStratumTokens(r, byUnit)
+    }))
+  ];
+  if (keptStrata.length) strata.sort((a, b) => (orderOf.get(a.ids[0]) ?? Infinity) - (orderOf.get(b.ids[0]) ?? Infinity));
   const claimedByStratum = new Set(strata.flatMap((s) => s.unitIds));
-  const cands = units.filter((u) => isEligibleToDeepen(u, scores, cfg) && !claimedByStratum.has(u.id)).filter((u) => savingOf(u) >= cfg.minFoldTokens).sort(
+  const keptFolds = (opts.keep?.folds ?? []).filter((f) => byUnit.has(f.unitId) && !claimedByStratum.has(f.unitId) && f.ids.length > 0);
+  const keptFoldUnits = new Set(keptFolds.map((f) => f.unitId));
+  const cands = units.filter((u) => isEligibleToDeepen(u, scores, cfg) && !claimedByStratum.has(u.id) && !keptFoldUnits.has(u.id)).filter((u) => savingOf(u) >= cfg.minFoldTokens).sort(
     (a, b) => savingOf(b) - savingOf(a) || // biggest saving first
     (scores.get(a.temperatureKey) ?? 1) - (scores.get(b.temperatureKey) ?? 1) || // colder first
     a.order - b.order
     // older first
   );
-  const folds = [];
-  const foldedIds = /* @__PURE__ */ new Set();
+  const folds = keptFolds.map((f) => ({ unitId: f.unitId, ids: f.ids.slice(), tier: f.tier }));
+  const foldedIds = new Set(folds.flatMap((f) => f.ids));
   const applied = () => ({
     foldedIds,
     strata: strata.map((s) => ({ memberIds: s.memberIds, summaryTokens: s.summaryTokens }))
@@ -2668,6 +2679,30 @@ function planEpoch(view, scores, _state, cfg = DEFAULT_CFG, opts = {}) {
       folds.splice(i, 1);
     }
   };
+  {
+    let floor = 0;
+    for (const b of view.blocks) {
+      if (isBolted(b)) floor += b.tokens;
+      else if (b.protected && !b.grouped) floor += b.folded ? b.foldedTokens : b.tokens;
+    }
+    if (floor > cap) {
+      const unitOf = /* @__PURE__ */ new Map();
+      for (const u of units) for (const id of u.ids) unitOf.set(id, u);
+      const saving = (b) => b.tokens - b.foldedTokens;
+      const fresh = view.blocks.filter((b) => b.kind === "tool_result" && b.protected && !b.sent && !b.folded && !b.grouped && !b.held && !foldedIds.has(b.id)).filter((b) => saving(b) >= cfg.minFoldTokens && unitOf.has(b.id)).sort((x, y) => saving(y) - saving(x) || x.order - y.order);
+      if (floor - fresh.reduce((t, b) => t + saving(b), 0) <= cap) {
+        for (const b of fresh) {
+          if (floor <= cap) break;
+          const u = unitOf.get(b.id);
+          const existing = folds.find((f) => f.unitId === u.id);
+          if (existing) existing.ids.push(b.id);
+          else folds.push({ unitId: u.id, ids: [b.id], tier: deterministic ? "trim" : "digest" });
+          foldedIds.add(b.id);
+          floor -= saving(b);
+        }
+      }
+    }
+  }
   let ci = 0;
   while (project(view, applied()) > targetTokens && ci < cands.length) {
     const u = cands[ci++];
@@ -2677,7 +2712,7 @@ function planEpoch(view, scores, _state, cfg = DEFAULT_CFG, opts = {}) {
       if (isMemberFoldable(byUnit.get(u.id), id)) foldedIds.add(id);
     }
   }
-  mergeOverCeiling(strata, cap, cfg, byUnit);
+  mergeOverCeiling(strata, cap, cfg, byUnit, keptKeys);
   if (project(view, applied()) > targetTokens) {
     const claimedBeforeLastResort = /* @__PURE__ */ new Set([
       ...claimedByStratum,
@@ -2700,7 +2735,20 @@ function planEpoch(view, scores, _state, cfg = DEFAULT_CFG, opts = {}) {
       strata.push(stratumEntry);
       for (const uid of r.unitIds) claimedBeforeLastResort.add(uid);
     }
-    mergeOverCeiling(strata, cap, cfg, byUnit);
+    mergeOverCeiling(strata, cap, cfg, byUnit, keptKeys);
+  }
+  if (project(view, applied()) > targetTokens) {
+    const claimedNow = /* @__PURE__ */ new Set([...strata.flatMap((s) => s.unitIds), ...folds.map((f) => f.unitId)]);
+    const stranded = units.filter((u) => !u.foldable && !claimedNow.has(u.id) && !u.held && !u.protected && !u.grouped).filter((u) => {
+      const temp = scores.get(u.temperatureKey);
+      return !(temp !== void 0 && temp >= cfg.coldThreshold) && memberFoldSaving(u) >= cfg.minFoldTokens;
+    }).sort((a, b) => memberFoldSaving(b) - memberFoldSaving(a) || a.order - b.order);
+    for (const u of stranded) {
+      if (project(view, applied()) <= targetTokens) break;
+      const ids = u.ids.filter((id) => isMemberFoldable(u, id));
+      folds.push({ unitId: u.id, ids, tier: deterministic ? "trim" : "digest" });
+      for (const id of ids) foldedIds.add(id);
+    }
   }
   dropStrataOldestFirst(strata, view, applied, targetTokens);
   if (project(view, applied()) > cap) {
@@ -2777,18 +2825,24 @@ function biggestForceFoldable(units, foldedIds, inStratum) {
   let best = null;
   let bestSave = 0;
   for (const u of units) {
-    if (!u.foldable) continue;
+    if (!u.ids.some((id) => isMemberFoldable(u, id))) continue;
     if (u.held || u.protected || u.grouped) continue;
-    if (u.foldedTokens >= u.tokens) continue;
     if (inStratum.has(u.id)) continue;
     if (u.ids.some((id) => foldedIds.has(id))) continue;
-    const save = savingOf(u);
+    const save = memberFoldSaving(u);
     if (save > bestSave) {
       best = u;
       bestSave = save;
     }
   }
   return best;
+}
+function memberFoldSaving(u) {
+  let save = 0;
+  u.blocks.forEach((b, i) => {
+    if (FOLDABLE_KINDS2.has(u.kinds[i])) save += Math.max(0, b.tokens - b.foldedTokens);
+  });
+  return save;
 }
 function runMemberTokens(run, byUnit) {
   let t = 0;
@@ -2821,11 +2875,17 @@ function estimateStratumTokens(run, byUnit) {
   }
   return Math.min(8e3, Math.max(60, Math.round(members * 0.12)));
 }
-function mergeOverCeiling(strata, cap, cfg, byUnit) {
+function mergeOverCeiling(strata, cap, cfg, byUnit, kept = /* @__PURE__ */ new Set()) {
   const ceiling = cfg.ceilingFrac * cap;
   const sumStrata = () => strata.reduce((s, x) => s + x.summaryTokens, 0);
+  const isKept = (s) => kept.has(stratumDigestKey(s.ids[0], s.ids[1]));
+  const keptAlone = strata.filter(isKept).reduce((t, x) => t + x.summaryTokens, 0);
+  const mayFuse = (s) => keptAlone > ceiling || !isKept(s);
   while (sumStrata() > ceiling && strata.length > 1) {
-    const [a, b] = [strata[0], strata[1]];
+    let i = 0;
+    while (i + 1 < strata.length && !(mayFuse(strata[i]) && mayFuse(strata[i + 1]))) i++;
+    if (i + 1 >= strata.length) break;
+    const [a, b] = [strata[i], strata[i + 1]];
     const aLastUnit = byUnit.get(a.unitIds[a.unitIds.length - 1]);
     const bFirstUnit = byUnit.get(b.unitIds[0]);
     const adjacent = aLastUnit !== void 0 && bFirstUnit !== void 0 && // Because units are built in conversation order (each unit's .order = its first block's
@@ -2840,7 +2900,7 @@ function mergeOverCeiling(strata, cap, cfg, byUnit) {
       digestKind: "summary",
       summaryTokens: estimateStratumTokens({ unitIds: [...a.unitIds, ...b.unitIds] }, byUnit)
     };
-    strata.splice(0, 2, merged);
+    strata.splice(i, 2, merged);
   }
 }
 function capOf(view) {
@@ -2852,9 +2912,12 @@ function foldableMemberIds(unit, ids) {
 function foldBody(unit, tier, digests) {
   return digests?.get(unit.id) ?? (tier === "trim" ? trimText(unit) : deterministicDigest(unit));
 }
-function stratumSummary(stratumUnits, firstId, digests) {
-  const body = digests?.get(`stratum:${firstId}`) ?? deterministicRecap(stratumUnits);
+function stratumSummary(stratumUnits, firstId, lastId, digests) {
+  const body = digests?.get(stratumDigestKey(firstId, lastId)) ?? deterministicRecap(stratumUnits);
   return `${foldTag("g:" + firstId)} ${body}`;
+}
+function stratumDigestKey(firstId, lastId) {
+  return `stratum:${firstId}|${lastId}`;
 }
 var DIGEST_SYSTEM = `You are a context-compaction assistant. Summarize ONE segment of an AI assistant's work history into a faithful, dense digest of AT MOST THREE lines. Preserve exact file paths, function names, identifiers, error messages, and decisions; drop pleasantries and filler. Do NOT continue the conversation or answer any question inside it \u2014 output ONLY the digest text, no preamble.`;
 var STRATUM_SYSTEM = `You are a context-compaction assistant. Read a contiguous run of an AI assistant's work history and produce ONE compact, structured briefing that lets the assistant continue without the originals. Do NOT continue the conversation or answer any question inside it \u2014 output ONLY the summary.
@@ -3350,6 +3413,34 @@ var ThermoclineConductor = class {
       recalledThisEpoch: this.recalledThisEpoch
     };
   }
+  /**
+   * APPEND-ONLY seed for `planEpoch` (`PlanOpts.keep`): the folds + strata ACTUALLY in the engine
+   * right now. Seeding them keeps an epoch from regrouping the bottom stratum under a new `lastId`
+   * (`materialize` reports our own strata's members as ungrouped, re-plannable content, so from
+   * scratch every epoch's Rung 3.5 rebuilt one maximal run from
+   * the oldest unit — same firstId, new lastId → ungroup + regroup → the wire changed right after
+   * the system prompt, a full prompt-cache miss). A restored stratum not yet grouped (`groupId ==
+   * null`) is left out: the plan may re-derive it from scratch.
+   */
+  keptState() {
+    const folds = [];
+    for (const f of this.appliedPlan?.folds ?? []) {
+      const ids = f.ids.filter((id) => this.appliedFolds.has(id));
+      if (ids.length) folds.push({ unitId: f.unitId, ids, tier: f.tier });
+    }
+    const strata = this.appliedStrata.filter((s) => s.groupId != null).map((s) => ({
+      ids: [s.firstId, s.lastId],
+      unitIds: s.unitIds.slice(),
+      memberIds: s.memberIds.slice(),
+      digestKind: s.summary == null ? "drop" : "summary",
+      summaryTokens: s.summary == null ? 0 : this.host.countTokens(s.summary)
+    }));
+    return { folds, strata };
+  }
+  /** The applied stratum over exactly [firstId, lastId], if it is actually grouped in the engine. */
+  appliedStratumAt(firstId, lastId) {
+    return this.appliedStrata.find((p) => p.firstId === firstId && p.lastId === lastId && p.groupId != null);
+  }
   appliedForProject() {
     return {
       foldedIds: new Set(this.appliedFolds.keys()),
@@ -3453,6 +3544,7 @@ var ThermoclineConductor = class {
     } else {
       this.irreducibleOverflow = false;
       this.overflowTokens = 0;
+      if (this.lastAction === "emergency") this.lastAction = "hold";
     }
     this.lastFill = fill;
     if (fill >= this.cfg.warmWater && !this.preparing && !this.irreducibleOverflow && this.needNewEpoch(fill)) {
@@ -3489,20 +3581,25 @@ var ThermoclineConductor = class {
     this.advanceGraduationOnce(view);
     const plan = planEpoch(view, this.scores, this.gradState(), this.cfg, {
       deterministic: true,
-      graduated: this.grad.graduated
+      graduated: this.grad.graduated,
+      keep: this.keptState()
     });
     await this.commit(view, plan, void 0);
     this.lastAction = "emergency";
+    const cap = capOf(view);
+    if (cap > 0) this.lastFill = project(view, this.appliedForProject()) / cap;
+    this.sendStatus();
   }
   // ── PREPARE: score + LLM summaries + commit (async, off every hook path) ─────────
   async prepareEpoch(view, token) {
-    const plan = planEpoch(view, this.scores, this.gradState(), this.cfg, { graduated: this.grad.graduated });
+    const plan = planEpoch(view, this.scores, this.gradState(), this.cfg, { graduated: this.grad.graduated, keep: this.keptState() });
     const units = buildUnits(view.blocks);
     const byUnit = new Map(units.map((u) => [u.id, u]));
     const jobs = [];
     for (const f of plan.folds) {
       if (f.tier !== "digest") continue;
       if (this.digestCache.has(f.unitId)) continue;
+      if (f.ids.every((id) => this.appliedFolds.has(id))) continue;
       const u = byUnit.get(f.unitId);
       if (!u) continue;
       const { system, prompt } = buildDigestPrompt(u);
@@ -3513,8 +3610,9 @@ var ThermoclineConductor = class {
     }
     for (const s of plan.strata) {
       if (s.digestKind !== "summary") continue;
-      const key = `stratum:${s.ids[0]}`;
+      const key = stratumDigestKey(s.ids[0], s.ids[1]);
       if (this.digestCache.has(key)) continue;
+      if (this.appliedStratumAt(s.ids[0], s.ids[1])) continue;
       const stratumUnits = s.unitIds.map((id) => byUnit.get(id)).filter(Boolean);
       if (!stratumUnits.length) continue;
       const { system, prompt } = buildStratumPrompt(stratumUnits);
@@ -3530,7 +3628,7 @@ var ThermoclineConductor = class {
       }
     }
     const lv = this.lastView ?? view;
-    const freshPlan = planEpoch(lv, this.scores, this.gradState(), this.cfg, { graduated: this.grad.graduated });
+    const freshPlan = planEpoch(lv, this.scores, this.gradState(), this.cfg, { graduated: this.grad.graduated, keep: this.keptState() });
     if (this.attached) await this.commit(lv, freshPlan, this.digestCache);
     this.preparing = false;
     this.sendStatus();
@@ -3591,7 +3689,7 @@ var ThermoclineConductor = class {
     const MAX_PASSES = 3;
     for (let pass = 0; pass < MAX_PASSES; pass++) {
       if (project(view, appliedShapeOf(plan)) <= cap) return settle();
-      const det = planEpoch(view, this.scores, this.gradState(), this.cfg, { deterministic: true, graduated: this.grad.graduated });
+      const det = planEpoch(view, this.scores, this.gradState(), this.cfg, { deterministic: true, graduated: this.grad.graduated, keep: this.keptState() });
       let added = false;
       for (const f of det.folds) {
         if (claimedUnits.has(f.unitId)) continue;
@@ -3632,6 +3730,15 @@ var ThermoclineConductor = class {
     await this.applyDesired(desired);
   }
   // ── desired state + diff ────────────────────────────────────────────────────────
+  //
+  // TEXT FREEZE (prompt-cache stability). A fold or stratum that is ALREADY on the wire keeps its
+  // exact applied text: re-deriving it would rewrite a block deep in the prefix, and every token
+  // after it is a prompt-cache miss. Re-derivation is NOT stable: the deterministic recap quotes
+  // `~N tok` from CALIBRATED view tokens, so every receipt's new calibration factor changed the
+  // bottom stratum's summary, and HOLD ungrouped + regrouped it — the live circuit_eval run read
+  // cache only for the system prompt on 20 of its last 22 turns. A late LLM digest landing would
+  // do the same. Tradeoff: an applied deterministic fold/recap is never upgraded in place to an LLM
+  // digest (and its `~N tok` figure stays as first written) — LLM text is used for new entries only.
   desiredFromPlan(plan, digests, view) {
     const units = buildUnits(view.blocks);
     const byUnit = new Map(units.map((u) => [u.id, u]));
@@ -3642,17 +3749,18 @@ var ThermoclineConductor = class {
       const ids = foldableMemberIds(u, f.ids);
       if (!ids.length) continue;
       const body = foldBody(u, f.tier, digests);
-      for (const id of ids) folds.set(id, body);
+      for (const id of ids) folds.set(id, this.appliedFolds.get(id) ?? body);
     }
     const strata = plan.strata.map((s) => {
       const drop = s.digestKind === "drop";
       const stratumUnits = s.unitIds.map((id) => byUnit.get(id)).filter(Boolean);
+      const prior = drop ? void 0 : this.appliedStratumAt(s.ids[0], s.ids[1]);
       return {
         firstId: s.ids[0],
         lastId: s.ids[1],
         unitIds: s.unitIds.slice(),
         memberIds: s.memberIds.slice(),
-        summary: drop ? null : stratumSummary(stratumUnits, s.ids[0], digests),
+        summary: drop ? null : prior?.summary ?? stratumSummary(stratumUnits, s.ids[0], s.ids[1], digests),
         summaryTokens: s.summaryTokens
       };
     });
@@ -3756,7 +3864,7 @@ var ThermoclineConductor = class {
     for (const k of this.scores.keys()) if (!liveTempKeys.has(k)) this.scores.delete(k);
     for (const k of this.attempted) if (!liveTempKeys.has(k)) this.attempted.delete(k);
     for (const k of this.digestCache.keys()) {
-      const stale = k.startsWith("stratum:") ? !liveBlockIds.has(k.slice("stratum:".length)) : !liveUnitIds.has(k);
+      const stale = k.startsWith("stratum:") ? !k.slice("stratum:".length).split("|").every((id) => liveBlockIds.has(id)) : !liveUnitIds.has(k);
       if (stale) this.digestCache.delete(k);
     }
   }
@@ -3774,7 +3882,7 @@ var ThermoclineConductor = class {
           continue;
         }
         const bare = stripTag(s.summary);
-        this.digestCache.set(`stratum:${s.firstId}`, bare);
+        this.digestCache.set(stratumDigestKey(s.firstId, s.lastId), bare);
         s.summaryTokens = this.host.countTokens(bare);
       }
       this.appliedPlan = {
@@ -3951,7 +4059,7 @@ function planWithRealStratumTokens(plan, digests, countTokens) {
   const d = digests ?? /* @__PURE__ */ new Map();
   const strata = plan.strata.map((s) => {
     if (s.digestKind === "drop") return s;
-    const summary = d.get(`stratum:${s.ids[0]}`);
+    const summary = d.get(stratumDigestKey(s.ids[0], s.ids[1]));
     if (summary == null) return s;
     return { ...s, summaryTokens: countTokens(summary) };
   });
