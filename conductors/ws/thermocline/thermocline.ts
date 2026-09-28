@@ -44,7 +44,7 @@ import type {
 } from "../../../core/conductor/contract";
 import type { ConductorView } from "../../../core/conductor/view";
 import { isBolted } from "../../../core/digest";
-import type { Config, Plan, ThermoState, Applied, Unit } from "./policy";
+import type { Config, Plan, PlanFold, PlanStratum, ThermoState, Applied, Unit } from "./policy";
 import {
 	DEFAULT_CFG,
 	buildUnits,
@@ -55,6 +55,7 @@ import {
 	foldBody,
 	foldableMemberIds,
 	stratumSummary,
+	stratumDigestKey,
 	buildDigestPrompt,
 	buildStratumPrompt,
 	unionSet,
@@ -388,6 +389,38 @@ export class ThermoclineConductor implements Conductor {
 		};
 	}
 
+	/**
+	 * APPEND-ONLY seed for `planEpoch` (`PlanOpts.keep`): the folds + strata ACTUALLY in the engine
+	 * right now. Seeding them keeps an epoch from regrouping the bottom stratum under a new `lastId`
+	 * (`materialize` reports our own strata's members as ungrouped, re-plannable content, so from
+	 * scratch every epoch's Rung 3.5 rebuilt one maximal run from
+	 * the oldest unit — same firstId, new lastId → ungroup + regroup → the wire changed right after
+	 * the system prompt, a full prompt-cache miss). A restored stratum not yet grouped (`groupId ==
+	 * null`) is left out: the plan may re-derive it from scratch.
+	 */
+	private keptState(): { folds: PlanFold[]; strata: PlanStratum[] } {
+		const folds: PlanFold[] = [];
+		for (const f of this.appliedPlan?.folds ?? []) {
+			const ids = f.ids.filter((id) => this.appliedFolds.has(id));
+			if (ids.length) folds.push({ unitId: f.unitId, ids, tier: f.tier });
+		}
+		const strata: PlanStratum[] = this.appliedStrata
+			.filter((s) => s.groupId != null)
+			.map((s) => ({
+				ids: [s.firstId, s.lastId] as [string, string],
+				unitIds: s.unitIds.slice(),
+				memberIds: s.memberIds.slice(),
+				digestKind: s.summary == null ? ("drop" as const) : ("summary" as const),
+				summaryTokens: s.summary == null ? 0 : this.host.countTokens(s.summary),
+			}));
+		return { folds, strata };
+	}
+
+	/** The applied stratum over exactly [firstId, lastId], if it is actually grouped in the engine. */
+	private appliedStratumAt(firstId: string, lastId: string): AppliedStratum | undefined {
+		return this.appliedStrata.find((p) => p.firstId === firstId && p.lastId === lastId && p.groupId != null);
+	}
+
 	private appliedForProject(): Applied {
 		return {
 			foldedIds: new Set(this.appliedFolds.keys()),
@@ -514,6 +547,10 @@ export class ThermoclineConductor implements Conductor {
 			// straight under 1.0 self-heals without waiting for another emergency to re-check.
 			this.irreducibleOverflow = false;
 			this.overflowTokens = 0;
+			// No emergency this tick. `lastAction` used to stay "emergency" through every later HOLD
+			// tick (only a PREPARE commit overwrote it), so the status read "EMERGENCY 68%" for dozens of
+			// turns after one wire-departing emergency. HOLD is what is happening now.
+			if (this.lastAction === "emergency") this.lastAction = "hold";
 		}
 		this.lastFill = fill;
 
@@ -566,24 +603,34 @@ export class ThermoclineConductor implements Conductor {
 		const plan = planEpoch(view, this.scores, this.gradState(), this.cfg, {
 			deterministic: true,
 			graduated: this.grad.graduated,
+			keep: this.keptState(),
 		});
 		await this.commit(view, plan, undefined); // undefined digests → deterministic fallbacks everywhere
+		// Report the emergency with the fill it LEFT (commit's own status went out before this label
+		// was set, and on the wire-departing path no tick follows to refresh it). `runTick` clears the
+		// label on the next tick that finds fill ≤ 100% — EMERGENCY names an event, not a standing state.
 		this.lastAction = "emergency";
+		const cap = capOf(view);
+		if (cap > 0) this.lastFill = project(view, this.appliedForProject()) / cap;
+		this.sendStatus();
 	}
 
 	// ── PREPARE: score + LLM summaries + commit (async, off every hook path) ─────────
 	private async prepareEpoch(view: ConductorView, token: number): Promise<void> {
 		// 1. Plan (deterministic paths, no LLM yet). Graduation was advanced ONCE this tick.
-		const plan = planEpoch(view, this.scores, this.gradState(), this.cfg, { graduated: this.grad.graduated });
+		const plan = planEpoch(view, this.scores, this.gradState(), this.cfg, { graduated: this.grad.graduated, keep: this.keptState() });
 
 		// 2. Fire host.complete for every digest/stratum not cached.
 		const units = buildUnits(view.blocks);
 		const byUnit = new Map(units.map((u) => [u.id, u]));
 		const jobs: Promise<{ key: string; text: string } | null>[] = [];
 
+		// An entry already applied keeps its wire text byte-identical (`desiredFromPlan`), so an LLM
+		// digest for it would never be used — don't pay for one.
 		for (const f of plan.folds) {
 			if (f.tier !== "digest") continue;
 			if (this.digestCache.has(f.unitId)) continue;
+			if (f.ids.every((id) => this.appliedFolds.has(id))) continue;
 			const u = byUnit.get(f.unitId);
 			if (!u) continue;
 			const { system, prompt } = buildDigestPrompt(u);
@@ -596,8 +643,9 @@ export class ThermoclineConductor implements Conductor {
 		}
 		for (const s of plan.strata) {
 			if (s.digestKind !== "summary") continue;
-			const key = `stratum:${s.ids[0]}`;
+			const key = stratumDigestKey(s.ids[0], s.ids[1]);
 			if (this.digestCache.has(key)) continue;
+			if (this.appliedStratumAt(s.ids[0], s.ids[1])) continue;
 			const stratumUnits = s.unitIds.map((id) => byUnit.get(id)).filter(Boolean) as Unit[];
 			if (!stratumUnits.length) continue;
 			const { system, prompt } = buildStratumPrompt(stratumUnits);
@@ -625,7 +673,7 @@ export class ThermoclineConductor implements Conductor {
 
 		// Re-plan on the LAST view (not the stale one) so the ops are fresh, then COMMIT atomically.
 		const lv = this.lastView ?? view;
-		const freshPlan = planEpoch(lv, this.scores, this.gradState(), this.cfg, { graduated: this.grad.graduated });
+		const freshPlan = planEpoch(lv, this.scores, this.gradState(), this.cfg, { graduated: this.grad.graduated, keep: this.keptState() });
 		if (this.attached) await this.commit(lv, freshPlan, this.digestCache);
 		this.preparing = false;
 		this.sendStatus();
@@ -717,7 +765,7 @@ export class ThermoclineConductor implements Conductor {
 		const MAX_PASSES = 3;
 		for (let pass = 0; pass < MAX_PASSES; pass++) {
 			if (project(view, appliedShapeOf(plan)) <= cap) return settle();
-			const det = planEpoch(view, this.scores, this.gradState(), this.cfg, { deterministic: true, graduated: this.grad.graduated });
+			const det = planEpoch(view, this.scores, this.gradState(), this.cfg, { deterministic: true, graduated: this.grad.graduated, keep: this.keptState() });
 			let added = false;
 
 			// Merge NEW deterministic folds (unit not already claimed, no member already folded).
@@ -766,6 +814,15 @@ export class ThermoclineConductor implements Conductor {
 	}
 
 	// ── desired state + diff ────────────────────────────────────────────────────────
+	//
+	// TEXT FREEZE (prompt-cache stability). A fold or stratum that is ALREADY on the wire keeps its
+	// exact applied text: re-deriving it would rewrite a block deep in the prefix, and every token
+	// after it is a prompt-cache miss. Re-derivation is NOT stable: the deterministic recap quotes
+	// `~N tok` from CALIBRATED view tokens, so every receipt's new calibration factor changed the
+	// bottom stratum's summary, and HOLD ungrouped + regrouped it — the live circuit_eval run read
+	// cache only for the system prompt on 20 of its last 22 turns. A late LLM digest landing would
+	// do the same. Tradeoff: an applied deterministic fold/recap is never upgraded in place to an LLM
+	// digest (and its `~N tok` figure stays as first written) — LLM text is used for new entries only.
 	private desiredFromPlan(plan: Plan, digests: Map<string, string> | undefined, view: ConductorView): Desired {
 		const units = buildUnits(view.blocks);
 		const byUnit = new Map(units.map((u) => [u.id, u]));
@@ -776,17 +833,18 @@ export class ThermoclineConductor implements Conductor {
 			const ids = foldableMemberIds(u, f.ids);
 			if (!ids.length) continue;
 			const body = foldBody(u, f.tier, digests);
-			for (const id of ids) folds.set(id, body);
+			for (const id of ids) folds.set(id, this.appliedFolds.get(id) ?? body);
 		}
 		const strata = plan.strata.map((s) => {
 			const drop = s.digestKind === "drop";
 			const stratumUnits = s.unitIds.map((id) => byUnit.get(id)).filter(Boolean) as Unit[];
+			const prior = drop ? undefined : this.appliedStratumAt(s.ids[0], s.ids[1]);
 			return {
 				firstId: s.ids[0],
 				lastId: s.ids[1],
 				unitIds: s.unitIds.slice(),
 				memberIds: s.memberIds.slice(),
-				summary: drop ? null : stratumSummary(stratumUnits, s.ids[0], digests),
+				summary: drop ? null : (prior?.summary ?? stratumSummary(stratumUnits, s.ids[0], s.ids[1], digests)),
 				summaryTokens: s.summaryTokens,
 			};
 		});
@@ -931,7 +989,12 @@ export class ThermoclineConductor implements Conductor {
 		for (const k of this.scores.keys()) if (!liveTempKeys.has(k)) this.scores.delete(k);
 		for (const k of this.attempted) if (!liveTempKeys.has(k)) this.attempted.delete(k);
 		for (const k of this.digestCache.keys()) {
-			const stale = k.startsWith("stratum:") ? !liveBlockIds.has(k.slice("stratum:".length)) : !liveUnitIds.has(k);
+			const stale = k.startsWith("stratum:")
+				? !k
+						.slice("stratum:".length)
+						.split("|")
+						.every((id) => liveBlockIds.has(id))
+				: !liveUnitIds.has(k);
 			if (stale) this.digestCache.delete(k);
 		}
 	}
@@ -952,7 +1015,7 @@ export class ThermoclineConductor implements Conductor {
 					continue;
 				}
 				const bare = stripTag(s.summary);
-				this.digestCache.set(`stratum:${s.firstId}`, bare);
+				this.digestCache.set(stratumDigestKey(s.firstId, s.lastId), bare);
 				// RECOUNT on restore (issue #11 F1, ADR 0025): the persisted `summaryTokens` was counted
 				// under whatever `calibration` was in effect when it was written to disk — a value that
 				// need not match THIS process's current `k` (a fresh session starts at `k=1` until its
@@ -1239,7 +1302,7 @@ export function planWithRealStratumTokens(
 	const d = digests ?? new Map<string, string>();
 	const strata = plan.strata.map((s) => {
 		if (s.digestKind === "drop") return s; // a drop contributes 0 — no real text
-		const summary = d.get(`stratum:${s.ids[0]}`);
+		const summary = d.get(stratumDigestKey(s.ids[0], s.ids[1]));
 		if (summary == null) return s; // no LLM text yet → keep the estimate
 		return { ...s, summaryTokens: countTokens(summary) };
 	});

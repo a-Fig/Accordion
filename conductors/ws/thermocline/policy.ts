@@ -551,6 +551,17 @@ function ageBasedRuns(
 export interface PlanOpts {
 	deterministic?: boolean;
 	graduated?: Set<string>;
+	/**
+	 * APPEND-ONLY seed: the folds + strata the caller has ALREADY applied to the engine. They enter
+	 * the plan up front, claimed, so the ladder plans only the content they don't cover and a new
+	 * epoch never regroups an existing stratum under a new `lastId` (which rewrites the wire from
+	 * that group onward — for the bottom stratum, everything after the system prompt, i.e. a full
+	 * provider prompt-cache miss). They still yield under pressure: Rung 3 merges kept strata only
+	 * when they ALONE exceed the deep-zone ceiling, Rungs 4/5 may turn them into drops, and Rung 3.5
+	 * may absorb a kept fold into a new stratum.
+	 * Absent → a from-scratch plan (every existing caller/test).
+	 */
+	keep?: { folds: PlanFold[]; strata: PlanStratum[] };
 }
 
 /**
@@ -579,24 +590,39 @@ export function planEpoch(
 
 	const units = buildUnits(view.blocks);
 	const byUnit = new Map(units.map((u) => [u.id, u]));
+	const orderOf = new Map(view.blocks.map((b) => [b.id, b.order]));
+
+	// 0. APPEND-ONLY seed (see PlanOpts.keep). A kept entry whose units left the view is skipped.
+	const keptStrata = (opts.keep?.strata ?? []).filter((s) => s.unitIds.length > 0 && s.unitIds.every((id) => byUnit.has(id)));
+	const keptStrataUnits = new Set(keptStrata.flatMap((s) => s.unitIds));
+	const keptKeys = new Set(keptStrata.map((s) => stratumDigestKey(s.ids[0], s.ids[1])));
 
 	// 1. Sediment the already-graduated-cold units (graduation was advanced ONCE by the caller and
-	//    handed in via opts.graduated — planEpoch never advances dwell itself) into strata runs.
-	const graduated = opts.graduated ?? new Set<string>();
+	//    handed in via opts.graduated — planEpoch never advances dwell itself) into strata runs. A
+	//    kept stratum's units are not re-sedimented: they act as buoys between new runs.
+	const graduatedIn = opts.graduated ?? new Set<string>();
+	const graduated = keptStrataUnits.size ? new Set([...graduatedIn].filter((id) => !keptStrataUnits.has(id))) : graduatedIn;
 	const runs = sedimentRuns(view, scores, graduated, cfg, units);
 
-	const strata: PlanStratum[] = runs.map((r) => ({
-		ids: [r.firstId, r.lastId],
-		unitIds: r.unitIds,
-		memberIds: r.memberIds,
-		digestKind: "summary", // an LLM (or deterministic recap) summary; never DROP at birth
-		summaryTokens: estimateStratumTokens(r, byUnit),
-	}));
+	const strata: PlanStratum[] = [
+		...keptStrata.map((s) => ({ ...s, ids: [s.ids[0], s.ids[1]] as [string, string], unitIds: s.unitIds.slice(), memberIds: s.memberIds.slice() })),
+		...runs.map((r) => ({
+			ids: [r.firstId, r.lastId] as [string, string],
+			unitIds: r.unitIds,
+			memberIds: r.memberIds,
+			digestKind: "summary" as const, // an LLM (or deterministic recap) summary; never DROP at birth
+			summaryTokens: estimateStratumTokens(r, byUnit),
+		})),
+	];
+	// Conversation order — Rung 3 merges strata[0..1] as "the oldest", and kept + new interleave.
+	if (keptStrata.length) strata.sort((a, b) => (orderOf.get(a.ids[0]) ?? Infinity) - (orderOf.get(b.ids[0]) ?? Infinity));
 	const claimedByStratum = new Set(strata.flatMap((s) => s.unitIds));
 
-	// 2. Eligible deepen candidates, BIGGEST-COLD-FIRST.
+	// 2. Eligible deepen candidates, BIGGEST-COLD-FIRST. A kept fold is already in the plan (below).
+	const keptFolds = (opts.keep?.folds ?? []).filter((f) => byUnit.has(f.unitId) && !claimedByStratum.has(f.unitId) && f.ids.length > 0);
+	const keptFoldUnits = new Set(keptFolds.map((f) => f.unitId));
 	const cands = units
-		.filter((u) => isEligibleToDeepen(u, scores, cfg) && !claimedByStratum.has(u.id))
+		.filter((u) => isEligibleToDeepen(u, scores, cfg) && !claimedByStratum.has(u.id) && !keptFoldUnits.has(u.id))
 		.filter((u) => savingOf(u) >= cfg.minFoldTokens)
 		.sort(
 			(a, b) =>
@@ -605,8 +631,8 @@ export function planEpoch(
 				a.order - b.order, // older first
 		);
 
-	const folds: PlanFold[] = [];
-	const foldedIds = new Set<string>();
+	const folds: PlanFold[] = keptFolds.map((f) => ({ unitId: f.unitId, ids: f.ids.slice(), tier: f.tier }));
+	const foldedIds = new Set<string>(folds.flatMap((f) => f.ids));
 
 	const applied = (): Applied => ({
 		foldedIds,
@@ -625,6 +651,47 @@ export function planEpoch(
 		}
 	};
 
+	// Rung 0 — OVERSIZED FRESH TOOL RESULT (birth-fold). When the protected tail ALONE (plus the
+	// bolted system prompt) exceeds the hard cap, no move outside the tail can fit the wire — yet
+	// every rung below would still spend the whole history trying. The live circuit_eval run: a 61k
+	// tool result landed as the newest block, and the emergency turned both applied strata into drops
+	// and grouped a third (a full prefix bust plus lost summaries), only for the result to be folded
+	// one append later anyway. Fold the biggest never-sent tool results first — the engine's
+	// birth-fold exemption (`Truth.canFold`: protected but unsent) permits it — until the tail fits.
+	// Narrow on purpose:
+	//   • tool_result only — never the user's words or the model's own text/thinking;
+	//   • only when the tail is over cap, so a fresh result that COULD fit whole reaches the model whole;
+	//   • only when folding fresh results can actually close the gap. A SENT tail over cap is a
+	//     config problem (budget < protect — the P1-4 irreducible state); birth-folding every new
+	//     result there would blind the agent without ever fitting the wire.
+	{
+		let floor = 0;
+		for (const b of view.blocks) {
+			if (isBolted(b)) floor += b.tokens;
+			else if (b.protected && !b.grouped) floor += b.folded ? b.foldedTokens : b.tokens;
+		}
+		if (floor > cap) {
+			const unitOf = new Map<string, Unit>();
+			for (const u of units) for (const id of u.ids) unitOf.set(id, u);
+			const saving = (b: ViewBlock) => b.tokens - b.foldedTokens;
+			const fresh = view.blocks
+				.filter((b) => b.kind === "tool_result" && b.protected && !b.sent && !b.folded && !b.grouped && !b.held && !foldedIds.has(b.id))
+				.filter((b) => saving(b) >= cfg.minFoldTokens && unitOf.has(b.id))
+				.sort((x, y) => saving(y) - saving(x) || x.order - y.order);
+			if (floor - fresh.reduce((t, b) => t + saving(b), 0) <= cap) {
+				for (const b of fresh) {
+					if (floor <= cap) break;
+					const u = unitOf.get(b.id)!;
+					const existing = folds.find((f) => f.unitId === u.id);
+					if (existing) existing.ids.push(b.id);
+					else folds.push({ unitId: u.id, ids: [b.id], tier: deterministic ? "trim" : "digest" });
+					foldedIds.add(b.id);
+					floor -= saving(b);
+				}
+			}
+		}
+	}
+
 	// 3. Compose moves until the projection fits, or we run out of moves.
 	let ci = 0;
 	// Rung 1: deepen coldest-biggest units one at a time.
@@ -638,7 +705,7 @@ export function planEpoch(
 	}
 
 	// Rung 3: if the deep zone is over its ceiling, MERGE the oldest strata into one coarser stratum.
-	mergeOverCeiling(strata, cap, cfg, byUnit);
+	mergeOverCeiling(strata, cap, cfg, byUnit, keptKeys);
 
 	// Rung 3.5 — AGE-BASED LAST-RESORT COMPACTION. Engaged ONLY when still over budget after
 	// Rungs 1–3. This is the probe-independent safety net that makes the budget invariant hold even
@@ -666,7 +733,32 @@ export function planEpoch(
 			for (const uid of r.unitIds) claimedBeforeLastResort.add(uid);
 		}
 		// Re-apply ceiling merge after adding age-based strata.
-		mergeOverCeiling(strata, cap, cfg, byUnit);
+		mergeOverCeiling(strata, cap, cfg, byUnit, keptKeys);
+	}
+
+	// Rung 3.75 — STRANDED TOOL RESULTS. Rung 1 never deepens a tool pair (a pair is not `foldable`:
+	// its call can't fold) and a pair joins a group only with its WHOLE message atom — so when that
+	// message's sibling call has its result inside the tail (one assistant turn, two calls: a 60k
+	// result just outside the tail, a small one inside it), the atom straddles, Rung 3.5 snaps the pair
+	// away, and the big result rode the wire over the hard cap until the tail moved past its sibling
+	// (3 wires in the live circuit_eval run). Fold the RESULT alone — the call stays on the wire, and
+	// the engine never folds a tool_call — biggest first, before any stratum is dropped for want of
+	// a move. Soft-target rung, so a HOT pair is spared exactly as Rung 1 spares a hot unit.
+	if (project(view, applied()) > targetTokens) {
+		const claimedNow = new Set<string>([...strata.flatMap((s) => s.unitIds), ...folds.map((f) => f.unitId)]);
+		const stranded = units
+			.filter((u) => !u.foldable && !claimedNow.has(u.id) && !u.held && !u.protected && !u.grouped)
+			.filter((u) => {
+				const temp = scores.get(u.temperatureKey);
+				return !(temp !== undefined && temp >= cfg.coldThreshold) && memberFoldSaving(u) >= cfg.minFoldTokens;
+			})
+			.sort((a, b) => memberFoldSaving(b) - memberFoldSaving(a) || a.order - b.order);
+		for (const u of stranded) {
+			if (project(view, applied()) <= targetTokens) break;
+			const ids = u.ids.filter((id) => isMemberFoldable(u, id));
+			folds.push({ unitId: u.id, ids, tier: deterministic ? "trim" : "digest" });
+			for (const id of ids) foldedIds.add(id);
+		}
 	}
 
 	// Rung 4: the DROP floor toward the SOFT target. Drop strata OLDEST-FIRST (hard delete).
@@ -781,18 +873,29 @@ function biggestForceFoldable(units: Unit[], foldedIds: Set<string>, inStratum: 
 	let best: Unit | null = null;
 	let bestSave = 0;
 	for (const u of units) {
-		if (!u.foldable) continue;
+		// A tool pair counts through its RESULT (see Rung 3.75): the caller folds only the foldable
+		// members, so the call stays on the wire.
+		if (!u.ids.some((id) => isMemberFoldable(u, id))) continue;
 		if (u.held || u.protected || u.grouped) continue;
-		if (u.foldedTokens >= u.tokens) continue;
 		if (inStratum.has(u.id)) continue;
 		if (u.ids.some((id) => foldedIds.has(id))) continue; // already folded this epoch
-		const save = savingOf(u);
+		const save = memberFoldSaving(u);
 		if (save > bestSave) {
 			best = u;
 			bestSave = save;
 		}
 	}
 	return best;
+}
+
+/** Tokens reclaimed by folding a unit's FOLDABLE members only — for a tool pair, its result. For a
+ *  single foldable block this equals `savingOf`. */
+function memberFoldSaving(u: Unit): number {
+	let save = 0;
+	u.blocks.forEach((b, i) => {
+		if (FOLDABLE_KINDS.has(u.kinds[i])) save += Math.max(0, b.tokens - b.foldedTokens);
+	});
+	return save;
 }
 
 /** Σ member tokens of a run (for picking the biggest force-group candidate). */
@@ -848,12 +951,25 @@ function estimateStratumTokens(run: { unitIds: string[] }, byUnit: Map<string, U
  * them, fusing would create a group spanning a gap: the host snaps the range outward and could
  * swallow the buoy (grouping a hot/held block or getting the whole group refused → lost savings →
  * budget invariant breaks). Non-adjacent strata are left as separate group commands.
+ *
+ * APPEND-ONLY: a KEPT stratum (`kept`, range keys of strata already on the wire) is not fused
+ * while the kept strata alone fit under the ceiling — fusing one rewrites the cached prefix from
+ * that point on (the live replay: a fresh 66k+ run is estimated at the full 8k ceiling by itself,
+ * so every later epoch fused ALL the kept strata into it for a paper saving of ~100 tokens). Only
+ * the new strata fuse, oldest adjacent pair first; if the kept strata alone exceed the ceiling the
+ * old oldest-first behaviour applies to all of them.
  */
-function mergeOverCeiling(strata: PlanStratum[], cap: number, cfg: Config, byUnit: Map<string, Unit>): void {
+function mergeOverCeiling(strata: PlanStratum[], cap: number, cfg: Config, byUnit: Map<string, Unit>, kept: ReadonlySet<string> = new Set()): void {
 	const ceiling = cfg.ceilingFrac * cap;
 	const sumStrata = () => strata.reduce((s, x) => s + x.summaryTokens, 0);
+	const isKept = (s: PlanStratum) => kept.has(stratumDigestKey(s.ids[0], s.ids[1]));
+	const keptAlone = strata.filter(isKept).reduce((t, x) => t + x.summaryTokens, 0);
+	const mayFuse = (s: PlanStratum) => keptAlone > ceiling || !isKept(s);
 	while (sumStrata() > ceiling && strata.length > 1) {
-		const [a, b] = [strata[0], strata[1]];
+		let i = 0;
+		while (i + 1 < strata.length && !(mayFuse(strata[i]) && mayFuse(strata[i + 1]))) i++;
+		if (i + 1 >= strata.length) break; // only kept strata (or a lone new one) left — nothing to fuse
+		const [a, b] = [strata[i], strata[i + 1]];
 		const aLastUnit = byUnit.get(a.unitIds[a.unitIds.length - 1]);
 		const bFirstUnit = byUnit.get(b.unitIds[0]);
 		const adjacent =
@@ -871,7 +987,7 @@ function mergeOverCeiling(strata: PlanStratum[], cap: number, cfg: Config, byUni
 			digestKind: "summary",
 			summaryTokens: estimateStratumTokens({ unitIds: [...a.unitIds, ...b.unitIds] }, byUnit),
 		};
-		strata.splice(0, 2, merged);
+		strata.splice(i, 2, merged);
 	}
 }
 
@@ -933,7 +1049,7 @@ export function emitOps(plan: Plan, digests: Map<string, string> | null | undefi
 			continue;
 		}
 		const stratumUnits = s.unitIds.map((id) => byUnit.get(id)).filter(Boolean) as Unit[];
-		ops.push({ kind: "group", ids: [s.ids[0], s.ids[1]], summary: stratumSummary(stratumUnits, s.ids[0], digests) });
+		ops.push({ kind: "group", ids: [s.ids[0], s.ids[1]], summary: stratumSummary(stratumUnits, s.ids[0], s.ids[1], digests) });
 	}
 
 	return ops;
@@ -959,11 +1075,22 @@ export function foldBody(unit: Unit, tier: "trim" | "digest", digests?: Map<stri
  * recall-able, so we prefix the group's recall tag ourselves — `foldTag('g:'+firstId)`, keyed on
  * the engine's group id (`g:${memberIds[0]}`, core/truth.ts → opGroup). `firstId` is a fixed point of
  * the host's message-atom snap (guaranteed by `safeRunFromUnits` during run formation), so the tag
- * keyed here is exactly the code the applied group carries. Keyed by `stratum:<firstId>`.
+ * keyed here is exactly the code the applied group carries. The LLM body is looked up by the
+ * stratum's RANGE (`stratumDigestKey`), never by `firstId` alone.
  */
-export function stratumSummary(stratumUnits: Unit[], firstId: string, digests?: Map<string, string> | null): string {
-	const body = digests?.get(`stratum:${firstId}`) ?? deterministicRecap(stratumUnits);
+export function stratumSummary(stratumUnits: Unit[], firstId: string, lastId: string, digests?: Map<string, string> | null): string {
+	const body = digests?.get(stratumDigestKey(firstId, lastId)) ?? deterministicRecap(stratumUnits);
 	return `${foldTag("g:" + firstId)} ${body}`;
+}
+
+/**
+ * The digest-cache key for a stratum's LLM summary: its full [firstId, lastId] range. Keyed on
+ * `firstId` alone, a summary written for [a..x] was reused verbatim for a later [a..y] — a Rung-3
+ * merge (the fused stratum keeps the older one's firstId), or a from-scratch epoch that regrew the
+ * bottom run — so the model got a summary silently missing everything in (x..y].
+ */
+export function stratumDigestKey(firstId: string, lastId: string): string {
+	return `stratum:${firstId}|${lastId}`;
 }
 
 // ── prompt builders & deterministic fallbacks (compaction-naive style, pure strings) ─────────
