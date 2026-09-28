@@ -79,8 +79,8 @@ fully reversible. The most recent ~20k tokens are a **protected working tail** t
 reasons over at full fidelity.
 
 **Conductors are opt-in, same as folding itself** — pick one from the header's Conductor
-menu, or leave it on "None" for fully manual steering. `compaction-naive`, `handoff`, and
-`doorman` run right inside this extension, no extra setup. Two more, `thermocline`
+menu, or leave it on "None" for fully manual steering. `compaction-naive`, `handoff`,
+`doorman`, and `keel-lite` run right inside this extension, no extra setup. Two more, `thermocline`
 (attention-gated compression under a hard budget invariant) and `triptych` (pressure-gated
 thirds with tree-sitter code skeletons), each run as their own out-of-process Node program.
 Their runners ship with the full [GitHub repo](https://github.com/a-Fig/Accordion) and not
