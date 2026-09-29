@@ -188,6 +188,7 @@ function wireToBlock(w) {
     callId: w.callId,
     model: w.model,
     isError: w.isError,
+    ...w.signed ? { signed: true } : {},
     override: null,
     autoFolded: false,
     by: null
@@ -2025,6 +2026,7 @@ function viewBlockOf(truth, b) {
     protected: truth.isProtected(b),
     grouped: truth.inFoldedGroup(b.id),
     sent: truth.sent(b),
+    ...b.signed ? { signed: true } : {},
     text: b.text
   };
 }

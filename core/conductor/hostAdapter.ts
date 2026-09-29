@@ -44,6 +44,7 @@ export function viewBlockOf(truth: Truth, b: Block): ViewBlock {
 		protected: truth.isProtected(b),
 		grouped: truth.inFoldedGroup(b.id),
 		sent: truth.sent(b),
+		...(b.signed ? { signed: true } : {}),
 		text: b.text,
 	};
 }

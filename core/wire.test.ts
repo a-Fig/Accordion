@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { linearize, applyPlan, blockId, isDurableId, messageInfo, contentFingerprint, wireToBlock, type PiMessage } from "./wire";
+import { linearize, applyPlan, blockId, isDurableId, messageInfo, contentFingerprint, wireToBlock, thinkingIsSigned, type PiMessage } from "./wire";
+import { blockToWire } from "./replica";
 import type { GroupOp } from "./protocol";
 
 /*
@@ -53,6 +54,44 @@ describe("core/wire — linearize", () => {
 		expect(b.override).toBe(null);
 		expect(b.autoFolded).toBe(false);
 		expect(b.by).toBe(null);
+	});
+});
+
+describe("core/wire — signed thinking", () => {
+	const think = (extra: Record<string, unknown>): PiMessage => ({
+		role: "assistant",
+		timestamp: 2,
+		responseId: "r1",
+		content: [{ type: "thinking", thinking: "hmm", ...extra }] as any,
+	});
+
+	it("marks a provider signature, an opaque payload or redacted reasoning as signed", () => {
+		expect(thinkingIsSigned({ type: "thinking", thinking: "hmm", thinkingSignature: "EqQBCkgIARABGAIiQL2x+sig==" })).toBe(true); // Anthropic
+		expect(thinkingIsSigned({ type: "thinking", thinking: "hmm", thinkingSignature: '{"type":"reasoning","id":"rs_1"}' })).toBe(true); // OpenAI Responses
+		expect(thinkingIsSigned({ type: "thinking", thinking: "", thinkingSignature: "opaque", redacted: true })).toBe(true);
+	});
+
+	it("does not mark a field-name marker (DeepSeek's reasoning_content), an empty or a missing signature", () => {
+		for (const s of ["reasoning_content", "reasoning", "reasoning_text", "", "   ", undefined]) {
+			expect(thinkingIsSigned({ type: "thinking", thinking: "hmm", thinkingSignature: s })).toBe(false);
+		}
+	});
+
+	it("carries the flag from linearize through wireToBlock and blockToWire; unsigned blocks carry nothing", () => {
+		const [signed] = linearize([think({ thinkingSignature: "EqQBsig" })]);
+		expect(signed.signed).toBe(true);
+		expect(wireToBlock(signed).signed).toBe(true);
+		expect(blockToWire(wireToBlock(signed)).signed).toBe(true);
+		const [plain] = linearize([think({ thinkingSignature: "reasoning_content" })]);
+		expect("signed" in plain).toBe(false);
+		expect("signed" in wireToBlock(plain)).toBe(false);
+		expect("signed" in blockToWire(wireToBlock(plain))).toBe(false);
+	});
+
+	it("a signature flip changes the fingerprint; a field-name marker hashes like no signature", () => {
+		const bare = contentFingerprint(think({}));
+		expect(contentFingerprint(think({ thinkingSignature: "reasoning_content" }))).toBe(bare);
+		expect(contentFingerprint(think({ thinkingSignature: "EqQBsig" }))).not.toBe(bare);
 	});
 });
 

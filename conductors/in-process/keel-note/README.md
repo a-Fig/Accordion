@@ -41,10 +41,12 @@ output. So the note rides on an existing assistant block:
 
 - The **boundary** is the oldest live `thinking` block outside the protected tail that a fold would
   shrink. keel-lite restarts every epoch at rung R1 (thinking, oldest first), so the next epoch's
-  first change is at or before it.
-- The **carrier** is the first usable block after the boundary. That is either a `thinking` block,
-  which the note overwrites, or a live assistant `text` block of at most 150 tokens (and at most a
-  quarter of the cap). A text block keeps its words, with the note appended.
+  first change is usually at or before it. The exception is rung R0, which runs before R1 and
+  re-asserts one of keel-lite's own lapsed decisions (for example a fold the protected tail
+  healed). That can make the first change earlier. It costs cache, never budget.
+- The **carrier** is the first usable block after the boundary. That is either an unsigned
+  `thinking` block, which the note overwrites, or a live assistant `text` block of at most 150
+  tokens (and at most a quarter of the cap). A text block keeps its words, with the note appended.
 - When no such thinking is left outside the tail, the next epoch starts in the part of the tail
   that leaves it next. The carrier is then the last usable block before the tail.
 
@@ -55,22 +57,39 @@ from the stub on.
 In the bench sessions every epoch has to shed more than the new thinking alone, so it folds all
 live thinking outside the tail. Nearly every placement is therefore at the tail edge, and the note
 sits between the compacted history and the live 8k tail (see *Cache cost*). The carrier is
-usually a thinking block, because assistant text is rare there. A thinking block is fragile across
-providers:
+usually a thinking block, because assistant text is rare there.
 
-- Anthropic signs thinking blocks. The wire keeps the part's other fields and swaps only its text.
-- OpenAI's reasoning items are opaque.
-- DeepSeek and others drop earlier reasoning once a new user message arrives. DeepSeek re-sends it
-  within one user turn, which covers a SlopCode session.
+**Signed thinking is never a carrier.** When the wire rewrites a thinking block it swaps only the
+text and keeps the part's other fields, including pi-ai's `thinkingSignature`. What that field
+holds depends on the provider:
 
-None of this has been tested against a real provider here.
+- Anthropic (and Bedrock) store a signature, which pi-ai re-sends with the thought, and the API
+  can reject a thought that no longer matches it. Gemini replays a `thoughtSignature`. OpenAI
+  Responses and OpenRouter's `reasoning_details` replay an opaque item instead of the text, so a
+  rewrite would be ignored.
+- OpenAI-compatible chat APIs, DeepSeek among them, store only the name of the field the text is
+  replayed under (`reasoning_content`, `reasoning` or `reasoning_text`). The rewritten text is what
+  gets sent. Every thinking block in the recorded DeepSeek sessions carries `reasoning_content`.
+
+`core/wire.ts → thinkingIsSigned` marks a thinking block `signed` (on `Block`, `WireBlock` and
+`ViewBlock`) when its signature is anything but one of those field names, or when the reasoning is
+redacted. keel-note never places the note on a signed block. With signed thinking the note rides
+only on small text blocks. If there is no usable block at all, it is not placed that epoch: a
+finished note waits, ready, for the next trim, and keel-lite's reserve still holds its room. There
+is no switch for this. DeepSeek also drops earlier reasoning once a new user message arrives; it
+re-sends it within one user turn, which covers a SlopCode session.
+
+None of this has been tested against a real provider here. The same exposure applies to every
+thinking FOLD (keel-lite's R1, doorman), since a fold also swaps the text under the old signature.
+That is outside keel-note and is not changed here.
 
 A note lands as a non-recoverable `replace` of the carrier. The content is verbatim, with no
 `{#code FOLDED}` handle, and the whole block (kept text plus note) is hard-capped at
 `noteMaxTokens` including block overhead. If the model writes more, `fitNote` drops the oldest
 "Built & verified" / "Tried and failed" bullets first, then whole lines from the end, then
-characters. The original text of an overwritten thinking block goes into the next note update,
-like any trimmed block.
+characters. Once the placement has applied, the original text of an overwritten thinking block
+goes into the next note update, like any trimmed block. A clamped placement leaves the thought live
+and copies nothing.
 
 **Note calls are batched.** Each applied keel-lite epoch copies the blocks it dropped, at trim time,
 into a pending buffer. Each block is clipped head and tail, sent to the note model once, and paired
@@ -137,7 +156,10 @@ recorded calibration, a stubbed note model that answers two requests later, and 
 
 - Every request that carried a placement also carried an epoch, with one exception: a turn-boundary
   re-placement in seed 0, which re-billed nothing measurable. Seed 2 had one re-placement too, in a
-  request with an epoch. I have not traced why the note left the context in those two cases.
+  request with an epoch. The review of #149 traced both: the extension applies a new calibration
+  at `message_end`, before the reply is appended, and `Truth.setCalibration` re-runs
+  `healProtected`. The recalibrated tail grew back over the tail-edge carrier and healed its
+  substitution, and the turn-boundary re-placement put the same bytes back.
 - What remains is mostly the note itself. It sits in every epoch's re-billed region, so each epoch
   re-bills its ~570 tokens. The rest comes from epochs that start just past the note, where the
   move re-bills the carrier's own tool call and results.
@@ -194,9 +216,12 @@ failure. The metrics add these fields:
 
 - The cap is enforced at the calibration in force when the note lands. Calibration follows the
   whole context's real-to-estimated token ratio, which was typically about 1.4 in the bench
-  sessions but reached 2.6, so a placed 600-token block later measured up to 871. keel-lite always
-  sees the carrier's current cost, so this drift never breaks the budget.
-- The note usually rides on a `thinking` block, with the provider risks above.
+  sessions but reached 2.6. In the boundary replay a placed 600-token block later measured up to
+  735 (661, 689 and 735 in seeds 0–2). keel-lite always sees the carrier's current cost, so this
+  drift never breaks the budget. (An earlier version of this README said 871. That was measured
+  with the pinned text carrier this design replaced.)
+- The note usually rides on an unsigned `thinking` block. With signed thinking (Claude, Gemini) it
+  needs a small text block, and it is not placed when there is none.
 - With the note at the tail edge, a trim that starts just past it re-bills the carrier's own tool
   call and results when the note moves. In the replay this came to 0.4–0.6k tokens per placement on
   average.

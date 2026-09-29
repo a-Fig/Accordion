@@ -26,9 +26,13 @@
  *      block. Rewriting a block invalidates the provider's prompt cache from that block on, and
  *      every keel-lite epoch already invalidates it from its first change on. The next epoch
  *      always starts by folding the oldest still-live thinking block outside the tail (rung R1),
- *      so that block is the BOUNDARY, and the carrier is the first usable block after it: a
- *      `thinking` block (overwritten) or a small (≤ `textCarrierMax`, 150 tokens at the default
- *      cap) live assistant `text` block (the note is appended to its words). When no live
+ *      so that block is the BOUNDARY, and the carrier is the first usable block after it: an
+ *      unsigned `thinking` block (overwritten) or a small (≤ `textCarrierMax`, 150 tokens at the
+ *      default cap) live assistant `text` block (the note is appended to its words). A thinking
+ *      block sealed by a provider signature (`ViewBlock.signed`: Anthropic, Gemini, OpenAI
+ *      Responses) is never a carrier, since the rewritten thought would go out under the old
+ *      signature; with signed thinking only text blocks carry the note, and with no usable block
+ *      at all the note is not placed that epoch (it waits, ready, for the next trim). When no live
  *      thinking is left outside the protected tail (the steady state of the bench sessions, where
  *      every epoch must shed more than the new thinking alone), the next epoch starts in what
  *      leaves the tail next, so the carrier is the last usable block before the tail. The
@@ -320,7 +324,9 @@ export class KeelNoteConductor implements Conductor {
 	/**
 	 * Where the note goes after a trim. The BOUNDARY is the oldest live thinking block outside the
 	 * protected tail that a plain fold would shrink: rung R1 of keel-lite's next epoch folds it
-	 * first, so that epoch's first change is at or before it. The carrier is the first usable
+	 * first, so that epoch's first change is at or before it. (Rung R0 runs before R1: re-asserting
+	 * one of keel-lite's own lapsed decisions, e.g. a fold the protected tail healed, can make the
+	 * first change earlier. That costs cache, never budget.) The carrier is the first usable
 	 * block after it, so the next trim covers the note it will release. With no such thinking
 	 * block, the next epoch starts in what leaves the tail next, so the carrier is the last usable
 	 * block before the tail (`tail: true`); a trim that starts just past it then re-bills the
@@ -398,7 +404,14 @@ export class KeelNoteConductor implements Conductor {
 	/**
 	 * One transaction: the note onto `target`, and the previous carrier (if another block) released.
 	 * The in-process propose applies synchronously, so the carrier state is updated right away
-	 * (keel-lite may plan again before the promise settles) and rolled back if the note was clamped.
+	 * (keel-lite may plan again before the promise settles) and rolled back if the note was clamped
+	 * or the propose failed (rejected, or threw before returning a promise).
+	 *
+	 * Known cache-only gaps (review of #149, left as is): a reassert still landing when keel-lite
+	 * commits an epoch in the same tick makes that epoch's move a no-op (`landing`), so the note
+	 * stays on the reasserted carrier until the next epoch; and a carrier the tail healed stays
+	 * masked `held` until the next move, where `releaseOp` finds it live and leaves it live one epoch
+	 * longer than its neighbours.
 	 */
 	private place(host: ConductorHost, target: string, why: "trim" | "reassert", tail: boolean): void | Promise<void> {
 		if (this.landing) return;
@@ -410,10 +423,15 @@ export class KeelNoteConductor implements Conductor {
 		const ops: Op[] = [{ kind: "replace", id: target, content, recoverable: false }];
 		const release = prev.carrierId && prev.carrierId !== target ? releaseOp(host.get(prev.carrierId)) : null;
 		if (release) ops.push(release);
-		// A thinking carrier is overwritten: its text leaves the agent's view now, so the next update
-		// sees it, like any trimmed block. (A text carrier keeps its words.)
+		// A thinking carrier is overwritten: once the note is on it, its text has left the agent's
+		// view, so the next update sees it like any trimmed block. (A text carrier keeps its words.)
+		// Only once the placement applied: a clamped one leaves the thought live, and copying it
+		// anyway would hand the note model a thought that is still in context.
 		const t = host.get(target);
-		if (t?.kind === "thinking" && !this.captured.has(t.id)) this.addEntries(host, [t]);
+		const overwritten = t?.kind === "thinking" && !this.captured.has(t.id) ? t : null;
+		const captureOverwritten = (): void => {
+			if (overwritten && !this.captured.has(overwritten.id)) this.addEntries(host, [overwritten]);
+		};
 
 		const rollback = (): void => {
 			this.carrierId = prev.carrierId;
@@ -426,12 +444,26 @@ export class KeelNoteConductor implements Conductor {
 		this.carrierId = target;
 		this.currentBody = body;
 		this.landedContent = content;
-		return host
-			.propose({ baseRev: host.stats().rev, ops })
+		let pending: Promise<TxnResult>;
+		try {
+			pending = host.propose({ baseRev: host.stats().rev, ops });
+		} catch {
+			// A host that throws instead of rejecting: treat it as a clamp, or `landing` would stay
+			// set and the note would never move again.
+			rollback();
+			this.landing = false;
+			return;
+		}
+		// An in-process host has already applied it: capture now, so this trim's batch check (in
+		// `onKeelApplied`, right after this returns) counts the overwritten thought.
+		const now = host.get(target);
+		if (overwritten && now && this.showsNote(host, now)) captureOverwritten();
+		return pending
 			.then(
 				(res) => {
 					if (this.host !== host) return;
 					if (res.results[0]?.applied) {
+						captureOverwritten(); // (an out-of-process host applies it only now)
 						this.placements++;
 						if (fresh) this.refreshes++;
 						if (prev.carrierId !== null && prev.carrierId !== target) this.moves++;
@@ -780,9 +812,13 @@ export function fitNote(body: string, cap: number, cost: (text: string) => numbe
 
 // ── helpers ───────────────────────────────────────────────────────────────────────────────
 
-/** A block the note may sit on: assistant text or thinking we can still replace. */
+/**
+ * A block the note may sit on: assistant text or thinking we can still replace. Never a SIGNED
+ * thinking block: the wire keeps its provider signature when the text is swapped, and Anthropic
+ * (for one) re-sends that signature and can reject a thought that no longer matches it.
+ */
 function holdable(b: ViewBlock): boolean {
-	return (b.kind === "text" || b.kind === "thinking") && !b.held && !b.grouped && !b.protected && isDurableId(b.id);
+	return (b.kind === "text" || (b.kind === "thinking" && !b.signed)) && !b.held && !b.grouped && !b.protected && isDurableId(b.id);
 }
 
 /**
