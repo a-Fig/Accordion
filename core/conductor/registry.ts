@@ -26,6 +26,7 @@ import { NaiveCompactionConductor } from "../../conductors/in-process/compaction
 import { HandoffConductor } from "../../conductors/in-process/handoff/handoff";
 import { DoormanConductor } from "../../conductors/in-process/doorman/doorman";
 import { KeelLiteConductor, KEEL_LITE_DEFAULTS, type KeelLiteOptions } from "../../conductors/in-process/keel-lite/keel-lite";
+import { KeelNoteConductor, type KeelNoteOptions } from "../../conductors/in-process/keel-note/keel-note";
 
 /** One catalog entry: everything the host needs to attach (or detach to) this conductor. */
 export interface RegistryEntry {
@@ -141,6 +142,31 @@ export function keelLiteOptionsFromEnv(env?: Record<string, string | undefined>)
 	return low < high ? { high, low } : { high: KEEL_LITE_DEFAULTS.high, low: KEEL_LITE_DEFAULTS.low };
 }
 
+/**
+ * keel-note's own knobs from the environment, for benchmark sweeps (keel-lite's band comes from
+ * `keelLiteOptionsFromEnv` above): `ACCORDION_KEEL_NOTE_MAX_TOKENS` (the note's hard cap, integer
+ * ≥ 64, default 600), `ACCORDION_KEEL_NOTE_FALLBACK_TURNS` (refresh after this many turns with no
+ * trim, integer ≥ 1, default 30) and `ACCORDION_KEEL_NOTE_SPAN_TOKENS` (the pending-span bound,
+ * integer ≥ 500, default 12000). An unparseable or out-of-range value is ignored (`undefined`, so
+ * that knob keeps its default). Exported for tests.
+ */
+export function keelNoteOptionsFromEnv(env?: Record<string, string | undefined>): KeelNoteOptions {
+	const source = env ?? (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
+	const int = (raw: string | undefined, min: number): number | undefined => {
+		if (raw === undefined || raw.trim() === "") return undefined;
+		const v = Number(raw);
+		return Number.isSafeInteger(v) && v >= min ? v : undefined;
+	};
+	return {
+		keel: keelLiteOptionsFromEnv(source),
+		noteMaxTokens: int(source.ACCORDION_KEEL_NOTE_MAX_TOKENS, 64),
+		fallbackTurns: int(source.ACCORDION_KEEL_NOTE_FALLBACK_TURNS, 1),
+		spanMaxTokens: int(source.ACCORDION_KEEL_NOTE_SPAN_TOKENS, 500),
+		landDelayTurns: int(source.ACCORDION_KEEL_NOTE_LAND_DELAY_TURNS, 0),
+		minLandGapTurns: int(source.ACCORDION_KEEL_NOTE_MIN_LAND_GAP_TURNS, 0),
+	};
+}
+
 /** The full catalog, in picker order: detach first, then the shipped conductors. */
 export const ENTRIES: readonly RegistryEntry[] = [
 	NONE,
@@ -148,6 +174,7 @@ export const ENTRIES: readonly RegistryEntry[] = [
 	inProcess(() => new HandoffConductor()),
 	inProcess(() => new DoormanConductor()),
 	inProcess(() => new KeelLiteConductor(keelLiteOptionsFromEnv())),
+	inProcess(() => new KeelNoteConductor(keelNoteOptionsFromEnv())),
 	THERMOCLINE,
 	TRIPTYCH,
 ];
