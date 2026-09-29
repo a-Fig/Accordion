@@ -18,8 +18,9 @@ socket, no child process. Bundled straight into the pi extension.
   epochs walk a recoverable fold ladder (thinking → stale reads → bash trims → skeletons → groups),
   never touching the briefing/spec/user roots. No model calls, no locks.
 - [`keel-note/`](in-process/keel-note/) — keel-lite (unchanged, wrapped) plus a small first-person
-  progress note pinned after the task, refreshed off the hot path by a model call whenever a trim
-  drops old turns. The note's size is reserved inside keel-lite's budget math. No locks.
+  progress note pinned near the task, refreshed off the hot path by a batched model call as trims
+  drop old turns, and landed together with the next trim. The note's size is reserved inside
+  keel-lite's budget math. No locks.
 - `agedSummaryConductor.ts` — shared base class factored out of `compaction-naive` and `handoff`
   (PR #82); not a conductor on its own, not in the shipped catalog.
 

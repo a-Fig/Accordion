@@ -23,29 +23,40 @@
  *          replaced or grouped), copying their original text at trim time as the next note input.
  *      Budget enforcement is keel-lite's, unchanged and synchronous: nothing here ever waits on a
  *      model call before trimming.
- *   2. THE NOTE rides on one existing block, because a conductor cannot insert blocks: the first
- *      assistant `text`/`thinking` block after the first user message (the task) that has left
- *      the protected tail. A note lands as a non-recoverable `replace` of that block, verbatim (no
- *      `{#code FOLDED}` handle), capped at `noteMaxTokens` including block overhead. Before the
- *      first note exists the carrier keeps its original content (in SlopCode, a one-line thought).
- *   3. REFRESH TRIGGERS. (a) An applied keel-lite epoch that dropped content the note has not yet
- *      seen. (b) A fallback after `fallbackTurns` turns with no trigger, fed the most recent
- *      not-yet-seen blocks. While an update is in flight, new spans accumulate (coalescing) and a
- *      follow-up call is chained when it lands. The pending buffer keeps only the most recent
- *      `spanMaxTokens` tokens; each block is clipped head+tail and sent to the note model once.
+ *   2. THE NOTE rides on one existing block, because a conductor cannot insert blocks and cannot
+ *      edit a `user` block (Truth clamps it `not-foldable`). The carrier is the first assistant
+ *      `text` block after the task that is small (≤ `textCarrierMax`, 150 tokens at the default
+ *      cap) and has left the protected tail; the note is APPENDED to its words, which stay. Only
+ *      when no such block exists does it fall back to the first assistant `thinking` block, which
+ *      it overwrites. Text is preferred because every provider replays assistant text verbatim,
+ *      while reasoning is fragile: Anthropic signs thinking blocks (the wire keeps the part's
+ *      other fields and swaps only its text), OpenAI's reasoning items are opaque, and DeepSeek
+ *      and others drop earlier reasoning once a new user message arrives. Until the first note
+ *      lands the carrier may still move from a thinking block to a text block that has appeared;
+ *      after that it stays put (every move rewrites an early block). A note lands as a
+ *      non-recoverable `replace`, verbatim (no `{#code FOLDED}` handle), and the whole landed
+ *      block is capped at `noteMaxTokens` including block overhead. Before the first note the
+ *      carrier keeps its original content.
+ *   3. NOTE CALLS are batched. Each applied keel-lite epoch copies the blocks it dropped into a
+ *      pending buffer (each block clipped head+tail, sent to the note model once). A call starts
+ *      once the buffer holds `minDroppedTokens`, or as soon as it is full (it keeps only the
+ *      newest `spanMaxTokens`, so waiting longer would only discard more). A fallback also calls
+ *      after `fallbackTurns` turns with no call, topping the buffer up with the newest blocks the
+ *      note has not seen. While a call is in flight, new spans accumulate and one follow-up call
+ *      is chained when it lands, if the buffer has reached the threshold again.
  *   4. THE UPDATE CALL goes through `host.complete` (the live session's model and route, logged by
  *      the extension's completion-usage log). Its input is the previous note plus the dropped
  *      span(s), framed as the agent's OWN earlier turns; the output is five terse first-person
  *      sections under a fixed header.
- *   5. ASYNC LANDING. A finished note waits in `ready` and lands at the next `turn-committed`,
- *      before keel-lite evaluates that turn, or right after an applied keel-lite epoch, whichever
- *      comes first. The old note stays until then. A failed or timed-out call keeps the old note,
- *      puts its spans back in the buffer, and is retried on the next trigger. The agent loop never
- *      waits for a note. Rewriting the carrier (an early block) invalidates the provider's prompt
- *      cache from that point on, as an epoch does; `landDelayTurns > 0` lets a finished note wait
- *      up to that many turn boundaries for the next epoch so both cache busts coincide, and
- *      `minLandGapTurns > 0` spaces fresh landings at least that many turns apart (updates keep
- *      running and fold into the waiting note). Both default to 0, i.e. land at the next boundary.
+ *   5. LANDING RIDES ON A TRIM. Rewriting the carrier invalidates the provider's prompt cache from
+ *      the carrier on, and an epoch already invalidates it from its first dropped block on. So a
+ *      finished note waits in `ready` and lands right after the next applied keel-lite epoch, in
+ *      the same request. Note that the carrier sits near the front while an epoch's first dropped
+ *      block sits where the previous epoch stopped, so the shared landing still re-bills the span
+ *      between the two (see the README). With no epoch within `maxStaleTurns` turn boundaries,
+ *      the note lands at the next boundary anyway, before keel-lite evaluates that turn. The old
+ *      note stays until then. A failed or timed-out call keeps the old note, puts its spans back
+ *      in the buffer, and is retried on the next trigger. The agent loop never waits for a note.
  */
 import type { Conductor, ConductorHost, HostEvent, ViewBlock, CompletionRequest } from "../../../core/conductor/contract";
 import type { Op, TxnResult } from "../../../core/ops";
@@ -59,40 +70,45 @@ import { KeelLiteConductor, type KeelLiteOptions } from "../keel-lite/keel-lite"
 export interface KeelNoteOptions {
 	/** keel-lite's own knobs (HIGH/LOW band, ladder thresholds). */
 	keel?: KeelLiteOptions;
-	/** Hard cap on the landed note, block overhead included (calibrated tokens). Default 600. */
+	/**
+	 * Hard cap on the landed carrier block (the note plus any carrier text it keeps), block
+	 * overhead included (calibrated tokens). Default 600.
+	 */
 	noteMaxTokens?: number;
-	/** Refresh after this many turns with no trim-triggered refresh. Default 30. */
+	/**
+	 * A note call starts once the pending span (the trimmed blocks' text as the note model will see
+	 * it, after per-block clipping) reaches this many tokens, or once the buffer is full. Default
+	 * 8000. A keel-lite epoch at a 40k budget frees ≥ 8k raw tokens, so a raw-token threshold this
+	 * size would call on every trim; the clipped span is what the call actually costs.
+	 */
+	minDroppedTokens?: number;
+	/** Also call after this many turns with no call, adding the newest unseen blocks. Default 30. */
 	fallbackTurns?: number;
+	/**
+	 * A finished note lands with the next keel-lite epoch. With no epoch within this many turn
+	 * boundaries it lands at the next boundary anyway. Default 40.
+	 */
+	maxStaleTurns?: number;
 	/** The pending span buffer keeps only the most recent this-many tokens. Default 12000. */
 	spanMaxTokens?: number;
 	/** Each captured block is clipped (head + tail) to about this many tokens. Default 1500. */
 	blockMaxTokens?: number;
-	/** A trim starts a call only once at least this many span tokens are pending. Default 400. */
-	minSpanTokens?: number;
 	/** Abandon a note call after this long (ms); the old note stays. Default 90000. */
 	timeoutMs?: number;
-	/**
-	 * A finished note may wait up to this many turn boundaries for a keel-lite epoch to land with
-	 * (one prompt-cache bust instead of two). 0 = land at the next boundary. Default 0.
-	 */
-	landDelayTurns?: number;
-	/**
-	 * A fresh note never lands within this many turns of the previous landing (the first note is
-	 * exempt). Updates keep running meanwhile; the newest one lands. 0 = no spacing. Default 0.
-	 */
-	minLandGapTurns?: number;
 }
 
 export const KEEL_NOTE_DEFAULTS: Readonly<Required<Omit<KeelNoteOptions, "keel">>> = Object.freeze({
 	noteMaxTokens: 600,
+	minDroppedTokens: 8_000,
 	fallbackTurns: 30,
+	maxStaleTurns: 40,
 	spanMaxTokens: 12_000,
 	blockMaxTokens: 1_500,
-	minSpanTokens: 400,
 	timeoutMs: 90_000,
-	landDelayTurns: 0,
-	minLandGapTurns: 0,
 });
+
+/** A text carrier keeps its words, so it must be small: at most this, and at most a quarter of the cap. */
+const TEXT_CARRIER_MAX_TOKENS = 150;
 
 /** The fixed first line of every landed note. */
 export const NOTE_HEADER = "My progress notes (written by me, earlier in this same session; older turns were trimmed from my context):";
@@ -120,7 +136,7 @@ export class KeelNoteConductor implements Conductor {
 	readonly id = "keel-note";
 	readonly label = "Keel-note";
 	readonly description =
-		"keel-lite's synchronous budget keeper plus a small first-person progress note, pinned after the task and refreshed off the hot path by a model call whenever a trim drops old turns. The trim never waits for the note.";
+		"keel-lite's synchronous budget keeper plus a small first-person progress note, pinned near the task and refreshed off the hot path by a batched model call as trims drop old turns. The trim never waits for the note.";
 
 	private readonly k: Readonly<Required<Omit<KeelNoteOptions, "keel">>>;
 	private readonly keel: KeelLiteConductor;
@@ -134,12 +150,10 @@ export class KeelNoteConductor implements Conductor {
 	/** The note body (sections only) currently on the carrier, and the exact content landed. */
 	private currentBody: string | null = null;
 	private landedContent: string | null = null;
-	/** A finished note waiting for the next turn boundary. */
+	/** A finished note waiting for the next keel-lite epoch (or for `maxStaleTurns`). */
 	private ready: string | null = null;
-	/** Turn boundaries `ready` has waited through (for `landDelayTurns`). */
+	/** Turn boundaries `ready` has waited through. */
 	private readyTurns = 0;
-	/** Turn boundaries since the last fresh landing (∞ before the first). */
-	private turnsSinceLanding = Number.POSITIVE_INFINITY;
 	private landing = false;
 
 	/** Block ids whose content the note model has already been given (or is being given). */
@@ -149,11 +163,12 @@ export class KeelNoteConductor implements Conductor {
 	private abort: AbortController | null = null;
 	/** Bumped on detach so a call that settles afterwards is ignored. */
 	private gen = 0;
-	private turnsSinceTrigger = 0;
+	private turnsSinceCall = 0;
 
 	// metrics
 	private trims = 0;
 	private calls = 0;
+	private staleLandings = 0;
 	private failures = 0;
 	private refreshes = 0;
 	private reasserts = 0;
@@ -173,10 +188,9 @@ export class KeelNoteConductor implements Conductor {
 		if (!(Number.isInteger(k.fallbackTurns) && k.fallbackTurns >= 1)) throw new RangeError(`keel-note: fallbackTurns must be an integer ≥ 1, got ${k.fallbackTurns}`);
 		if (!(k.spanMaxTokens >= 500)) throw new RangeError(`keel-note: spanMaxTokens must be ≥ 500, got ${k.spanMaxTokens}`);
 		if (!(k.blockMaxTokens >= 50)) throw new RangeError(`keel-note: blockMaxTokens must be ≥ 50, got ${k.blockMaxTokens}`);
-		if (!(k.minSpanTokens >= 0)) throw new RangeError(`keel-note: minSpanTokens must be ≥ 0`);
+		if (!(Number.isFinite(k.minDroppedTokens) && k.minDroppedTokens >= 0)) throw new RangeError(`keel-note: minDroppedTokens must be ≥ 0, got ${k.minDroppedTokens}`);
+		if (!(Number.isInteger(k.maxStaleTurns) && k.maxStaleTurns >= 1)) throw new RangeError(`keel-note: maxStaleTurns must be an integer ≥ 1, got ${k.maxStaleTurns}`);
 		if (!(k.timeoutMs > 0)) throw new RangeError(`keel-note: timeoutMs must be > 0`);
-		if (!(Number.isInteger(k.landDelayTurns) && k.landDelayTurns >= 0)) throw new RangeError(`keel-note: landDelayTurns must be an integer ≥ 0, got ${k.landDelayTurns}`);
-		if (!(Number.isInteger(k.minLandGapTurns) && k.minLandGapTurns >= 0)) throw new RangeError(`keel-note: minLandGapTurns must be an integer ≥ 0, got ${k.minLandGapTurns}`);
 		this.k = Object.freeze(k);
 		this.keel = new KeelLiteConductor(keel);
 	}
@@ -214,13 +228,12 @@ export class KeelNoteConductor implements Conductor {
 		this.landedContent = null;
 		this.ready = null;
 		this.readyTurns = 0;
-		this.turnsSinceLanding = Number.POSITIVE_INFINITY;
 		this.landing = false;
 		this.captured.clear();
 		this.buffer = [];
 		this.inflight = null;
 		this.abort = null;
-		this.turnsSinceTrigger = 0;
+		this.turnsSinceCall = 0;
 		this.keelText = null;
 		this.keelMetrics = {};
 	}
@@ -284,12 +297,13 @@ export class KeelNoteConductor implements Conductor {
 		if (!host) return;
 		switch (e.type) {
 			case "turn-committed": {
-				this.turnsSinceTrigger++;
+				this.turnsSinceCall++;
 				if (this.ready !== null) this.readyTurns++;
-				this.turnsSinceLanding++;
-				if (this.turnsSinceTrigger >= this.k.fallbackTurns) this.fallback(host);
+				if (this.turnsSinceCall >= this.k.fallbackTurns && !this.inflight) this.fallback(host);
 				this.ensureCarrier(host);
-				const landed = this.land(host); // applies synchronously, before keel-lite plans
+				// A fresh note normally waits for the next epoch; here only a stale one lands, or the
+				// current one is re-asserted. Either applies synchronously, before keel-lite plans.
+				const landed = this.land(host, this.readyTurns >= this.k.maxStaleTurns);
 				return join(landed, this.forward(e));
 			}
 			case "blocks-appended":
@@ -314,41 +328,49 @@ export class KeelNoteConductor implements Conductor {
 
 	// ── carrier ────────────────────────────────────────────────────────────────────────────
 
-	/** Keep the current carrier while it is usable; otherwise pick a new one. */
+	/**
+	 * Keep the current carrier while it is usable, and once a note has landed on it. Before the
+	 * first landing a thinking carrier is only provisional: a small text block may appear later.
+	 */
 	private ensureCarrier(host: ConductorHost): string | null {
 		if (this.carrierId) {
 			const b = host.get(this.carrierId);
-			if (b && usableCarrier(b)) return this.carrierId;
-			this.carrierId = null; // held by a human, grouped, pulled into the tail, or gone
+			if (b && usableCarrier(b)) {
+				if (this.landedContent !== null || b.kind === "text") return this.carrierId;
+			} else this.carrierId = null; // held by a human, grouped, pulled into the tail, or gone
 		}
 		return this.pickCarrier(host);
 	}
 
 	/**
-	 * The first assistant `text`/`thinking` block after the first user message that is outside the
-	 * protected tail and usable. Within that first assistant message a `text` part is preferred
-	 * (every provider replays it; some drop old reasoning).
+	 * Outside the protected tail and after the first user message (the task): the first usable
+	 * assistant `text` block small enough to keep its words (every provider replays assistant
+	 * text), else the first usable `thinking` block (overwritten; see the header on why reasoning
+	 * is the fallback).
 	 */
 	private pickCarrier(host: ConductorHost): string | null {
 		const blocks = host.blocks();
 		const firstUser = blocks.findIndex((b) => b.kind === "user");
 		if (firstUser < 0) return null;
+		const textMax = this.textCarrierMax();
+		let thinking: string | null = null;
 		for (let i = firstUser + 1; i < blocks.length; i++) {
 			const b = blocks[i];
 			if (b.protected) break;
 			if (!usableCarrier(b)) continue;
-			const key = messageKey(b.id);
-			let pick = b;
-			for (let j = i + 1; j < blocks.length && messageKey(blocks[j].id) === key; j++) {
-				if (blocks[j].kind === "text" && usableCarrier(blocks[j])) {
-					pick = blocks[j];
-					break;
+			if (b.kind === "text") {
+				if (b.tokens <= textMax && !b.folded) {
+					this.carrierId = b.id;
+					return b.id;
 				}
-			}
-			this.carrierId = pick.id;
-			return pick.id;
+			} else thinking ??= b.id;
 		}
-		return null;
+		this.carrierId = thinking;
+		return thinking;
+	}
+
+	private textCarrierMax(): number {
+		return Math.min(TEXT_CARRIER_MAX_TOKENS, Math.floor(this.k.noteMaxTokens / 4));
 	}
 
 	/**
@@ -365,26 +387,26 @@ export class KeelNoteConductor implements Conductor {
 	// ── landing ────────────────────────────────────────────────────────────────────────────
 
 	/**
-	 * At a turn boundary (or right after an epoch, `force`): land a finished note, or re-assert the
-	 * current one if its carrier no longer shows it (the carrier moved, or a resync dropped the
-	 * substitution). A finished note that is still inside `landDelayTurns` waits for an epoch unless
-	 * forced, and none lands within `minLandGapTurns` of the previous one. The propose applies
-	 * synchronously; only the result bookkeeping awaits.
+	 * Land the finished note if `landReady` (right after an epoch, or once it is stale); otherwise
+	 * only re-assert the current one if its carrier no longer shows it (the carrier moved, or a
+	 * resync dropped the substitution), landing the finished note instead when there is one, since
+	 * that rewrite re-bills the cache anyway. The propose applies synchronously; only the result
+	 * bookkeeping awaits.
 	 */
-	private land(host: ConductorHost, force = false): void | Promise<void> {
+	private land(host: ConductorHost, landReady: boolean, withEpoch = false): void | Promise<void> {
 		if (this.landing) return;
-		let fresh = this.ready !== null;
-		if (fresh && this.turnsSinceLanding < this.k.minLandGapTurns) fresh = false; // too soon after the last one
-		if (fresh && !force && this.readyTurns <= this.k.landDelayTurns) fresh = false; // hold it for an epoch
-		const body = fresh ? this.ready : this.currentBody;
-		if (body === null) return;
+		if (withEpoch) this.ensureCarrier(host); // (the turn-boundary caller already did)
 		const id = this.carrierId;
 		const b = id ? host.get(id) : undefined;
 		if (!id || !b) return; // no carrier yet: keep the note ready
-		if (!fresh && this.showsNote(host, b)) return;
+		const lost = this.currentBody !== null && !this.showsNote(host, b);
+		const fresh = this.ready !== null && (landReady || lost);
+		if (!fresh && !lost) return;
+		const body = (fresh ? this.ready : this.currentBody)!;
 
-		const content = this.compose(host, body);
+		const content = this.compose(host, id, body);
 		const waited = this.readyTurns;
+		const stale = fresh && !withEpoch && !lost;
 		if (fresh) {
 			this.ready = null;
 			this.readyTurns = 0;
@@ -401,7 +423,7 @@ export class KeelNoteConductor implements Conductor {
 						this.landedContent = content;
 						if (fresh) {
 							this.refreshes++;
-							this.turnsSinceLanding = 0;
+							if (stale) this.staleLandings++;
 						} else this.reasserts++;
 						this.publish();
 					} else {
@@ -426,9 +448,13 @@ export class KeelNoteConductor implements Conductor {
 		this.readyTurns = waited;
 	}
 
-	/** Header + body, fitted under the cap at the CURRENT calibration. */
-	private compose(host: ConductorHost, body: string): string {
-		return fitNote(body, this.k.noteMaxTokens, (t) => this.noteCost(host, t));
+	/**
+	 * The landed carrier content, fitted under the cap at the CURRENT calibration: a text carrier
+	 * keeps its own words first; a thinking carrier is replaced by the note alone.
+	 */
+	private compose(host: ConductorHost, id: string, body: string): string {
+		const kept = host.get(id)?.kind === "text" ? (host.textOf(id) ?? "").trim() : "";
+		return fitNote(body, this.k.noteMaxTokens, (t) => this.noteCost(host, t), kept ? `${kept}\n\n` : "");
 	}
 
 	/** What `content` costs once it replaces a block (calibrated, block overhead included, +1 rounding). */
@@ -438,7 +464,10 @@ export class KeelNoteConductor implements Conductor {
 
 	// ── span capture ───────────────────────────────────────────────────────────────────────
 
-	/** Record what one of keel-lite's applied transactions dropped, then maybe start an update. */
+	/**
+	 * Record what one of keel-lite's applied transactions dropped, land a finished note in the same
+	 * request, then start an update if enough dropped text is pending.
+	 */
 	private onKeelApplied(host: ConductorHost, res: TxnResult): void {
 		const dropped: string[] = [];
 		for (const r of res.results) {
@@ -456,21 +485,26 @@ export class KeelNoteConductor implements Conductor {
 		}
 		if (!dropped.length) return;
 		this.trims++;
-		this.turnsSinceTrigger = 0;
-		this.capture(host, dropped);
+		const full = this.capture(host, dropped);
 		// The epoch just invalidated the prompt cache from its first dropped block on; a finished note
-		// lands now so its own cache bust coincides with it.
-		if (this.ready !== null) void this.land(host, true);
-		if (sumTok(this.buffer) >= this.k.minSpanTokens) this.kick();
+		// lands now, in the same request.
+		if (this.ready !== null) void this.land(host, true, true);
+		if (full || this.batchReady()) this.kick();
 		else this.publish();
+	}
+
+	/** Enough trimmed text is pending for a call. */
+	private batchReady(): boolean {
+		return this.buffer.length > 0 && sumTok(this.buffer) >= this.k.minDroppedTokens;
 	}
 
 	/**
 	 * Copy the original text of `ids` (plus, for context, the tool calls of the same assistant
 	 * message and the call behind each tool result) into the pending buffer, oldest first, each
 	 * block at most once per session, then bound the buffer to its most recent `spanMaxTokens`.
+	 * Returns whether the bound had to discard anything (the buffer is full).
 	 */
-	private capture(host: ConductorHost, ids: readonly string[]): void {
+	private capture(host: ConductorHost, ids: readonly string[]): boolean {
 		const blocks = host.blocks();
 		const byId = new Map<string, ViewBlock>();
 		const callsByMsg = new Map<string, ViewBlock[]>();
@@ -498,43 +532,50 @@ export class KeelNoteConductor implements Conductor {
 			if (b.kind === "tool_result" && b.callId) add(callByCallId.get(b.callId));
 			if (b.kind === "thinking" || b.kind === "text") for (const c of callsByMsg.get(messageKey(b.id)) ?? []) add(c);
 		}
-		this.addEntries(host, [...want.values()]);
+		return this.addEntries(host, [...want.values()]);
 	}
 
-	private addEntries(host: ConductorHost, blocks: ViewBlock[]): void {
-		if (!blocks.length) return;
+	private addEntries(host: ConductorHost, blocks: ViewBlock[]): boolean {
+		if (!blocks.length) return false;
 		for (const b of blocks) {
 			this.captured.add(b.id);
 			const text = spanText(b, host.textOf(b.id) ?? b.text ?? "", b.kind === "tool_call" ? CALL_MAX_TOKENS : this.k.blockMaxTokens);
 			if (!text) continue;
 			this.buffer.push({ id: b.id, order: b.order, text, tokens: host.countTokens(text) });
 		}
-		this.boundBuffer();
+		return this.boundBuffer();
 	}
 
-	private boundBuffer(): void {
+	/** Keep the newest `spanMaxTokens`; returns whether anything was discarded. */
+	private boundBuffer(): boolean {
 		this.buffer.sort((a, b) => a.order - b.order);
 		let total = sumTok(this.buffer);
+		let discarded = false;
 		while (total > this.k.spanMaxTokens && this.buffer.length > 1) {
 			const drop = this.buffer.shift()!;
 			total -= drop.tokens;
 			this.discardedSpanTokens += drop.tokens;
+			discarded = true;
 		}
+		return discarded;
 	}
 
-	/** No trim for `fallbackTurns` turns: checkpoint the most recent blocks the note has not seen. */
+	/**
+	 * No call for `fallbackTurns` turns: call with whatever trimmed text is pending, topped up with
+	 * the newest blocks the note has not seen (only as many as still fit in the buffer).
+	 */
 	private fallback(host: ConductorHost): void {
-		this.turnsSinceTrigger = 0;
+		const room = this.k.spanMaxTokens - sumTok(this.buffer);
 		const blocks = host.blocks();
 		const pick: ViewBlock[] = [];
 		let tokens = 0;
-		for (let i = blocks.length - 1; i >= 0 && tokens < this.k.spanMaxTokens; i--) {
+		for (let i = blocks.length - 1; i >= 0 && tokens < room; i--) {
 			const b = blocks[i];
 			if (b.kind === "system" || b.kind === "user" || b.id === this.carrierId || this.captured.has(b.id)) continue;
 			pick.push(b);
 			tokens += Math.min(b.tokens, b.kind === "tool_call" ? CALL_MAX_TOKENS : this.k.blockMaxTokens);
 		}
-		if (!pick.length) return;
+		if (!pick.length && !this.buffer.length) return;
 		this.fallbacks++;
 		this.addEntries(host, pick);
 		this.kick();
@@ -557,6 +598,7 @@ export class KeelNoteConductor implements Conductor {
 		const gen = this.gen;
 		this.abort = ac;
 		this.calls++;
+		this.turnsSinceCall = 0;
 		let ok = false;
 		const run = async (): Promise<void> => {
 			const timer = setTimeout(() => ac.abort(new Error(`note update timed out after ${this.k.timeoutMs}ms`)), this.k.timeoutMs);
@@ -590,7 +632,7 @@ export class KeelNoteConductor implements Conductor {
 			if (gen !== this.gen) return;
 			this.inflight = null;
 			this.abort = null;
-			if (ok && this.buffer.length && sumTok(this.buffer) >= this.k.minSpanTokens) this.kick();
+			if (ok && this.batchReady()) this.kick();
 			else this.publish();
 		});
 		this.publish();
@@ -610,6 +652,7 @@ export class KeelNoteConductor implements Conductor {
 			note_failures: this.failures,
 			note_fallbacks: this.fallbacks,
 			note_reasserts: this.reasserts,
+			note_stale_landings: this.staleLandings,
 			note_trims_seen: this.trims,
 			note_input_tokens: this.inputTokens,
 			note_output_tokens: this.outputTokens,
@@ -686,13 +729,13 @@ export function cleanBody(raw: string): string {
 const HEADING_RE = /^[\s#*_]*(current goal|built|tried|current failing|next step)\b[^:\n]{0,40}:/i;
 
 /**
- * `NOTE_HEADER` + `body`, cut so that `cost(result) ≤ cap`. Over the cap it first drops the oldest
- * bullets of the two history sections ("Built & verified", "Tried and failed"), largest first, so
- * the goal, the failing test and the next step survive; then cuts whole lines from the end; then
- * characters.
+ * `prefix` (a text carrier's own words) + `NOTE_HEADER` + `body`, cut so that `cost(result) ≤ cap`.
+ * Over the cap it first drops the oldest bullets of the two history sections ("Built & verified",
+ * "Tried and failed"), largest first, so the goal, the failing test and the next step survive;
+ * then cuts whole lines from the end; then characters.
  */
-export function fitNote(body: string, cap: number, cost: (text: string) => number): string {
-	const render = (ls: readonly string[]) => [NOTE_HEADER, ...ls].join("\n");
+export function fitNote(body: string, cap: number, cost: (text: string) => number, prefix = ""): string {
+	const render = (ls: readonly string[]) => prefix + [NOTE_HEADER, ...ls].join("\n");
 	let lines = body.split("\n");
 	if (cost(render(lines)) <= cap) return render(lines);
 
