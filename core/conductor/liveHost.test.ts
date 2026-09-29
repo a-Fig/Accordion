@@ -127,6 +127,7 @@ describe("registry", () => {
 		expect(entryById("handoff")?.locks).toContain("tail-size");
 		expect(entryById("handoff")?.tailTokens).toBe(0);
 		expect(entryById("doorman")?.holdWireUpToMs).toBe(150);
+		expect(entryById("keel-lite")).toMatchObject({ kind: "in-process", locks: [], holdWireUpToMs: 0 });
 		expect(entryById("thermocline")?.spawn?.requiredModules).toBeUndefined();
 		expect(entryById("triptych")?.spawn?.requiredModules).toEqual(["web-tree-sitter", "tree-sitter-wasms/package.json"]);
 		expect(entryById(null)?.id).toBe("none");

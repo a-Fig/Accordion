@@ -25,6 +25,7 @@ import type { ActiveConductorMeta, ConductorReadiness } from "../protocol";
 import { NaiveCompactionConductor } from "../../conductors/in-process/compaction-naive/compaction-naive";
 import { HandoffConductor } from "../../conductors/in-process/handoff/handoff";
 import { DoormanConductor } from "../../conductors/in-process/doorman/doorman";
+import { KeelLiteConductor, KEEL_LITE_DEFAULTS, type KeelLiteOptions } from "../../conductors/in-process/keel-lite/keel-lite";
 
 /** One catalog entry: everything the host needs to attach (or detach to) this conductor. */
 export interface RegistryEntry {
@@ -119,12 +120,34 @@ const TRIPTYCH: RegistryEntry = {
 	},
 };
 
+/**
+ * keel-lite's hysteresis band from the environment, for benchmark sweeps:
+ * `ACCORDION_KEEL_LITE_HIGH` / `ACCORDION_KEEL_LITE_LOW`, fractions of the budget in (0, 1] with
+ * LOW < HIGH. An unparseable or out-of-range value is ignored (that knob keeps its default); if the
+ * resulting pair is not LOW < HIGH, BOTH fall back to the defaults (0.85 / 0.65). Read here, in the
+ * registry factory, so the conductor class stays pure and constructor-configured; `process` is
+ * looked up through `globalThis` so this module still loads where there is none (the browser app).
+ * Exported for tests.
+ */
+export function keelLiteOptionsFromEnv(env?: Record<string, string | undefined>): KeelLiteOptions {
+	const source = env ?? (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env ?? {};
+	const frac = (raw: string | undefined): number | undefined => {
+		if (raw === undefined || raw.trim() === "") return undefined;
+		const v = Number(raw);
+		return Number.isFinite(v) && v > 0 && v <= 1 ? v : undefined;
+	};
+	const high = frac(source.ACCORDION_KEEL_LITE_HIGH) ?? KEEL_LITE_DEFAULTS.high;
+	const low = frac(source.ACCORDION_KEEL_LITE_LOW) ?? KEEL_LITE_DEFAULTS.low;
+	return low < high ? { high, low } : { high: KEEL_LITE_DEFAULTS.high, low: KEEL_LITE_DEFAULTS.low };
+}
+
 /** The full catalog, in picker order: detach first, then the shipped conductors. */
 export const ENTRIES: readonly RegistryEntry[] = [
 	NONE,
 	inProcess(() => new NaiveCompactionConductor()),
 	inProcess(() => new HandoffConductor()),
 	inProcess(() => new DoormanConductor()),
+	inProcess(() => new KeelLiteConductor(keelLiteOptionsFromEnv())),
 	THERMOCLINE,
 	TRIPTYCH,
 ];

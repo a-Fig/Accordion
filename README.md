@@ -108,7 +108,7 @@ agent reasons over at full fidelity (the thick-bordered box below the fold line)
 
 A conductor is a strategy for deciding what gets folded. It watches the session and proposes
 edits between turns, and every edit goes through the same rules your own hand folds do, so a
-conductor can never do something you couldn't do yourself. Five ship today. Pick one from the
+conductor can never do something you couldn't do yourself. Six ship today. Pick one from the
 header menu, or leave it on None and steer everything by hand.
 
 **[thermocline](conductors/ws/thermocline/)** is the strongest one so far, and the one the
@@ -131,12 +131,18 @@ moment it arrives, so the model sees it at full size on the very first call, and
 catches those on their way out and folds them before they reach the model at all. It's a cheap
 proof of concept, so don't reach for it as a real strategy.
 
+**[keel-lite](conductors/in-process/keel-lite/)** is the deterministic one: no model calls, no
+locks. When the context passes 85% of the budget it runs one batched epoch that folds the
+cheapest-to-lose content first (old reasoning, then stale file reads, then long command output)
+until it is back under 65%, and never touches the task brief or the current spec. Every edit is
+recoverable, and batching the edits keeps prompt-cache breaks rare.
+
 **[handoff](conductors/in-process/handoff/)** is `/handoff`, automatic. The manual version is to
 ask the agent to write a handoff document, kill the session, and paste that document into a
 fresh one. This does all three for you without you leaving the session.
 
 **[compaction-naive](conductors/in-process/compaction-naive/)** re-implements the `/compact` you
-already have in Claude Code, ChatGPT and everywhere else. It is the baseline the other four get
+already have in Claude Code, ChatGPT and everywhere else. It is the baseline the other five get
 measured against, and it makes the point that Accordion covers what exists today before it does
 anything past that.
 
@@ -160,7 +166,7 @@ on each are in **[conductors/](conductors/)**.
   agent can ask to unfold.
 - ✅ Involvement locks — exclusive conductors, the consent gate, freeze-on-detach, and
   agent `recall`.
-- ✅ Five conductors — automatic fold/unfold between turns, based on context.
+- ✅ Six conductors — automatic fold/unfold between turns, based on context.
 - ✅ LLM-generated summaries, computed once and cached.
 - ✅ Read-only browsing of saved Claude Code transcripts.
 
@@ -303,7 +309,7 @@ Setup, the quality gate, and platform gotchas are in **[CONTRIBUTING.md](CONTRIB
 Our main frontier right now is **better conductors**: researching which context actually
 matters, developing stronger strategies, and testing them against real sessions. We're not
 chasing a long tail of mediocre ones — the goal is one to three conductors that genuinely
-hold up. The five listed above run against a small, frozen contract
+hold up. The six listed above run against a small, frozen contract
 (`core/conductor/contract.ts`): a conductor attaches to a host, reacts to context-change
 events, and proposes fold/group edits between turns — clamped by the exact same rules a
 human fold goes through, never a privileged write path. If you don't need that finer-grained event stream, `core/conductor/view.ts`'s

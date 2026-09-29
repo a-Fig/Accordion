@@ -14,6 +14,9 @@ socket, no child process. Bundled straight into the pi extension.
 - [`compaction-naive/`](in-process/compaction-naive/) — a deliberately-lossy LLM-summarization foil (ADR 0014).
 - [`handoff/`](in-process/handoff/) — simulates a manual handoff to a fresh session (ADR 0017).
 - [`doorman/`](in-process/doorman/) — the birth-fold demonstration conductor (ADR 0018 / 0023).
+- [`keel-lite/`](in-process/keel-lite/) — deterministic, collaborative budget keeper: hysteresis
+  epochs walk a recoverable fold ladder (thinking → stale reads → bash trims → skeletons → groups),
+  never touching the briefing/spec/user roots. No model calls, no locks.
 - `agedSummaryConductor.ts` — shared base class factored out of `compaction-naive` and `handoff`
   (PR #82); not a conductor on its own, not in the shipped catalog.
 
