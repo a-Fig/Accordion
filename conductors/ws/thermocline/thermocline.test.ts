@@ -18,8 +18,8 @@ import type { ConductorHost } from "../../../core/conductor/contract";
 import type { Block } from "../../../core/types";
 import type { Op, TxnResult } from "../../../core/ops";
 import { foldTag } from "../../../core/digest";
-import { ThermoclineConductor, reconcilePlan, planWithRealStratumTokens, dropOwnStrataOldestFirst } from "./thermocline";
-import { planEpoch, emitOps, DEFAULT_CFG } from "./policy";
+import { ThermoclineConductor, reconcilePlan, planWithRealStratumTokens, dropOwnStrataOldestFirst, overflowStatusText } from "./thermocline";
+import { planEpoch, emitOps, DEFAULT_CFG, stratumDigestKey } from "./policy";
 import type { Plan, ConductorView, ViewBlock } from "./policy";
 
 // ── helpers ───────────────────────────────────────────────────────────────────────────────────
@@ -114,7 +114,7 @@ describe("applied group == plan (real Truth, message-atom fixed point)", () => {
 		expect(stratum.memberIds).not.toContain("a:mA:p0");
 		expect(stratum.memberIds).not.toContain("a:mA:p1");
 
-		const digests = new Map<string, string>([[`stratum:${stratum.ids[0]}`, "HOLISTIC RUN SUMMARY"]]);
+		const digests = new Map<string, string>([[stratumDigestKey(stratum.ids[0], stratum.ids[1]), "HOLISTIC RUN SUMMARY"]]);
 		host.truth.apply(emitOps(plan, digests, view), "auto");
 
 		const groups = host.truth.groups;
@@ -270,7 +270,7 @@ describe("commit helpers", () => {
 		expect(reconcilePlan(p, new Set())).toBe(p);
 	});
 	test("planWithRealStratumTokens substitutes the real summary length (~len/4) via the given countTokens", () => {
-		const out = planWithRealStratumTokens(mkPlan(), new Map([["stratum:b", "y".repeat(800)]]), (t) => Math.ceil(t.length / 4));
+		const out = planWithRealStratumTokens(mkPlan(), new Map([[stratumDigestKey("b", "c"), "y".repeat(800)]]), (t) => Math.ceil(t.length / 4));
 		expect(out.strata[0].summaryTokens).toBe(200); // 800 chars → 200 tokens, was 100 estimate
 	});
 	// F1 (issue #11, ADR 0025): `summaryTokens` MUST come from the host's CALIBRATED `countTokens`,
@@ -281,7 +281,7 @@ describe("commit helpers", () => {
 	test("planWithRealStratumTokens uses the CALLER's countTokens, not a hardcoded chars/4 (F1)", () => {
 		const k = 2;
 		const calibratedCountTokens = (t: string) => Math.round((t.length / 4) * k);
-		const out = planWithRealStratumTokens(mkPlan(), new Map([["stratum:b", "y".repeat(800)]]), calibratedCountTokens);
+		const out = planWithRealStratumTokens(mkPlan(), new Map([[stratumDigestKey("b", "c"), "y".repeat(800)]]), calibratedCountTokens);
 		expect(out.strata[0].summaryTokens).toBe(400); // 800 chars → 200 raw → 400 calibrated (k=2), NOT 200
 	});
 	test("dropOwnStrataOldestFirst converts the OLDER stratum first (conversation order)", () => {
@@ -442,6 +442,102 @@ test("probe-absent fallback: a rejecting scorer still compresses (age-based stra
 	expect(host.completeLog.length).toBe(0); // deterministic emergency — no model calls
 	expect(host.truth.groups.length).toBeGreaterThanOrEqual(1); // age-based strata carried the strategy
 	expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(30_000);
+});
+
+// ── BUDGET FLOOR (probe absent) — the overnight log_query failure shape ─────────────────────────
+//
+// Live run (pi + deepseek, no attention probe, budget 40k / protect 8k): compliant for ~540s, then
+// every wire went over cap (peak 148k) while the status insisted "protected tail ≈ 8k > cap 40k".
+// Two compounding bugs, each pinned by one test below:
+//   (A) our OWN applied strata came back `grouped:true` in the next epoch's view, so every mover
+//       skipped them as buoys; against the fullTokens baseline the plan counted them at FULL cost,
+//       reported irreducible, and applyDesired UNGROUPED them all — flip-flopping every epoch.
+//   (B) folding a message's thinking part stranded its tool_call+result pair (see policy.test.ts
+//       "message-atom bridge"), so big write calls piled up outside the tail, ungroupable.
+describe("BUDGET FLOOR (probe absent)", () => {
+	function lastMetrics(host: TestHost) {
+		return [...host.statusLog].reverse().find((s) => s.metrics)?.metrics;
+	}
+	function pairsFrom(start: number, n: number): Block[] {
+		const out: Block[] = [];
+		for (let i = start; i < start + n; i++) {
+			out.push(block({ id: `call${i}`, kind: "tool_call", callId: `c${i}`, tokens: 500, order: i * 2, toolName: "read_file" }));
+			out.push(block({ id: `res${i}`, kind: "tool_result", callId: `c${i}`, tokens: 9_500, order: i * 2 + 1, text: `result body ${i}` }));
+		}
+		return out;
+	}
+
+	test("(A) a second over-budget batch re-plans OUR strata instead of ungrouping them: live ≤ cap at the wire", async () => {
+		const host = new TestHost();
+		const cond = new ThermoclineConductor({ scorer: rejectScorer, sessionKey: null });
+		cond.attach(host);
+		host.setBudget(30_000);
+		host.setProtect(300);
+		host.appendBlocks(pairsFrom(0, 8)); // 80k of NON-foldable pairs → only age-based strata compress
+		await flush();
+		expect(host.truth.groups.length).toBeGreaterThanOrEqual(1);
+		expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(30_000);
+
+		host.appendBlocks(pairsFrom(8, 4)); // +40k — the next epoch must plan AROUND/THROUGH epoch 1's strata
+		await flush();
+		await host.departWire();
+
+		expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(30_000);
+		expect(host.truth.groups.length).toBeGreaterThanOrEqual(1);
+		expect(lastMetrics(host)?.irreducibleOverflow).toBe(false);
+	});
+
+	test("(A+B) message-shaped turns (thinking + whole-file write call): every wire ≤ cap, no false irreducible", async () => {
+		const host = new TestHost();
+		host.setWireAttached(true); // as on every live pi session
+		host.truth.setSystemPrompt("S".repeat(8_000), 2_000);
+		const cond = new ThermoclineConductor({ scorer: rejectScorer, sessionKey: null });
+		cond.attach(host);
+		host.setBudget(40_000);
+		host.setProtect(8_000);
+
+		const CAP = 40_000;
+		let order = 0;
+		const wires: number[] = [];
+		for (let i = 0; i < 16; i++) {
+			await host.departWire();
+			wires.push(host.truth.stats().liveTokens);
+			const turn = i + 1;
+			host.appendBlocks([
+				block({ id: `a:m${i}:p0`, kind: "thinking", tokens: 6_000, order: order++, turn }),
+				block({ id: `a:m${i}:p1`, kind: "tool_call", callId: `w${i}`, toolName: "write", tokens: 4_000, order: order++, turn }),
+				block({ id: `r:w${i}`, kind: "tool_result", callId: `w${i}`, tokens: 150, order: order++, turn }),
+			]);
+			await host.commitTurn(turn);
+			await flush();
+		}
+		await host.departWire();
+		wires.push(host.truth.stats().liveTokens);
+
+		// ~164k of history went through a 40k cap: the invariant held on EVERY departing wire.
+		expect(Math.max(...wires)).toBeLessThanOrEqual(CAP);
+		expect(host.truth.stats().fullTokens).toBeGreaterThan(4 * CAP);
+		// The tail (~8k) + system prompt (2k) always fit — "irreducible" would be a lie here.
+		for (const s of host.statusLog) expect(s.text).not.toMatch(/irreducible/i);
+		expect(lastMetrics(host)?.irreducibleOverflow).toBe(false);
+	});
+
+	test("overflow status names the REAL blocker: the floor only when it exceeds cap, else un-absorbed history", () => {
+		// The live run's numbers: ~42k projected, 40k cap, ~9k tail, 2.6k system prompt. The floor fits.
+		const live = overflowStatusText({ projected: 41_961, cap: 40_000, tail: 8_509, held: 0, fixed: 2_600 });
+		expect(live).not.toMatch(/irreducible/i);
+		expect(live).not.toMatch(/tail ≈ \d+k > cap/); // the old, self-contradictory "tail ≈ 8k > cap 40k"
+		expect(live).toMatch(/≈ 31k of older content could not be folded or grouped/);
+		expect(live).toMatch(/protected tail ≈ 9k \+ system prompt ≈ 3k fit under cap/);
+
+		// A genuinely un-winnable configuration keeps the original wording + knobs.
+		const config = overflowStatusText({ projected: 30_000, cap: 12_000, tail: 21_000, held: 0, fixed: 0 });
+		expect(config).toBe("over budget and irreducible: protected tail ≈ 21k > cap 12k — raise the budget or shrink the protected tail");
+		const pinned = overflowStatusText({ projected: 30_000, cap: 12_000, tail: 6_000, held: 9_000, fixed: 0 });
+		expect(pinned).toBe(
+			"over budget and irreducible: protected tail ≈ 6k + held content ≈ 9k > cap 12k — raise the budget, shrink the protected tail, or unpin held content",
+		);
+	});
 });
 
 // ── persistence round-trip — write after commit, restore + validate against live ids ─────────
@@ -692,6 +788,9 @@ test("protect-heal reconciliation: raising setProtect over an applied stratum dr
 	// The epoch committed at least one stratum (a `group` op) to fit under the 30k cap.
 	expect(host.truth.groups.length).toBeGreaterThanOrEqual(1);
 	expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(30_000);
+	// The model has SEEN this content (the wire departed). Without this every block is still unsent,
+	// and Rung 0 would legitimately birth-fold the now-protected tool results — a different scenario.
+	await host.departWire();
 
 	// The human raises the protected tail to cover EVERYTHING. Truth's housekeep — inside
 	// `setProtect`, synchronously, BEFORE the state-changed event fires — prunes every stratum group
@@ -740,4 +839,92 @@ test("restore validation: a stratum with a vanished member is dropped (never gro
 
 	// No restored stratum could validate → none grouped (a group over vanished ids would be unsafe).
 	expect(hostB.truth.groups.length).toBe(0);
+});
+
+// ── PREFIX STABILITY + BURST (live A/B of PR #148: circuit_eval, DeepSeek flash, 40k/8k) ─────────
+//
+// Live: cacheRead fell to the bare system prompt (2,560) on 20 of the last 22 turns. Every HOLD
+// re-derived the applied stratum's deterministic recap, which quotes `~N tok` from CALIBRATED view
+// tokens — so each receipt's new calibration factor changed the summary text, HOLD ungrouped and
+// regrouped it, and the wire changed right after the system prompt. The status also read
+// "EMERGENCY 68%" for dozens of turns after a single wire-departing emergency.
+describe("PREFIX STABILITY (live A/B of PR #148)", () => {
+	const wireText = (host: TestHost) =>
+		JSON.stringify({
+			groups: host.truth.groups.map((g) => [g.id, g.memberIds.length, g.digest]),
+			folds: host.truth.blocks.filter((b) => b.subst).map((b) => [b.id, b.subst]),
+		});
+
+	test("a HOLD after the calibration factor moves proposes nothing: applied fold/stratum text stays byte-identical", async () => {
+		const host = new TestHost();
+		const cond = new ThermoclineConductor({ scorer: rejectScorer, sessionKey: null });
+		cond.attach(host);
+		host.setBudget(30_000);
+		host.setProtect(300);
+		host.appendBlocks(pairs(8)); // non-foldable pairs → age-based strata
+		await flush();
+		await flush();
+		expect(host.truth.groups.length).toBeGreaterThanOrEqual(1);
+		await host.departWire();
+		const before = wireText(host);
+
+		let proposed = 0;
+		const real = host.propose.bind(host);
+		host.propose = (txn) => {
+			proposed += txn.ops.length;
+			return real(txn);
+		};
+		// A receipt lands with a new real/est factor (every turn does, live), then the turn settles.
+		host.truth.setCalibration(1.15, host.truth.blocks[host.truth.blocks.length - 1].order);
+		await host.commitTurn();
+		await flush();
+
+		expect(proposed).toBe(0);
+		expect(wireText(host)).toBe(before);
+	});
+
+	test("EMERGENCY names an event, not a standing state: the next under-cap tick reads HOLD", async () => {
+		const host = new TestHost();
+		const cond = new ThermoclineConductor({ scorer: rejectScorer, sessionKey: null });
+		cond.attach(host);
+		host.setBudget(40_000);
+		host.setProtect(300);
+		host.appendBlocks(pairs(8)); // 80k raw > 40k cap → the tick's deterministic emergency
+		await flush();
+		await flush();
+		const lastText = () => [...host.statusLog].reverse().find((s) => s.text)?.text ?? "";
+		expect(lastText()).toMatch(/^EMERGENCY/);
+		expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(40_000);
+
+		await host.commitTurn();
+		await flush();
+		expect(lastText()).toMatch(/^HOLD/);
+	});
+
+	test("a fresh tool result bigger than the cap is birth-folded on arrival; strata already on the wire are untouched", async () => {
+		const host = new TestHost();
+		const cond = new ThermoclineConductor({ scorer: rejectScorer, sessionKey: null });
+		cond.attach(host);
+		host.setBudget(40_000);
+		host.setProtect(8_000);
+		host.appendBlocks(pairs(6)); // 60k → the emergency lays down strata
+		await flush();
+		await flush();
+		await host.departWire();
+		expect(host.truth.groups.length).toBeGreaterThanOrEqual(1);
+		const groupsBefore = JSON.stringify(host.truth.groups.map((g) => [g.id, g.memberIds, g.digest]));
+
+		// One call whose result alone (61k) exceeds the 40k cap: it is the newest block, so it is the
+		// whole protected tail — before, the emergency dropped every applied stratum trying to make room.
+		host.appendBlocks([
+			block({ id: "callX", kind: "tool_call", callId: "cX", toolName: "run", tokens: 100, order: 100 }),
+			block({ id: "resX", kind: "tool_result", callId: "cX", tokens: 61_000, order: 101, text: "huge output" }),
+		]);
+		await flush();
+		await flush();
+
+		expect(host.truth.isFolded(host.truth.get("resX")!)).toBe(true); // birth-folded before any wire
+		expect(host.truth.stats().liveTokens).toBeLessThanOrEqual(40_000);
+		expect(JSON.stringify(host.truth.groups.map((g) => [g.id, g.memberIds, g.digest]))).toBe(groupsBefore);
+	});
 });
