@@ -25,12 +25,22 @@
  * `../agedSummaryConductor.ts`; `compaction-naive` does not override it). The "all block kinds"
  * and "a user block in the middle" describe blocks below exercise mixed-kind fixtures directly.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { TestHost } from "../../../core/conductor/testhost";
 import { estTokens, BLOCK_OVERHEAD } from "../../../core/tokens";
 import { roleFloorRecap } from "../../../core/wire";
 import type { Block, BlockKind } from "../../../core/types";
+import type { CompletionResult } from "../../../core/conductor/contract";
 import { COMPACTION_SYSTEM, NaiveCompactionConductor } from "./compaction-naive";
+import {
+	DEFAULT_OVERSHOOT,
+	DEFAULT_TRIGGER,
+	OVERSHOOT,
+	OVERSHOOT_COOLDOWN_MS,
+	TRIGGER,
+	summaryTuningFromEnv,
+	type AgedSummaryOptions,
+} from "../agedSummaryConductor";
 
 const BUDGET = 1000; // TRIGGER (0.9) high-water mark = 900 tokens
 const PROTECT = 250; // protect target; cap = 312.5 (PROTECT_OVERFLOW_CAP = 1.25)
@@ -73,15 +83,22 @@ function buildPass2AddedBlocks(): Block[] {
 
 /** Attach a fresh conductor to a fresh host preloaded with `buildPass1Blocks()`, budget/protect
  *  set as documented above. Blocks appended and locks NOT applied (TestHost/adapter do not
- *  auto-apply a conductor's declared `locks` on attach — see the note on `locks` below). */
-function setupHost(): { host: TestHost; conductor: NaiveCompactionConductor } {
+ *  auto-apply a conductor's declared `locks` on attach — see the note on `locks` below).
+ *  `budget` overrides BUDGET BEFORE attach (a later `setBudget` is a state-changed pass of its
+ *  own); `now` pins the conductor's overshoot-cooldown clock. */
+function setupHost(opts: AgedSummaryOptions & { budget?: number } = {}): { host: TestHost; conductor: NaiveCompactionConductor } {
 	const host = new TestHost();
-	host.setBudget(BUDGET);
+	host.setBudget(opts.budget ?? BUDGET);
 	host.setProtect(PROTECT);
 	host.appendBlocks(buildPass1Blocks());
-	const conductor = new NaiveCompactionConductor();
+	const conductor = new NaiveCompactionConductor({ now: opts.now });
 	conductor.attach(host);
 	return { host, conductor };
+}
+
+/** The most recent `setStatus` text. */
+function lastStatus(host: TestHost): string | null {
+	return host.statusLog[host.statusLog.length - 1]?.text ?? null;
 }
 
 /** setupHost() + drive one successful first-pass compaction to completion. */
@@ -693,6 +710,210 @@ describe("NaiveCompactionConductor — heavy fragmentation never grows the wire 
 		const digests = host.truth.groups.map((g) => host.truth.groupSummary(g)).sort();
 		expect(digests.filter((d) => d === "").length).toBe(1);
 		expect(digests.filter((d) => d !== "").length).toBe(1);
+	});
+
+	// THE OVERSHOOT UN-LATCH. The refill bar above is the WHOLE aged region the unproductive pass was
+	// handed — on a real recursive pass, effectively the entire session history — so in the field a
+	// latched conductor could watch the wire climb to 2x budget and never clear it. Below OVERSHOOT
+	// (1.15x the cap) nothing changes but the status line; at/over it the latch lifts, at most once
+	// per OVERSHOOT_COOLDOWN_MS since the last attempt started or settled.
+	const moreBlocks = (from: number, n: number): Block[] =>
+		Array.from({ length: n }, (_, i) => mkBlock(`a:f${FRAG_N + from + i}:p0`, FRAG_N + from + i, "text", FRAG_TOK, `MORE-${from + i}`));
+
+	/** setupFragmented() + a clock-pinned conductor + the one unproductive pass that latches it. */
+	async function latched(): Promise<{ host: TestHost; clock: { t: number } }> {
+		const clock = { t: 1_000_000 };
+		const host = setupFragmented();
+		const conductor = new NaiveCompactionConductor({ now: () => clock.t });
+		conductor.attach(host);
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+		expect(host.truth.liveTokens()).toBe(1020); // grew by the carrier's 10 tokens: unproductive
+		return { host, clock };
+	}
+
+	it("below OVERSHOOT the latch holds no matter how long it waits — and the status bar now says why", async () => {
+		const { host, clock } = await latched();
+		host.appendBlocks(moreBlocks(0, 1)); // wire 1030: over the 900 trigger, under the 1150 overshoot mark
+		clock.t += 60 * 60_000; // an hour — the cooldown is irrelevant below OVERSHOOT
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+		// Pre-fix a latched pass surfaced nothing at all (setStatus(null)): the conductor went dark.
+		expect(lastStatus(host)).toBe("Naive compaction back-off: last pass grew the wire 10 tok; waiting for refill (10/510 tok newly aged)");
+	});
+
+	it("at/over OVERSHOOT the latch lifts — not before the cooldown since the last attempt, and exactly at it", async () => {
+		const { host, clock } = await latched();
+		// 13 blocks (130 tokens, far under the 510-token refill bar) take the wire to 1150 = 1.15 x cap.
+		host.appendBlocks(moreBlocks(0, 13));
+		expect(host.truth.liveTokens()).toBe(1150);
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1); // the last attempt settled "just now"
+		expect(lastStatus(host)).toBe(
+			"Naive compaction back-off: last pass grew the wire 10 tok; waiting for refill (130/510 tok newly aged) — over 1.15x cap, overshoot retry in 45s",
+		);
+
+		clock.t += OVERSHOOT_COOLDOWN_MS - 1;
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+		expect(lastStatus(host)).toMatch(/overshoot retry in 1s$/);
+
+		clock.t += 1;
+		host.queueCompletion({ text: SUMMARY_B });
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(2);
+		expect(host.statusLog.some((s) => s.text === "Naive compaction overshoot un-latch: visible 1150 tok ≥ 1.15x cap 1000; re-summarizing despite back-off")).toBe(true);
+		const prompt = host.completeLog[1].prompt;
+		expect(prompt).toContain("<previous-summary>");
+		for (let i = 0; i < 13; i++) expect(prompt).toContain(`MORE-${i}`);
+		// The un-latched pass had something to collapse this time (the new contiguous run at the tip).
+		expect(host.truth.liveTokens()).toBeLessThan(1150);
+	});
+
+	it("the un-latch never launches a second completion while one is in flight", async () => {
+		const { host, clock } = await latched();
+		// Hold the next completion open until released.
+		let release!: (r: CompletionResult) => void;
+		host.complete = (req) => {
+			host.completeLog.push(req);
+			return new Promise<CompletionResult>((resolve) => (release = resolve));
+		};
+
+		host.appendBlocks(moreBlocks(0, 13));
+		clock.t += OVERSHOOT_COOLDOWN_MS;
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(2); // the un-latch launched…
+
+		// …and stays the only one in flight: far past the cooldown, the wire still growing, every turn.
+		for (let n = 0; n < 5; n++) {
+			clock.t += 10 * OVERSHOOT_COOLDOWN_MS;
+			host.appendBlocks(moreBlocks(13 + n * 5, 5));
+			await host.commitTurn();
+			await flush();
+		}
+		expect(host.completeLog.length).toBe(2);
+
+		release({ text: SUMMARY_B, model: "test-model" });
+		await flush(6);
+		expect(host.truth.groups.some((g) => host.truth.groupSummary(g).includes(SUMMARY_B))).toBe(true);
+	});
+});
+
+describe("NaiveCompactionConductor — OVERSHOOT lifts the attempt-key dedupe too (rate-limited)", () => {
+	// buildPass1Blocks() is 1200 visible tokens: 1.2 x the 1000 cap, past the 1150 overshoot mark.
+	it("after a genuine rejection the SAME newly-aged set is retried once the cooldown passes", async () => {
+		const clock = { t: 5_000 };
+		const { host } = setupHost({ now: () => clock.t });
+		host.queueCompletionError(new Error("provider timeout"));
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+
+		// Same aged set: held, and the countdown is APPENDED to the sticky failure, never replacing it.
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+		expect(lastStatus(host)).toBe("Naive compaction failed — waiting for new context to age in before retrying — over 1.15x cap, overshoot retry in 45s");
+
+		clock.t += OVERSHOOT_COOLDOWN_MS;
+		host.queueCompletion({ text: SUMMARY_A });
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(2);
+		expect(host.completeLog[1].prompt).toBe(host.completeLog[0].prompt); // the identical newly-aged set
+		expect(host.statusLog.some((s) => s.text === "Naive compaction overshoot un-latch: visible 1200 tok ≥ 1.15x cap 1000; re-summarizing despite attempt dedupe")).toBe(true);
+		expect(host.truth.groups.length).toBe(1);
+		expect(lastStatus(host)).toBeNull(); // committed and back under the mark
+	});
+
+	it("the cooldown restarts when an attempt SETTLES — a slow failure is not retried the instant it lands", async () => {
+		const clock = { t: 5_000 };
+		const { host } = setupHost({ now: () => clock.t });
+		let fail!: (err: unknown) => void;
+		host.complete = (req) => {
+			host.completeLog.push(req);
+			return new Promise<CompletionResult>((_resolve, reject) => (fail = reject));
+		};
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+
+		// The call hangs for two full cooldowns, then fails, and a turn commits that same instant.
+		// Measured from launch START the un-latch would re-bill right there; measured from the
+		// settle it waits a full cooldown.
+		clock.t += 2 * OVERSHOOT_COOLDOWN_MS;
+		fail(new Error("provider timeout"));
+		await flush();
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+		expect(lastStatus(host)).toMatch(/^Naive compaction failed — .* — over 1\.15x cap, overshoot retry in 45s$/);
+
+		clock.t += OVERSHOOT_COOLDOWN_MS;
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(2);
+	});
+
+	it("below OVERSHOOT the dedupe still holds indefinitely (default behavior unchanged)", async () => {
+		const clock = { t: 5_000 };
+		// Budget 1100: 1200 visible is 1.09 x cap — over the 990 trigger, under the 1265 overshoot mark.
+		const { host } = setupHost({ now: () => clock.t, budget: 1100 });
+		host.queueCompletionError(new Error("provider timeout"));
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+
+		clock.t += 60 * 60_000;
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog.length).toBe(1);
+		expect(lastStatus(host)).toBe("Naive compaction failed — waiting for new context to age in before retrying");
+	});
+});
+
+describe("AgedSummaryConductor — ACCORDION_SUMMARY_TRIGGER / ACCORDION_SUMMARY_OVERSHOOT", () => {
+	it("absent → the shipped 0.9 / 1.15", () => {
+		expect(summaryTuningFromEnv({})).toEqual({ trigger: 0.9, overshoot: 1.15 });
+		expect(summaryTuningFromEnv(undefined)).toEqual({ trigger: DEFAULT_TRIGGER, overshoot: DEFAULT_OVERSHOOT });
+		// The module constants are whatever the real environment resolves to (unset in CI → defaults).
+		expect({ trigger: TRIGGER, overshoot: OVERSHOOT }).toEqual(summaryTuningFromEnv(process.env));
+	});
+
+	it("valid values override, each independently", () => {
+		expect(summaryTuningFromEnv({ ACCORDION_SUMMARY_TRIGGER: "0.75", ACCORDION_SUMMARY_OVERSHOOT: "1.3" })).toEqual({ trigger: 0.75, overshoot: 1.3 });
+		expect(summaryTuningFromEnv({ ACCORDION_SUMMARY_TRIGGER: " 0.5 " })).toEqual({ trigger: 0.5, overshoot: 1.15 });
+		expect(summaryTuningFromEnv({ ACCORDION_SUMMARY_OVERSHOOT: "2" })).toEqual({ trigger: 0.9, overshoot: 2 });
+	});
+
+	it("invalid values fall back to the default, without disturbing the other dial", () => {
+		for (const bad of ["", "   ", "abc", "0", "1", "1.5", "-0.2", "NaN", "Infinity"]) {
+			expect(summaryTuningFromEnv({ ACCORDION_SUMMARY_TRIGGER: bad, ACCORDION_SUMMARY_OVERSHOOT: "1.4" })).toEqual({ trigger: 0.9, overshoot: 1.4 });
+		}
+		for (const bad of ["", "abc", "1", "0.9", "0", "-2", "NaN", "Infinity"]) {
+			expect(summaryTuningFromEnv({ ACCORDION_SUMMARY_TRIGGER: "0.8", ACCORDION_SUMMARY_OVERSHOOT: bad })).toEqual({ trigger: 0.8, overshoot: 1.15 });
+		}
+	});
+
+	it("is read at module load: a fresh import under a set environment sees the override", async () => {
+		vi.stubEnv("ACCORDION_SUMMARY_TRIGGER", "0.6");
+		vi.stubEnv("ACCORDION_SUMMARY_OVERSHOOT", "1.25");
+		vi.resetModules();
+		try {
+			const fresh = await import("../agedSummaryConductor");
+			expect(fresh.TRIGGER).toBe(0.6);
+			expect(fresh.OVERSHOOT).toBe(1.25);
+		} finally {
+			vi.unstubAllEnvs();
+			vi.resetModules();
+		}
 	});
 });
 

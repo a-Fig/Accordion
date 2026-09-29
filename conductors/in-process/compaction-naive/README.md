@@ -106,6 +106,25 @@ stale-completion guard (comparing `AbortController` identity) — is ported/kept
 just relocated to the shared base (or, for the prompt text and status messages, kept here since they
 are genuinely this conductor's own).
 
+## Suppressions, the overshoot un-latch, and tuning
+
+Two gates in the shared base stop a conductor that sits just over the mark from paying for the same
+nothing every turn: the **paid-retry back-off** (after a pass that saved ≤ `MIN_PASS_SAVING`, wait
+until newly-aged tokens exceed that pass's whole aged region) and the **attempt-key dedupe** (after a
+rejected/declined attempt, wait for a different newly-aged set). Both now say so on the status bar
+while they hold instead of going dark.
+
+At or over `OVERSHOOT` (visible ≥ 1.15× the effective cap) either gate may be bypassed — the
+**overshoot un-latch** — but at most once per `OVERSHOOT_COOLDOWN_MS` (45 s) since the last attempt
+started or settled, and never while a completion is in flight. Below `OVERSHOOT` both gates behave
+exactly as before. The shared base adds no deterministic drop/fold fallback: an un-latched pass is
+still an ordinary summary.
+
+Two optional environment overrides, read once at module load (for benchmark sweeps; production sets
+neither): `ACCORDION_SUMMARY_TRIGGER` — the high-water mark, a float in (0, 1), default 0.9;
+`ACCORDION_SUMMARY_OVERSHOOT` — a float > 1, default 1.15. An invalid value falls back to the default.
+Both apply to every `AgedSummaryConductor` (compaction-naive, handoff, triptych).
+
 ## Locks
 
 Declares `locks: ["human-steering", "agent-unfold"]` (ADR 0011). Neither `TestHost` nor the

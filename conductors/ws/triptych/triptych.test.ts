@@ -21,6 +21,7 @@ import { describe, expect, it } from "vitest";
 import { TestHost } from "../../../core/conductor/testhost";
 import type { Block, BlockKind } from "../../../core/types";
 import { TriptychConductor, COMPACTION_SYSTEM, type Skeletonizer } from "./triptych";
+import { OVERSHOOT_COOLDOWN_MS } from "../../in-process/agedSummaryConductor";
 
 const BUDGET = 6000; // TRIGGER (0.9) high-water mark = 5400
 const PROTECT = 250;
@@ -99,7 +100,7 @@ function fakeSkeletonizer(opts: { holdInit?: boolean; skeletonOf?: (path: string
 	return { skel, releaseInit: release };
 }
 
-function setup(opts: Parameters<typeof fakeSkeletonizer>[0] & { blocks?: Block[] } = {}): {
+function setup(opts: Parameters<typeof fakeSkeletonizer>[0] & { blocks?: Block[]; now?: () => number } = {}): {
 	host: TestHost;
 	conductor: TriptychConductor;
 	releaseInit: () => void;
@@ -109,7 +110,7 @@ function setup(opts: Parameters<typeof fakeSkeletonizer>[0] & { blocks?: Block[]
 	host.setProtect(PROTECT);
 	host.appendBlocks(opts.blocks ?? buildBlocks());
 	const { skel, releaseInit } = fakeSkeletonizer(opts);
-	const conductor = new TriptychConductor(skel);
+	const conductor = new TriptychConductor(skel, { now: opts.now });
 	conductor.attach(host);
 	return { host, conductor, releaseInit };
 }
@@ -289,5 +290,137 @@ describe("TriptychConductor", () => {
 		await flush();
 		const last = host.statusLog[host.statusLog.length - 1];
 		expect(last.text).toContain("skeleton engine failed to load");
+	});
+});
+
+describe("TriptychConductor — sustained OVERSHOOT widens the summarizable band", () => {
+	// OVERSHOOT (1.15) x the 6000 cap = 6900. Extra 200-token prose blocks appended after the
+	// 28-block fixture; each one moves both band boundaries one block toward the tip.
+	const extra = (from: number, n: number): Block[] =>
+		Array.from({ length: n }, (_, i) => mkBlock(idOf(from + i), from + i, "text", 200, `NEW-${from + i}`));
+
+	it("at/over OVERSHOOT the boundary falls back to the middle band's end — top + middle summarized, bottom raw", async () => {
+		// 34 blocks, 7200 raw: bottom band [24, 34), middle [14, 24), top [0, 14).
+		const { host } = setup({ blocks: [...buildBlocks(), ...extra(28, 6)] });
+		host.queueCompletion({ text: SUMMARY_A });
+		await flush();
+		await host.commitTurn();
+		await flush();
+
+		expect(host.completeLog).toHaveLength(1);
+		const prompt = host.completeLog[0].prompt;
+		for (let i = 0; i <= 9; i++) expect(prompt).toContain(`OLD-${i}`);
+		for (let i = 14; i <= 17; i++) expect(prompt).toContain(`MID-${i}`); // the middle band…
+		for (let i = 18; i <= 23; i++) expect(prompt).toContain(`NEW-${i}`);
+		for (let i = 24; i <= 33; i++) expect(prompt).not.toContain(`NEW-${i}`); // …but never the bottom band
+
+		expect(host.truth.groups).toHaveLength(1);
+		const members = host.truth.groups[0].memberIds;
+		expect(members).toContain(idOf(23));
+		expect(members).not.toContain(idOf(24));
+		expect(host.truth.groups[0].digest).not.toMatch(FOLD_TAG_RE); // still the one lossy group
+	});
+
+	it("just under OVERSHOOT the thirds are untouched — only the top band is summarized", async () => {
+		// 31 blocks, 6600 raw: over the 5400 trigger, under the 6900 overshoot mark.
+		const { host } = setup({ blocks: [...buildBlocks(), ...extra(28, 3)] });
+		host.queueCompletion({ text: SUMMARY_A });
+		await flush();
+		await host.commitTurn();
+		await flush();
+
+		expect(host.completeLog).toHaveLength(1);
+		const prompt = host.completeLog[0].prompt;
+		for (let i = 0; i <= 9; i++) expect(prompt).toContain(`OLD-${i}`);
+		expect(prompt).not.toContain("MID-");
+		expect(prompt).not.toContain("NEW-");
+		expect(host.truth.groups[0].memberIds).not.toContain(idOf(14));
+	});
+
+	it("once widened, the group does not shrink back to the top band when the wire drops under the mark", async () => {
+		const { host } = setup({ blocks: [...buildBlocks(), ...extra(28, 6)] });
+		host.queueCompletion({ text: SUMMARY_A });
+		await flush();
+		await host.commitTurn();
+		await flush();
+		expect(host.truth.groups[0].memberIds).toContain(idOf(23));
+
+		// Well under the trigger now. Plain thirds would put the boundary back at the top band's end
+		// (index 14, then 16) and re-emit a group holding only [0, 14) — the middle band's already
+		// summarized content would reappear on the wire and the next crossing would summarize it again.
+		await host.commitTurn();
+		await flush();
+		host.appendBlocks(extra(34, 2));
+		await host.commitTurn();
+		await flush();
+
+		expect(host.truth.liveTokens()).toBeLessThan(BUDGET * 0.9);
+		expect(host.completeLog).toHaveLength(1);
+		expect(host.truth.groups).toHaveLength(1);
+		const members = host.truth.groups[0].memberIds;
+		for (let i = 0; i <= 23; i++) expect(members).toContain(idOf(i));
+		expect(members).not.toContain(idOf(24));
+	});
+
+	it("a latched triptych is freed at OVERSHOOT — by the widened band's refill, then by the cooldown un-latch", async () => {
+		const clock = { t: 1_000_000 };
+		const oversized = (n: number): string => "S".repeat(n); // an oversized "summary" (≈ n/4 tokens)
+		// No skeletons, and a summary BIGGER than the 2000-token top band it replaces: the first pass
+		// grows the wire, so the paid-retry back-off latches with a 2000-token refill bar.
+		const { host } = setup({ skeletonOf: () => null, now: () => clock.t });
+		host.queueCompletion({ text: oversized(8200) });
+		await flush();
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog).toHaveLength(1);
+		expect(host.truth.liveTokens()).toBeGreaterThan(6000);
+
+		// One more block: only the 50-token tool_call ages into the top band — latched, and it says so.
+		host.appendBlocks(extra(28, 1));
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog).toHaveLength(1);
+		expect(host.statusLog[host.statusLog.length - 1].text).toMatch(
+			/^Triptych back-off: last pass grew the wire \d+ tok; waiting for refill \(50\/2000 tok newly aged\)$/,
+		);
+
+		// Four more: over 6900. The boundary widens to the bottom band (33 blocks → [0, 23)), which ages
+		// in 3000 tokens at once — past the 2000-token bar, so this is an ordinary REFILL launch, with
+		// no cooldown involved. (Pre-fix the thirds would have aged in only the 850-token code reads.)
+		host.appendBlocks(extra(29, 4));
+		expect(host.truth.liveTokens()).toBeGreaterThanOrEqual(6900);
+		// Unproductive AGAIN: ≈ 5060 tokens replacing the 5000-token region. The bar is now 5000.
+		host.queueCompletion({ text: oversized(20200) });
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog).toHaveLength(2);
+		expect(host.statusLog.some((s) => s.text?.includes("overshoot un-latch"))).toBe(false);
+		const widened = host.completeLog[1].prompt;
+		expect(widened).toContain("MID-14"); // the widened band reaches past the top third…
+		expect(widened).toContain("NEW-22");
+		expect(widened).not.toContain("NEW-23"); // …and stops at the bottom band [23, 33)
+		expect(host.truth.liveTokens()).toBeGreaterThanOrEqual(6900); // still overshooting
+
+		// Now only 200 tokens age in per block against a 5000-token bar: latched for good — except that
+		// past OVERSHOOT it is released once the cooldown since the last settle has run out.
+		host.appendBlocks(extra(33, 1));
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog).toHaveLength(2);
+		expect(host.statusLog[host.statusLog.length - 1].text).toMatch(
+			/^Triptych back-off: last pass (saved|grew the wire) \d+ tok; waiting for refill \(200\/5000 tok newly aged\) — over 1\.15x cap, overshoot retry in 45s$/,
+		);
+
+		clock.t += OVERSHOOT_COOLDOWN_MS;
+		host.queueCompletion({ text: SUMMARY_B });
+		await host.commitTurn();
+		await flush();
+		expect(host.completeLog).toHaveLength(3);
+		expect(host.statusLog.some((s) => /^Triptych overshoot un-latch: visible \d+ tok ≥ 1\.15x cap 6000; re-summarizing despite back-off$/.test(s.text ?? ""))).toBe(true);
+		const prompt = host.completeLog[2].prompt;
+		expect(prompt).toContain("<previous-summary>");
+		expect(prompt).toContain("NEW-23");
+		expect(prompt).not.toContain("NEW-24"); // 34 blocks → bottom band [24, 34)
+		expect(host.truth.liveTokens()).toBeLessThan(BUDGET);
 	});
 });
