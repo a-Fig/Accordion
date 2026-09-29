@@ -599,6 +599,34 @@ describe("keel-lite · monotonicity and robustness", () => {
 		expect(host.txns).toHaveLength(0);
 		expect(host.statusLog.at(-1)).toEqual({ text: null, metrics: undefined });
 	});
+
+	it("a throw while reconciling an applied epoch does not leave it stuck busy", async () => {
+		const { s } = thinkBashSession(12);
+		const host = setup(s, { budgetFactor: 0.9 });
+		let failNext = true;
+		const setStatus = host.setStatus.bind(host);
+		host.setStatus = (text, metrics) => {
+			if (failNext && text !== null) {
+				failNext = false;
+				throw new Error("status sink down");
+			}
+			setStatus(text, metrics);
+		};
+		new KeelLiteConductor().attach(host);
+		// Epoch 1 applies, then its status publish throws (the host's event pump absorbs the rejection).
+		await host.commitTurn();
+		expect(failNext).toBe(false);
+		expect(host.txns).toHaveLength(1);
+		// Grow until keel-lite has to act again. A stuck `busy` would only ever set `pending`.
+		for (let i = 0; i < 12 && host.txns.length < 2; i++) {
+			s.step({ think: thought(2000, 900 + i), calls: [bash(`again ${i}`, lines(20, 40, `again${i}`))] });
+			s.flush(host);
+			await host.commitTurn();
+			expect(host.stats().liveTokens).toBeLessThan(highOf(host));
+		}
+		expect(host.txns).toHaveLength(2);
+		expect(String(host.statusLog.at(-1)?.text)).toMatch(/^epoch 2 /);
+	});
 });
 
 describe("keel-lite · registry", () => {
