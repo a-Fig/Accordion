@@ -113,6 +113,11 @@ state locally, in-process, immediately before the model call: there's no GUI rou
 no timeout to tune, because the state the extension already holds *is* the state applied,
 synchronously, every time.
 
+A conductor's out-of-band completion calls (the LLM calls it makes to summarize or hand off
+context) never appear on the `context` hook path. If you need their cost/usage for external
+accounting, set `ACCORDION_COMPLETION_LOG=<path>` and the extension appends one JSON line
+per completion (success or failure) to that file.
+
 ## Skills included
 
 This package registers two pi skills the agent uses to interact with folded context:

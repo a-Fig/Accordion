@@ -633,12 +633,28 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	}
 
 	/**
+	 * Fire-and-forget append of one JSON line to `ACCORDION_COMPLETION_LOG`, when set. This is the
+	 * only place `runCompletion` records the usage/cost of an out-of-band completion — protocol v22
+	 * gives conductors only `CompletionResult { text, model, inputTokens?, outputTokens? }`, so
+	 * without this side-log a conductor's spend is invisible to anything summing `host.jsonl` (e.g.
+	 * bellows' collector). NEVER on the `context` hook path (disk I/O is fine here — see the doc
+	 * comment on `runCompletion` below) and must never throw into, delay, or alter the completion
+	 * result: every error is swallowed, and the write is not awaited by the caller.
+	 */
+	function logCompletion(line: Record<string, unknown>): void {
+		const target = process.env.ACCORDION_COMPLETION_LOG;
+		if (typeof target !== "string" || target.length === 0) return;
+		void fs.promises.appendFile(target, JSON.stringify(line) + "\n").catch(() => {});
+	}
+
+	/**
 	 * The out-of-band completion executor (ported from dc037bc's completeRequest handler): resolve
 	 * the live model's API key, lazily import pi-ai, clamp `maxOutputTokens` to the model's ceiling,
 	 * and race the provider call against an abortable timeout. NEVER on the `context` hook path — the
 	 * conductor awaits it off to the side. A process-wide semaphore bounds concurrent spend.
 	 */
 	async function runCompletion(req: CompletionRequest, signal: AbortSignal): Promise<CompletionResult> {
+		const startedAt = Date.now();
 		if (typeof req.prompt !== "string" || req.prompt.length === 0) throw new Error("missing or empty prompt");
 		if (req.maxOutputTokens !== undefined && (!Number.isSafeInteger(req.maxOutputTokens) || req.maxOutputTokens <= 0))
 			throw new Error("maxOutputTokens must be a positive safe integer");
@@ -663,10 +679,14 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		// not let spend accounting reopen a slot while its call is still burning tokens (issue: the
 		// `finally` fires when Promise.race settles, i.e. on timeout BEFORE providerCall settles).
 		let providerSettlement: Promise<void> | null = null;
+		// Captured once a model is resolved so the catch block's failure line can report the same
+		// provider/model a success line would have, when available.
+		let mForLog: any = null;
 		try {
 			const ctx = latestCtx;
 			const m = latestModelObj ?? (ctx?.model as any);
 			if (!ctx || !m) throw new Error("no model available");
+			mForLog = m;
 			const auth = await Promise.race([(ctx as any).modelRegistry.getApiKeyAndHeaders(m), deadline]);
 			if (!auth?.ok) throw new Error(`could not resolve API key: ${auth?.error ?? "unknown"}`);
 			const complete: CompletionFunction = dependencies.complete ?? (await Promise.race([import("@earendil-works/pi-ai" as any), deadline])).complete;
@@ -686,12 +706,37 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 			let text = "";
 			if (Array.isArray(result.content))
 				text = result.content.filter((p: any) => p?.type === "text").map((p: any) => (typeof p?.text === "string" ? p.text : "")).join("");
+			const usage = result.usage as { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; cost?: { total?: number } } | undefined;
+			logCompletion({
+				t: "complete",
+				at: startedAt,
+				conductor: liveHost.activeMeta()?.id ?? null,
+				provider: m.provider,
+				model: result.model ?? m.id,
+				input: typeof usage?.input === "number" ? usage.input : null,
+				output: typeof usage?.output === "number" ? usage.output : null,
+				cacheRead: typeof usage?.cacheRead === "number" ? usage.cacheRead : null,
+				cacheWrite: typeof usage?.cacheWrite === "number" ? usage.cacheWrite : null,
+				costUsd: typeof usage?.cost?.total === "number" ? usage.cost.total : null,
+				ms: Date.now() - startedAt,
+			});
 			return {
 				text,
 				model: result.model,
 				inputTokens: typeof result.usage?.input === "number" ? result.usage.input : undefined,
 				outputTokens: typeof result.usage?.output === "number" ? result.usage.output : undefined,
 			};
+		} catch (err) {
+			logCompletion({
+				t: "complete",
+				at: startedAt,
+				conductor: liveHost.activeMeta()?.id ?? null,
+				provider: mForLog?.provider ?? null,
+				model: mForLog?.id ?? null,
+				error: err instanceof Error ? err.message : String(err),
+				ms: Date.now() - startedAt,
+			});
+			throw err;
 		} finally {
 			if (timer) clearTimeout(timer);
 			signal.removeEventListener("abort", onAbort);
