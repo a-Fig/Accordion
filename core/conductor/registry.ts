@@ -147,10 +147,8 @@ export function keelLiteOptionsFromEnv(env?: Record<string, string | undefined>)
  * `keelLiteOptionsFromEnv` above): `ACCORDION_KEEL_NOTE_MAX_TOKENS` (the note's hard cap, integer
  * ≥ 64, default 600), `ACCORDION_KEEL_NOTE_MIN_DROPPED_TOKENS` (pending trimmed-span tokens that
  * start a note call, integer ≥ 0, default 8000), `ACCORDION_KEEL_NOTE_FALLBACK_TURNS` (call after
- * this many turns with no call, integer ≥ 1, default 30), `ACCORDION_KEEL_NOTE_MAX_STALE_TURNS`
- * (a finished note waits at most this many turns for a trim to land with, integer ≥ 1, default
- * 40) and `ACCORDION_KEEL_NOTE_SPAN_TOKENS` (the pending-span bound, integer ≥ 500, default
- * 12000). An unparseable or out-of-range value is ignored (`undefined`, so that knob keeps its
+ * this many turns with no call, integer ≥ 1, default 30) and `ACCORDION_KEEL_NOTE_SPAN_TOKENS`
+ * (the pending-span bound, integer ≥ 500, default 12000). An unparseable or out-of-range value is ignored (`undefined`, so that knob keeps its
  * default). Exported for tests.
  */
 export function keelNoteOptionsFromEnv(env?: Record<string, string | undefined>): KeelNoteOptions {
@@ -165,7 +163,6 @@ export function keelNoteOptionsFromEnv(env?: Record<string, string | undefined>)
 		noteMaxTokens: int(source.ACCORDION_KEEL_NOTE_MAX_TOKENS, 64),
 		minDroppedTokens: int(source.ACCORDION_KEEL_NOTE_MIN_DROPPED_TOKENS, 0),
 		fallbackTurns: int(source.ACCORDION_KEEL_NOTE_FALLBACK_TURNS, 1),
-		maxStaleTurns: int(source.ACCORDION_KEEL_NOTE_MAX_STALE_TURNS, 1),
 		spanMaxTokens: int(source.ACCORDION_KEEL_NOTE_SPAN_TOKENS, 500),
 	};
 }

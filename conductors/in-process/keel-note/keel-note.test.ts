@@ -12,7 +12,7 @@ import { hasOwnFoldTag } from "../../../core/digest";
 import { entryById, keelNoteOptionsFromEnv } from "../../../core/conductor/registry";
 import type { Block } from "../../../core/types";
 import type { Op, TxnResult } from "../../../core/ops";
-import type { CompletionRequest, CompletionResult } from "../../../core/conductor/contract";
+import type { CompletionRequest, CompletionResult, ViewBlock } from "../../../core/conductor/contract";
 
 // ── session builder ─────────────────────────────────────────────────────────────────────────
 
@@ -79,14 +79,29 @@ function lines(n: number, width = 40, tag = "out"): string {
 }
 const bash = (command: string, out: string): Call => ({ tool: "bash", args: { command }, out });
 
-/** A SlopCode-shaped start: the task, a one-line first thought (the carrier), then `n` big steps. */
-function session(n: number): { s: Session; carrier: string; steps: StepIds[] } {
+/** How big a step's thought is (chars), how many output lines its bash result has, what it says. */
+interface Shape {
+	think: number;
+	out: number;
+	say?: (i: number) => string;
+}
+/**
+ * SlopCode-like steps, thinking ~2/3 of the mass. Every epoch has to shed more than the new
+ * thinking alone, so it folds ALL live thinking outside the protected tail and the note waits at
+ * the tail edge (the steady state of the real replays too).
+ */
+const SLOP: Shape = { think: 2000, out: 20 };
+/** Thinking-heavy steps: an epoch leaves live thinking behind, so there is a boundary block. */
+const DEEP: Shape = { think: 4000, out: 3 };
+
+/** The task, a one-line first thought, then `n` steps of `shape`. */
+function session(n: number, shape: Shape = SLOP): { s: Session; steps: StepIds[] } {
 	const s = new Session();
 	s.user("Read AGENT_BRIEFING.md and complete the benchmark run it describes.");
-	const carrier = s.step({ think: "Let me start by reading the briefing file.", calls: [bash("pwd && ls -la", lines(3, 20, "ls"))] }).think!;
+	s.step({ think: "Let me start by reading the briefing file.", calls: [bash("pwd && ls -la", lines(3, 20, "ls"))] });
 	const steps: StepIds[] = [];
-	for (let i = 0; i < n; i++) steps.push(s.step({ think: thought(2000, i), calls: [bash(`python run.py --case ${i}`, lines(20, 40, `case${i}`))] }));
-	return { s, carrier, steps };
+	for (let i = 0; i < n; i++) steps.push(s.step({ think: thought(shape.think, i), say: shape.say?.(i), calls: [bash(`python run.py --case ${i}`, lines(shape.out, 40, `case${i}`))] }));
+	return { s, steps };
 }
 
 /** A plausible model note, ~`bullets`×2 history lines. */
@@ -100,11 +115,8 @@ function noteBody(tag: string, bullets = 3): string {
 	return out.join("\n");
 }
 
-/**
- * The pre-batching behavior: call on every trim, land at the next turn boundary. Tests about the
- * note's own mechanics use it so each trim yields one call and each settled call one landing.
- */
-const EAGER = { minDroppedTokens: 0, maxStaleTurns: 1 } as const;
+/** Call on every trim, so each trim yields one call. Tests about the note's own mechanics use it. */
+const EAGER = { minDroppedTokens: 0 } as const;
 
 // ── host ────────────────────────────────────────────────────────────────────────────────────
 
@@ -115,13 +127,22 @@ interface Pending {
 	settled: boolean;
 }
 
+interface Txn {
+	ops: Op[];
+	res: TxnResult;
+	/** `probe()` just before the transaction was proposed (the tests record the note's carrier). */
+	carrierBefore: string | null;
+}
+
 /** Records every transaction; every `complete` waits until the test settles it by hand. */
 class NoteHost extends TestHost {
-	readonly txns: Array<{ ops: Op[]; res: TxnResult }> = [];
+	readonly txns: Txn[] = [];
 	readonly calls: Pending[] = [];
+	probe: (() => string | null) | null = null;
 	override async propose(txn: { baseRev: number; ops: Op[] }): Promise<TxnResult> {
+		const carrierBefore = this.probe?.() ?? null;
 		const res = await super.propose(txn);
-		this.txns.push({ ops: txn.ops, res });
+		this.txns.push({ ops: txn.ops, res, carrierBefore });
 		return res;
 	}
 	override complete(req: CompletionRequest): Promise<CompletionResult> {
@@ -142,16 +163,17 @@ class NoteHost extends TestHost {
 			this.calls.push(p);
 		});
 	}
-	/** keel-lite's epochs (everything but our non-recoverable note landings). */
-	epochs(): Array<{ ops: Op[]; res: TxnResult }> {
-		return this.txns.filter((t) => !t.ops.every(isLanding));
+	/** keel-lite's epochs (everything but our note placements). */
+	epochs(): Txn[] {
+		return this.txns.filter((t) => !isPlacement(t));
 	}
-	landings(): Array<{ ops: Op[]; res: TxnResult }> {
-		return this.txns.filter((t) => t.ops.every(isLanding) && t.res.results[0]?.applied);
+	/** Applied note placements (a non-recoverable replace, plus the old carrier's release). */
+	landings(): Txn[] {
+		return this.txns.filter((t) => isPlacement(t) && t.res.results[0]?.applied);
 	}
 }
 
-const isLanding = (op: Op) => op.kind === "replace" && op.recoverable === false;
+const isPlacement = (t: { ops: Op[] }) => t.ops[0]?.kind === "replace" && t.ops[0].recoverable === false;
 
 function setup(s: Session, opts: { protect?: number; budgetFactor?: number; budget?: number } = {}): NoteHost {
 	const host = new NoteHost();
@@ -163,7 +185,7 @@ function setup(s: Session, opts: { protect?: number; budgetFactor?: number; budg
 
 const tick = () => new Promise<void>((r) => setTimeout(r, 0));
 /** Let settled note calls run their continuations (never waits for an unsettled call). */
-async function settle(_c?: KeelNoteConductor): Promise<void> {
+async function settle(): Promise<void> {
 	for (let i = 0; i < 3; i++) await tick();
 }
 const costOf = (host: TestHost, id: string | null) => {
@@ -178,29 +200,87 @@ const lowOf = (host: TestHost) => KEEL_LITE_DEFAULTS.low * host.stats().budget;
 const opIds = (op: Op): string[] => (op.kind === "fold" || op.kind === "group" ? op.ids : op.kind === "replace" ? [op.id] : []);
 const turnsOf = (req: CompletionRequest) => req.prompt.slice(req.prompt.indexOf("<my-earlier-turns>"), req.prompt.indexOf("</my-earlier-turns>"));
 const prevOf = (req: CompletionRequest) => req.prompt.slice(req.prompt.indexOf("<previous-notes>"), req.prompt.indexOf("</previous-notes>"));
+const metricsOf = (host: TestHost) => host.statusLog.at(-1)?.metrics ?? {};
 
-/** Add one big step and commit the turn. */
-async function grow(host: NoteHost, s: Session, seed: number, thinkChars = 2000): Promise<StepIds> {
-	const st = s.step({ think: thought(thinkChars, seed), calls: [bash(`python run.py --case ${seed}`, lines(20, 40, `grow${seed}`))] });
+/** Ids of the blocks currently showing a note (folded, with the note header in their substitution). */
+const showingNote = (host: TestHost) => host.blocks().filter((b) => b.folded && (substOf(host, b.id) ?? "").includes(NOTE_HEADER)).map((b) => b.id);
+
+/** Positions (block order) an epoch actually changed. */
+function changedOrders(host: TestHost, t: Txn): number[] {
+	const out: number[] = [];
+	for (const r of t.res.results) {
+		if (!r.applied) continue;
+		const ids = r.perId ? r.perId.filter((p) => p.applied).map((p) => p.id) : opIds(r.op);
+		for (const id of ids) {
+			const b = host.get(id);
+			if (b) out.push(b.order);
+		}
+	}
+	return out;
+}
+
+/**
+ * Where the spec puts the note, computed from the view alone: the first usable block (thinking,
+ * the carrier itself, or live text ≤ 150 tokens) after the BOUNDARY, the oldest live thinking
+ * outside the tail that a fold would shrink; with no such block, the last usable block before the
+ * tail.
+ */
+function specCarrier(host: TestHost, carrierId: string | null): { id: string; tail: boolean } | null {
+	const blocks = host.blocks();
+	const first = blocks.findIndex((b) => b.kind === "user");
+	const pfi = Math.min(host.stats().protectedFromIndex, blocks.length);
+	const inGroup = new Set(host.groups().flatMap((g) => g.memberIds));
+	const free = (b: ViewBlock) => !b.held && !b.grouped && !b.protected && !inGroup.has(b.id);
+	const usable = (b: ViewBlock) => free(b) && (b.kind === "thinking" || (b.kind === "text" && (b.id === carrierId || (!b.folded && b.tokens <= 150))));
+	const boundary = blocks.findIndex((b, i) => i > first && i < pfi && b.kind === "thinking" && !b.folded && free(b) && b.tokens > b.foldedTokens);
+	if (boundary >= 0) for (let i = boundary + 1; i < pfi; i++) if (usable(blocks[i])) return { id: blocks[i].id, tail: false };
+	for (let i = pfi - 1; i > first; i--) if (usable(blocks[i])) return { id: blocks[i].id, tail: true };
+	return null;
+}
+
+/** Add one step and commit the turn. */
+async function grow(host: NoteHost, s: Session, seed: number, thinkChars = 2000, shape: Shape = SLOP): Promise<StepIds> {
+	const st = s.step({ think: thought(thinkChars, seed), say: shape.say?.(seed), calls: [bash(`python run.py --case ${seed}`, lines(shape.out, 40, `grow${seed}`))] });
 	s.flush(host);
 	await host.commitTurn();
 	return st;
 }
 
-/** Grow until keel-lite runs another epoch (bounded). */
-async function growUntilEpoch(host: NoteHost, s: Session, seed: number): Promise<number> {
+/** Grow until keel-lite runs another epoch (bounded), then let the note's continuations run. */
+async function growUntilEpoch(host: NoteHost, s: Session, seed: number, shape: Shape = SLOP): Promise<number> {
 	const before = host.epochs().length;
 	let n = 0;
-	while (host.epochs().length === before && n < 60) await grow(host, s, seed + n++);
+	while (host.epochs().length === before && n < 60) {
+		await grow(host, s, seed + n, shape.think, shape);
+		n++;
+	}
 	expect(host.epochs().length).toBeGreaterThan(before);
+	await settle();
 	return seed + n;
+}
+
+/** A DEEP session with a first note (`tag`) resolved and placed by the second trim. */
+async function withLandedNote(opts: ConstructorParameters<typeof KeelNoteConductor>[0] = EAGER, tag = "A") {
+	const { s, steps } = session(40, DEEP);
+	const host = setup(s, { budgetFactor: 0.9 });
+	const c = new KeelNoteConductor(opts);
+	host.probe = () => c.noteState.carrierId;
+	c.attach(host);
+	await host.commitTurn(); // epoch 1 → call 1; nothing to place yet
+	host.calls[0].resolve({ text: noteBody(tag) });
+	await settle();
+	const seed = await growUntilEpoch(host, s, 2000, DEEP); // epoch 2 places it
+	expect(host.landings()).toHaveLength(1);
+	const id = c.noteState.carrierId!;
+	expect(specCarrier(host, id)).toEqual({ id, tail: false });
+	return { s, steps, host, c, seed };
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────────────────────
 
 describe("keel-note · budget reserve", () => {
-	it("reserves the note inside keel-lite's budget math before any note exists", async () => {
-		// live = 84% of budget: keel-lite alone says nothing; with a ~590-token reserve keel-note trims.
+	it("reserves the whole cap inside keel-lite's budget math before any note exists", async () => {
+		// live = 84% of budget: keel-lite alone says nothing; with the 600-token reserve keel-note trims.
 		const a = session(12);
 		const plain = setup(a.s, { budgetFactor: 0.84 });
 		new KeelLiteConductor().attach(plain);
@@ -211,31 +291,17 @@ describe("keel-note · budget reserve", () => {
 		const host = setup(b.s, { budgetFactor: 0.84 });
 		const c = new KeelNoteConductor();
 		c.attach(host);
-		expect(c.noteState.carrierId).toBe(b.carrier);
-		expect(host.stats().liveTokens + reserveOf(host, c)).toBeGreaterThanOrEqual(highOf(host));
+		expect(c.noteState.carrierId).toBeNull();
+		expect(reserveOf(host, c)).toBe(KEEL_NOTE_DEFAULTS.noteMaxTokens);
+		expect(effOf(host, c)).toBeGreaterThanOrEqual(highOf(host));
 		await host.commitTurn();
 		expect(host.epochs()).toHaveLength(1);
 		expect(effOf(host, c)).toBeLessThanOrEqual(lowOf(host));
-		// The carrier still holds its original one-line thought: no note yet, nothing inserted.
-		expect(host.get(b.carrier)!.folded).toBe(false);
+		expect(host.landings()).toHaveLength(0); // no note yet, nothing written anywhere
+		expect(showingNote(host)).toEqual([]);
 	});
 
-	it("keel-lite never folds, trims or groups the carrier, even under a brutal budget", async () => {
-		const { s, carrier } = session(20);
-		const host = setup(s, { protect: 300 });
-		host.setBudget(Math.ceil(host.stats().liveTokens / 15)); // every rung, groups included
-		const c = new KeelNoteConductor();
-		c.attach(host);
-		await host.commitTurn();
-		const ops = host.epochs().flatMap((t) => t.ops);
-		expect(ops.some((o) => o.kind === "group")).toBe(true);
-		for (const op of ops) expect(opIds(op)).not.toContain(carrier);
-		expect(host.get(carrier)!.folded).toBe(false);
-		expect(host.get(carrier)!.grouped).toBe(false);
-		expect(host.groups().some((g) => g.memberIds.includes(carrier))).toBe(false);
-	});
-
-	it("holds real + reserve under HIGH after every turn of a long run with late-landing notes", async () => {
+	it("holds real + reserve under HIGH after every turn of a long run, and the note never drops out", async () => {
 		const { s } = session(12);
 		const host = setup(s, { budgetFactor: 0.9 });
 		const c = new KeelNoteConductor();
@@ -245,18 +311,18 @@ describe("keel-note · budget reserve", () => {
 		let seen = 0;
 		let landedTurns = 0;
 		for (let t = 0; t < 90; t++) {
-			// Settle every call 2 turns after it was made (the note lands one turn after that).
+			// Settle every call 2 turns after it was made (the note then waits for the next trim).
 			for (const p of host.calls.slice(seen)) due.set(p, t + 2);
 			seen = host.calls.length;
 			for (const [p, when] of due) if (when <= t && !p.settled) p.resolve({ text: noteBody(`n${t}`, 6), inputTokens: 5000, outputTokens: 450 });
-			await settle(c);
+			await settle();
 			await grow(host, s, 100 + t, 1200 + (t % 5) * 900);
-			await settle(c);
+			await settle();
 
-			const carrierCost = costOf(host, c.noteState.carrierId);
 			if (c.noteState.body !== null) {
 				landedTurns++;
-				expect(carrierCost).toBeLessThanOrEqual(KEEL_NOTE_DEFAULTS.noteMaxTokens);
+				expect(costOf(host, c.noteState.carrierId)).toBeLessThanOrEqual(KEEL_NOTE_DEFAULTS.noteMaxTokens);
+				expect(showingNote(host)).toEqual([c.noteState.carrierId]); // exactly one copy, in context
 			}
 			// keel-lite's post-turn guarantee, applied to the reserved context…
 			expect(effOf(host, c)).toBeLessThan(highOf(host));
@@ -266,93 +332,9 @@ describe("keel-note · budget reserve", () => {
 		expect(host.epochs().length).toBeGreaterThan(5);
 		expect(host.landings().length).toBeGreaterThan(2);
 		expect(landedTurns).toBeGreaterThan(40);
+		expect(metricsOf(host)).toMatchObject({ note_reasserts: 0 });
 		expect(String(host.statusLog.at(-1)?.text)).not.toMatch(/saturated/);
 	}, 60_000);
-
-	it("a note landing right after a trim does not move the budget math or trigger an epoch", async () => {
-		const { s, carrier } = session(12);
-		const host = setup(s, { budgetFactor: 0.9 });
-		const c = new KeelNoteConductor(EAGER);
-		c.attach(host);
-		await host.commitTurn(); // epoch 1 → note call 1
-		expect(host.epochs()).toHaveLength(1);
-		expect(host.calls).toHaveLength(1);
-		// Push to just under HIGH (the worst case for a landing), with the note still in flight.
-		while (effOf(host, c) < highOf(host) - 700) await grow(host, s, 50, 400);
-		const epochsBefore = host.epochs().length;
-		const realBefore = host.stats().liveTokens;
-		const effBefore = effOf(host, c);
-		expect(effBefore).toBeLessThan(highOf(host));
-
-		host.calls[0].resolve({ text: noteBody("late", 8) });
-		await settle(c);
-		await host.commitTurn(); // the landing turn: no new blocks
-		expect(host.landings()).toHaveLength(1);
-		expect(host.epochs()).toHaveLength(epochsBefore); // the landing alone never forces an epoch
-		expect(host.stats().liveTokens).toBeGreaterThan(realBefore); // the note is bigger than the old thought…
-		expect(Math.abs(effOf(host, c) - effBefore)).toBeLessThanOrEqual(2); // …but it was already reserved
-		expect(substOf(host, carrier)!.startsWith(NOTE_HEADER)).toBe(true);
-	});
-
-	it("when a landing and an epoch share a turn, the epoch sees the landed note", async () => {
-		const { s } = session(12);
-		const host = setup(s, { budgetFactor: 0.9 });
-		const c = new KeelNoteConductor(EAGER);
-		c.attach(host);
-		await host.commitTurn();
-		host.calls[0].resolve({ text: noteBody("shared", 8) });
-		await settle(c);
-		// A huge step crosses HIGH in the same turn the note lands.
-		const before = host.epochs().length;
-		s.step({ think: thought(9000, 7), calls: [bash("pytest -q", lines(60, 40, "big"))] });
-		s.flush(host);
-		await host.commitTurn();
-		await settle(c);
-		expect(host.landings()).toHaveLength(1);
-		expect(host.epochs().length).toBeGreaterThan(before);
-		expect(effOf(host, c)).toBeLessThanOrEqual(lowOf(host) + 1);
-	});
-
-	it("by default a finished note waits for the next trim and lands in the same request", async () => {
-		const { s, carrier } = session(12);
-		const host = setup(s, { budgetFactor: 0.9 });
-		const c = new KeelNoteConductor({ minDroppedTokens: 0 }); // the first trim calls
-		c.attach(host);
-		await host.commitTurn(); // epoch 1 → note call 1
-		host.calls[0].resolve({ text: noteBody("held", 4) });
-		await settle(c);
-		await grow(host, s, 60, 200); // a turn boundary with no epoch: the note waits
-		expect(host.epochs()).toHaveLength(1);
-		expect(host.landings()).toHaveLength(0);
-		expect(c.noteState.ready).toBe(true);
-		await growUntilEpoch(host, s, 61);
-		await settle(c);
-		// It landed right after the epoch's transaction, before the next request departs…
-		expect(host.landings()).toHaveLength(1);
-		const landingIdx = host.txns.indexOf(host.landings()[0]);
-		expect(host.txns.indexOf(host.epochs().at(-1)!)).toBe(landingIdx - 1);
-		expect(substOf(host, carrier)!.startsWith(NOTE_HEADER)).toBe(true);
-		// …and inside the room keel-lite had already reserved for it.
-		expect(effOf(host, c)).toBeLessThanOrEqual(lowOf(host) + 1);
-		expect(host.statusLog.at(-1)?.metrics).toMatchObject({ note_refreshes: 1, note_stale_landings: 0 });
-	});
-
-	it("a note with no trim in sight lands after maxStaleTurns turn boundaries", async () => {
-		const { s, carrier } = session(12);
-		const host = setup(s, { budgetFactor: 0.9 });
-		const c = new KeelNoteConductor({ minDroppedTokens: 0, maxStaleTurns: 3 });
-		c.attach(host);
-		await host.commitTurn();
-		host.calls[0].resolve({ text: noteBody("stale", 4) });
-		await settle(c);
-		for (let t = 0; t < 2; t++) await grow(host, s, 200 + t, 200);
-		expect(host.landings()).toHaveLength(0);
-		await grow(host, s, 202, 200);
-		expect(host.epochs()).toHaveLength(1); // no second trim came
-		expect(host.landings()).toHaveLength(1);
-		expect(substOf(host, carrier)).toContain("stale-NEXT");
-		expect(host.statusLog.at(-1)?.metrics).toMatchObject({ note_refreshes: 1, note_stale_landings: 1 });
-	});
 
 	it("batches trims: a call starts only once minDroppedTokens of trimmed text is pending", async () => {
 		const { s, steps } = session(12);
@@ -379,14 +361,202 @@ describe("keel-note · budget reserve", () => {
 		expect(host.countTokens(turns)).toBeGreaterThanOrEqual(6000);
 		expect(host.countTokens(turns)).toBeLessThanOrEqual(KEEL_NOTE_DEFAULTS.spanMaxTokens + 50);
 		expect(c.noteState.pendingSpanTokens).toBe(0);
-		expect(host.statusLog.at(-1)?.metrics).toMatchObject({ note_calls: 1 });
-		expect(Number(host.statusLog.at(-1)?.metrics?.note_trims_seen)).toBe(host.epochs().length);
+		expect(metricsOf(host)).toMatchObject({ note_calls: 1 });
+		expect(Number(metricsOf(host).note_trims_seen)).toBe(host.epochs().length);
+	});
+});
+
+describe("keel-note · boundary placement", () => {
+	it("a finished note never lands without a trim, however long it waits", async () => {
+		const { s } = session(12);
+		const host = setup(s, { budgetFactor: 0.9 });
+		const c = new KeelNoteConductor(EAGER);
+		c.attach(host);
+		await host.commitTurn(); // epoch 1 → call 1
+		host.calls[0].resolve({ text: noteBody("held", 4) });
+		await settle();
+		for (let t = 0; t < 12; t++) await host.commitTurn(); // turn boundaries, no epoch
+		expect(host.epochs()).toHaveLength(1);
+		expect(host.landings()).toHaveLength(0);
+		expect(c.noteState.ready).toBe(true);
+		const epochsBefore = host.epochs().length;
+		await growUntilEpoch(host, s, 100);
+		// It landed as the very next transaction after the epoch, before any request departs…
+		expect(host.landings()).toHaveLength(1);
+		expect(host.epochs()).toHaveLength(epochsBefore + 1); // …without forcing an epoch of its own…
+		expect(host.txns.indexOf(host.landings()[0])).toBe(host.txns.indexOf(host.epochs().at(-1)!) + 1);
+		expect(substOf(host, c.noteState.carrierId!)).toContain("held-NEXT");
+		// …and inside the room keel-lite had already reserved for it.
+		expect(effOf(host, c)).toBeLessThanOrEqual(lowOf(host) + 1);
+		expect(metricsOf(host)).toMatchObject({ note_refreshes: 1, note_placements: 1, note_moves: 0 });
+	});
+
+	it("after every trim the note sits just past the boundary, and the next trim starts before it", async () => {
+		const { s } = session(40, DEEP);
+		const host = setup(s, { budgetFactor: 0.9 });
+		const c = new KeelNoteConductor(EAGER);
+		host.probe = () => c.noteState.carrierId;
+		c.attach(host);
+		await host.commitTurn(); // epoch 1 → call 1
+		let seed = 1000;
+		for (let n = 0; n < 8; n++) {
+			for (const p of host.calls) if (!p.settled) p.resolve({ text: noteBody(`e${n}`) });
+			await settle();
+			const epochs = host.epochs().length;
+			seed = await growUntilEpoch(host, s, seed, DEEP);
+			expect(host.epochs()).toHaveLength(epochs + 1);
+			// The note (the one that was waiting) is on the first usable block past the boundary.
+			const id = c.noteState.carrierId!;
+			expect(specCarrier(host, id)).toEqual({ id, tail: false });
+			expect(substOf(host, id)).toContain(`e${n}-NEXT`);
+			expect(showingNote(host)).toEqual([id]);
+			// The move keeps the budget math where the epoch left it (a digest of slack at most).
+			expect(effOf(host, c)).toBeLessThanOrEqual(lowOf(host) + 40);
+			expect(host.stats().liveTokens).toBeLessThanOrEqual(effOf(host, c));
+		}
+		// Every epoch after the first placement started strictly before the carrier it found, so
+		// rewriting that carrier re-billed nothing the epoch did not already re-bill.
+		const later = host.epochs().filter((t) => t.carrierBefore !== null);
+		expect(later.length).toBeGreaterThanOrEqual(7);
+		for (const t of later) {
+			expect(t.ops.flatMap(opIds)).not.toContain(t.carrierBefore); // keel-lite never touched it
+			expect(Math.min(...changedOrders(host, t))).toBeLessThan(host.get(t.carrierBefore!)!.order);
+		}
+		// Each placement rode in the same request as its epoch: the very next transaction.
+		for (const l of host.landings()) expect(host.epochs()).toContain(host.txns[host.txns.indexOf(l) - 1]);
+		expect(metricsOf(host)).toMatchObject({ note_placements: 8, note_refreshes: 8, note_moves: 7, note_tail_placements: 0, note_reasserts: 0 });
+	});
+
+	it("with no new note, every trim still moves the current note forward: it is never lost", async () => {
+		const { s, host, c } = await withLandedNote(EAGER, "K");
+		let seed = 3000;
+		// Call 2 (kicked by epoch 2) is never answered, so no new note arrives.
+		const carriers = [c.noteState.carrierId!];
+		for (let n = 0; n < 5; n++) {
+			seed = await growUntilEpoch(host, s, seed, DEEP);
+			const id = c.noteState.carrierId!;
+			expect(id).not.toBe(carriers.at(-1));
+			carriers.push(id);
+			expect(showingNote(host)).toEqual([id]); // exactly one copy, on the new carrier
+			expect(substOf(host, id)).toContain("K-NEXT"); // the same note, re-placed unchanged
+			for (const old of carriers.slice(0, -1)) {
+				// A former thinking carrier is folded to its engine digest, like its neighbours.
+				expect(host.get(old)!.folded).toBe(true);
+				expect(substOf(host, old) ?? "").not.toContain(NOTE_HEADER);
+			}
+		}
+		expect(host.calls).toHaveLength(2);
+		expect(metricsOf(host)).toMatchObject({ note_refreshes: 1, note_placements: 6, note_moves: 5, note_reasserts: 0 });
+	});
+
+	it("keel-lite never folds, trims or groups the carrier, even under a brutal budget", async () => {
+		const { host, c } = await withLandedNote(EAGER, "B");
+		host.setBudget(Math.ceil(host.stats().liveTokens / 15)); // every rung, groups included
+		await host.commitTurn();
+		await settle();
+		const brutal = host.epochs().slice(2);
+		expect(brutal.flatMap((t) => t.ops).some((o) => o.kind === "group")).toBe(true);
+		for (const t of brutal) for (const op of t.ops) expect(opIds(op)).not.toContain(t.carrierBefore);
+		const id = c.noteState.carrierId!;
+		expect(host.get(id)!.grouped).toBe(false);
+		expect(host.groups().some((g) => g.memberIds.includes(id))).toBe(false);
+		expect(showingNote(host)).toEqual([id]);
+		expect(substOf(host, id)).toContain("B-NEXT");
+	});
+
+	it("with no live thinking left outside the tail, the note waits on the last usable block before it", async () => {
+		const { s } = session(12);
+		const host = setup(s, { protect: 300 });
+		host.setBudget(Math.ceil(host.stats().liveTokens / 2)); // epoch 1 folds every thinking block
+		const c = new KeelNoteConductor(EAGER);
+		c.attach(host);
+		await host.commitTurn();
+		expect(specCarrier(host, null)?.tail).toBe(true); // (the premise)
+		host.calls[0].resolve({ text: noteBody("T") });
+		await settle();
+		await growUntilEpoch(host, s, 4000);
+		const id = c.noteState.carrierId!;
+		expect(specCarrier(host, id)).toEqual({ id, tail: true });
+		expect(host.get(id)!.protected).toBe(false);
+		expect(showingNote(host)).toEqual([id]);
+		expect(Number(metricsOf(host).note_tail_placements)).toBeGreaterThanOrEqual(1);
+		// Here the next trim starts at the first block to leave the tail, AFTER the carrier: moving
+		// the note re-bills the carrier's own tool calls and results (the replay measures this gap).
+		const pfi = host.stats().protectedFromIndex;
+		const between = host.blocks().slice(host.blocks().findIndex((b) => b.id === id) + 1, pfi);
+		expect(between.every((b) => b.kind === "tool_call" || b.kind === "tool_result")).toBe(true);
+	});
+
+	it("a small text block past the boundary keeps its words, and gets them back when the note moves on", async () => {
+		const shape: Shape = { ...DEEP, say: (i) => `Step ${i}: running case ${i}.` };
+		const { s, steps } = session(40, shape);
+		const host = setup(s, { budgetFactor: 0.9 });
+		const c = new KeelNoteConductor(EAGER);
+		c.attach(host);
+		await host.commitTurn();
+		host.calls[0].resolve({ text: noteBody("T") });
+		await settle();
+		let seed = await growUntilEpoch(host, s, 5000, shape);
+		const first = c.noteState.carrierId!;
+		const step = steps.find((st) => st.say === first);
+		expect(step).toBeTruthy(); // the text of the boundary thought's own message
+		expect(host.get(step!.think!)!.folded).toBe(false); // the boundary itself: the next trim folds it
+		const words = host.truth.get(first)!.text;
+		const landed = substOf(host, first)!;
+		expect(landed.startsWith(`${words}\n\n${NOTE_HEADER}\n`)).toBe(true);
+		expect(landed).toContain("T-NEXT");
+		expect(host.get(first)!.foldedTokens).toBeLessThanOrEqual(KEEL_NOTE_DEFAULTS.noteMaxTokens);
+
+		seed = await growUntilEpoch(host, s, seed, shape);
+		const second = c.noteState.carrierId!;
+		expect(second).not.toBe(first);
+		expect(host.truth.get(second)!.kind).toBe("text");
+		expect(host.get(first)!.folded).toBe(false); // its own words are back
+		expect(showingNote(host)).toEqual([second]);
+		expect(effOf(host, c)).toBeLessThanOrEqual(lowOf(host) + 40);
+	});
+
+	it("never rides a large text block: the next thinking block carries it", async () => {
+		const shape: Shape = { ...DEEP, say: (i) => `Plan ${i}: ${"a long explanation of the approach. ".repeat(30)}` };
+		const { s } = session(40, shape);
+		const host = setup(s, { budgetFactor: 0.9 });
+		const c = new KeelNoteConductor(EAGER);
+		c.attach(host);
+		await host.commitTurn();
+		let seed = 6000;
+		for (let n = 0; n < 3; n++) {
+			for (const p of host.calls) if (!p.settled) p.resolve({ text: noteBody(`L${n}`) });
+			await settle();
+			seed = await growUntilEpoch(host, s, seed, shape);
+			const id = c.noteState.carrierId!;
+			expect(host.truth.get(id)!.kind).toBe("thinking");
+			expect(specCarrier(host, id)).toEqual({ id, tail: false });
+		}
+	});
+
+	it("re-places the note when a human takes its carrier, and only then", async () => {
+		const { host, c } = await withLandedNote(EAGER, "M");
+		const carrier = c.noteState.carrierId!;
+		host.humanUnfold(carrier); // a human reads the original thought
+		expect(showingNote(host)).toEqual([]);
+		await host.commitTurn();
+		const moved = c.noteState.carrierId!;
+		expect(moved).not.toBe(carrier);
+		expect(showingNote(host)).toEqual([moved]);
+		expect(substOf(host, moved)).toContain("M-NEXT");
+		expect(host.get(carrier)!.folded).toBe(false); // the human's choice stands
+		expect(metricsOf(host)).toMatchObject({ note_refreshes: 1, note_reasserts: 1 });
+		// And never re-asserts when nothing changed (every rewrite re-bills the cache).
+		const n = host.landings().length;
+		await host.commitTurn();
+		await host.commitTurn();
+		expect(host.landings()).toHaveLength(n);
 	});
 });
 
 describe("keel-note · note size", () => {
 	it("caps an oversized note at noteMaxTokens, keeping the header, goal, failing test and next step", async () => {
-		const { s, carrier } = session(12);
+		const { s } = session(12);
 		const host = setup(s, { budgetFactor: 0.9 });
 		const c = new KeelNoteConductor(EAGER);
 		c.attach(host);
@@ -394,8 +564,9 @@ describe("keel-note · note size", () => {
 		const huge = noteBody("big", 80); // ~3.3k tokens
 		expect(host.countTokens(huge)).toBeGreaterThan(3000);
 		host.calls[0].resolve({ text: "```\n" + huge + "\n```" });
-		await settle(c);
-		await host.commitTurn();
+		await settle();
+		await growUntilEpoch(host, s, 7000);
+		const carrier = c.noteState.carrierId!;
 		const note = substOf(host, carrier)!;
 		expect(host.get(carrier)!.foldedTokens).toBeLessThanOrEqual(KEEL_NOTE_DEFAULTS.noteMaxTokens);
 		expect(note.startsWith(`${NOTE_HEADER}\n`)).toBe(true);
@@ -408,19 +579,19 @@ describe("keel-note · note size", () => {
 		expect(note).toContain("big tried 79:");
 		// Verbatim and non-recoverable: no fold handle the agent could unfold into the old thought.
 		expect(hasOwnFoldTag(note, carrier)).toBe(false);
-		expect(host.truth.get(carrier)!.text).toBe("Let me start by reading the briefing file.");
+		expect(host.truth.get(carrier)!.text.startsWith("Thinking ")).toBe(true); // the original is kept in truth
 	});
 
 	it("honors a smaller cap", async () => {
-		const { s, carrier } = session(12);
+		const { s } = session(12);
 		const host = setup(s, { budgetFactor: 0.9 });
 		const c = new KeelNoteConductor({ ...EAGER, noteMaxTokens: 150 });
 		c.attach(host);
 		await host.commitTurn();
 		host.calls[0].resolve({ text: noteBody("small", 10) });
-		await settle(c);
-		await host.commitTurn();
-		expect(host.get(carrier)!.foldedTokens).toBeLessThanOrEqual(150);
+		await settle();
+		await growUntilEpoch(host, s, 7100);
+		expect(host.get(c.noteState.carrierId!)!.foldedTokens).toBeLessThanOrEqual(150);
 		expect(host.calls[0].req.maxOutputTokens).toBe(225);
 	});
 
@@ -445,7 +616,7 @@ describe("keel-note · note size", () => {
 
 describe("keel-note · span capture", () => {
 	it("captures the dropped span at trim time, framed as the agent's own earlier turns", async () => {
-		const { s, carrier, steps } = session(12);
+		const { s, steps } = session(12);
 		const host = setup(s, { budgetFactor: 0.9 });
 		const c = new KeelNoteConductor(EAGER);
 		c.attach(host);
@@ -458,7 +629,6 @@ describe("keel-note · span capture", () => {
 		for (const id of folded) expect(turns).toContain(host.textOf(id)!.slice(0, 200));
 		expect(turns).toContain("[my thinking]");
 		expect(turns).toContain("[my tool call]"); // the folded thought's own calls, for context
-		expect(turns).not.toContain(host.textOf(carrier)!);
 		expect(prevOf(req)).toContain("(none yet)");
 		expect(req.system).toMatch(/first person/i);
 		expect(req.system).toMatch(/YOUR OWN earlier work in this same session/);
@@ -466,6 +636,15 @@ describe("keel-note · span capture", () => {
 		for (const sec of NOTE_SECTIONS) expect(req.system).toContain(`${sec}:`);
 		expect(req.maxOutputTokens).toBe(Math.ceil(KEEL_NOTE_DEFAULTS.noteMaxTokens * 1.5));
 		expect(req.signal).toBeInstanceOf(AbortSignal);
+	});
+
+	it("a thinking block the note overwrites goes into the next update, like any trimmed block", async () => {
+		const { host, c } = await withLandedNote(EAGER, "W");
+		const carrier = c.noteState.carrierId!;
+		expect(host.truth.get(carrier)!.kind).toBe("thinking");
+		expect(host.calls).toHaveLength(2); // epoch 2's span, kicked right after the placement
+		expect(turnsOf(host.calls[1].req)).toContain(host.textOf(carrier)!.slice(0, 60));
+		expect(prevOf(host.calls[1].req)).toContain("W-NEXT");
 	});
 
 	it("coalesces trims while an update is in flight, then chains one follow-up with the new spans", async () => {
@@ -483,10 +662,10 @@ describe("keel-note · span capture", () => {
 		expect(c.noteState.pendingSpanTokens).toBeGreaterThan(0);
 
 		host.calls[0].resolve({ text: noteBody("first") });
-		await settle(c);
+		await settle();
 		expect(host.calls).toHaveLength(2); // chained immediately, not on the next trim
 		const second = host.calls[1].req;
-		expect(prevOf(second)).toContain("first-NEXT"); // the not-yet-landed note is the input
+		expect(prevOf(second)).toContain("first-NEXT"); // the not-yet-placed note is the input
 		const thoughts = (t: string) => new Set(t.match(/Thinking \d+: /g) ?? []);
 		const before = thoughts(firstTurns);
 		const after = thoughts(turnsOf(second));
@@ -508,7 +687,7 @@ describe("keel-note · span capture", () => {
 		const dropped = steps.map((st) => st.think!).filter((id) => host.get(id)!.folded || host.get(id)!.grouped);
 		expect(dropped.length).toBeGreaterThan(5);
 		expect(turns).not.toContain(host.textOf(dropped[0])!.slice(0, 40)); // oldest discarded
-		expect(Number(host.statusLog.at(-1)?.metrics?.note_discarded_span_tokens)).toBeGreaterThan(0);
+		expect(Number(metricsOf(host).note_discarded_span_tokens)).toBeGreaterThan(0);
 	});
 
 	it("clips each block head+tail", () => {
@@ -522,43 +701,35 @@ describe("keel-note · span capture", () => {
 });
 
 describe("keel-note · failures", () => {
-	it("a failed update keeps the old note and retries its spans on the next trigger", async () => {
-		const { s, carrier } = session(12);
-		const host = setup(s, { budgetFactor: 0.9 });
-		const c = new KeelNoteConductor(EAGER);
-		c.attach(host);
-		await host.commitTurn();
-		host.calls[0].resolve({ text: noteBody("A") });
-		await settle(c);
-		await host.commitTurn();
-		expect(substOf(host, carrier)).toContain("A-NEXT");
-
-		let seed = await growUntilEpoch(host, s, 300);
+	it("a failed update keeps the old note in place and retries its spans on the next trigger", async () => {
+		const { s, host, c, seed: s0 } = await withLandedNote({ ...EAGER, spanMaxTokens: 100_000 }, "A"); // (nothing discarded)
 		expect(host.calls).toHaveLength(2);
 		const failedTurns = turnsOf(host.calls[1].req);
 		host.calls[1].reject(new Error("provider 503"));
-		await settle(c);
+		await settle();
 		await host.commitTurn();
-		expect(substOf(host, carrier)).toContain("A-NEXT"); // old note kept
+		expect(substOf(host, c.noteState.carrierId!)).toContain("A-NEXT"); // old note kept
 		expect(host.statusLog.at(-1)?.text).toMatch(/last update failed \(provider 503\), kept previous/);
-		expect(host.statusLog.at(-1)?.metrics).toMatchObject({ note_failures: 1, note_refreshes: 1 });
+		expect(metricsOf(host)).toMatchObject({ note_failures: 1, note_refreshes: 1 });
 		expect(host.calls).toHaveLength(2); // no immediate retry
 
-		seed = await growUntilEpoch(host, s, seed);
+		let seed = await growUntilEpoch(host, s, s0, DEEP);
+		expect(showingNote(host)).toEqual([c.noteState.carrierId]); // moved, still the old note
+		expect(substOf(host, c.noteState.carrierId!)).toContain("A-NEXT");
 		expect(host.calls).toHaveLength(3);
 		const retry = turnsOf(host.calls[2].req);
 		const failedFirstThought = failedTurns.match(/Thinking \d+: /)?.[0];
 		expect(failedFirstThought).toBeTruthy();
 		expect(retry).toContain(failedFirstThought!); // the failed spans ride again
 		host.calls[2].resolve({ text: noteBody("B") });
-		await settle(c);
-		await host.commitTurn();
-		expect(substOf(host, carrier)).toContain("B-NEXT");
+		await settle();
+		seed = await growUntilEpoch(host, s, seed, DEEP);
+		expect(substOf(host, c.noteState.carrierId!)).toContain("B-NEXT");
 		expect(host.statusLog.at(-1)?.text).not.toMatch(/failed/);
 	});
 
 	it("a hung update times out without ever blocking the agent loop", async () => {
-		const { s, carrier } = session(12);
+		const { s } = session(12);
 		const host = setup(s, { budgetFactor: 0.9 });
 		const c = new KeelNoteConductor({ ...EAGER, timeoutMs: 20 });
 		c.attach(host);
@@ -566,13 +737,13 @@ describe("keel-note · failures", () => {
 		expect(c.noteState.inFlight).toBe(true);
 		await grow(host, s, 400); // turns keep flowing
 		await new Promise((r) => setTimeout(r, 60));
-		await settle(c);
+		await settle();
 		expect(c.noteState.inFlight).toBe(false);
 		expect(host.statusLog.at(-1)?.text).toMatch(/timed out/);
-		expect(host.get(carrier)!.folded).toBe(false); // no note, nothing half-landed
+		expect(showingNote(host)).toEqual([]); // no note, nothing half-landed
 		expect(c.noteState.pendingSpanTokens).toBeGreaterThan(0); // kept for the next trigger
 		host.calls[0].resolve({ text: noteBody("too-late") }); // a straggler never lands
-		await settle(c);
+		await settle();
 		await host.commitTurn();
 		expect(host.landings()).toHaveLength(0);
 	});
@@ -584,16 +755,16 @@ describe("keel-note · failures", () => {
 		c.attach(host);
 		await host.commitTurn();
 		host.calls[0].resolve({ text: "  " });
-		await settle(c);
-		expect(host.statusLog.at(-1)?.metrics).toMatchObject({ note_failures: 1 });
+		await settle();
+		expect(metricsOf(host)).toMatchObject({ note_failures: 1 });
 	});
 });
 
 describe("keel-note · fallback trigger", () => {
-	it("refreshes every fallbackTurns turns when nothing is trimmed", async () => {
-		const { s, carrier } = session(6);
+	it("refreshes every fallbackTurns turns when nothing is trimmed, and lands at the first trim", async () => {
+		const { s } = session(6);
 		const host = setup(s, { budget: 1_000_000, protect: 300 });
-		const c = new KeelNoteConductor({ fallbackTurns: 5, maxStaleTurns: 1 });
+		const c = new KeelNoteConductor({ fallbackTurns: 5 });
 		c.attach(host);
 		for (let t = 0; t < 4; t++) await grow(host, s, 500 + t);
 		expect(host.calls).toHaveLength(0);
@@ -602,23 +773,35 @@ describe("keel-note · fallback trigger", () => {
 		expect(host.calls).toHaveLength(1);
 		const turns = turnsOf(host.calls[0].req);
 		expect(turns).toContain(host.textOf(last.think!)!.slice(0, 100)); // the newest work
-		expect(turns).not.toContain(host.textOf(carrier)!);
 		host.calls[0].resolve({ text: noteBody("F1") });
-		await settle(c);
+		await settle();
 		await host.commitTurn();
-		expect(substOf(host, carrier)).toContain("F1-NEXT");
+		// Nothing was trimmed, so nothing needs a note in context yet: it waits.
+		expect(host.landings()).toHaveLength(0);
+		expect(c.noteState.ready).toBe(true);
 
 		for (let t = 0; t < 4; t++) await grow(host, s, 600 + t);
-		expect(host.calls).toHaveLength(2); // 5 turns since the last fallback (the landing turn counted)
-		const second = turnsOf(host.calls[1].req);
-		expect(second).not.toContain(host.textOf(last.think!)!.slice(0, 100)); // each block once
-		expect(host.statusLog.at(-1)?.metrics).toMatchObject({ note_fallbacks: 2 });
+		expect(host.calls).toHaveLength(2); // 5 turns since the last call
+		const second = host.calls[1].req;
+		expect(turnsOf(second)).not.toContain(host.textOf(last.think!)!.slice(0, 100)); // each block once
+		expect(prevOf(second)).toContain("F1-NEXT"); // built on the waiting note
+		expect(metricsOf(host)).toMatchObject({ note_fallbacks: 2 });
+
+		host.calls[1].resolve({ text: noteBody("F2") });
+		await settle();
+		host.setBudget(Math.ceil(host.stats().liveTokens / 0.9)); // the first trim
+		await host.commitTurn();
+		await settle();
+		expect(host.epochs()).toHaveLength(1);
+		const id = c.noteState.carrierId!;
+		expect(showingNote(host)).toEqual([id]);
+		expect(substOf(host, id)).toContain("F2-NEXT");
 	});
 
 	it("a call resets the fallback clock; a trim that does not call does not", async () => {
 		const { s } = session(12);
 		const host = setup(s, { budgetFactor: 0.9 });
-		const c = new KeelNoteConductor({ fallbackTurns: 3, minDroppedTokens: 1_000_000, maxStaleTurns: 1 }); // trims never call
+		const c = new KeelNoteConductor({ fallbackTurns: 3, minDroppedTokens: 1_000_000 }); // trims never call
 		c.attach(host);
 		await host.commitTurn(); // a trim, and turn 1 with no call
 		expect(host.epochs()).toHaveLength(1);
@@ -629,103 +812,18 @@ describe("keel-note · fallback trigger", () => {
 		expect(turnsOf(host.calls[0].req)).toContain("[my thinking]");
 		expect(c.noteState.pendingSpanTokens).toBe(0);
 		host.calls[0].resolve({ text: noteBody("F") });
-		await settle(c);
+		await settle();
 		await grow(host, s, 800, 200);
 		await grow(host, s, 801, 200);
 		expect(host.calls).toHaveLength(1); // the clock restarted at the call
 		await grow(host, s, 802, 200);
 		expect(host.calls).toHaveLength(2);
 		expect(turnsOf(host.calls[1].req)).toContain(host.textOf(s.blocks.at(-3)!.id)!.slice(0, 40)); // the newest step
-		expect(host.statusLog.at(-1)?.metrics).toMatchObject({ note_fallbacks: 2 });
+		expect(metricsOf(host)).toMatchObject({ note_fallbacks: 2 });
 	});
 });
 
-describe("keel-note · carrier, cost, lifecycle", () => {
-	it("moves the note when a human takes the carrier", async () => {
-		const { s, carrier } = session(12);
-		const host = setup(s, { budgetFactor: 0.9 });
-		const c = new KeelNoteConductor(EAGER);
-		c.attach(host);
-		await host.commitTurn();
-		host.calls[0].resolve({ text: noteBody("M") });
-		await settle(c);
-		await host.commitTurn();
-		expect(substOf(host, carrier)).toContain("M-NEXT");
-		host.humanUnfold(carrier); // a human reads the original thought
-		await host.commitTurn();
-		const moved = c.noteState.carrierId!;
-		expect(moved).not.toBe(carrier);
-		expect(substOf(host, moved)).toContain("M-NEXT");
-		expect(host.statusLog.at(-1)?.metrics).toMatchObject({ note_refreshes: 1, note_reasserts: 1 });
-		// And never re-asserts when nothing changed (every re-assert re-bills the cache).
-		const n = host.landings().length;
-		await host.commitTurn();
-		await host.commitTurn();
-		expect(host.landings()).toHaveLength(n);
-	});
-
-	it("prefers a small assistant text block, keeps its words and appends the note", async () => {
-		const s = new Session();
-		s.user("Read AGENT_BRIEFING.md and complete the benchmark run it describes.");
-		const think = s.step({ think: thought(1200, 0), calls: [bash("cat AGENT_BRIEFING.md", lines(3, 20, "brief"))] }).think!;
-		const long = s.step({ think: thought(800, 1), say: `Plan: ${"a long explanation of the approach. ".repeat(30)}`, calls: [bash("ls", lines(2))] }).say!;
-		const say = s.step({ think: thought(800, 2), say: "Now I'll run the case tests.", calls: [bash("pytest -q", lines(4))] }).say!;
-		for (let i = 0; i < 12; i++) s.step({ think: thought(2000, 10 + i), calls: [bash(`python run.py --case ${i}`, lines(20, 40, `case${i}`))] });
-		const host = setup(s, { budgetFactor: 0.9 });
-		expect(host.get(long)!.tokens).toBeGreaterThan(150); // too big to keep
-		const c = new KeelNoteConductor(EAGER);
-		c.attach(host);
-		expect(c.noteState.carrierId).toBe(say);
-		await host.commitTurn();
-		expect(host.get(think)!.folded).toBe(true); // the first thought is no carrier, so keel-lite's R1 took it
-		host.calls[0].resolve({ text: noteBody("T") });
-		await settle(c);
-		await host.commitTurn();
-		const landed = substOf(host, say)!;
-		expect(landed.startsWith(`Now I'll run the case tests.
-
-${NOTE_HEADER}
-`)).toBe(true);
-		expect(landed).toContain("T-NEXT");
-		expect(host.get(say)!.foldedTokens).toBeLessThanOrEqual(KEEL_NOTE_DEFAULTS.noteMaxTokens);
-		expect(host.truth.get(say)!.text).toBe("Now I'll run the case tests.");
-	});
-
-	it("moves a provisional thinking carrier to a text block before the first landing, never after", async () => {
-		const sayStep = (s: Session, seed: number) => s.step({ think: thought(600, seed), say: `Step ${seed} done; moving on.`, calls: [bash("true", "ok")] }).say!;
-		// Before the first note: the carrier moves to the text block once it leaves the tail.
-		const a = session(12);
-		const h1 = setup(a.s, { budgetFactor: 0.9 });
-		const c1 = new KeelNoteConductor(EAGER);
-		c1.attach(h1);
-		await h1.commitTurn(); // note call in flight, nothing landed
-		const say = sayStep(a.s, 900);
-		a.s.flush(h1);
-		for (let i = 0; i < 4 && c1.noteState.carrierId === a.carrier; i++) await grow(h1, a.s, 901 + i, 400);
-		expect(c1.noteState.carrierId).toBe(say);
-		h1.calls[0].resolve({ text: noteBody("P") });
-		await settle(c1);
-		await h1.commitTurn();
-		expect(substOf(h1, say)).toContain("P-NEXT");
-
-		// After the first note: it stays on its thinking block.
-		const b = session(12);
-		const h2 = setup(b.s, { budgetFactor: 0.9 });
-		const c2 = new KeelNoteConductor(EAGER);
-		c2.attach(h2);
-		await h2.commitTurn();
-		h2.calls[0].resolve({ text: noteBody("Q") });
-		await settle(c2);
-		await h2.commitTurn();
-		expect(substOf(h2, b.carrier)).toContain("Q-NEXT");
-		const late = sayStep(b.s, 950);
-		b.s.flush(h2);
-		for (let i = 0; i < 4; i++) await grow(h2, b.s, 951 + i, 400);
-		expect(h2.get(late)!.protected).toBe(false);
-		expect(c2.noteState.carrierId).toBe(b.carrier);
-		expect(h2.landings()).toHaveLength(1);
-	});
-
+describe("keel-note · cost, lifecycle", () => {
 	it("routes note calls through host.complete and reports their usage", async () => {
 		const { s } = session(12);
 		const host = setup(s, { budgetFactor: 0.9 });
@@ -733,16 +831,17 @@ ${NOTE_HEADER}
 		c.attach(host);
 		await host.commitTurn();
 		host.calls[0].resolve({ text: noteBody("U"), inputTokens: 4321, outputTokens: 456 });
-		await settle(c);
-		await host.commitTurn();
-		expect(host.completeLog).toHaveLength(1);
-		const m = host.statusLog.at(-1)!.metrics!;
-		expect(m).toMatchObject({ note_calls: 1, note_refreshes: 1, note_input_tokens: 4321, note_output_tokens: 456, note_tokens_estimated: false, epochs: 1 });
-		expect(host.statusLog.at(-1)!.text).toMatch(/^epoch 1 · R1 · −.* · note: 1 refresh$/);
+		await settle();
+		await growUntilEpoch(host, s, 8000);
+		expect(host.completeLog).toHaveLength(2); // the second is epoch 2's, still in flight
+		const m = metricsOf(host);
+		expect(m).toMatchObject({ note_calls: 2, note_refreshes: 1, note_input_tokens: 4321, note_output_tokens: 456, note_tokens_estimated: false, epochs: 2 });
+		expect(m.note_carrier).toBe(c.noteState.carrierId);
+		expect(host.statusLog.at(-1)!.text).toMatch(/^epoch 2 · R1 · −.* · note: 1 refresh · updating$/);
 	});
 
 	it("detach aborts the in-flight call, clears status, and a late reply never lands", async () => {
-		const { s, carrier } = session(12);
+		const { s } = session(12);
 		const host = setup(s, { budgetFactor: 0.9 });
 		const c = new KeelNoteConductor(EAGER);
 		c.attach(host);
@@ -755,15 +854,13 @@ ${NOTE_HEADER}
 		await tick();
 		await host.commitTurn();
 		expect(host.landings()).toHaveLength(0);
-		expect(host.get(carrier)!.folded).toBe(false);
+		expect(showingNote(host)).toEqual([]);
 	});
 
 	it("rejects out-of-range knobs", () => {
 		expect(() => new KeelNoteConductor({ noteMaxTokens: 10 })).toThrow(RangeError);
 		expect(() => new KeelNoteConductor({ fallbackTurns: 0 })).toThrow(RangeError);
 		expect(() => new KeelNoteConductor({ spanMaxTokens: 100 })).toThrow(RangeError);
-		expect(() => new KeelNoteConductor({ maxStaleTurns: 0 })).toThrow(RangeError);
-		expect(() => new KeelNoteConductor({ maxStaleTurns: 1.5 })).toThrow(RangeError);
 		expect(() => new KeelNoteConductor({ minDroppedTokens: -1 })).toThrow(RangeError);
 		expect(() => new KeelNoteConductor({ minDroppedTokens: Number.NaN })).toThrow(RangeError);
 		expect(() => new KeelNoteConductor({ keel: { high: 0.5, low: 0.7 } })).toThrow(RangeError);
@@ -777,19 +874,18 @@ describe("keel-note · registry", () => {
 	});
 
 	it("reads its knobs from the environment, ignoring junk", () => {
-		expect(keelNoteOptionsFromEnv({})).toEqual({ keel: { high: 0.85, low: 0.65 }, noteMaxTokens: undefined, minDroppedTokens: undefined, fallbackTurns: undefined, maxStaleTurns: undefined, spanMaxTokens: undefined });
+		expect(keelNoteOptionsFromEnv({})).toEqual({ keel: { high: 0.85, low: 0.65 }, noteMaxTokens: undefined, minDroppedTokens: undefined, fallbackTurns: undefined, spanMaxTokens: undefined });
 		expect(
 			keelNoteOptionsFromEnv({
 				ACCORDION_KEEL_NOTE_MAX_TOKENS: "800",
 				ACCORDION_KEEL_NOTE_FALLBACK_TURNS: "20",
 				ACCORDION_KEEL_NOTE_SPAN_TOKENS: "8000",
 				ACCORDION_KEEL_NOTE_MIN_DROPPED_TOKENS: "4000",
-				ACCORDION_KEEL_NOTE_MAX_STALE_TURNS: "25",
 				ACCORDION_KEEL_LITE_HIGH: "0.8",
 			}),
-		).toEqual({ keel: { high: 0.8, low: 0.65 }, noteMaxTokens: 800, minDroppedTokens: 4000, fallbackTurns: 20, maxStaleTurns: 25, spanMaxTokens: 8000 });
-		const junk = keelNoteOptionsFromEnv({ ACCORDION_KEEL_NOTE_MAX_TOKENS: "12", ACCORDION_KEEL_NOTE_FALLBACK_TURNS: "2.5", ACCORDION_KEEL_NOTE_SPAN_TOKENS: "lots", ACCORDION_KEEL_NOTE_MAX_STALE_TURNS: "0", ACCORDION_KEEL_NOTE_MIN_DROPPED_TOKENS: "-5" });
-		expect(junk).toMatchObject({ noteMaxTokens: undefined, fallbackTurns: undefined, spanMaxTokens: undefined, maxStaleTurns: undefined, minDroppedTokens: undefined });
+		).toEqual({ keel: { high: 0.8, low: 0.65 }, noteMaxTokens: 800, minDroppedTokens: 4000, fallbackTurns: 20, spanMaxTokens: 8000 });
+		const junk = keelNoteOptionsFromEnv({ ACCORDION_KEEL_NOTE_MAX_TOKENS: "12", ACCORDION_KEEL_NOTE_FALLBACK_TURNS: "2.5", ACCORDION_KEEL_NOTE_SPAN_TOKENS: "lots", ACCORDION_KEEL_NOTE_MIN_DROPPED_TOKENS: "-5" });
+		expect(junk).toMatchObject({ noteMaxTokens: undefined, fallbackTurns: undefined, spanMaxTokens: undefined, minDroppedTokens: undefined });
 		const c = new KeelNoteConductor(junk);
 		expect(c.options.noteMaxTokens).toBe(600);
 		expect(c.keelOptions.high).toBe(0.85);

@@ -27,36 +27,50 @@ real host. The proxy changes three things:
 - It records which blocks each of keel-lite's applied epochs dropped (folded, replaced or grouped),
   and copies their original text at trim time.
 
-A landed note costs at most `noteMaxTokens`, so landing one never changes `real + reserve`. A note
-can land late, even the turn right after a trim, and still never push the context past what
-keel-lite already made room for. Before the first note exists, the reserve costs about 600 tokens
-of headroom and nothing on the wire.
+A placed note costs at most `noteMaxTokens`, and `real + reserve` equals everything but the
+carrier plus `noteMaxTokens`, whichever block holds the note. Moving the note therefore shifts
+keel-lite's number only by the two blocks that change hands: up by at most one thinking digest or
+one small text block, and down when the note overwrites a large thinking block. Before the first
+note exists, the reserve costs 600 tokens of headroom and nothing on the wire.
 
-**The carrier.** A conductor cannot insert blocks, so the note rides on an existing one. Truth
-never lets a conductor edit a `user` block (`not-foldable`), so the task message cannot hold it;
-the foldable kinds are `text`, `thinking` and `tool_result`, and a tool result would pass the note
-off as tool output. keel-note therefore picks, after the task and outside the protected tail:
+**The carrier sits at the trim boundary.** Rewriting a block invalidates the provider's prompt
+cache from that block on. Every keel-lite epoch already invalidates it from its first change on, so
+the note goes where the next epoch will start anyway. A conductor cannot insert blocks, and Truth
+never lets it edit a `user` block (`not-foldable`); a tool result would pass the note off as tool
+output. So the note rides on an existing assistant block:
 
-1. the first assistant `text` block of at most 150 tokens (and at most a quarter of the cap). The
-   note is appended to the block's own words, which stay;
-2. only if there is none, the first assistant `thinking` block, which the note overwrites.
+- The **boundary** is the oldest live `thinking` block outside the protected tail that a fold would
+  shrink. keel-lite restarts every epoch at rung R1 (thinking, oldest first), so the next epoch's
+  first change is at or before it.
+- The **carrier** is the first usable block after the boundary. That is either a `thinking` block,
+  which the note overwrites, or a live assistant `text` block of at most 150 tokens (and at most a
+  quarter of the cap). A text block keeps its words, with the note appended.
+- When no such thinking is left outside the tail, the next epoch starts in the part of the tail
+  that leaves it next. The carrier is then the last usable block before the tail.
 
-Text comes first because every provider replays assistant text verbatim. A thinking block is
-fragile: Anthropic signs thinking blocks, and the wire keeps the part's other fields and swaps only
-its text; OpenAI's reasoning items are opaque; DeepSeek and others drop earlier reasoning once a new
-user message arrives. None of this has been tested against a real provider here.
+The stub keel-lite writes for the trimmed region is not an option. keel-lite never revisits a
+decided fold, so the next trim is not guaranteed to cover it, and appending there would re-bill
+from the stub on.
 
-In the three SlopCode bench sessions the first reply is thinking plus a tool call, and the first
-assistant text part appears in the 11th to 13th reply. Until the first note lands, the carrier is
-therefore provisional: keel-note holds the first thought and moves to a small text block as soon as
-one has left the protected tail. After the first landing the carrier stays put, because every move
-rewrites an early block. If a human takes the carrier, the note moves to the next usable block.
+In the bench sessions every epoch has to shed more than the new thinking alone, so it folds all
+live thinking outside the tail. Nearly every placement is therefore at the tail edge, and the note
+sits between the compacted history and the live 8k tail (see *Cache cost*). The carrier is
+usually a thinking block, because assistant text is rare there. A thinking block is fragile across
+providers:
+
+- Anthropic signs thinking blocks. The wire keeps the part's other fields and swaps only its text.
+- OpenAI's reasoning items are opaque.
+- DeepSeek and others drop earlier reasoning once a new user message arrives. DeepSeek re-sends it
+  within one user turn, which covers a SlopCode session.
+
+None of this has been tested against a real provider here.
 
 A note lands as a non-recoverable `replace` of the carrier. The content is verbatim, with no
 `{#code FOLDED}` handle, and the whole block (kept text plus note) is hard-capped at
 `noteMaxTokens` including block overhead. If the model writes more, `fitNote` drops the oldest
 "Built & verified" / "Tried and failed" bullets first, then whole lines from the end, then
-characters.
+characters. The original text of an overwritten thinking block goes into the next note update,
+like any trimmed block.
 
 **Note calls are batched.** Each applied keel-lite epoch copies the blocks it dropped, at trim time,
 into a pending buffer. Each block is clipped head and tail, sent to the note model once, and paired
@@ -70,7 +84,7 @@ with its tool call for context. A call starts when:
 The threshold counts the clipped span, which is what a call costs, rather than the raw tokens an
 epoch frees. At a 40k budget every epoch frees at least 8k raw tokens (HIGH 85% down to LOW 65%), so
 a raw 8000 threshold would still call on every trim. While a call is in flight, new spans
-accumulate. When it lands, one follow-up call is chained if the buffer has reached the threshold
+accumulate. When it returns, one follow-up call is chained if the buffer has reached the threshold
 again.
 
 **The update call** goes through `host.complete`, which uses the live session's model and route and
@@ -88,40 +102,54 @@ Current failing test / error:
 Next step:
 ```
 
-**Landing rides on a trim.** A finished note waits and lands right after the next applied
-keel-lite epoch, in the same request. If no epoch comes within `maxStaleTurns` (40) turn boundaries,
-it lands at the next boundary anyway, before keel-lite evaluates that turn. The old note stays until
-then. A failed, empty or timed-out call keeps the old note, logs the error in the status line, and
-puts its spans back in the buffer for the next trigger. The agent loop never waits for a note.
+**Every trim moves the note, in the same request.** Right after each applied keel-lite epoch, one
+transaction places the note on the new boundary carrier and releases the old one. A thinking
+carrier is folded to its engine digest, as the trim does to its neighbours. A text carrier gets its
+own words back. If a finished note is waiting, that one is placed; otherwise the current text moves
+unchanged, so the note never drops out of context. A finished note never lands on its own: it waits
+for the next trim. At a turn boundary the note is re-placed only if it has left the context, for
+example because a human took the carrier or a resync lost the substitution.
 
-**Cache cost.** Rewriting the carrier invalidates the provider's prompt cache from the carrier on.
-An epoch invalidates it from its first dropped block on. If the carrier sat at or after that
-block, landing with the epoch would add only about the note's own tokens. It does not: the carrier
-sits near the front, while keel-lite's ladder restarts each epoch at the oldest *undecided* block,
-which is roughly where the previous epoch stopped. Everything in between (the compacted prefix of
-fold stubs, tool calls, trimmed results and small blocks keel-lite never folds) is cached before
-the landing and re-billed by it.
+The old `maxStaleTurns` fallback is gone. With the note at the boundary, landing between trims
+would rewrite a block the next trim has not reached yet, and that re-bills the whole suffix. In the
+previous replay it never fired anyway. A failed, empty or timed-out call keeps the old note, logs
+the error in the status line, and puts its spans back in the buffer for the next trigger. The agent
+loop never waits for a note.
 
-A replay of the three keel-lite bench sessions (note model stubbed, default knobs) measured this:
+**Cache cost.** Before this change the carrier sat about 0.8k tokens into the context. Each landing
+re-billed everything from there to the epoch's first change, about 10–12k tokens against a
+~580-token note, for +32–42% uncached input over keel-lite. At the boundary, the old note is
+inside the region the next epoch re-bills anyway.
 
-- The carrier was a text block about 0.7–0.9k tokens into the context. Each epoch's first change
-  sat at a median of 9.5k–14k tokens.
-- Every landing coincided with an epoch. Each one still added about 10–12k uncached tokens, against
-  about 580 for the note itself.
-- In one session the carrier's message also holds a ~5k-token `write` tool call. keel-lite never
-  folds tool calls, so every landing re-bills it too.
-- Landings account for about 90% of keel-note's extra uncached input over keel-lite (+32–42%).
+A replay of the three keel-lite bench sessions measured the result. It used the real wire and
+recorded calibration, a stubbed note model that answers two requests later, and default knobs:
 
-For a landing to cost about the note's size, the note would have to sit at or after the trim
-point, for example on a fresh block at the tail, with old copies left to keel-lite's ordinary
-sweep. That is not implemented.
+| per seed (0 / 1 / 2) | note pinned near the task (before) | note at the trim boundary |
+|---|---|---|
+| requests over 40k | 0% | 0% |
+| note calls / placements | 78/74, 100/93, 74/69 | 77/122, 107/161, 75/109 |
+| placements at the tail edge | – | 121, 161, 109 |
+| uncached main input vs keel-lite | +41%, +42%, +32% | +4.8%, +3.4%, +5.1% |
+| extra uncached per placement, beyond the epoch's own | 11.1k, 12.4k, 9.8k (mean) | 0.5k, 0.4k, 0.6k (mean; median 0) |
+| added $ per run (main + note calls) | +$0.27, +$0.35, +$0.23 | +$0.15, +$0.20, +$0.15 |
+| of which note calls | $0.14, $0.18, $0.14 | $0.14, $0.19, $0.14 |
+| note position (median) | ~0.8k tokens in | 19.7k, 19.2k, 18.3k tokens in (63–68%), ~9–10k before the end |
 
-With the defaults, the replay had 0% of requests over budget. It made 74–100 note calls for 113–173
-epochs and landed 69–93 notes, every one with an epoch; `maxStaleTurns` never fired, and 20 gave
-identical results. The added cost was about $0.23–0.35 per run at DeepSeek prices, roughly half
-note calls and half cache. When every trim called the model and every note landed at the next turn
-boundary, it was $0.56–0.82. The 12k bound discarded 12–17% of the captured span text, the oldest
-part of a two-epoch batch.
+- Every request that carried a placement also carried an epoch, with one exception: a turn-boundary
+  re-placement in seed 0, which re-billed nothing measurable. Seed 2 had one re-placement too, in a
+  request with an epoch. I have not traced why the note left the context in those two cases.
+- What remains is mostly the note itself. It sits in every epoch's re-billed region, so each epoch
+  re-bills its ~570 tokens. The rest comes from epochs that start just past the note, where the
+  move re-bills the carrier's own tool call and results.
+- The main-input share of the added cost is now about $0.015 per run. Note calls are about 90% of
+  the rest.
+- The 12k span bound discards the oldest part of a two-epoch batch: 12–17% of the captured span
+  text in the earlier replay and 11–14% in this one.
+
+At the median, the agent reads the task, then the compacted history (folded stubs), then the note
+("My progress notes … older turns were trimmed from my context"), then the ~9k tokens of recent
+turns that are still live. The note sits at the seam between compacted and live history, in
+chronological order, and after the trimmed turns it summarizes.
 
 ## Knobs
 
@@ -133,7 +161,6 @@ Constructor options (`KeelNoteOptions`, defaults in `KEEL_NOTE_DEFAULTS`):
 | `noteMaxTokens` | 600 | hard cap on the landed carrier block (kept text + note), block overhead included; also the reserve |
 | `minDroppedTokens` | 8000 | a call starts once this many clipped span tokens from trimmed blocks are pending (or the buffer is full) |
 | `fallbackTurns` | 30 | also call after this many turns with no call |
-| `maxStaleTurns` | 40 | a finished note waits at most this many turn boundaries for an epoch to land with |
 | `spanMaxTokens` | 12000 | the pending span buffer keeps the most recent this-many tokens (the call's input bound) |
 | `blockMaxTokens` | 1500 | each captured block is clipped head and tail to about this size (tool calls: 300) |
 | `timeoutMs` | 90000 | abandon a note call after this long; the old note stays |
@@ -145,7 +172,6 @@ The registry factory reads these from the environment. Invalid values are ignore
 | `ACCORDION_KEEL_NOTE_MAX_TOKENS` | integer ≥ 64 |
 | `ACCORDION_KEEL_NOTE_MIN_DROPPED_TOKENS` | integer ≥ 0 |
 | `ACCORDION_KEEL_NOTE_FALLBACK_TURNS` | integer ≥ 1 |
-| `ACCORDION_KEEL_NOTE_MAX_STALE_TURNS` | integer ≥ 1 |
 | `ACCORDION_KEEL_NOTE_SPAN_TOKENS` | integer ≥ 500 |
 
 keel-lite's `ACCORDION_KEEL_LITE_HIGH` / `_LOW` also apply.
@@ -155,8 +181,10 @@ keel-lite's `ACCORDION_KEEL_LITE_HIGH` / `_LOW` also apply.
 The status line is keel-lite's, followed by `note: N refreshes` and `updating`, `ready` or the last
 failure. The metrics add these fields:
 
-- `note_refreshes`, `note_calls`, `note_failures`, `note_fallbacks`, `note_reasserts`, and
-  `note_stale_landings` (landings that gave up waiting for an epoch)
+- `note_refreshes` (new notes placed), `note_placements` (every write of the note),
+  `note_moves`, `note_tail_placements` (placements at the tail edge, with no live thinking left
+  outside the tail), `note_reasserts` (turn-boundary re-placements after the note left the
+  context), `note_calls`, `note_failures` and `note_fallbacks`
 - `note_input_tokens` / `note_output_tokens`, where `note_tokens_estimated` marks counts estimated
   locally because the route reported no usage
 - the pending and discarded span tokens
@@ -166,10 +194,11 @@ failure. The metrics add these fields:
 
 - The cap is enforced at the calibration in force when the note lands. Calibration follows the
   whole context's real-to-estimated token ratio, which was typically about 1.4 in the bench
-  sessions but reached 2.6, so a landed 600-token block later measured up to 871. keel-lite always sees the
-  carrier's current cost, so this drift never breaks the budget.
-- When a session has no small assistant text block, the note rides on a `thinking` block, with the
-  provider risks above. DeepSeek re-sends reasoning within a single user turn, which covers a
-  SlopCode session.
+  sessions but reached 2.6, so a placed 600-token block later measured up to 871. keel-lite always
+  sees the carrier's current cost, so this drift never breaks the budget.
+- The note usually rides on a `thinking` block, with the provider risks above.
+- With the note at the tail edge, a trim that starts just past it re-bills the carrier's own tool
+  call and results when the note moves. In the replay this came to 0.4–0.6k tokens per placement on
+  average.
 - The note is only as good as the model call. The tests and replay use a stub, so how well the
   prompt preserves continuity is untested until a real run.

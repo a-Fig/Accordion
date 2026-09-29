@@ -140,8 +140,9 @@ recoverable, and batching the edits keeps prompt-cache breaks rare.
 **[keel-note](conductors/in-process/keel-note/)** is keel-lite plus a memory. The trim stays
 exactly keel-lite's, synchronous, but as trims drop old turns a batched background model call folds
 them into a short first-person progress note (goal, what's built, what failed, the current error,
-the next step) pinned near the task. The trim never waits for the note: room for it is reserved in
-the budget from the first turn, and a finished note lands together with the next trim.
+the next step). The note sits where the trimmed history meets the live turns and moves forward
+with every trim, in the same request, so it adds little to cache cost. The trim never waits for the
+note: room for it is reserved in the budget from the first turn.
 
 **[handoff](conductors/in-process/handoff/)** is `/handoff`, automatic. The manual version is to
 ask the agent to write a handoff document, kill the session, and paste that document into a
