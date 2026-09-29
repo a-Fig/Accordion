@@ -71,6 +71,13 @@ export interface ViewBlock {
 	 * protected tail — there is nothing to yank). ADR 0018's `fresh`, inverted.
 	 */
 	sent: boolean;
+	/**
+	 * A `thinking` block sealed by a provider signature that is replayed with it (Anthropic, Gemini,
+	 * OpenAI Responses; not DeepSeek, whose "signature" only names the field). A fold or `replace`
+	 * rewrites the text but keeps the signature, so the API may reject the request: a strategy that
+	 * rewrites thinking should leave these alone. Absent means unsigned.
+	 */
+	signed?: boolean;
 	/** Full content (always present in-process). */
 	text?: string;
 }

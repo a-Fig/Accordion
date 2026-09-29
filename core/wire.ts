@@ -34,6 +34,32 @@ export interface PiTextPart {
 export interface PiThinkingPart {
 	type: "thinking";
 	thinking: string;
+	/** pi-ai's replay token for this reasoning: a provider signature, an opaque payload, or (for
+	 *  OpenAI-compatible chat APIs) just the name of the field the text is replayed under. */
+	thinkingSignature?: string;
+	/** Encrypted reasoning (the text is not the model's words; `thinkingSignature` holds the payload). */
+	redacted?: boolean;
+}
+
+/**
+ * The `thinkingSignature` values pi-ai's openai-completions adapter uses as FIELD NAMES: it replays
+ * the block's current text under that field (`assistantMsg[signature] = thinking`), so a rewritten
+ * thought is simply sent rewritten. DeepSeek sessions carry `"reasoning_content"` on every block.
+ */
+const REASONING_FIELD_MARKERS: ReadonlySet<string> = new Set(["reasoning", "reasoning_content", "reasoning_text"]);
+
+/**
+ * Does this thinking part carry a provider seal that is replayed with it? Anthropic (and Bedrock)
+ * send `signature` back and verify it against the text; Gemini replays `thoughtSignature`; OpenAI
+ * Responses and OpenRouter `reasoning_details` replay an opaque item instead of the text. `foldOne`
+ * keeps the signature when it swaps the text, so a rewritten signed block can be rejected by the
+ * API, or silently ignored. Conservative: any non-empty signature that is not a field-name marker
+ * counts, as does redacted reasoning.
+ */
+export function thinkingIsSigned(p: PiThinkingPart): boolean {
+	if (p.redacted === true) return true;
+	const s = p.thinkingSignature;
+	return typeof s === "string" && s.trim().length > 0 && !REASONING_FIELD_MARKERS.has(s);
 }
 export interface PiToolCallPart {
 	type: "toolCall";
@@ -134,7 +160,7 @@ export function linearize(messages: PiMessage[], orderStart = 0, turnStart = 0):
 		id: string,
 		kind: WireBlock["kind"],
 		text: string,
-		extra: Partial<Pick<WireBlock, "toolName" | "callId" | "model" | "isError">> = {},
+		extra: Partial<Pick<WireBlock, "toolName" | "callId" | "model" | "isError" | "signed">> = {},
 	) => {
 		if (!text && kind !== "tool_result") return; // drop empty non-results (parity with parse.ts)
 		out.push({ id, kind, turn, order: order++, text, tokens: tokensFor(text), ...extra });
@@ -150,8 +176,10 @@ export function linearize(messages: PiMessage[], orderStart = 0, turnStart = 0):
 			case "assistant": {
 				const parts = Array.isArray(m.content) ? (m.content as PiPart[]) : [];
 				parts.forEach((b, j) => {
-					if (b?.type === "thinking") push(blockId(m, i, j), "thinking", (b as PiThinkingPart).thinking || "", { model: m.model });
-					else if (b?.type === "text") push(blockId(m, i, j), "text", (b as PiTextPart).text || "", { model: m.model });
+					if (b?.type === "thinking") {
+						const t = b as PiThinkingPart;
+						push(blockId(m, i, j), "thinking", t.thinking || "", thinkingIsSigned(t) ? { model: m.model, signed: true } : { model: m.model });
+					} else if (b?.type === "text") push(blockId(m, i, j), "text", (b as PiTextPart).text || "", { model: m.model });
 					else if (b?.type === "toolCall") {
 						const c = b as PiToolCallPart;
 						push(blockId(m, i, j), "tool_call", `${c.name} ${JSON.stringify(c.arguments ?? {})}`, {
@@ -194,6 +222,7 @@ export function wireToBlock(w: WireBlock): Block {
 		callId: w.callId,
 		model: w.model,
 		isError: w.isError,
+		...(w.signed ? { signed: true } : {}),
 		override: null,
 		autoFolded: false,
 		by: null,
@@ -343,6 +372,7 @@ export function contentFingerprint(m: PiMessage): number {
 				} else if (b?.type === "thinking") {
 					h = fnvByte(h, 0x11);
 					h = fnvStr(h, (b as PiThinkingPart).thinking || "");
+					if (thinkingIsSigned(b as PiThinkingPart)) h = fnvByte(h, 0x13); // (unsigned hashes unchanged)
 				} else if (b?.type === "toolCall") {
 					const c = b as PiToolCallPart;
 					h = fnvByte(h, 0x12);

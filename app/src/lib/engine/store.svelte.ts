@@ -34,6 +34,7 @@ function cloneBlock(b: Block): Block {
 		callId: b.callId,
 		model: b.model,
 		isError: b.isError,
+		...(b.signed ? { signed: true } : {}),
 		override: b.override,
 		autoFolded: b.autoFolded,
 		by: b.by,

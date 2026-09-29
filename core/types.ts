@@ -96,6 +96,11 @@ export interface Block {
 	/** Model that produced an assistant block, if known. */
 	model?: string;
 	isError?: boolean;
+	/**
+	 * A `thinking` block whose provider signature is replayed with it (`core/wire.ts →
+	 * thinkingIsSigned`): rewriting its text keeps the old signature, which the API may reject.
+	 */
+	signed?: boolean;
 
 	// --- mutable, reactive state (the OVERLAY) -----------------------------
 	override: Override;

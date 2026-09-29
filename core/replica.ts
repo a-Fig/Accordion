@@ -30,6 +30,7 @@ export function blockToWire(b: Block): WireBlock {
 		callId: b.callId,
 		model: b.model,
 		isError: b.isError,
+		...(b.signed ? { signed: true } : {}),
 	};
 }
 
