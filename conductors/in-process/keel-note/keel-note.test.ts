@@ -42,11 +42,11 @@ class Session {
 		this.turn++;
 		return this.push({ id: `u:${1000 + this.order}`, kind: "user", text });
 	}
-	step(p: { think?: string; say?: string; calls?: Call[] }): StepIds {
+	step(p: { think?: string; say?: string; calls?: Call[]; signed?: boolean }): StepIds {
 		const r = ++this.resp;
 		let j = 0;
 		const ids: StepIds = { calls: [] };
-		if (p.think !== undefined) ids.think = this.push({ id: `a:resp${r}:p${j++}`, kind: "thinking", text: p.think });
+		if (p.think !== undefined) ids.think = this.push({ id: `a:resp${r}:p${j++}`, kind: "thinking", text: p.think, ...(p.signed ? { signed: true } : {}) });
 		if (p.say !== undefined) ids.say = this.push({ id: `a:resp${r}:p${j++}`, kind: "text", text: p.say });
 		const calls = p.calls ?? [];
 		const callIds = calls.map((c, n) => {
@@ -83,7 +83,9 @@ const bash = (command: string, out: string): Call => ({ tool: "bash", args: { co
 interface Shape {
 	think: number;
 	out: number;
-	say?: (i: number) => string;
+	say?: (i: number) => string | undefined;
+	/** Every thought carries a provider signature (Anthropic-style). */
+	signed?: boolean;
 }
 /**
  * SlopCode-like steps, thinking ~2/3 of the mass. Every epoch has to shed more than the new
@@ -98,9 +100,9 @@ const DEEP: Shape = { think: 4000, out: 3 };
 function session(n: number, shape: Shape = SLOP): { s: Session; steps: StepIds[] } {
 	const s = new Session();
 	s.user("Read AGENT_BRIEFING.md and complete the benchmark run it describes.");
-	s.step({ think: "Let me start by reading the briefing file.", calls: [bash("pwd && ls -la", lines(3, 20, "ls"))] });
+	s.step({ think: "Let me start by reading the briefing file.", signed: shape.signed, calls: [bash("pwd && ls -la", lines(3, 20, "ls"))] });
 	const steps: StepIds[] = [];
-	for (let i = 0; i < n; i++) steps.push(s.step({ think: thought(shape.think, i), say: shape.say?.(i), calls: [bash(`python run.py --case ${i}`, lines(shape.out, 40, `case${i}`))] }));
+	for (let i = 0; i < n; i++) steps.push(s.step({ think: thought(shape.think, i), say: shape.say?.(i), signed: shape.signed, calls: [bash(`python run.py --case ${i}`, lines(shape.out, 40, `case${i}`))] }));
 	return { s, steps };
 }
 
@@ -175,8 +177,36 @@ class NoteHost extends TestHost {
 
 const isPlacement = (t: { ops: Op[] }) => t.ops[0]?.kind === "replace" && t.ops[0].recoverable === false;
 
-function setup(s: Session, opts: { protect?: number; budgetFactor?: number; budget?: number } = {}): NoteHost {
-	const host = new NoteHost();
+/** Throws synchronously (instead of rejecting) on the next `throwPlacements` note placements. */
+class ThrowingHost extends NoteHost {
+	throwPlacements = 0;
+	override propose(txn: { baseRev: number; ops: Op[] }): Promise<TxnResult> {
+		if (this.throwPlacements > 0 && isPlacement(txn)) {
+			this.throwPlacements--;
+			throw new Error("host threw synchronously");
+		}
+		return super.propose(txn);
+	}
+}
+
+/** Clamps the next `clampPlacements` note placements without applying anything. */
+class ClampingHost extends NoteHost {
+	clampPlacements = 0;
+	readonly clamped: string[] = [];
+	override propose(txn: { baseRev: number; ops: Op[] }): Promise<TxnResult> {
+		if (this.clampPlacements > 0 && isPlacement(txn)) {
+			this.clampPlacements--;
+			const carrierBefore = this.probe?.() ?? null;
+			this.clamped.push(opIds(txn.ops[0])[0]);
+			const res: TxnResult = { rev: this.stats().rev, results: txn.ops.map((op) => ({ op, applied: false, clamped: "noop" as const })) };
+			this.txns.push({ ops: txn.ops, res, carrierBefore });
+			return Promise.resolve(res);
+		}
+		return super.propose(txn);
+	}
+}
+
+function setup<H extends NoteHost = NoteHost>(s: Session, opts: { protect?: number; budgetFactor?: number; budget?: number } = {}, host: H = new NoteHost() as H): H {
 	s.flush(host);
 	host.setProtect(opts.protect ?? 400);
 	host.setBudget(opts.budget ?? Math.ceil(host.stats().liveTokens / (opts.budgetFactor ?? 0.9)));
@@ -231,7 +261,7 @@ function specCarrier(host: TestHost, carrierId: string | null): { id: string; ta
 	const pfi = Math.min(host.stats().protectedFromIndex, blocks.length);
 	const inGroup = new Set(host.groups().flatMap((g) => g.memberIds));
 	const free = (b: ViewBlock) => !b.held && !b.grouped && !b.protected && !inGroup.has(b.id);
-	const usable = (b: ViewBlock) => free(b) && (b.kind === "thinking" || (b.kind === "text" && (b.id === carrierId || (!b.folded && b.tokens <= 150))));
+	const usable = (b: ViewBlock) => free(b) && ((b.kind === "thinking" && !b.signed) || (b.kind === "text" && (b.id === carrierId || (!b.folded && b.tokens <= 150))));
 	const boundary = blocks.findIndex((b, i) => i > first && i < pfi && b.kind === "thinking" && !b.folded && free(b) && b.tokens > b.foldedTokens);
 	if (boundary >= 0) for (let i = boundary + 1; i < pfi; i++) if (usable(blocks[i])) return { id: blocks[i].id, tail: false };
 	for (let i = pfi - 1; i > first; i--) if (usable(blocks[i])) return { id: blocks[i].id, tail: true };
@@ -240,7 +270,7 @@ function specCarrier(host: TestHost, carrierId: string | null): { id: string; ta
 
 /** Add one step and commit the turn. */
 async function grow(host: NoteHost, s: Session, seed: number, thinkChars = 2000, shape: Shape = SLOP): Promise<StepIds> {
-	const st = s.step({ think: thought(thinkChars, seed), say: shape.say?.(seed), calls: [bash(`python run.py --case ${seed}`, lines(shape.out, 40, `grow${seed}`))] });
+	const st = s.step({ think: thought(thinkChars, seed), say: shape.say?.(seed), signed: shape.signed, calls: [bash(`python run.py --case ${seed}`, lines(shape.out, 40, `grow${seed}`))] });
 	s.flush(host);
 	await host.commitTurn();
 	return st;
@@ -260,9 +290,9 @@ async function growUntilEpoch(host: NoteHost, s: Session, seed: number, shape: S
 }
 
 /** A DEEP session with a first note (`tag`) resolved and placed by the second trim. */
-async function withLandedNote(opts: ConstructorParameters<typeof KeelNoteConductor>[0] = EAGER, tag = "A") {
+async function withLandedNote<H extends NoteHost = NoteHost>(opts: ConstructorParameters<typeof KeelNoteConductor>[0] = EAGER, tag = "A", into?: H) {
 	const { s, steps } = session(40, DEEP);
-	const host = setup(s, { budgetFactor: 0.9 });
+	const host = setup(s, { budgetFactor: 0.9 }, into ?? (new NoteHost() as H));
 	const c = new KeelNoteConductor(opts);
 	host.probe = () => c.noteState.carrierId;
 	c.attach(host);
@@ -534,6 +564,49 @@ describe("keel-note · boundary placement", () => {
 		}
 	});
 
+	it("never overwrites a signed thinking block: small text blocks carry the note instead", async () => {
+		// Text on every third step only, so the block right after the boundary is often a signed thought.
+		const shape: Shape = { ...DEEP, signed: true, say: (i) => (i % 3 === 0 ? `Step ${i}: running case ${i}.` : undefined) };
+		const { s } = session(40, shape);
+		const host = setup(s, { budgetFactor: 0.9 });
+		const c = new KeelNoteConductor(EAGER);
+		c.attach(host);
+		await host.commitTurn();
+		let seed = 9000;
+		for (let n = 0; n < 3; n++) {
+			for (const p of host.calls) if (!p.settled) p.resolve({ text: noteBody(`G${n}`) });
+			await settle();
+			seed = await growUntilEpoch(host, s, seed, shape);
+			const id = c.noteState.carrierId!;
+			expect(host.truth.get(id)!.kind).toBe("text");
+			expect(specCarrier(host, id)?.id).toBe(id);
+			expect(showingNote(host)).toEqual([id]);
+		}
+		const placed = host.txns.filter(isPlacement).map((t) => opIds(t.ops[0])[0]);
+		expect(placed.length).toBeGreaterThanOrEqual(3);
+		for (const id of placed) expect(host.get(id)!.signed).not.toBe(true);
+	});
+
+	it("with only signed thinking and no small text, the note is not placed, and the budget still holds", async () => {
+		const shape: Shape = { ...DEEP, signed: true };
+		const { s } = session(40, shape);
+		const host = setup(s, { budgetFactor: 0.9 });
+		const c = new KeelNoteConductor(EAGER);
+		c.attach(host);
+		await host.commitTurn();
+		let seed = 9500;
+		for (let n = 0; n < 3; n++) {
+			for (const p of host.calls) if (!p.settled) p.resolve({ text: noteBody(`N${n}`) });
+			await settle();
+			seed = await growUntilEpoch(host, s, seed, shape);
+			expect(effOf(host, c)).toBeLessThanOrEqual(highOf(host)); // the full cap stays reserved
+		}
+		expect(host.txns.filter(isPlacement)).toHaveLength(0);
+		expect(c.noteState).toMatchObject({ carrierId: null, ready: true });
+		expect(showingNote(host)).toEqual([]);
+		expect(host.calls.length).toBeGreaterThan(1); // the note still updates, waiting for a carrier
+	});
+
 	it("re-places the note when a human takes its carrier, and only then", async () => {
 		const { host, c } = await withLandedNote(EAGER, "M");
 		const carrier = c.noteState.carrierId!;
@@ -647,6 +720,40 @@ describe("keel-note · span capture", () => {
 		expect(prevOf(host.calls[1].req)).toContain("W-NEXT");
 	});
 
+	it("a clamped placement copies nothing: the thought it failed to overwrite stays live and out of the note input", async () => {
+		const { s } = session(40, DEEP);
+		const host = setup(s, { budgetFactor: 0.9 }, new ClampingHost());
+		const c = new KeelNoteConductor(EAGER);
+		host.probe = () => c.noteState.carrierId;
+		c.attach(host);
+		await host.commitTurn(); // epoch 1 → call 1
+		host.calls[0].resolve({ text: noteBody("C") });
+		await settle();
+		host.clampPlacements = 1;
+		let seed = await growUntilEpoch(host, s, 2000, DEEP); // epoch 2's placement is clamped
+		expect(host.clamped).toHaveLength(1);
+		const target = host.clamped[0];
+		expect(host.truth.get(target)!.kind).toBe("thinking");
+		expect(host.get(target)!.folded).toBe(false); // still live
+		expect(c.noteState).toMatchObject({ carrierId: null, ready: true }); // the note waits for the next trim
+		const words = host.textOf(target)!.slice(0, 60);
+		const sent = host.calls.length;
+		expect(sent).toBe(2); // epoch 2's span went out right after the clamp…
+		expect(turnsOf(host.calls[1].req)).not.toContain(words); // …without the live thought
+		// Once the thought really leaves the view (trimmed, or overwritten by a later placement), the
+		// next update gets it: the clamp did not mark it as seen.
+		for (let n = 0; n < 6 && !host.get(target)!.folded; n++) {
+			for (const p of host.calls) if (!p.settled) p.resolve({ text: noteBody(`C${n}`) });
+			await settle();
+			seed = await growUntilEpoch(host, s, seed, DEEP);
+		}
+		expect(host.get(target)!.folded).toBe(true);
+		for (const p of host.calls) if (!p.settled) p.resolve({ text: noteBody("C-last") });
+		await settle();
+		seed = await growUntilEpoch(host, s, seed, DEEP);
+		expect(host.calls.slice(sent).some((p) => turnsOf(p.req).includes(words))).toBe(true);
+	});
+
 	it("coalesces trims while an update is in flight, then chains one follow-up with the new spans", async () => {
 		const { s } = session(12);
 		const host = setup(s, { budgetFactor: 0.9 });
@@ -726,6 +833,23 @@ describe("keel-note · failures", () => {
 		seed = await growUntilEpoch(host, s, seed, DEEP);
 		expect(substOf(host, c.noteState.carrierId!)).toContain("B-NEXT");
 		expect(host.statusLog.at(-1)?.text).not.toMatch(/failed/);
+	});
+
+	it("a host whose propose throws synchronously leaves the note where it was, and the next trim still moves it", async () => {
+		const { s, host, c, seed } = await withLandedNote(EAGER, "X", new ThrowingHost());
+		const before = c.noteState.carrierId!;
+		host.throwPlacements = 1;
+		let next = await growUntilEpoch(host, s, seed, DEEP); // this epoch's move throws
+		expect(host.throwPlacements).toBe(0);
+		expect(c.noteState.carrierId).toBe(before); // rolled back to the block that still shows it
+		expect(showingNote(host)).toEqual([before]);
+		for (let n = 0; n < 2; n++) {
+			next = await growUntilEpoch(host, s, next, DEEP);
+			const id = c.noteState.carrierId!;
+			expect(id).not.toBe(before); // not stuck: later trims move it again
+			expect(showingNote(host)).toEqual([id]);
+			expect(specCarrier(host, id)?.id).toBe(id);
+		}
 	});
 
 	it("a hung update times out without ever blocking the agent loop", async () => {
