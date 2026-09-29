@@ -527,43 +527,48 @@ export class KeelLiteConductor implements Conductor {
 		}
 
 		this.busy = true;
-		let res: TxnResult;
 		try {
-			// The in-process host applies this synchronously, before the first await resumes.
-			res = await host.propose({ baseRev: host.stats().rev, ops });
-		} catch {
-			this.busy = false;
-			return;
-		}
-		if (this.host !== host) return; // detached mid-flight
-
-		let blocksApplied = 0;
-		let groupsApplied = 0;
-		res.results.forEach((r, i) => {
-			if (!r.applied) return; // a clamped op is never recorded
-			const m = meta[i];
-			if (!m) return;
-			if (m.kind === "block") {
-				const prev = this.decisions.get(m.p.id);
-				this.decisions.set(m.p.id, { rung: m.p.rung || prev?.rung || 0, form: m.p.form, content: m.p.content });
-				blocksApplied++;
-			} else {
-				const gid = r.detail ?? `g:${m.g.ids[0]}`;
-				this.ownGroups.set(gid, m.g.ids.slice());
-				groupsApplied++;
+			let res: TxnResult;
+			try {
+				// The in-process host applies this synchronously, before the first await resumes.
+				res = await host.propose({ baseRev: host.stats().rev, ops });
+			} catch {
+				return;
 			}
-		});
+			if (this.host !== host) return; // detached mid-flight
 
-		const after = host.stats();
-		if (blocksApplied || groupsApplied) {
-			this.epochs++;
-			const saved = Math.max(0, plan.live - after.liveTokens);
-			this.savedTotal += saved;
-			this.publishEpoch(host, plan, after.liveTokens, saved, blocksApplied, groupsApplied);
+			let blocksApplied = 0;
+			let groupsApplied = 0;
+			res.results.forEach((r, i) => {
+				if (!r.applied) return; // a clamped op is never recorded
+				const m = meta[i];
+				if (!m) return;
+				if (m.kind === "block") {
+					const prev = this.decisions.get(m.p.id);
+					this.decisions.set(m.p.id, { rung: m.p.rung || prev?.rung || 0, form: m.p.form, content: m.p.content });
+					blocksApplied++;
+				} else {
+					const gid = r.detail ?? `g:${m.g.ids[0]}`;
+					this.ownGroups.set(gid, m.g.ids.slice());
+					groupsApplied++;
+				}
+			});
+
+			const after = host.stats();
+			if (blocksApplied || groupsApplied) {
+				this.epochs++;
+				const saved = Math.max(0, plan.live - after.liveTokens);
+				this.savedTotal += saved;
+				this.publishEpoch(host, plan, after.liveTokens, saved, blocksApplied, groupsApplied);
+			}
+		} finally {
+			// Always clear `busy`, even when reconciling throws (e.g. the host's `setStatus`), or every
+			// later evaluate() would only set `pending` and keel-lite would go silent for the rest of
+			// the session. The error itself still reaches the host.
+			this.busy = false;
 		}
 
-		this.busy = false;
-		if (this.pending) {
+		if (this.pending && this.host === host) {
 			this.pending = false;
 			await this.evaluate();
 		}
