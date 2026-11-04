@@ -5,8 +5,8 @@
  * The signal is a PROXY, not ground truth: it counts how often the agent reached back into folded
  * content (`unfold`/`recall`), attributed to the conductor attached AT THE MOMENT OF THE CALL. An
  * agent may unfold out of curiosity because the tag invites it, and under an `agent-unfold` lock
- * the refused attempts land in `missingCodes`, so a lock-holder reading 0 means "can't tell", not
- * "no regret". `foldedBlocks` is a point-in-time gauge (what is folded NOW), not a rate denominator.
+ * the refused attempts are counted apart as `lockRefusals`, so read a lock-holder's unfold calls
+ * together with them; `byKind.group` counts member blocks restored via a group. `foldedBlocks` is a point-in-time gauge (what is folded NOW), not a rate denominator.
  */
 
 export interface RegretCounts {
@@ -15,6 +15,8 @@ export interface RegretCounts {
 	recallCalls: number;
 	recallBlocks: number;
 	missingCodes: number;
+	/** Unfold attempts refused because `agent-unfold` is locked (older extensions omit it → 0). */
+	lockRefusals: number;
 	byKind: Record<string, number>;
 }
 
@@ -44,6 +46,7 @@ function parseCounts(v: unknown): RegretCounts | null {
 		recallCalls: num(o.recallCalls),
 		recallBlocks: num(o.recallBlocks),
 		missingCodes: num(o.missingCodes),
+		lockRefusals: num(o.lockRefusals),
 		byKind,
 	};
 }
@@ -94,11 +97,12 @@ export function regretTooltip(r: RegretMeta, activeId: string | null): string {
 			.join(", ");
 		lines.push(
 			`${id === activeId || (id === NO_CONDUCTOR && activeId === null) ? "▸ " : ""}${id}: ${c.unfoldCalls} unfold · ${c.recallCalls} recall` +
-				` · ${c.missingCodes} missing/refused` +
+				` · ${c.missingCodes} missing` +
+				(c.lockRefusals > 0 ? ` · ${c.lockRefusals} refused by agent-unfold lock` : "") +
 				(kinds ? ` (${kinds})` : ""),
 		);
 	}
 	lines.push(`blocks folded right now: ${r.foldedBlocks} (a gauge, not a rate denominator)`);
-	lines.push("missing/refused includes agent-unfold lock refusals, so a locked conductor can read 0 here.");
+	lines.push("A conductor holding the agent-unfold lock refuses unfolds (shown as refused); the agent's other path back is recall.");
 	return lines.join("\n");
 }

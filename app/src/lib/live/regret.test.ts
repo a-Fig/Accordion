@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { parseRegret, reachBackCalls, regretTooltip } from "./regret";
 
-const counts = { unfoldCalls: 2, unfoldBlocks: 3, recallCalls: 1, recallBlocks: 1, missingCodes: 4, byKind: { tool_result: 3, text: 1 } };
+const counts = { unfoldCalls: 2, unfoldBlocks: 3, recallCalls: 1, recallBlocks: 1, missingCodes: 4, lockRefusals: 0, byKind: { tool_result: 3, text: 1 } };
 const body = (over: Record<string, unknown> = {}) => ({
 	sessionId: "s1",
 	regret: { foldedBlocks: 9, byConductor: { thermocline: counts, none: { ...counts, unfoldCalls: 0 } } },
@@ -54,10 +54,23 @@ describe("regretTooltip", () => {
 	it("marks the active conductor and carries the caveats", () => {
 		const r = parseRegret(body(), "s1")!;
 		const t = regretTooltip(r, "thermocline");
-		expect(t).toContain("▸ thermocline: 2 unfold · 1 recall · 4 missing/refused (text 1, tool_result 3)");
+		expect(t).toContain("▸ thermocline: 2 unfold · 1 recall · 4 missing (text 1, tool_result 3)");
+		expect(t).not.toContain("refused by agent-unfold lock");
 		expect(t).not.toContain("▸ none");
 		expect(t).toContain("a gauge, not a rate denominator");
-		expect(t).toContain("lock refusals");
+		expect(t).toContain("agent-unfold lock");
+	});
+
+	it("shows lock refusals and a group kind", () => {
+		const r = parseRegret({ sessionId: "s1", regret: { foldedBlocks: 1, byConductor: { triptych: { ...counts, unfoldCalls: 0, lockRefusals: 5, byKind: { group: 12 } } } } }, "s1")!;
+		expect(r.byConductor.triptych.lockRefusals).toBe(5);
+		const t = regretTooltip(r, "triptych");
+		expect(t).toContain("▸ triptych: 0 unfold · 1 recall · 4 missing · 5 refused by agent-unfold lock (group 12)");
+	});
+
+	it("defaults lockRefusals to 0 for an older extension", () => {
+		const { lockRefusals: _drop, ...legacy } = counts;
+		expect(parseRegret({ sessionId: "s1", regret: { foldedBlocks: 0, byConductor: { x: legacy } } }, "s1")?.byConductor.x.lockRefusals).toBe(0);
 	});
 
 	it("treats a null active conductor as the 'none' bucket", () => {
