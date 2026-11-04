@@ -4,6 +4,7 @@
 	import { connectLive, disconnectLive, live, claimController } from "$lib/live/liveClient.svelte";
 	import { discovery, startDiscovery, stopDiscovery, DEMO_ID } from "$lib/live/discovery.svelte";
 	import { startBrowserDiscovery, stopBrowserDiscovery } from "$lib/live/browserDiscovery.svelte";
+	import { startRegretPoll, stopRegretPoll } from "$lib/live/regretPoll.svelte";
 	import { claudeDiscovery, startClaudeDiscovery, stopClaudeDiscovery } from "$lib/live/claudeDiscovery.svelte";
 	import { folding } from "$lib/live/folding.svelte";
 	import { foldAlarm, runFoldCheck } from "$lib/live/foldAlarm.svelte";
@@ -137,6 +138,7 @@
 					const port = Number(window.location.port) || DEFAULT_PORT;
 					connectLive(port, { host: window.location.hostname, token: readServedToken() ?? undefined });
 					startBrowserDiscovery();
+					startRegretPoll();
 				} catch {
 					// 404, network error, non-JSON — leave browserServed false; manual UI stays.
 				}
@@ -146,6 +148,7 @@
 		return () => {
 			stopDiscovery();
 			stopBrowserDiscovery();
+			stopRegretPoll();
 			stopClaudeDiscovery();
 			disconnectLive();
 		};
