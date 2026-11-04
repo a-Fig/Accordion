@@ -485,15 +485,18 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	// recovered afterwards). `missing` is counted apart: an already-open or unknown code is not regret.
 	// A proxy, not ground truth — an agent may unfold out of curiosity because the tag invites it.
 	// Surfaced only through /__accordion/meta (plain JSON), so no protocol bump.
-	type RegretCounts = { unfoldCalls: number; unfoldBlocks: number; recallCalls: number; recallBlocks: number; missingCodes: number; byKind: Record<string, number> };
+	type RegretCounts = { unfoldCalls: number; unfoldBlocks: number; recallCalls: number; recallBlocks: number; missingCodes: number; lockRefusals: number; byKind: Record<string, number> };
 	const regretByConductor = new Map<string, RegretCounts>();
-	const noteRegret = (op: "unfold" | "recall", res: { restored: Array<{ kind?: string } | null | undefined>; missing: string[] }) => {
+	const noteRegret = (op: "unfold" | "recall", res: { restored: Array<{ kind?: string; label?: string; ids?: string[] } | null | undefined>; missing: string[] }) => {
 		const id = liveHost.activeMeta()?.id ?? "none";
 		let c = regretByConductor.get(id);
-		if (!c) regretByConductor.set(id, (c = { unfoldCalls: 0, unfoldBlocks: 0, recallCalls: 0, recallBlocks: 0, missingCodes: 0, byKind: {} }));
-		if (op === "unfold") { c.unfoldCalls++; c.unfoldBlocks += res.restored.length; } else { c.recallCalls++; c.recallBlocks += res.restored.length; }
-		c.missingCodes += res.missing.length;
-		for (const r of res.restored) { const k = r?.kind ?? "unknown"; c.byKind[k] = (c.byKind[k] ?? 0) + 1; }
+		if (!c) regretByConductor.set(id, (c = { unfoldCalls: 0, unfoldBlocks: 0, recallCalls: 0, recallBlocks: 0, missingCodes: 0, lockRefusals: 0, byKind: {} }));
+		// Blocks = member ids touched (a group restore is many), not restore entries; groups get their own byKind bucket.
+		const blocks = res.restored.reduce((n, r) => n + (r?.ids?.length ?? 1), 0);
+		if (op === "unfold") { c.unfoldCalls++; c.unfoldBlocks += blocks; } else { c.recallCalls++; c.recallBlocks += blocks; }
+		// Under an agent-unfold lock a refused code lands in `missing`; count it apart so a lock-holder doesn't read as zero regret.
+		if (op === "unfold" && truth?.isLocked("agent-unfold")) c.lockRefusals += res.missing.length; else c.missingCodes += res.missing.length;
+		for (const r of res.restored) { const k = r?.label?.startsWith("group") ? "group" : (r?.kind ?? "unknown"); c.byKind[k] = (c.byKind[k] ?? 0) + (r?.ids?.length ?? 1); }
 	};
 	const hookDurations: number[] = []; // bounded ring for the p95 readout
 	const HOOK_RING = 256;
@@ -1169,7 +1172,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 						sessionId,
 						protocolVersion: PROTOCOL_VERSION,
 						telemetry: { hookCount, lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookErrors, ingressErrors, foldingEnabled },
-						// Denominator for the regret rate: blocks folded right now, plus per-conductor agent reach-backs.
+						// foldedBlocks is a point-in-time GAUGE (blocks folded right now), not a cumulative rate denominator. Plus per-conductor agent reach-backs.
 						regret: { foldedBlocks: truth ? truth.foldedCount() : 0, byConductor: Object.fromEntries(regretByConductor) },
 					}),
 				);
