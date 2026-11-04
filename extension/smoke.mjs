@@ -717,7 +717,8 @@ if (unfoldTool && foldCodeStr) {
 			fails.push(`regret unfold counters expected 1 call / 1 block, got ${none.unfoldCalls}/${none.unfoldBlocks}`);
 		if (none.missingCodes !== 0) fails.push(`regret.missingCodes expected 0 before any bad code, got ${none.missingCodes}`);
 		if (none.lockRefusals !== 0) fails.push(`regret.lockRefusals expected 0 with no conductor, got ${none.lockRefusals}`);
-		if ((none.byKind?.text ?? 0) !== 1) fails.push(`regret.byKind.text expected 1 (the unfolded text block), got ${JSON.stringify(none.byKind)}`);
+		if ((none.byKind?.text ?? 0) !== 2) fails.push(`regret.byKind.text expected 2 (recall + unfold of the same text block), got ${JSON.stringify(none.byKind)}`);
+		if (none.byKind?.unknown) fails.push(`regret.byKind.unknown should not appear for a text block, got ${JSON.stringify(none.byKind)}`);
 	}
 	// A missing code: counted as missing, and the call still counts, but no block is restored.
 	if (recallTool && foldCodeStr) {
