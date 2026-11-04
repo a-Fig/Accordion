@@ -696,6 +696,45 @@ if (unfoldTool && foldCodeStr) {
 	fails.push("unfold tool was not registered");
 }
 
+// regret counters (#152) — /__accordion/meta must attribute the recall + unfold above to the conductor attached at call time ("none" here), count a missing code apart, and report foldedBlocks as a point-in-time gauge (1 while folded above, 0 now that unfold opened it).
+{
+	const getMeta = () =>
+		new Promise((resolve, reject) => {
+			http.get({ host: "127.0.0.1", port: PORT, path: "/__accordion/meta" }, (res) => {
+				let buf = ""; res.on("data", (d) => (buf += d)); res.on("end", () => resolve(JSON.parse(buf)));
+			}).on("error", reject);
+		});
+	const meta = await getMeta();
+	const none = meta.regret?.byConductor?.none;
+	if (!meta.regret) fails.push("/__accordion/meta did not expose a regret object");
+	if (meta.regret && meta.regret.foldedBlocks !== 0)
+		fails.push(`regret.foldedBlocks expected 0 after unfold (gauge), got ${meta.regret.foldedBlocks}`);
+	if (!none) fails.push(`regret.byConductor.none missing (got ${JSON.stringify(meta.regret?.byConductor)})`);
+	else {
+		if (none.recallCalls !== 1 || none.recallBlocks !== 1)
+			fails.push(`regret recall counters expected 1 call / 1 block, got ${none.recallCalls}/${none.recallBlocks}`);
+		if (none.unfoldCalls !== 1 || none.unfoldBlocks !== 1)
+			fails.push(`regret unfold counters expected 1 call / 1 block, got ${none.unfoldCalls}/${none.unfoldBlocks}`);
+		if (none.missingCodes !== 0) fails.push(`regret.missingCodes expected 0 before any bad code, got ${none.missingCodes}`);
+		if (none.lockRefusals !== 0) fails.push(`regret.lockRefusals expected 0 with no conductor, got ${none.lockRefusals}`);
+		if ((none.byKind?.text ?? 0) !== 1) fails.push(`regret.byKind.text expected 1 (the unfolded text block), got ${JSON.stringify(none.byKind)}`);
+	}
+	// A missing code: counted as missing, and the call still counts, but no block is restored.
+	if (recallTool && foldCodeStr) {
+		const MISSING = foldCodeStr === "qqqqqq" ? "wwwwww" : "qqqqqq";
+		const res = await recallTool.execute("call-recall-missing", { codes: [MISSING] }, null, () => {}, ctx);
+		const text = res?.content?.map((c) => c.text).join("\n") || "";
+		if (!text.includes("No folded block for")) fails.push(`recall of a missing code did not report it missing (got ${JSON.stringify(text)})`);
+		const after = await getMeta();
+		const n2 = after.regret?.byConductor?.none;
+		if (!n2 || n2.missingCodes !== 1) fails.push(`regret.missingCodes expected 1 after a missing recall, got ${n2?.missingCodes}`);
+		if (n2 && (n2.recallCalls !== 2 || n2.recallBlocks !== 1))
+			fails.push(`regret recall counters after missing code expected 2 calls / 1 block, got ${n2?.recallCalls}/${n2?.recallBlocks}`);
+		if (after.regret && after.regret.foldedBlocks !== 0)
+			fails.push(`regret.foldedBlocks changed after a missing recall (got ${after.regret.foldedBlocks})`);
+	}
+}
+
 // telemetry accumulated across the several context hooks above.
 {
 	const meta = await new Promise((resolve, reject) => {
