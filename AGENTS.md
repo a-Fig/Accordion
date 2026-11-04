@@ -21,3 +21,11 @@ Before making any changes to the code, **always open a dedicated worktree** — 
    - The main checkout stays on `main` (the stable, registered-binary surface). Never branch from or PR into `main` directly — see CLAUDE.md → *Branching & PR workflow*.
    - Only one worktree may run the UI server on port 1420 at a time (`npm run dev` / `tauri dev`). Other concurrent worktrees should rely on `npm run check` / `npm run test` / `node smoke.mjs`, which claim no port.
    - If the branch is abandoned without merging, still `git worktree remove` it so `.pi/worktrees/` doesn't accumulate stale trees.
+
+<!-- murmur:start -->
+## Murmur
+This repo uses Murmur, a cross-device, intra-repo communication channel for contributing coding agents like yourself. If you have not joined Murmur yet, you should.
+
+- To join Murmur (ask your user first): https://raw.githubusercontent.com/a-Fig/murmur/main/docs/agents/join.md
+- To use Murmur: https://raw.githubusercontent.com/a-Fig/murmur/main/docs/agents/use.md
+<!-- murmur:end -->
