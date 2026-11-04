@@ -7,6 +7,8 @@
 	import { folding } from "$lib/live/folding.svelte";
 	import { live, setArmed, conductorState, conductorStatus, controllerState, anotherSurfaceControls, claimController } from "$lib/live/liveClient.svelte";
 	import { attemptSteer, flashBlockedHint, readOnlyTip } from "$lib/live/controllerUi.svelte";
+	import { regretView } from "$lib/live/regretPoll.svelte";
+	import { NO_CONDUCTOR, reachBackCalls, regretTooltip } from "$lib/live/regret";
 	import ConductorMenu from "./ConductorMenu.svelte";
 
 	let { store, readOnly = false }: { store: AccordionStore; readOnly?: boolean } = $props();
@@ -188,6 +190,15 @@
 			`timeouts this connection: ${live.telemetry.holdTimeouts} (passed through unchanged when the hold ran out)`,
 	);
 
+	// ── REACH-BACK chip: how often the agent unfolded/recalled folded content under the CURRENTLY
+	// attached conductor (the extension attributes each call to the conductor attached at call time,
+	// "none" when no conductor was). Browser-served mode only for now (see regretPoll.svelte.ts);
+	// hidden whenever the poll has no data for this session. A proxy for fold regret, not ground
+	// truth — the tooltip carries the caveats and the full per-conductor breakdown.
+	const regretActiveId = $derived(conductorState.active?.id ?? null);
+	const reachBacks = $derived(reachBackCalls(regretView.regret?.byConductor[regretActiveId ?? NO_CONDUCTOR]));
+	const regretTip = $derived(regretView.regret ? regretTooltip(regretView.regret, regretActiveId) : "");
+
 	// ── Conductor status readout (Phase C): the attached conductor's own display-only status
 	// line (`conductorStatus.text`), shown only while a conductor is actually attached and has
 	// published non-empty text — mirrors the PROTECT/BUDGET ctl-field visual pattern.
@@ -343,6 +354,18 @@
 					<span class="ctl-value mono tnum">
 						{holdMs}ms
 					</span>
+				</div>
+			{/if}
+
+			<!-- REACH-BACK chip: agent unfold/recall calls under the attached conductor. Neutral,
+			     like HOLD — a count, not a warning. Hidden without poll data for this session. -->
+			{#if live.status === "connected" && regretView.regret}
+				<div class="ctl-field reach-read" title={regretTip}>
+					<span class="ctl-eyebrow mono">
+						<Icon name="activity" size={10} />
+						REACH-BACK
+					</span>
+					<span class="ctl-value mono tnum">{reachBacks}</span>
 				</div>
 			{/if}
 
@@ -893,6 +916,12 @@
 	   conductor spending its declared wire-departing hold budget is expected behavior, not a
 	   warning. */
 	.hold-read {
+		cursor: default;
+	}
+
+	/* REACH-BACK chip — neutral like HOLD (plain `.ctl-value` color, no tint): a count of the
+	   agent reaching back into folded content, informational only. */
+	.reach-read {
 		cursor: default;
 	}
 
