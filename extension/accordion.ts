@@ -496,7 +496,8 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 		if (op === "unfold") { c.unfoldCalls++; c.unfoldBlocks += blocks; } else { c.recallCalls++; c.recallBlocks += blocks; }
 		// Under an agent-unfold lock a refused code lands in `missing`; count it apart so a lock-holder doesn't read as zero regret.
 		if (op === "unfold" && truth?.isLocked("agent-unfold")) c.lockRefusals += res.missing.length; else c.missingCodes += res.missing.length;
-		for (const r of res.restored) { const k = r?.label?.startsWith("group") ? "group" : (r?.kind ?? "unknown"); c.byKind[k] = (c.byKind[k] ?? 0) + (r?.ids?.length ?? 1); }
+		for (const r of res.restored) { // RecallContent has no `kind`, but its label is blockLabel() / "group · N blocks", i.e. starts with the kind.
+			const k = r?.label?.startsWith("group") ? "group" : (r?.kind ?? r?.label?.split(" ")[0] ?? "unknown"); c.byKind[k] = (c.byKind[k] ?? 0) + (r?.ids?.length ?? 1); }
 	};
 	const hookDurations: number[] = []; // bounded ring for the p95 readout
 	const HOOK_RING = 256;
