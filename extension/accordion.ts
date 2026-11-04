@@ -480,6 +480,21 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 	let rebuilds = 0; // structural-divergence Truth rebuilds
 	let hookErrors = 0; // `context` hook throws caught by the passthrough guard (should stay 0)
 	let ingressErrors = 0; // unexpected throws caught at the WS message boundary (should stay 0 — a buggy peer must not crash us)
+	// Regret signal: how often the agent reaches back into folded content, attributed to the conductor
+	// attached AT THE MOMENT OF THE CALL (Truth overwrites `Block.by` on an unfold, so it can't be
+	// recovered afterwards). `missing` is counted apart: an already-open or unknown code is not regret.
+	// A proxy, not ground truth — an agent may unfold out of curiosity because the tag invites it.
+	// Surfaced only through /__accordion/meta (plain JSON), so no protocol bump.
+	type RegretCounts = { unfoldCalls: number; unfoldBlocks: number; recallCalls: number; recallBlocks: number; missingCodes: number; byKind: Record<string, number> };
+	const regretByConductor = new Map<string, RegretCounts>();
+	const noteRegret = (op: "unfold" | "recall", res: { restored: Array<{ kind?: string } | null | undefined>; missing: string[] }) => {
+		const id = liveHost.activeMeta()?.id ?? "none";
+		let c = regretByConductor.get(id);
+		if (!c) regretByConductor.set(id, (c = { unfoldCalls: 0, unfoldBlocks: 0, recallCalls: 0, recallBlocks: 0, missingCodes: 0, byKind: {} }));
+		if (op === "unfold") { c.unfoldCalls++; c.unfoldBlocks += res.restored.length; } else { c.recallCalls++; c.recallBlocks += res.restored.length; }
+		c.missingCodes += res.missing.length;
+		for (const r of res.restored) { const k = r?.kind ?? "unknown"; c.byKind[k] = (c.byKind[k] ?? 0) + 1; }
+	};
 	const hookDurations: number[] = []; // bounded ring for the p95 readout
 	const HOOK_RING = 256;
 
@@ -1154,6 +1169,8 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 						sessionId,
 						protocolVersion: PROTOCOL_VERSION,
 						telemetry: { hookCount, lastHookMs, maxHookMs, p95HookMs: p95HookMs(), rebuilds, hookErrors, ingressErrors, foldingEnabled },
+						// Denominator for the regret rate: blocks folded right now, plus per-conductor agent reach-backs.
+						regret: { foldedBlocks: truth ? truth.foldedCount() : 0, byConductor: Object.fromEntries(regretByConductor) },
 					}),
 				);
 				return;
@@ -2857,6 +2874,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				return { content: [{ type: "text", text: "Accordion isn't folding your context right now, so nothing is folded to restore — it is already full." }] };
 			}
 			const res = resolveUnfold(truth, codes); // LOCAL: mutates the Truth (broadcasts to clients)
+			noteRegret("unfold", res);
 			const lines: string[] = [];
 			if (res.restored.length) {
 				lines.push(`Unfolded ${res.restored.length} block(s); full content returns on your next turn:`);
@@ -2902,6 +2920,7 @@ export default function accordionLive(pi: ExtensionAPI, dependencies: RuntimeDep
 				return { content: [{ type: "text", text: "Accordion isn't attached, so nothing in your context is folded right now — it is already full." }] };
 			}
 			const res = resolveRecall(truth, codes); // LOCAL, pure read — never mutates fold state
+			noteRegret("recall", res);
 			// Surface the read so clients/conductors can observe it (no Truth state changed). The
 			// broadcast reaches conductor-role sockets too (a remote conductor derives its recall
 			// observation from it); an in-process conductor gets the derived HostEvent via dispatchRecall.
