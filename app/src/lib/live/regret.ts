@@ -6,7 +6,8 @@
  * content (`unfold`/`recall`), attributed to the conductor attached AT THE MOMENT OF THE CALL. An
  * agent may unfold out of curiosity because the tag invites it, and under an `agent-unfold` lock
  * the refused attempts are counted apart as `lockRefusals`, so read a lock-holder's unfold calls
- * together with them; `byKind.group` counts member blocks restored via a group. `foldedBlocks` is a point-in-time gauge (what is folded NOW), not a rate denominator.
+ * together with them; `byKind.group` counts member blocks restored via a group. `foldedBlocks` is a
+ * point-in-time gauge (what is folded NOW), not a rate denominator.
  */
 
 export interface RegretCounts {
